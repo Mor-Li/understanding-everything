@@ -10,6 +10,8 @@ from typing import Any
 
 import markdown
 
+from utils import get_output_path
+
 
 def build_tree_structure(repo_path: Path, subdir: Path, explain_base: Path) -> dict[str, Any]:
     """
@@ -690,14 +692,13 @@ def main():
     args = parser.parse_args()
 
     repo_path = Path(args.repo_path)
-    repo_name = repo_path.name
     subdir = Path(args.subdir)
 
     # 默认路径
     if args.explain is None:
-        args.explain = f"output/{repo_name}/explain"
+        args.explain = get_output_path(args.repo_path, args.subdir, "explain")
     if args.output is None:
-        args.output = f"output/{repo_name}/website"
+        args.output = get_output_path(args.repo_path, args.subdir, "website")
 
     explain_base = Path(args.explain)
     output_dir = Path(args.output)

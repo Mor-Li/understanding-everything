@@ -12,6 +12,8 @@ import git
 from openai import OpenAI
 from tqdm import tqdm
 
+from utils import get_output_path
+
 
 # Prompt 模板
 EXPLAIN_PROMPT = """这个我完全看不懂讲的啥 你觉得能不能列一个list 列一个task的todo 逐渐的给我一步一步讲讲文中的观点。请说中文
@@ -178,12 +180,9 @@ def main():
 
     args = parser.parse_args()
 
-    # 获取仓库名称
-    repo_name = Path(args.repo_path).name
-
-    # 默认输出路径：output/<repo_name>/explain
+    # 默认输出路径：output/<repo_name>/explain-<date>
     if args.output is None:
-        args.output = f"output/{repo_name}/explain"
+        args.output = get_output_path(args.repo_path, args.subdir, "explain")
 
     # 检查参数
     if args.top is None and args.percent is None:

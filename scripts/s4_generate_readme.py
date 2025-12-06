@@ -12,6 +12,8 @@ import tiktoken
 from openai import OpenAI
 from tqdm import tqdm
 
+from utils import get_output_path
+
 # 初始化 tokenizer
 tokenizer = tiktoken.get_encoding("o200k_base")
 
@@ -279,12 +281,9 @@ def main():
 
     args = parser.parse_args()
 
-    # 获取仓库名称
-    repo_name = Path(args.repo_path).name
-
-    # 默认输出路径：output/<repo_name>/explain
+    # 默认输出路径：output/<repo_name>/explain-<date>
     if args.output is None:
-        args.output = f"output/{repo_name}/explain"
+        args.output = get_output_path(args.repo_path, args.subdir, "explain")
 
     explain_base = Path(args.output)
     root_folder = Path(args.subdir)

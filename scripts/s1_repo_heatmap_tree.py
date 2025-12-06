@@ -17,6 +17,8 @@ import matplotlib.patches as mpatches
 from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 
+from utils import get_output_base
+
 
 class RepoTreeHeatmap:
     def __init__(self, repo_path: str, max_depth: int = 5, max_files_per_dir: int = 20):
@@ -300,12 +302,10 @@ def main():
 
     args = parser.parse_args()
 
-    # 获取仓库名称
-    repo_name = Path(args.repo_path).name
-
     # 默认输出路径：output/<repo_name>/s1_heatmap.png
     if args.output is None:
-        args.output = f"output/{repo_name}/s1_heatmap.png"
+        output_base = get_output_base(args.repo_path)
+        args.output = f"{output_base}/s1_heatmap.png"
 
     heatmap = RepoTreeHeatmap(args.repo_path, args.max_depth, args.max_files)
     heatmap.run(args.output)
