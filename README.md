@@ -1,4 +1,4 @@
-# Understand Every Repo
+# RepoDoc
 
 通过 Git 历史和 AI 分析，将任何代码仓库转换为通俗易懂的交互式文档。
 
@@ -17,7 +17,7 @@
 ## 项目结构
 
 ```
-understanding-everything/
+repodoc/
 ├── scripts/              # 3 个核心脚本（按执行顺序命名）
 │   ├── s1_explain_files.py        # AI 解读代码文件
 │   ├── s2_generate_readme.py      # 生成层级 README
@@ -52,7 +52,7 @@ uvpe
 设置环境变量（用于 Gemini API）：
 ```bash
 export OPENAI_API_KEY="your-api-key"
-export OPENAI_BASE_URL="https://openai.app.msh.team/v1"
+export OPENAI_BASE_URL="your-"
 ```
 
 ### 3. 完整分析流程
