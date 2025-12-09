@@ -48,12 +48,12 @@ def build_tree_structure(repo_path: Path, subdir: Path, explain_base: Path) -> d
 
         if current_path.exists():
             for item in sorted(current_path.iterdir()):
-                if item.name.startswith("."):
+                if item.name == ".git":
                     continue
 
                 if item.is_dir():
                     folders.append(item)
-                elif item.is_file() and item.suffix == ".py":
+                elif item.is_file():
                     files.append(item)
 
         # 递归处理子文件夹
@@ -96,15 +96,37 @@ def copy_source_files(repo_path: Path, subdir: Path, output_dir: Path):
 
     print(f"📦 复制源代码文件...")
 
-    for py_file in source_folder.rglob("*.py"):
-        if ".git" in str(py_file):
-            continue
+    # 收集所有需要复制的文件（包括根目录的文件）
+    all_files = []
 
-        rel_path = py_file.relative_to(source_folder)
+    # 先添加根目录的文件
+    if source_folder.exists():
+        for item in source_folder.iterdir():
+            if item.name == ".git":
+                continue
+            if item.is_file():
+                all_files.append(item)
+
+    # 再添加子目录中的文件
+    for source_file in source_folder.rglob("*"):
+        if not source_file.is_file():
+            continue
+        if ".git" in str(source_file):
+            continue
+        all_files.append(source_file)
+
+    # 复制所有文件
+    for source_file in all_files:
+        rel_path = source_file.relative_to(source_folder)
         dest_file = output_source / rel_path
 
         dest_file.parent.mkdir(parents=True, exist_ok=True)
-        dest_file.write_text(py_file.read_text(encoding="utf-8"), encoding="utf-8")
+
+        # 尝试作为文本文件复制，如果失败则作为二进制文件复制
+        try:
+            dest_file.write_text(source_file.read_text(encoding="utf-8"), encoding="utf-8")
+        except (UnicodeDecodeError, UnicodeError):
+            dest_file.write_bytes(source_file.read_bytes())
 
     print(f"✓ 源代码已复制到 {output_source}")
 
