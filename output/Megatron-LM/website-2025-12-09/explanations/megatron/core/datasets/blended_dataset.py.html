@@ -1,0 +1,62 @@
+<h1>megatron/core/datasets/blended_dataset.py</h1>
+<p>完全没问题。这段代码乍一看确实很枯燥，全是数学逻辑和文件操作。</p>
+<p>为了让你听懂，我们换个角度：<strong>把这个 <code>BlendedDataset</code> 类想象成一个“超级DJ”或者“调酒师”。</strong></p>
+<p>它的核心任务是：手里拿着好几本不同的歌谱（Datasets），根据观众的口味（Weights），列出一张长长的、混合好的播放清单（Indices），然后按顺序播放。</p>
+<p>下面我把这个类要做的事情，拆解成一个 <strong>Todo List (任务清单)</strong>，带你一步步看它是怎么工作的。</p>
+<hr />
+<h3>📋 BlendedDataset 的工作任务清单</h3>
+<h4>Task 1: 原料检查 (初始化检查)</h4>
+<p><strong>对应代码：</strong> <code>__init__</code> 方法的前半部分 (assert 语句)
+*   <strong>情景：</strong> 你给了我 3 个数据集（比如 Wikipedia, 代码库, 论文库），告诉我要按 5:3:2 的比例混合。
+*   <strong>Todo:</strong>
+    *   [x] 检查数据集数量和权重数量是否一致？（不能给我3个数据集却只给2个权重）。
+    *   [x] 检查权重是不是都是正数？
+    *   [x] 检查是不是只有一个数据集？（如果是，那就不需要混合了，虽然也能跑，但我会警告你一下）。
+    *   [x] 归一化权重（比如你给 50, 30, 20，我会自动算成 0.5, 0.3, 0.2）。</p>
+<h4>Task 2: 制作“身份证” (生成唯一标识)</h4>
+<p><strong>对应代码：</strong> <code>unique_identifiers</code> 和 <code>hashlib.md5</code> 部分
+*   <strong>情景：</strong> 混合大量数据非常慢。如果下次你还用同样的原料、同样的比例，我就不想重新算一遍了。所以我需要给这次的任务起个独一无二的名字。
+*   <strong>Todo:</strong>
+    *   [x] 把数据集的名字、权重、总大小、切分方式写在一张纸上。
+    *   [x] 用 MD5 算法把这张纸的内容算成一个乱码一样的“指纹”（Hash值）。
+    *   [x] 以后看到这个指纹，我就知道是完全一样的配方。</p>
+<h4>Task 3: 制定“播放清单” (核心逻辑：构建索引)</h4>
+<p><strong>对应代码：</strong> <code>_build_indices</code> 方法
+*   <strong>情景：</strong> 这是最难的一步。假设总共要训练 100 万条数据。我需要决定：第 1 条数据取自哪个库的第几行？第 2 条数据取自哪个库的第几行？... 直到第 100 万条。
+*   <strong>Todo:</strong>
+    *   <strong>Step 3.1: 查缓存 (Cache Hit?)</strong>
+        *   [ ] 去硬盘的缓存文件夹看看，有没有文件名包含上面那个“指纹”的文件？
+        *   [ ] 如果有 (<code>dataset_index.npy</code> 等)，直接加载进内存！<strong>任务完成，跳到 Task 4。</strong>
+    *   <strong>Step 3.2: 没缓存？自己算！(Build Indices)</strong>
+        *   [ ] 只有主进程 (Rank 0) 负责计算，别的进程等着。
+        *   [ ] <strong>核心动作</strong>：调用底层的 C++ 辅助函数 (<code>helpers.build_blending_indices</code>)。它会根据权重随机撒点，生成两张巨大的表格：
+            1.  <strong>Dataset Index</strong>: 每一条数据来自哪个数据集？(比如：[0, 0, 1, 0, 2...])
+            2.  <strong>Sample Index</strong>: 它是该数据集里的第几条？(比如：[5, 8, 102, 9, 33...])
+    *   <strong>Step 3.3: 检查是否超标 (Oversampling Check)</strong>
+        *   [ ] 检查一下，按这个比例混合，会不会把某个小数据集抽干了还不够？如果某个数据集只有 100 条，你非要我取 200 条，我就报错 (<code>IndexError</code>)，告诉你数据不够用了。
+    *   <strong>Step 3.4: 存盘 (Save Cache)</strong>
+        *   [ ] 把算好的那两张巨大表格存成 <code>.npy</code> 文件，方便下次直接用 (Step 3.1)。</p>
+<h4>Task 4: 随时待命，提供数据 (取数据)</h4>
+<p><strong>对应代码：</strong> <code>__getitem__</code> 方法
+*   <strong>情景：</strong> 训练开始了，训练器喊：“嘿，给我第 10086 条数据！”
+*   <strong>Todo:</strong>
+    *   [x] 查表 <code>dataset_index[10086]</code>：哦，这条数据属于 <strong>第 2 个数据集</strong>。
+    *   [x] 查表 <code>dataset_sample_index[10086]</code>：哦，它是第 2 个数据集里的 <strong>第 55 行</strong>。
+    *   [x] 去第 2 个数据集里抓取第 55 行数据，返回给训练器。</p>
+<hr />
+<h3>总结一下它的核心思想</h3>
+<p>这个文件其实不“存储”数据，它只是一个<strong>调度员</strong>。</p>
+<p>它维护了两个巨大的数组（索引表）：
+1.  <strong><code>dataset_index</code></strong>: 告诉你是哪个库（A 还是 B）。
+2.  <strong><code>dataset_sample_index</code></strong>: 告诉你是库里的哪一行。</p>
+<p><strong>举个极简的例子：</strong>
+假设你有两个库：
+*   Dataset A (3条数据): <code>[A1, A2, A3]</code>
+*   Dataset B (2条数据): <code>[B1, B2]</code>
+*   权重 1:1 混合，总共取 4 条。</p>
+<p><code>BlendedDataset</code> 可能会生成这样的索引：
+*   <code>dataset_index</code>: <code>[0, 1, 0, 1]</code> (意思是：A, B, A, B)
+*   <code>dataset_sample_index</code>: <code>[0, 0, 2, 1]</code> (意思是：A的第0条, B的第0条, A的第2条, B的第1条)</p>
+<p>当你访问 <code>BlendedDataset[2]</code> 时，它就去找 <code>Datasets[0][2]</code>，也就是 <code>A3</code>。</p>
+<h3>为什么看不懂？</h3>
+<p>你可能卡在 <code>_build_indices</code> 里那些 <code>path_to_cache</code> 和 <code>numpy.save/load</code> 上了。那些只是为了<strong>加速</strong>（因为计算几亿条数据的混合顺序很慢），核心逻辑就是生成上面那两个“映射表”。</p>

@@ -1,0 +1,93 @@
+<h1>tools/checkpoint/schema_hf.py</h1>
+<p>这份代码确实看起来全是字符串和字典，很容易让人晕。</p>
+<p>简单来说，这个文件的作用是 <strong>“翻译字典”</strong>。它定义了如何把一种格式的模型参数（通常是 NVIDIA Megatron 或其它训练框架的格式）<strong>映射/转换</strong> 成 HuggingFace (HF) 的格式。</p>
+<p>我们可以把阅读这份代码当做一个 <strong>“编写翻译器”</strong> 的任务。请按照下面的 To-Do List 一步步来看：</p>
+<hr />
+<h3>Task 1: 理解核心目标（这是在干什么？）</h3>
+<p><strong>任务：</strong> 搞清楚为什么我们需要这个文件。
+*   <strong>背景：</strong> 不同的深度学习框架给模型参数起的名字是不一样的。
+    *   框架 A 可能叫：<code>layers.0.attention.query_weight</code>
+    *   HuggingFace 可能叫：<code>model.layers.0.self_attn.q_proj.weight</code>
+*   <strong>本文件作用：</strong> 建立一个<strong>对照表</strong>。比如告诉程序：“当我提到 <code>q_proj_weight</code> 时，我指的就是 HuggingFace 里的 <code>self_attn.q_proj.weight</code>”。</p>
+<hr />
+<h3>Task 2: 阅读基类 <code>HFSchema</code>（翻译器的地基）</h3>
+<p><strong>任务：</strong> 看懂代码第 8-22 行的 <code>class HFSchema</code>。
+这是一个通用的模板，所有具体的模型都要继承它。</p>
+<ol>
+<li>
+<p><strong><code>__init__</code> (初始化):</strong></p>
+<ul>
+<li>它接收两个字典：<code>schema</code> (全局参数，比如 Embedding) 和 <code>layer_schema</code> (每一层重复的参数，比如 Attention, MLP)。</li>
+<li>它接收 <code>prefix</code>：有些模型参数前面有个前缀（比如 <code>bert.encoder...</code>），这里用来拼接。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>set</code> 方法 (处理全局参数):</strong></p>
+<ul>
+<li><strong>逻辑：</strong> 给你一堆参数 <code>params</code>，你根据 <code>mapping</code> (对照表)，把它们改名并存入 <code>state_dict</code> (最终的 HF 权重字典)。</li>
+<li><strong>代码意思：</strong> <code>state_dict[对照表查到的HF名字] = 参数.clone()</code></li>
+</ul>
+</li>
+<li>
+<p><strong><code>set_layer</code> 方法 (处理层级参数):</strong></p>
+<ul>
+<li><strong>逻辑：</strong> Transformer 模型有很多层（Layer 0, Layer 1...）。这个方法负责处理第 <code>layer_idx</code> 层。</li>
+<li><strong>关键点：</strong> 名字是拼接出来的。</li>
+<li><strong>公式：</strong> <code>前缀</code> + <code>.</code> + <code>层号</code> + <code>.</code> + <code>对照表查到的HF名字</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 3: 分析语言模型翻译 <code>HFLMSchema</code></h3>
+<p><strong>任务：</strong> 看懂代码第 25-58 行的 <code>class HFLMSchema</code>。
+这是专门针对 <strong>LLM (大语言模型)</strong> 的翻译字典。</p>
+<ol>
+<li>
+<p><strong>全局字典 (<code>schema</code>):</strong></p>
+<ul>
+<li><code>word_embeddings</code> 对应 HF 的 <code>model.embed_tokens.weight</code>。</li>
+<li><code>output_layer</code> 对应 HF 的 <code>lm_head.weight</code>。</li>
+<li><em>理解：这些是整个模型只有一份的参数。</em></li>
+</ul>
+</li>
+<li>
+<p><strong>层级字典 (<code>layer_schema</code>):</strong></p>
+<ul>
+<li>这里列出了 Transformer 每一层内部的组件。</li>
+<li>比如 <code>q_proj_weight</code> 对应 <code>self_attn.q_proj.weight</code>。</li>
+<li><strong>注意 SwiGLU 判断：</strong> 代码里有 <code>if use_swiglu else ...</code>。这是因为不同的激活函数（SwiGLU vs GeLU），MLP 层的参数命名或结构通常不同（比如 SwiGLU 多一个 gate 投影），这里做了兼容处理。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 4: 分析视觉模型翻译 (InternViT, SigLIP, RADIO)</h3>
+<p><strong>任务：</strong> 快速浏览后面三个类：<code>HFInternViTSchema</code>, <code>HFSiglipSchema</code>, <code>HFRADIOSchema</code>。</p>
+<ul>
+<li><strong>逻辑是一模一样的</strong>，只是“外语”的单词变了。</li>
+<li><strong>举例 (<code>HFInternViTSchema</code>)：</strong><ul>
+<li>它的 Embedding 不叫 <code>word_embeddings</code>，而是叫 <code>patch_embedding_weight</code>。</li>
+<li>它的 Attention 归一化参数叫 <code>k_norm_weight</code>。</li>
+</ul>
+</li>
+<li><strong>总结：</strong> 这些类只是针对不同类型的 Vision Transformer (ViT) 模型，填入了特定的参数名字对照表。</li>
+</ul>
+<hr />
+<h3>Task 5: 也就是最后一步，工厂函数</h3>
+<p><strong>任务：</strong> 看代码最后面的两个函数 <code>get_vision_model_schema</code> 和 <code>get_language_model_schema</code>。</p>
+<ul>
+<li><strong>作用：</strong> 这是给外部调用的“前台接待员”。</li>
+<li><strong>逻辑：</strong><ul>
+<li>你想转语言模型？调用 <code>get_language_model_schema</code> -&gt; 返回 <code>HFLMSchema</code> 对象。</li>
+<li>你想转视觉模型？调用 <code>get_vision_model_schema</code>，并告诉我是哪种（"siglip", "internvit" 等） -&gt; 返回对应的对象。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<p><strong>这段代码其实只做了一件事：</strong>
+定义了一堆 <strong>字符串变量</strong>，用来把 <strong>NVIDIA 内部格式</strong> 的 key 名字，替换成 <strong>HuggingFace</strong> 官方格式的 key 名字。</p>
+<ul>
+<li><strong>输入：</strong> <code>mlp_l0_weight</code></li>
+<li><strong>经过这个文件处理：</strong> 变成了 <code>mlp.fc1.weight</code> (或者 <code>mlp.gate_proj.weight</code>)。</li>
+</ul>
+<p>你看不懂是因为它没有逻辑运算，全是硬编码的字符串映射规则。你只需要知道它是个“改名手册”就行了。</p>

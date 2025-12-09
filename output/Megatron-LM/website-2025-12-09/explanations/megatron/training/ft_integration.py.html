@@ -1,0 +1,70 @@
+<h1>megatron/training/ft_integration.py</h1>
+<p>这份代码文件 <code>megatron/training/ft_integration.py</code> 的核心目的是为了给 Megatron-LM（一个大模型训练框架）添加 <strong>容错机制（Fault Tolerance, FT）</strong>。</p>
+<p>简单来说，它的作用就像一个<strong>“监工”</strong>，拿着秒表盯着训练过程。如果某个环节（比如计算、存盘）超时了，它就判定机器出故障了（比如 GPU 挂了），然后触发重启或恢复流程，而不是让训练任务无限期卡死。</p>
+<p>为了让你更容易理解，我把你（作为这个容错系统）的任务列成了一个 <strong>To-Do List</strong>，按时间顺序一步步讲：</p>
+<hr />
+<h3>📋 容错系统（FT）的任务清单 (To-Do List)</h3>
+<h4>Task 1: 入职与准备 (Setup)</h4>
+<p><strong>代码对应：</strong> <code>setup(args)</code>
+*   <strong>情景</strong>：训练任务刚启动。
+*   <strong>你的任务</strong>：
+    1.  <strong>初始化监工</strong>：启动 <code>RankMonitorClient</code>，这是核心监控客户端。
+    2.  <strong>确定存档点</strong>：找到 checkpoint 的保存目录，并在那里创建一个 <code>ft_state.json</code> 文件。这个文件用来记录“每个动作应该花多少时间”。
+    3.  <strong>开始计时</strong>：宣布进入 <strong>"Setup"（启动）阶段</strong>。这时候程序在加载模型、构建网络，通常比较慢。如果这里卡太久，说明启动失败。</p>
+<h4>Task 2: 忽略热身动作 (Warmup)</h4>
+<p><strong>代码对应：</strong> <code>on_training_step_start</code> / <code>_NUM_WARMUP_ITERS</code>
+*   <strong>情景</strong>：模型刚开始跑前几步（Warmup），速度通常很不稳定，忽快忽慢。
+*   <strong>你的任务</strong>：
+    *   <strong>睁一只眼闭一只眼</strong>。在前几步（默认是前1步），不要开启严格的监控计时。因为这时候的数据没有参考价值，乱报警会打断训练。</p>
+<h4>Task 3: 监控日常训练 (Step Monitoring)</h4>
+<p><strong>代码对应：</strong> <code>on_training_step_start</code> 和 <code>on_training_step_end</code>
+*   <strong>情景</strong>：热身结束，进入正式的训练循环（Training Loop）。
+*   <strong>你的任务</strong>：
+    1.  <strong>上班打卡</strong>：每次训练迭代开始时，通知系统进入 <strong>"Step"（步进）阶段</strong>。
+    2.  <strong>下班打卡</strong>：每次迭代结束时，通知系统退出该阶段。
+    3.  <strong>超时报警</strong>：如果“上班”到“下班”的时间超过了预设的阈值（比如平时只要10秒，这次过了3分钟还没完），你就判定某个 GPU 卡死了，触发故障处理。</p>
+<h4>Task 4: 监控存盘过程 (Checkpointing)</h4>
+<p><strong>代码对应：</strong> <code>on_checkpointing_start</code> 和 <code>on_checkpointing_end</code>
+*   <strong>情景</strong>：训练了一段时间，需要保存模型权重到硬盘。这是一个很慢的 I/O 操作。
+*   <strong>你的任务</strong>：
+    1.  <strong>切换模式</strong>：告诉系统：“现在暂停训练监控，进入 <strong>"Checkpointing"（存盘）阶段</strong>”。
+    2.  <strong>调整容忍度</strong>：存盘通常比训练一步要慢得多，所以这个阶段的超时阈值会设得很高。
+    3.  <strong>结束监控</strong>：存盘完后，切回正常状态。</p>
+<h4>Task 5: 自我学习与调整 (Update Timeouts)</h4>
+<p><strong>代码对应：</strong> <code>_maybe_update_timeouts</code>
+*   <strong>情景</strong>：你发现预设的超时时间（比如由人工设定的）可能不准。
+*   <strong>你的任务</strong>：
+    *   <strong>动态计算</strong>：根据过去几十步的实际运行时间，计算出一个更合理的超时时间。
+    *   <strong>例如</strong>：如果实际每步只花 5 秒，而预设是 600 秒，那太宽了。你会把它自动更新为比如 15 秒。这样如果机器卡死，能更快发现。
+    *   <strong>保存记忆</strong>：把这些新计算出的时间写回 <code>ft_state.json</code>，下次重启时直接用新的标准。</p>
+<h4>Task 6: 演习 (Simulated Fault) - <em>可选</em></h4>
+<p><strong>代码对应：</strong> <code>maybe_setup_simulated_fault</code>
+*   <strong>情景</strong>：开发人员想测试你这个“监工”灵不灵。
+*   <strong>你的任务</strong>：
+    *   <strong>搞破坏</strong>：根据环境变量的指令，故意杀掉某个进程（<code>rank_killed</code>）或者让某个进程卡死（<code>rank_hung</code>）。
+    *   <strong>目的</strong>：看看系统能不能检测到这个人为的故障并成功恢复。</p>
+<hr />
+<h3>总结文中的核心观点</h3>
+<ol>
+<li>
+<p><strong>分阶段监控（Section-based API）</strong>：
+    代码把训练过程切分为三个主要阶段：</p>
+<ul>
+<li><code>setup</code>: 启动阶段。</li>
+<li><code>step</code>: 正常的训练/验证迭代阶段。</li>
+<li><code>checkpointing</code>: 保存模型阶段。</li>
+<li><em>以及一个隐藏的阶段</em>：<code>out-of-section</code>（各个阶段之间的空隙）。
+<strong>观点</strong>：不同阶段的耗时差异巨大，必须分别设定不同的超时阈值。</li>
+</ul>
+</li>
+<li>
+<p><strong>动态超时计算 (Dynamic Timeouts)</strong>：
+    <strong>观点</strong>：用户很难手动猜准每个阶段到底要花多少秒。代码主张<strong>自动学习</strong>，运行一段时间后，根据实际观测值更新超时时间，并保存到文件里。</p>
+</li>
+<li>
+<p><strong>依赖外部工具</strong>：
+    代码里反复提到 <code>nvidia-resiliency-ext</code> 和 <code>ft_launcher</code>。
+    <strong>观点</strong>：这个 Python 文件只是大机器的一个零件（接口），真正的“重启、杀进程、恢复”操作是由外部的启动器 (<code>ft_launcher</code>) 完成的。这个文件只是负责<strong>汇报状态</strong>。</p>
+</li>
+</ol>
+<p>希望这个 To-Do List 能帮你理解这段代码在干什么！</p>

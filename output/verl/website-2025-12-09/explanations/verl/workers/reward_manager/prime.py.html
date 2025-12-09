@@ -1,0 +1,84 @@
+<h1>verl/workers/reward_manager/prime.py</h1>
+<p>这份代码的核心功能是 <strong>“给大模型的回答打分（Reward Calculation）”</strong>。</p>
+<p>在强化学习（RLHF）训练中，模型生成了一个回答，我们需要一个裁判来判断这个回答好不好，给它一个分数（Reward）。这个文件就是那个“裁判系统”的实现，特别是针对 <strong>PRIME</strong> 这个项目（通常涉及数学或代码任务，因为代码里有很多防卡死的逻辑）。</p>
+<p>为了让你看懂，我把这个文件的逻辑拆解成一个 <strong>“阅卷老师的工作清单 (To-Do List)”</strong>。我们按照代码运行的顺序，一步步来看：</p>
+<hr />
+<h3>✅ Task 1: 准备阅卷环境 (初始化)</h3>
+<p><strong>对应代码：</strong> <code>class PrimeRewardManager</code> 的 <code>__init__</code> 方法</p>
+<ul>
+<li><strong>任务描述：</strong> 就像老师进办公室前要带好红笔和参考答案。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li><code>self.tokenizer</code>: 这是一个翻译器。模型说的是数字（Token IDs），我们需要把它翻译成文字。</li>
+<li><code>self.compute_score</code>: 这是评分标准（比如答案对不对，代码能不能跑通）。</li>
+<li><code>num_examine</code>: 用于调试，决定要打印多少个学生的卷子看看情况。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 收到试卷，开始处理 (入口函数)</h3>
+<p><strong>对应代码：</strong> <code>__call__</code> 方法</p>
+<ul>
+<li><strong>任务描述：</strong> 老师拿到一摞试卷（<code>DataProto</code> 数据包）。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li><strong>检查是否已有分数：</strong> 如果试卷上已经有分了 (<code>rm_scores</code> in data)，直接返回，不用再改了。</li>
+<li><strong>准备打分：</strong> 如果没分，就准备一个全为 0 的记分册 (<code>reward_tensor</code>)。</li>
+<li><strong>翻译试卷：</strong> 这里的关键一步是 <code>sequences_str = self.tokenizer.batch_decode(...)</code>。把模型输出的一堆数字 ID 变成人类能读的字符串（比如 python 代码或数学解题步骤）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 批量批改试卷 (核心逻辑)</h3>
+<p><strong>对应代码：</strong> <code>verify</code> 方法</p>
+<ul>
+<li><strong>任务描述：</strong> 这一步是核心。老师要把学生的回答 (<code>sequences_str</code>) 和标准答案 (<code>ground_truth</code>) 进行比对。</li>
+<li><strong>难点：</strong> 如果有 64 个学生，一个一个改太慢了。如果学生的答案是代码，运行代码可能会卡死（死循环）。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>提取出题目 (<code>prompts</code>)、回答 (<code>sequences_str</code>) 和参考答案 (<code>ground_truth</code>)。</li>
+<li>调用一个“超级并行批改器”：<code>run_reward_scoring</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 启动“影分身”并行批改 (异步与多进程)</h3>
+<p><strong>对应代码：</strong> <code>run_reward_scoring</code> -&gt; <code>parallel_compute_score_async</code></p>
+<ul>
+<li><strong>任务描述：</strong> 这是一个比较硬核的工程实现。为了快，我们同时雇佣 64 个助教（进程）一起改。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li><code>ProcessPoolExecutor(max_workers=64)</code>: 开启 64 个并行的进程池。</li>
+<li><code>asyncio.gather</code>: 异步地收集所有助教的批改结果。</li>
+<li><strong>为什么这么写？</strong> 主要是为了速度。评估代码生成的正确性通常需要运行代码，这是 CPU 密集型任务，必须用多进程。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 监控助教，防止“卡死” (超时保护)</h3>
+<p><strong>对应代码：</strong> <code>single_compute_score</code> 和 <code>parallel_compute_score_async</code> 中的 <code>finally</code> 块</p>
+<ul>
+<li><strong>任务描述：</strong> 这是这份代码最“暴力”也最重要的地方。如果模型生成的代码是个死循环（比如 <code>while True: pass</code>），助教运行它时会永远卡住，导致整个训练卡死。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li><strong>单任务超时：</strong> <code>single_compute_score</code> 里面设置了 <code>timeout=300.0</code> 秒。如果 5 分钟没改完，直接判 0 分。</li>
+<li><strong>暴力清理：</strong> 在 <code>parallel_compute_score_async</code> 的 <code>finally</code> 块里，用 <code>psutil</code> 库。一旦批改结束（或者出错了），<strong>强制杀死所有子进程</strong> (<code>p.kill()</code>)。这是一种非常激进的清理手段，确保不会有僵尸进程占用显卡或 CPU，防止训练任务挂起。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 6: 登记分数 (Sparse Reward)</h3>
+<p><strong>对应代码：</strong> 回到 <code>__call__</code> 方法的后半部分</p>
+<ul>
+<li><strong>任务描述：</strong> 助教们把分打完了，现在要填回记分册 (<code>reward_tensor</code>)。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li><code>scores = self.verify(data)</code>: 拿到了分数列表（比如 [1.0, 0.0, 1.0...]）。</li>
+<li><strong>填空位置：</strong> <code>reward_tensor[i, valid_response_length[i].item() - 1] = scores[i]</code>。</li>
+<li><strong>解释：</strong> 这是一个强化学习的惯例。我们在模型说完<strong>最后一个字</strong>的那个位置给它奖励。前面的字奖励都是 0。比如句子长 100 个词，我们在第 100 个位置打分 1.0。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 总结：这个文件到底在干啥？</h3>
+<p>简单来说，这个文件实现了一个<strong>“防卡死、高并发的代码/数学题判分器”</strong>。</p>
+<ol>
+<li>它把模型生成的 Token 变成文本。</li>
+<li>它利用多进程 (<code>ProcessPoolExecutor</code>) 并行地运行评分函数（比如跑单元测试）。</li>
+<li>它极度重视<strong>安全性</strong>：如果评分过程超时或出错，它会无情地杀死进程，确保主训练程序活着。</li>
+<li>最后把分数填在句子结束的位置，传回给 PPO 等算法去优化模型。</li>
+</ol>

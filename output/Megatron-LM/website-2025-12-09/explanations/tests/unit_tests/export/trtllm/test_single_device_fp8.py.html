@@ -1,0 +1,61 @@
+<h1>tests/unit_tests/export/trtllm/test_single_device_fp8.py</h1>
+<p>这份代码确实涉及了很多底层概念：<strong>Megatron-LM（大模型训练框架）</strong>、<strong>TensorRT-LLM（推理加速框架）</strong> 以及 <strong>FP8（8位浮点数量化技术）</strong>。</p>
+<p>看不懂很正常，因为它不是一个简单的脚本，而是一个<strong>单元测试（Unit Test）</strong>。它的目的是验证：“当我们把一个 Megatron 模型转换成 TensorRT-LLM 格式时，FP8 量化相关的权重和参数是否正确转换了？”</p>
+<p>我为你整理了一个 <strong>Task List（任务清单）</strong>，带你通过执行任务的方式，一步步拆解这段代码的逻辑。</p>
+<hr />
+<h3>📋 任务清单：理解 FP8 模型转换测试</h3>
+<h4>Task 1: 搭建“地基” —— 定义我们要测试什么样的模型</h4>
+<p><strong>代码对应：</strong> <code>_model_provider</code> 函数
+*   <strong>任务说明：</strong> 我们需要先创建一个 GPT 模型。但在创建时，必须开启 FP8 功能，否则后面没法测试 FP8 转换。
+*   <strong>关键点：</strong> 注意 <code>TransformerConfig</code> 里的配置：
+    *   <code>fp8='hybrid'</code>: 开启 FP8 混合精度训练。
+    *   <code>fp8_amax_compute_algo="max"</code>: 这是 FP8 的核心。FP8 这种数据格式范围很小，需要统计数据的最大值（amax）来计算缩放因子（Scaling Factor），才能保证精度不丢失。</p>
+<h4>Task 2: 准备“假数据” —— 喂给模型吃</h4>
+<p><strong>代码对应：</strong> <code>_get_train_data_iterator</code> 函数
+*   <strong>任务说明：</strong> 既然是测试，我们不需要真实的互联网数据。这个函数创建了一些随机生成的假数据（Mock Data），格式符合 GPT 的输入要求（Token ID, Mask 等）。</p>
+<h4>Task 3: 模拟“热身”训练 —— 这一步最关键！</h4>
+<p><strong>代码对应：</strong> <code>TestTRTLLMSingleDeviceConverterFP8</code> 类中的 <code>setup_method</code>
+*   <strong>任务说明：</strong> 为什么转换模型前要先训练？
+    *   <strong>核心逻辑：</strong> FP8 量化需要<strong>缩放因子（Scaling Factors）</strong>。这些因子不是随机生成的，而是模型在看到数据流过时统计出来的。
+    *   <strong>操作：</strong> 代码里执行了 <code>for _ in range(2): ... optim.step()</code>。
+    *   <strong>目的：</strong> 这不是为了让模型变聪明，而是为了让模型内部的 Transformer Engine <strong>“记住”</strong> 数据的统计特征（amax），从而生成 FP8 转换所需的 scaling factor。如果不跑这两步，转换出来的模型可能缺少量化参数。</p>
+<h4>Task 4: 制定“验收标准” —— 什么样的转换才算成功？</h4>
+<p><strong>代码对应：</strong> 类顶部的 <code>QUANTIZED_LAYERS</code>, <code>NON_QUANTIZED_LAYERS</code>, <code>SCALING_FACTORS</code> 列表
+*   <strong>任务说明：</strong> 在测试开始前，我们要列出清单，规定哪些层应该变，哪些层不能变。
+    *   <strong>应该被量化（变 FP8）的层：</strong> 主要是矩阵乘法的权重，比如 <code>dense.weight</code>, <code>qkv.weight</code>, <code>fc.weight</code>。
+    *   <strong>不该被量化（保持 BF16/FP32）的层：</strong> 比如 <code>LayerNorm</code>, <code>Bias</code>（偏置项）, <code>Embedding</code>（词向量）。
+    *   <strong>必须存在的参数：</strong> <code>SCALING_FACTORS</code>（缩放因子）。如果是 FP8 模型，必须有这些额外的参数来辅助计算。</p>
+<h4>Task 5: 执行“转换任务” —— 调用转换器</h4>
+<p><strong>代码对应：</strong> <code>test_get_model_weights_converter</code> 函数
+*   <strong>任务说明：</strong> 这是测试的主体。它模拟了用户想要导出模型的场景。
+*   <strong>核心动作：</strong>
+    1.  初始化 <code>TRTLLMHelper</code>（转换助手）。
+    2.  调用 <code>get_trtllm_pretrained_config_and_model_weights</code>。这个函数会把 Megatron 的 <code>state_dict</code>（权重字典）转换成 TensorRT-LLM 认识的格式。
+*   <strong>测试组合：</strong> 代码用了两个 <code>for</code> 循环来测试不同情况：
+    *   <code>fp8_quantized = True/False</code>: 测试是否开启权重 FP8 量化。
+    *   <code>fp8_kvcache = True/False</code>: 测试是否开启 KV Cache 的 FP8 量化（这是推理加速的另一个优化点）。</p>
+<h4>Task 6: 最终“质检” —— 验证结果</h4>
+<p><strong>代码对应：</strong> <code>_assert_...</code> 开头的几个函数
+*   <strong>任务说明：</strong> 转换完了，我们要拿着 Task 4 的“验收标准”去检查结果。
+*   <strong>检查点：</strong>
+    1.  <strong>检查 Config：</strong> 输出的配置里，<code>quant_algo</code> 是不是写着 'FP8'？
+    2.  <strong>检查 Scaling Factors：</strong> <code>_assert_has_scales</code>。如果开启了量化，权重字典里必须包含 <code>activation_scaling_factor</code> 和 <code>weights_scaling_factor</code>。
+    3.  <strong>检查数据类型：</strong> <code>_assert_quantizable_layers</code>。
+        *   如果是 FP8 模式，权重的 <code>dtype</code> 必须是 <code>torch.float8_e4m3fn</code>（一种具体的 FP8 格式）。
+        *   如果没开 FP8，权重的 <code>dtype</code> 应该是 <code>torch.bfloat16</code>。
+    4.  <strong>检查 KV Cache：</strong> 如果开启了 KV Cache 量化，也要检查对应的缩放因子是否存在。</p>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p>简单来说，这个文件的剧本是：</p>
+<ol>
+<li><strong>建一个支持 FP8 的空模型。</strong></li>
+<li><strong>假装训练两步</strong>，让模型生成 FP8 必需的统计数据（Scaling Factors）。</li>
+<li><strong>启动转换器</strong>，把模型转成 TensorRT-LLM 格式。</li>
+<li><strong>打开转换后的包检查</strong>：<ul>
+<li>核心权重是不是变成 FP8 格式了？</li>
+<li>缩放因子是不是都带上了？</li>
+<li>不该变的层是不是没变？</li>
+</ul>
+</li>
+</ol>
+<p>如果所有检查都通过，说明 Megatron 到 TensorRT-LLM 的 FP8 单卡转换逻辑是正常的。</p>

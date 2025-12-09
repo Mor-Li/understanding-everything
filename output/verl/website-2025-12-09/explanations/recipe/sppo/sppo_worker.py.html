@@ -1,0 +1,115 @@
+<h1>recipe/sppo/sppo_worker.py</h1>
+<p>这份代码确实看起来比较“硬核”，因为它属于<strong>大模型分布式训练框架（Verl）</strong>的底层基础设施代码。简单来说，它不是在写具体的算法公式，而是在<strong>“安排干活的人”</strong>。</p>
+<p>为了帮你理解，我制定了一个<strong>“6步学习任务清单 (To-Do List)”</strong>。我们把这个文件想象成一个<strong>“多功能工人的入职手册”</strong>，一步步拆解它的工作。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解背景 —— 我们在干什么？</strong> (SPPO 与 RLHF)</li>
+<li><strong>Task 2: 搞懂主角 —— 这个 Class 是谁？</strong> (多面手工人)</li>
+<li><strong>Task 3: 核心流程 —— <code>init_model</code> 在做什么？</strong> (工人的岗前准备)</li>
+<li><strong>Task 4: 角色拆解 A —— Actor 是什么？</strong> (负责学习的学生)</li>
+<li><strong>Task 5: 角色拆解 B &amp; C —— Rollout 和 Ref 是什么？</strong> (负责考试和对照的老师)</li>
+<li><strong>Task 6: 进阶操作 —— 内存优化与存档</strong> (FSDP 与 Checkpoint)</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>✅ Task 1: 理解背景 —— 我们在干什么？</h4>
+<ul>
+<li><strong>背景：</strong> 这段代码是为 <strong>SPPO</strong> (Self-Play Preference Optimization) 服务的。这是一种训练大模型（LLM）的方法，类似 PPO（RLHF的一种），目的是让模型生成的回答更符合人类喜好。</li>
+<li><strong>难点：</strong> 训练大模型很占显存，需要把模型切分到很多张显卡上（分布式训练）。</li>
+<li><strong>代码作用：</strong> 这个文件定义了一个“工人节点（Worker）”，它负责在显卡上加载模型、准备数据、进行计算。</li>
+</ul>
+<h4>✅ Task 2: 搞懂主角 —— 这个 Class 是谁？</h4>
+<p>看这一行代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">SPPOActorRolloutRefWorker</span><span class="p">(</span><span class="n">ActorRolloutRefWorker</span><span class="p">):</span>
+</code></pre></div>
+
+<ul>
+<li><strong>名字含义：</strong> <code>SPPO</code> (算法名) + <code>Actor</code> (演员/学生) + <code>Rollout</code> (采样/生成) + <code>Ref</code> (参考/对照) + <code>Worker</code> (工人)。</li>
+<li><strong>核心概念：</strong> 这是一个<strong>“瑞士军刀”</strong>式的类。根据配置不同，它既可以是“训练者”，也可以是“数据生成者”，还可以是“对照组”，或者同时身兼数职。</li>
+<li><strong>继承关系：</strong> 它继承自 <code>ActorRolloutRefWorker</code>，说明它复用了通用的逻辑，但针对 SPPO 算法做了定制。</li>
+</ul>
+<h4>✅ Task 3: 核心流程 —— <code>init_model</code> 在做什么？</h4>
+<p>代码里最主要的方法是 <code>@register... def init_model(self):</code>。
+这是<strong>“开工前的准备工作”</strong>。当你启动训练程序时，这个函数会被调用，用来加载模型权重到显卡上。</p>
+<p><strong>它的逻辑流是这样的：</strong>
+1.  <strong>看图纸：</strong> 读取配置文件 (<code>self.config</code>)。
+2.  <strong>看身份：</strong> 检查自己今天是干什么的？(<code>if self._is_actor</code>, <code>if self._is_rollout</code>, <code>if self._is_ref</code>)。
+3.  <strong>领工具：</strong> 根据身份，从硬盘加载对应的模型文件 (<code>_build_model_optimizer</code>)。</p>
+<h4>✅ Task 4: 角色拆解 A —— Actor (演员/学生)</h4>
+<p>在强化学习中，<strong>Actor</strong> 是那个<strong>正在被训练的模型</strong>。</p>
+<p>看这段代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_actor</span><span class="p">:</span>
+    <span class="c1"># ...配置优化器等...</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">actor_module_fsdp</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">actor_optimizer</span><span class="p">,</span> <span class="o">...</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_model_optimizer</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">role</span><span class="o">=</span><span class="s2">&quot;actor&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 初始化 SPPO 专用的 Actor 逻辑</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">actor</span> <span class="o">=</span> <span class="n">DataParallelSPPOActor</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释：</strong><ul>
+<li>如果当前工人被分配了 <code>Actor</code> 的角色，它就要加载模型，并且还要加载<strong>优化器 (Optimizer)</strong>，因为它需要更新参数（学习）。</li>
+<li>它使用了 <strong>FSDP</strong> (Fully Sharded Data Parallel)，这是一种把大模型切碎了放在不同显卡上的技术，为了省显存。</li>
+<li>最后它初始化了 <code>DataParallelSPPOActor</code>，这是真正执行 SPPO 算法更新逻辑的地方。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 角色拆解 B &amp; C —— Rollout (生成) 和 Ref (参考)</h4>
+<ul>
+<li>
+<p><strong>Rollout (生成/采样):</strong>
+    <code>python
+    if self._is_rollout:
+        self._build_rollout(...)</code></p>
+<ul>
+<li><strong>解释：</strong> 负责用当前的模型去“做题”（生成文本）。生成的这些文本会被拿去评分，用来指导 Actor 学习。</li>
+</ul>
+</li>
+<li>
+<p><strong>Ref (Reference/参考模型/老师):</strong>
+    <code>python
+    if self._is_ref:
+        self.ref_module_fsdp = self._build_model_optimizer(..., role="ref")
+        self.ref_policy = DataParallelSPPOActor(...)</code></p>
+<ul>
+<li><strong>解释：</strong> 这是一个<strong>冻结的模型</strong>（不更新参数），通常是训练开始前的原始模型。</li>
+<li><strong>作用：</strong> 防止 Actor 学习太猛，“走火入魔”忘掉了原来的知识。计算 Loss 时，会比较 Actor 和 Ref 的输出差异（KL Divergence）。注意这里 <code>optim_config=None</code>，因为它不需要优化器。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 进阶操作 —— 内存优化与存档</h4>
+<p>代码里还有一些看起来很复杂的“杂活”：</p>
+<ol>
+<li>
+<p><strong>Offload (卸载到CPU):</strong>
+    <code>python
+    if self._is_offload_param:
+        offload_fsdp_model_to_cpu(...)</code></p>
+<ul>
+<li><strong>解释：</strong> 如果显存不够用，就把暂时不用的模型参数挪到内存（CPU）里，用的时候再拿回来。</li>
+</ul>
+</li>
+<li>
+<p><strong>Checkpoint (存档):</strong>
+    <code>python
+    self.checkpoint_manager = FSDPCheckpointManager(...)</code></p>
+<ul>
+<li><strong>解释：</strong> 定期保存模型权重。万一训练挂了，可以从这里恢复；或者训练结束了，保存最终结果。</li>
+</ul>
+</li>
+<li>
+<p><strong>FlopsCounter (算力计):</strong></p>
+<ul>
+<li>用来统计训练过程中消耗了多少计算量，用于写论文或性能分析。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p><strong>这个文件就是 SPPO 训练中的“总管”。</strong></p>
+<p>它不负责具体的数学公式计算（那是 <code>DataParallelSPPOActor</code> 的事），它的工作是：
+1.  <strong>读取配置</strong>。
+2.  <strong>根据配置把自己初始化为</strong>：负责学习的 Actor、负责做题的 Rollout、或者负责对照的 Ref。
+3.  <strong>管理硬件资源</strong>：把模型加载到 GPU，搞不定就利用 CPU 内存，还负责保存模型文件。</p>
+<p>你看懂这个逻辑了吗？它其实就是个<strong>资源配置和初始化的脚本</strong>。</p>

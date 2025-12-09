@@ -1,0 +1,59 @@
+<h1>recipe/gkd/teacher/client.py</h1>
+<p>这段代码看起来确实涉及了很多概念（多线程、网络通信、深度学习张量处理），如果直接看代码细节很容易晕。</p>
+<p>简单来说，这是一个 <strong>“教师模型客户端”（Teacher Client）</strong>。</p>
+<p>它的核心作用是：<strong>你在训练一个小模型（学生），需要向一个大模型（教师）请教。但是大模型太大，跑在另一台机器（服务器）上。这个脚本就是负责把学生的问题（Prompt）打包发给服务器，然后把老师的回答（Logprobs/Response）拿回来。</strong></p>
+<p>为了让你彻底看懂，我列了一个 <strong>6步学习任务清单 (To-Do List)</strong>，我们一步步拆解它的逻辑：</p>
+<hr />
+<h3>任务 1：理解核心角色 (Context)</h3>
+<p><strong>观点：</strong> 这不是一个独立的程序，而是一个“中间人”。
+*   <strong>背景：</strong> 在 GKD (Generalized Knowledge Distillation) 这种任务中，我们通常有一个“学生模型”在本地训练，还有一个“教师模型”在远程服务器上推理。
+*   <strong>代码对应：</strong> <code>TeacherClient</code> 类。
+*   <strong>白话解释：</strong> 就像你（学生）在做作业，遇到不会的题，需要通过微信（网络）发给老师（服务器）。这个 <code>client.py</code> 就是你的微信软件。</p>
+<h3>任务 2：理解“拼车”机制 (Batching)</h3>
+<p><strong>观点：</strong> 为了效率，不能一题一题问，要凑够一批再问。
+*   <strong>代码对应：</strong> <code>num_microbatches</code> 和 <code>bg_task</code> 中的 <code>for</code> 循环。
+*   <strong>逻辑拆解：</strong>
+    1.  <code>submit</code> 函数接收单个请求，放进 <code>task_queue</code>（排队）。
+    2.  后台线程 <code>bg_task</code> 不会收到一个就发一个，而是像“拼车”一样，坐在那里等。
+    3.  等到凑齐了 <code>num_microbatches</code> 这么多人的请求，或者队列里有足够的数据。
+    4.  把这一批数据合并成一个大包 (<code>batch</code>)。
+*   <strong>为什么这么做？</strong> 网络传输有延迟，发一次送100个数据，比发100次每次送1个数据快得多。</p>
+<h3>任务 3：理解“点餐号牌” (Asynchronous Future)</h3>
+<p><strong>观点：</strong> 发送请求后，主程序不想傻等，想要个“凭证”继续干别的。
+*   <strong>代码对应：</strong> <code>Future</code> 对象和 <code>submit</code> 函数。
+*   <strong>逻辑拆解：</strong>
+    1.  当你调用 <code>tc.submit(data)</code> 时，它不会立刻给你结果（因为还要联网去问老师）。
+    2.  它会立刻给你一个 <code>Future</code> 对象。这就像在餐厅点餐后给你的<strong>流水号</strong>。
+    3.  你可以拿着这个号先去忙别的。
+    4.  当你必须要结果时，调用 <code>future.result()</code>，如果老师还没回，程序才会在这里等待。
+*   <strong>代码细节：</strong> <code>futures</code> 列表用来保存这一批“拼车”乘客的流水号，等服务器回包后，再按顺序把答案填回去 (<code>f.set_result(...)</code>)。</p>
+<h3>任务 4：理解通信协议 (ZMQ Networking)</h3>
+<p><strong>观点：</strong> 它是怎么跟服务器说话的？
+*   <strong>代码对应：</strong> <code>import zmq</code>, <code>socket.send</code>, <code>socket.recv</code>。
+*   <strong>逻辑拆解：</strong>
+    1.  它使用了 <strong>ZeroMQ</strong>，这是一个极高性能的消息队列库，比普通的 HTTP 请求快很多。
+    2.  模式是 <code>REQ</code> (Request) / <code>REP</code> (Reply)。也就是“一问一答”。
+    3.  <code>serialize</code> 和 <code>deserialize</code>：把数据（Python对象或Tensor）打包成二进制流发送，收到后再解包回来。</p>
+<h3>任务 5：理解数据校验 (Safety Check)</h3>
+<p><strong>观点：</strong> 老师如果“疯了”（输出乱码或无效数值），客户端要能发现。
+*   <strong>代码对应：</strong> <code>check_if_invalid</code> 函数。
+*   <strong>逻辑拆解：</strong>
+    1.  深度学习模型有时候会计算出 <code>NaN</code> (不是数) 或者 <code>Inf</code> (无穷大)。
+    2.  如果把这些脏数据拿去训练学生模型，学生模型也会崩溃。
+    3.  这个函数就是安检员，检查老师返回的概率值 (<code>logps</code>) 是否正常。</p>
+<h3>任务 6：全流程复盘 (The Workflow)</h3>
+<p>现在我们把所有步骤串起来，看 <code>bg_task</code>（后台任务）到底在干啥：</p>
+<ol>
+<li><strong>连接</strong>：连上服务器 (<code>socket.connect</code>)。</li>
+<li><strong>死循环</strong>：一直在后台运行 (<code>while True</code>)。</li>
+<li><strong>取货</strong>：从队列里拿出 <code>num_microbatches</code> 这么多的小任务。</li>
+<li><strong>打包</strong>：把这些任务的输入 (<code>prompt_token_ids</code>) 拼在一起。</li>
+<li><strong>发送</strong>：<code>socket.send</code> 发给服务器。</li>
+<li><strong>等待</strong>：<code>socket.recv</code> 等服务器算完（此时线程阻塞）。</li>
+<li><strong>分发</strong>：服务器返回了一个大包。客户端把大包切开，根据之前的“流水号”，把答案分发给每一个对应的 <code>future</code>。</li>
+<li><strong>完成</strong>：主线程里的 <code>future.result()</code> 此时就会收到数据，继续运行。</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这个文件的作用就是：<strong>高效、异步、批量地将本地的 Prompt 发送到远程服务器，并取回 Teacher 模型的推理结果（Logits/Response），供本地训练使用。</strong></p>
+<p>如果你要修改或调试它，重点看 <code>bg_task</code> 里的 <code>try...except</code> 块，那里是数据流转的核心。</p>

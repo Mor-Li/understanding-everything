@@ -1,0 +1,84 @@
+<h1>docs/single_controller.rst</h1>
+<p>这篇文章主要是在讲 <code>verl</code> 这个框架底层的设计哲学，特别是 <code>single_controller</code> 这个模块是如何工作的。它的核心目的是：<strong>让开发者像写单进程代码一样，轻松地写出能在多张显卡上运行的分布式代码。</strong></p>
+<p>这篇文章确实比较硬核，主要面向贡献者而非普通用户。为了帮你理解，我把它拆解成一个<strong>“学习清单 (To-Do List)”</strong>，我们一步步来完成这个思维任务。</p>
+<hr />
+<h3>✅ Task 1: 理解“为什么要造这个轮子” (背景)</h3>
+<ul>
+<li><strong>现状：</strong> 传统的分布式训练（比如 PyTorch DDP）通常把所有逻辑封装好，启动多个进程，大家跑一样的代码。</li>
+<li><strong>痛点：</strong> 在 RLHF（强化学习人类反馈）场景下，这种方式很难受：<ol>
+<li>流程复杂（PPO算法涉及多个步骤，不像监督学习那么简单）。</li>
+<li><strong>调试极其困难</strong>（想看中间某个张量的数据很难）。</li>
+</ol>
+</li>
+<li><strong>目标：</strong> 作者希望保留单进程脚本那种“容易调试”、“逻辑清晰”的优点，但又能自动在多卡上跑。</li>
+<li><strong>方案：</strong> 选用 <strong>Ray</strong> 作为底层架构，因为它可以像调用函数一样调用远程资源。</li>
+</ul>
+<h3>✅ Task 2: 认识核心“三巨头” (组件)</h3>
+<p>为了把复杂的分布式细节藏起来，作者设计了三个核心概念，你需要先混个脸熟：</p>
+<ol>
+<li><strong><code>WorkerGroup</code> (工人组/包工头)：</strong> 这是用户直接打交道的对象。你对它发号施令，它负责管理背后的一群远程 Worker。</li>
+<li><strong><code>ResourcePool</code> (资源池)：</strong> 负责管硬件（比如每台机器几张卡）。</li>
+<li><strong><code>ClassWithArgs</code> (带参数的类模版)：</strong> 这是一个延迟初始化的技巧，先不急着创建对象，等资源分配好了再创建。</li>
+</ol>
+<h3>✅ Task 3: 搞懂“魔法”是如何发生的 (运行机制)</h3>
+<p>文章用 <code>generate_sequences</code>（生成序列）这个函数作为例子，演示了如何把一个普通函数变成分布式函数。</p>
+<h4>3.1 第一步：打标签 (Decorator)</h4>
+<ul>
+<li><strong>动作：</strong> 在 Worker 类的函数上加一个装饰器 <code>@register</code>。</li>
+<li><strong>作用：</strong> 这行代码本身不干活，只是给函数贴个条（元数据）。<ul>
+<li>比如：贴上 <code>dispatch_mode=DP</code>，意思是“这个函数处理数据时，需要把数据切分给不同显卡”。</li>
+</ul>
+</li>
+</ul>
+<h4>3.2 第二步：动态绑定 (Binding) —— <strong>这是最核心的一步</strong></h4>
+<ul>
+<li><strong>场景：</strong> 当你初始化 <code>WorkerGroup</code> 时。</li>
+<li><strong>发生了什么：</strong><ol>
+<li><code>WorkerGroup</code> 会去扫描 Worker 类里的所有函数。</li>
+<li>如果发现函数上有 <code>@register</code> 贴条，<code>WorkerGroup</code> 就会根据贴条的内容，<strong>动态地</strong>给自己也生成一个同名函数。</li>
+<li>它会根据贴条选择两个助手：<ul>
+<li><strong><code>dispatch_fn</code> (分发助手)：</strong> 决定输入数据怎么分。比如把一大包数据切成 N 份发给 N 个显卡。</li>
+<li><strong><code>collect_fn</code> (收集助手)：</strong> 决定结果怎么收。比如把 N 个显卡返回的结果拼成一个大结果。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>3.3 第三步：实际调用 (Call Chain)</h4>
+<ul>
+<li><strong>用户视角：</strong> 你写代码时，只写了一行 <code>worker_group.generate_sequences(data)</code>。</li>
+<li><strong>内部视角：</strong><ol>
+<li><strong>分发：</strong> <code>dispatch_fn</code> 把 <code>data</code> 切碎。</li>
+<li><strong>执行：</strong> <code>execute_fn</code> 远程指挥所有显卡上的 Worker 运行函数。</li>
+<li><strong>收集：</strong> <code>collect_fn</code> 等所有 Worker 跑完，把结果收回来拼好。</li>
+<li><strong>返回：</strong> 你拿到了完整的结果，感觉就像是在本地跑的一样。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 4: 理解数据分发策略 (Dispatch Mode)</h3>
+<p>文章特意对比了两种分发模式，你需要理解区别：</p>
+<ol>
+<li><strong><code>ONE_TO_ALL</code> (广播模式)：</strong><ul>
+<li><strong>做法：</strong> 把同样的参数复制 N 份，发给所有 Worker。</li>
+<li><strong>场景：</strong> 比如更新模型参数时，设置相同的超参数。</li>
+</ul>
+</li>
+<li><strong><code>DP_COMPUTE_PROTO</code> (数据并行模式)：</strong><ul>
+<li><strong>做法：</strong> 把一大块数据（DataProto）切成 N 小块，每个 Worker 领一小块去算。</li>
+<li><strong>场景：</strong> 比如模型推理（Generate）或者计算梯度时。</li>
+</ul>
+</li>
+</ol>
+<h3>✅ Task 5: 总结 (Conclusion)</h3>
+<ul>
+<li><strong>最终效果：</strong><ul>
+<li><strong>以前 (单进程)：</strong> <code>rollout.generate(batch)</code></li>
+<li><strong>现在 (Verl 分布式)：</strong> <code>worker_group.generate(batch)</code></li>
+</ul>
+</li>
+<li><strong>优势：</strong> 代码长得几乎一样，逻辑清晰，容易调试，但底层已经是大规模分布式并行了。</li>
+<li><strong>扩展性：</strong> 这套设计不仅用于 RLHF，任何需要“批量远程调用”的任务都能用。</li>
+</ul>
+<hr />
+<p><strong>一句话总结全文：</strong>
+这篇文章介绍了一种设计模式，通过<strong>装饰器</strong>和<strong>动态绑定</strong>技术，让 <code>WorkerGroup</code> 这个“包工头”能自动学会如何把任务切分、分发给底下的工人们，最后把结果拼好给你，让你写分布式代码像写单机代码一样简单。</p>

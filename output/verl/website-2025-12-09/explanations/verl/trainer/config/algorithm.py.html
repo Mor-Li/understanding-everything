@@ -1,0 +1,91 @@
+<h1>verl/trainer/config/algorithm.py</h1>
+<p>这个文件 <code>algorithm.py</code> 其实是在配置 <strong>强化学习（RL）训练大模型</strong>（比如 PPO 算法）时的核心参数。</p>
+<p>之所以你觉得难懂，是因为它涉及了很多<strong>工程上的优化</strong>，特别是为了解决“训练速度”和“训练稳定性”之间的矛盾（即所谓的 Off-policy 问题）。</p>
+<p>我们可以把这个文件的功能想象成一个<strong>“训练大模型的任务清单 (Task Todo List)”</strong>。我们一步步来看，如果要训练一个模型，你需要配置哪些东西：</p>
+<hr />
+<h3>✅ Task 1: 设定基础游戏规则 (AlgoConfig)</h3>
+<p><strong>目标</strong>：告诉模型怎么算分，怎么看待未来的奖励。
+<strong>对应代码类</strong>：<code>AlgoConfig</code> (文件最下面)</p>
+<p>这是总控室。当你开始训练时，你首先要决定：
+1.  <strong>眼光放多长远？</strong> (<code>gamma</code>): 设为 1.0 表示模型非常在乎长远的未来奖励，设小一点表示更在乎眼前的利益。
+2.  <strong>怎么算优势？</strong> (<code>adv_estimator</code>): 也就是怎么判断“这一步走得好不好”。通常用 <code>gae</code> (Generalized Advantage Estimation) 或 <code>grpo</code>。
+3.  <strong>要不要开启其他功能模块？</strong> 比如下面要讲的 KL 惩罚 (<code>kl_ctrl</code>) 或 修正模块 (<code>rollout_correction</code>)。</p>
+<hr />
+<h3>✅ Task 2: 给模型戴上“紧箍咒” (KLControlConfig)</h3>
+<p><strong>目标</strong>：防止模型为了拿高分而“胡言乱语”，必须保持和原模型（Reference Model）不要差太远。
+<strong>对应代码类</strong>：<code>KLControlConfig</code></p>
+<p>在强化学习中，模型很容易为了讨好打分器（Reward Model）而输出奇怪的句子（这叫 Reward Hacking）。
+*   <strong>Todo 2.1</strong>: <strong>决定紧箍咒的类型</strong> (<code>type</code>): 是固定紧度 (<code>fixed</code>) 还是根据情况自动调节 (<code>adaptive</code>)？
+*   <strong>Todo 2.2</strong>: <strong>决定紧箍咒的力度</strong> (<code>kl_coef</code>): 这个系数越大，模型越不敢乱改原来的说话方式。</p>
+<hr />
+<h3>✅ Task 3: 处理“筛选”逻辑 (FilterGroupsConfig)</h3>
+<p><strong>目标</strong>：把生成的垃圾数据扔掉，只学好的。
+<strong>对应代码类</strong>：<code>FilterGroupsConfig</code></p>
+<p>有时候生成的样本太差了，或者不符合某些规则，我们直接过滤掉，不让模型学习这些样本。
+*   <strong>Todo 3.1</strong>: <strong>开启过滤</strong> (<code>enable</code>): 是否开启。
+*   <strong>Todo 3.2</strong>: <strong>过滤标准</strong> (<code>metric</code>): 按准确率 (<code>acc</code>) 还是按分数 (<code>score</code>) 过滤？</p>
+<hr />
+<h3>✅ Task 4: (最难懂的部分) 修正“时空错乱” (RolloutCorrectionConfig)</h3>
+<p><strong>目标</strong>：解决“生成数据的模型”和“正在训练的模型”不一致的问题。
+<strong>对应代码类</strong>：<code>RolloutCorrectionConfig</code></p>
+<p><strong>背景故事（为什么要这个？）</strong>：
+在大模型训练中，为了快，我们通常用一个推理引擎（如 vLLM）快速生成数据（Rollout），然后用另一个训练框架（如 PyTorch FSDP）去更新参数。
+这就导致了一个问题：<strong>生成数据时的模型参数，可能已经比当前训练的模型参数“老”了</strong>，或者因为精度不同（BF16 vs FP32）导致概率分布不一样。这叫 <strong>Off-policy（异策略）</strong> 现象，会导致训练崩溃。</p>
+<p>这个配置类就是为了<strong>修正</strong>这种偏差。</p>
+<h4>🛠️ 子任务 Todo List：</h4>
+<ol>
+<li>
+<p><strong>Todo 4.1: 决定修正的力度 (Importance Sampling, IS)</strong></p>
+<ul>
+<li><strong>概念</strong>：既然数据是用“老模型”生成的，那我们在用这些数据更新“新模型”时，就要加权。老模型觉得概率低但新模型觉得概率高的词，权重加大；反之减小。</li>
+<li><strong>选项</strong> (<code>rollout_is</code>):<ul>
+<li><code>token</code>: 每一个字（Token）都算一次权重修正（方差小，但有偏差）。</li>
+<li><code>sequence</code>: 整句话算一个权重修正（无偏差，但方差大，容易不稳定）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 4.2: 决定是否丢弃离谱数据 (Rejection Sampling, RS)</strong></p>
+<ul>
+<li><strong>概念</strong>：如果新老模型对某句话的看法差异太大（比如老模型觉得很通顺，新模型觉得完全不通），这种数据不仅没用，还有害。直接扔掉（Mask out）。</li>
+<li><strong>选项</strong> (<code>rollout_rs</code>):<ul>
+<li><code>geometric</code>: 使用几何平均值来判断是否丢弃（这通常用于推理模型，如 CoT 长思维链）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 4.3: 选择工作模式 (Mode)</strong></p>
+<ul>
+<li><strong>解耦模式 (Decoupled)</strong>: 最严谨。明确区分三个模型：生成模型、老模型、当前模型。计算量大，但稳。</li>
+<li><strong>旁路模式 (Bypass Mode)</strong>: 偷懒模式。假设生成模型 = 老模型。速度快，但在分布偏移大时容易崩。</li>
+</ul>
+</li>
+</ol>
+<h4>💡 只要记住这一条：</h4>
+<p>你不需要手动设置里面那个复杂的 <code>rollout_is_threshold</code> 或 <code>veto_threshold</code>。
+<strong>代码里贴心地写好了“套餐” (Factory Methods)</strong>，你直接调用即可：</p>
+<ul>
+<li><strong>套餐 A: <code>RolloutCorrectionConfig.decoupled_seq_is()</code></strong><ul>
+<li><em>场景</em>：标准 PPO 训练，追求理论正确，修正整句的偏差。</li>
+</ul>
+</li>
+<li><strong>套餐 B: <code>RolloutCorrectionConfig.geo_rs_seq_tis()</code></strong><ul>
+<li><em>场景</em>：训练像 <strong>OpenAI o1</strong> 这种长思维链（CoT）模型。因为句子很长，普通的修正方法会失效，必须用“几何平均拒绝采样” + “序列截断重要性采样”。</li>
+</ul>
+</li>
+<li><strong>套餐 C: <code>RolloutCorrectionConfig.ppo_is_bypass()</code></strong><ul>
+<li><em>场景</em>：想省资源，跑得快一点，且相信生成模型和训练模型差异不大。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件在讲什么？</h3>
+<p>这个文件定义了一个<strong>配置清单</strong>，核心思想是：</p>
+<ol>
+<li><strong>基础设置</strong>：怎么算分 (<code>AlgoConfig</code>)。</li>
+<li><strong>安全设置</strong>：别偏离原语言习惯太远 (<code>KLControlConfig</code>)。</li>
+<li><strong>高级补丁</strong> (<code>RolloutCorrectionConfig</code>)：<strong>这是本文档的精华</strong>。它承认在大规模分布式训练中，“生成数据”和“训练数据”存在时间差和精度差。为了不让这个差错毁掉训练，它提供了一套复杂的数学工具（重要性采样、拒绝采样）来修补数据，确保模型能稳定收敛。</li>
+</ol>
+<p>如果你是刚开始跑 PPO，通常只需要关注 <code>AlgoConfig</code> 里的学习率相关（这里没列出，通常在优化器配置里）和 <code>KLControlConfig</code> 的系数。<code>RolloutCorrectionConfig</code> 一般直接选一个默认的“套餐”即可。</p>

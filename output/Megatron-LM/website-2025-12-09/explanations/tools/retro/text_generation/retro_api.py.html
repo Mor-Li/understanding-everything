@@ -1,0 +1,85 @@
+<h1>tools/retro/text_generation/retro_api.py</h1>
+<p>这份代码文件 <code>retro_api.py</code> 是 <strong>NVIDIA Megatron-LM</strong> 项目中用于 <strong>RETRO (Retrieval-Enhanced Transformer)</strong> 模型进行 <strong>推理（Inference/文本生成）</strong> 的接口文件。</p>
+<p>简单来说，它的作用是：<strong>接收用户的输入文本，协调多个GPU，处理RETRO特有的检索数据，让模型生成后续文本，最后把结果转换回人类可读的文字。</strong></p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>“任务清单 (Task To-Do List)”</strong>，按照代码执行的顺序一步步讲：</p>
+<hr />
+<h3>📝 Task 1: 统一指挥 (参数同步)</h3>
+<p><strong>对应函数：</strong> <code>retro_generate</code> (前半部分)</p>
+<p>在多显卡（多GPU）并行计算时，通常只有一个“主进程”（Rank 0）知道用户想要什么（比如生成多少个字、温度系数是多少）。其他的显卡都在傻傻地等命令。</p>
+<ul>
+<li><strong>Todo:</strong><ol>
+<li>把所有控制参数（如 <code>tokens_to_generate</code> 生成长度, <code>temperature</code> 随机程度, <code>top_k</code> 等）打包成一个列表。</li>
+<li>使用 <code>broadcast_float_list</code> 把这些参数从 Rank 0 <strong>广播</strong> 给所有其他显卡。</li>
+<li><strong>目的：</strong> 确保所有显卡拿到的任务参数是一模一样的，避免大家各干各的导致报错。</li>
+</ol>
+</li>
+</ul>
+<h3>📝 Task 2: 翻译与打包 (文本分词与Padding)</h3>
+<p><strong>对应函数：</strong> <code>tokenize_prompts</code> 和 <code>_tokenize_prompts_and_batch</code></p>
+<p>模型看不懂中文或英文，它只认识数字。</p>
+<ul>
+<li><strong>Todo:</strong><ol>
+<li><strong>分词 (Tokenize):</strong> 调用 <code>tokenizer</code> 把用户的输入文本（Prompts）转换成数字列表（Token IDs）。</li>
+<li><strong>添加标记:</strong> 根据配置决定是否在开头加 <code>BOS</code> (Begin of Sentence) 或结尾加 <code>EOD</code> (End of Document)。</li>
+<li><strong>对齐长度 (Padding):</strong> 因为用户输入的句子长短不一，但模型需要矩阵输入。代码会计算出最长的句子，然后把短句子后面填满占位符，让它们变得一样长。</li>
+<li><strong>广播数据:</strong> 同样，只有 Rank 0 做了这件事，它需要把处理好的数字矩阵广播给其他显卡。</li>
+</ol>
+</li>
+</ul>
+<h3>📝 Task 3: 准备“外挂”知识库 (RETRO特有步骤)</h3>
+<p><strong>对应函数：</strong> <code>retro_generate</code> (中间部分)</p>
+<p>这是 <strong>RETRO</strong> 模型最特殊的地方。普通 GPT 只有脑子里的记忆，RETRO 可以查阅外部资料（检索增强）。</p>
+<ul>
+<li><strong>Todo:</strong><ol>
+<li><strong>计算块大小:</strong> RETRO 是按“块 (Chunk)”来处理文本的。代码会计算输入文本对应多少个块。</li>
+<li><strong>处理邻居 (Neighbours):</strong> <code>neighbours_array</code> 是检索到的外部知识（即“邻居”）。</li>
+<li><strong>变形 (Reshape/Repeat):</strong> 代码将检索到的数据进行变形 (<code>reshape</code>) 和复制 (<code>repeat</code>)，使其维度能和输入文本对齐。</li>
+<li><strong>目的：</strong> 把查到的外部资料整理好，喂给模型，让模型在生成时可以“抄作业”。</li>
+</ol>
+</li>
+</ul>
+<h3>📝 Task 4: 开始做题 (模型推理)</h3>
+<p><strong>对应函数：</strong> <code>retro_generate_tokens_probs_and_return_on_first_stage</code></p>
+<p>一切准备就绪，开始让显卡燃烧。</p>
+<ul>
+<li><strong>Todo:</strong><ol>
+<li><strong>判断模式:</strong><ul>
+<li>如果 <code>tokens_to_generate == 0</code>: 说明用户只想算一下当前句子的概率得分，不生成新词。</li>
+<li>否则: 进入生成模式。</li>
+</ul>
+</li>
+<li><strong>调用底层生成器:</strong> 调用 <code>retro_generate_tokens_probs_and_return_on_first_stage</code>。这个函数会跑 Transformer 的前向传播，一个词一个词地往外吐。</li>
+<li><strong>利用检索数据:</strong> 在生成过程中，模型会同时看输入的文本和 Task 3 中准备好的 <code>neighbours_array</code>。</li>
+</ol>
+</li>
+</ul>
+<h3>📝 Task 5: 翻译回人话 (后处理)</h3>
+<p><strong>对应函数：</strong> <code>retro_generate_and_post_process</code></p>
+<p>模型吐出来的是一堆数字（Token IDs），人类看不懂。</p>
+<ul>
+<li><strong>Todo:</strong><ol>
+<li><strong>收集结果:</strong> 从模型拿到生成的数字列表。</li>
+<li><strong>解码 (Detokenize):</strong> 只有在流水线的第一阶段（<code>mpu.is_pipeline_first_stage()</code>）进行操作。把数字转换回文本字符串。</li>
+<li><strong>分割:</strong> 把“提示词(Prompt)”和“生成词(Generation)”区分开。</li>
+<li><strong>返回:</strong> 把最终的文本列表返回给用户。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结一下流程图：</h3>
+<ol>
+<li><strong>用户输入</strong> ("你好", 生成50字)
+    ⬇️</li>
+<li><strong>广播</strong> (告诉所有显卡：我们要生成50字)
+    ⬇️</li>
+<li><strong>数字化</strong> ("你好" -&gt; <code>[123, 456]</code>, 补齐长度)
+    ⬇️</li>
+<li><strong>整理外挂</strong> (把检索到的相关文档整理成矩阵)
+    ⬇️</li>
+<li><strong>模型运行</strong> (RETRO 模型一边看输入，一边看外挂文档，一边生成数字 <code>[789, ...]</code>)
+    ⬇️</li>
+<li><strong>解码</strong> (<code>[123, 456, 789...]</code> -&gt; "你好，世界...")
+    ⬇️</li>
+<li><strong>输出结果</strong></li>
+</ol>
+<p>这就看懂了！这个文件就是一个<strong>大管家</strong>，负责把数据喂给 RETRO 模型并把结果拿回来。</p>

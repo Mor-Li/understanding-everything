@@ -1,0 +1,94 @@
+<h1>recipe/gkd/run_moonlight_dsv3_training.sh</h1>
+<p>这份脚本确实包含了很多大模型训练（特别是分布式训练）的专业术语。简单来说，这是一个<strong>启动脚本</strong>，用于在一个计算集群上训练一个叫 <strong>Moonlight (基于 DeepSeek-V3 架构)</strong> 的模型。</p>
+<p>它的核心任务是执行 <strong>GKD (Generalized Knowledge Distillation，广义知识蒸馏)</strong>，也就是让一个小模型（学生）去学习大模型（老师）的行为。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“任务清单 (To-Do List)”</strong>，按照执行顺序一步步给你讲：</p>
+<hr />
+<h3>任务清单：启动 Moonlight 模型蒸馏训练</h3>
+<h4>✅ 任务 1：准备“原材料” (模型配置文件与权重)</h4>
+<p><strong>代码对应部分：</strong> <code># 0. download the config</code> 和 <code># 1. download ...</code></p>
+<ul>
+<li><strong>要做什么：</strong><ol>
+<li><strong>下载配置文件</strong>：你需要从 HuggingFace 下载 DeepSeek 的配置文件（如 <code>config.json</code>）。</li>
+<li><strong>修改配置</strong>：脚本注释里提醒你，要手动删掉 <code>quantization_config</code>（量化配置），并且把 <code>num_nextn_predict_layers</code> 设为 0。<ul>
+<li><em>观点/背景</em>：这是因为目前的训练框架还不支持 DeepSeek V3 特有的 MTP (Multi-Token Prediction) 功能，所以要关掉。</li>
+</ul>
+</li>
+<li><strong>下载模型权重</strong>：下载已经切分好的分布式权重 (<code>dist_ckpt</code>)。</li>
+<li><strong>设置路径</strong>：把脚本里的 <code>HF_MODEL_PATH</code> 和 <code>DIST_CKPT_PATH</code> 改成你硬盘里的实际路径。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ 任务 2：设置“厨房环境” (环境变量与数据)</h4>
+<p><strong>代码对应部分：</strong> <code>export NVTE_...</code> 和 <code>gsm8k_train_path=...</code></p>
+<ul>
+<li><strong>要做什么：</strong><ol>
+<li><strong>优化加速</strong>：设置 <code>NVTE_FLASH_ATTN=1</code> 等，开启 NVIDIA 的 Transformer Engine 加速功能。</li>
+<li><strong>指定教材</strong>：设置 <code>gsm8k_train_path</code>，告诉程序训练数据（这里用的是 GSM8K 数学数据集）在哪里。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ 任务 3：制定“分工计划” (并行策略配置)</h4>
+<p><strong>代码对应部分：</strong> <code>NODES=1</code>, <code>PP=3</code>, <code>TP=1</code>, <code>EP=2</code>...</p>
+<ul>
+<li><strong>要做什么：</strong> 模型太大了，一张显卡装不下，需要决定怎么切分模型。</li>
+<li><strong>核心概念解释：</strong><ul>
+<li><strong>PP (Pipeline Parallelism)</strong> = 3：<strong>流水线并行</strong>。把模型的不同层切开，放在 3 个不同的地方处理（像工厂流水线）。</li>
+<li><strong>TP (Tensor Parallelism)</strong> = 1：<strong>张量并行</strong>。把每一层的矩阵计算切开。这里设为 1 表示不切。</li>
+<li><strong>EP (Expert Parallelism)</strong> = 2：<strong>专家并行</strong>。这是 <strong>MoE (混合专家模型)</strong> 独有的。DeepSeek V3 是 MoE 架构，这里表示把不同的“专家”网络分配到不同的卡上。</li>
+<li><strong>SP (Sequence Parallelism)</strong>：序列并行，通常配合 TP 使用，这里脚本写了逻辑：如果 TP=1，则自动关闭 SP。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 任务 4：确认“老师”是否在线</h4>
+<p><strong>代码对应部分：</strong> <code>TEACHER_SERVER_HOST</code> 和 <code>function check_server_ready</code></p>
+<ul>
+<li><strong>要做什么：</strong> 这是一个<strong>蒸馏 (Distillation)</strong> 任务，意味着有一个更强的“老师模型”在另一个地方运行，学生模型要通过网络向老师请教。</li>
+<li><strong>脚本逻辑：</strong><ol>
+<li>定义老师的 IP (<code>127.0.0.1</code>) 和端口 (<code>15555</code>)。</li>
+<li>运行 <code>check_server_ready</code> 函数：它会尝试用 <code>telnet</code> 连接老师的端口。</li>
+<li><strong>观点</strong>：如果连不上老师，训练就无法进行，脚本会直接报错退出 (<code>exit 1</code>)。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ 任务 5：正式下达“训练指令” (Ray Job Submit)</h4>
+<p><strong>代码对应部分：</strong> <code>ray job submit ...</code> 及其后的一大串参数</p>
+<ul>
+<li><strong>要做什么：</strong> 使用 <strong>Ray</strong>（一个分布式计算框架）提交 Python 任务。</li>
+<li><strong>核心参数拆解（这一大串在干嘛）：</strong><ul>
+<li><code>python3 -m main_gkd</code>：运行主程序，GKD 代表这是蒸馏训练。</li>
+<li><strong>数据设置 (<code>data.*</code>)</strong>：<ul>
+<li><code>train_batch_size=1024</code>：一次训练多少数据。</li>
+<li><code>max_prompt_length=2048</code>：输入最长多少。</li>
+</ul>
+</li>
+<li><strong>学生模型设置 (<code>actor_rollout_ref.*</code>)</strong>：<ul>
+<li><code>model.path</code>：学生模型的路径。</li>
+<li><code>actor.megatron.*</code>：把刚才任务 3 里设定的 PP, TP, EP 等参数传进去，告诉 Megatron 框架怎么切分模型。</li>
+<li><code>override_transformer_config</code>：强制修改一些模型内部配置，比如 <code>moe_permute_fusion=True</code>（开启 MoE 的融合算子加速）。</li>
+<li><code>actor.optim.lr=1e-6</code>：学习率，设得很小，说明是微调。</li>
+</ul>
+</li>
+<li><strong>生成/推理设置 (<code>rollout.*</code>)</strong>：<ul>
+<li><code>name=vllm</code>：使用 <strong>vLLM</strong> 这个库来做推理（生成回答）。</li>
+<li><code>gpu_memory_utilization=0.8</code>：显存占用限制。</li>
+</ul>
+</li>
+<li><strong>老师设置 (<code>teacher.*</code>)</strong>：<ul>
+<li>告诉程序去哪里找刚才检查过的那个老师服务器。</li>
+</ul>
+</li>
+<li><strong>训练器设置 (<code>trainer.*</code>)</strong>：<ul>
+<li><code>nnodes</code>, <code>n_gpus_per_node</code>：告诉训练器用了多少台机器，每台多少卡。这里是单机 (<code>NODES=1</code>)，用了 6 张卡训练 (<code>n_gpus_per_node=6</code>)，另外 2 张卡可能用于生成 (<code>rollout</code> 部分)。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇文档到底在讲啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>配置清单和启动按钮</strong>，用于在一台 8 卡（推测是 8 卡，因为训练用了 6 张，推理用了 2 张）的服务器上，利用 Ray 框架和 Megatron/vLLM 技术，让 Moonlight 模型通过学习远程“老师”的输出来进行微调训练。</p>
+<p><strong>你需要关注的重点：</strong>
+1.  <strong>路径</strong>：文件都在哪？(<code>HF_MODEL_PATH</code>, <code>DIST_CKPT_PATH</code>)
+2.  <strong>资源分配</strong>：你有多少卡？够不够跑这个 <code>PP=3</code>, <code>EP=2</code> 的配置？
+3.  <strong>依赖服务</strong>：你的 Teacher Server（老师模型服务）启动了吗？端口通了吗？</p>

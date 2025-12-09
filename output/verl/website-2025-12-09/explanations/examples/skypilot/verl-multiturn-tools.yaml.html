@@ -1,0 +1,54 @@
+<h1>examples/skypilot/verl-multiturn-tools.yaml</h1>
+<p>这份文件其实是一个 <strong>“自动化任务清单”</strong>，是写给一个叫 <strong>SkyPilot</strong> 的工具看的。SkyPilot 的作用是帮你去云端（比如 AWS, GCP, 或者你们公司的 K8s 集群）租一台服务器，然后自动把环境配好，最后跑起一个 AI 训练任务。</p>
+<p>简单来说，这份文件的核心观点是：<strong>“我要用 8 张 H100 显卡，基于 Qwen2.5 模型，使用 PPO/GRPO 强化学习算法，在 GSM8K 数学数据集上，训练模型学会‘使用工具’（Tool Use）的能力。”</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“保姆级 To-Do List”</strong>，这就是机器读到这份文件后会一步步执行的操作：</p>
+<hr />
+<h3>第一阶段：找电脑、备材料 (Resources &amp; Secrets)</h3>
+<p><strong>Task 1: 申请硬件资源</strong>
+*   <strong>原文对应：</strong> <code>resources: ... accelerators: H100:8 ...</code>
+*   <strong>机器在想：</strong> “老板要求很高。我要去 Kubernetes (k8s) 集群里申请一台超级计算机。这台电脑必须有 <strong>8 张 H100 显卡</strong>（目前最顶级的 AI 芯片），内存要大于 128GB。”
+*   <strong>环境底座：</strong> 使用 <code>verlai/verl:base-verl0.5...</code> 这个 Docker 镜像，相当于给电脑装好了一个预装了基础软件的操作系统。</p>
+<p><strong>Task 2: 拿到通行证</strong>
+*   <strong>原文对应：</strong> <code>secrets: ... WANDB_API_KEY ... HF_TOKEN ...</code>
+*   <strong>机器在想：</strong> “我需要钥匙。<code>WANDB_API_KEY</code> 是为了把训练过程的图表画在云端给我看；<code>HF_TOKEN</code> 是为了从 Hugging Face 下载这就需要权限的模型。”</p>
+<hr />
+<h3>第二阶段：装修厨房 (Setup)</h3>
+<p><strong>Task 3: 安装软件环境</strong>
+*   <strong>原文对应：</strong> <code>setup: ... git clone ... pip install ...</code>
+*   <strong>机器在想：</strong> “电脑拿到手了，但里面是空的。我需要：”
+    1.  把 <code>verl</code> 这个项目的代码下载下来 (<code>git clone</code>)。
+    2.  安装 Python 依赖包 (<code>pip install</code>)，特别是 <code>vllm</code>（用来加速模型推理的）和 <code>flashinfer</code>。
+    3.  <strong>关键点：</strong> 它特意降级了 <code>transformers</code> 库的版本，可能是为了避开某个已知的 Bug。</p>
+<p><strong>Task 4: 准备食材 (数据)</strong>
+*   <strong>原文对应：</strong> <code>setup: ... Download GSM8K dataset ...</code>
+*   <strong>机器在想：</strong> “我们要训练数学能力。我要下载 <strong>GSM8K</strong> 数据集（这是一个经典的小学数学应用题数据集），并把它处理好放在 <code>~/data/gsm8k</code> 目录下。”</p>
+<hr />
+<h3>第三阶段：开始做菜 (Run - 核心部分)</h3>
+<p>这是文件最长、最难懂的部分。实际上它只做了一件事：<strong>启动训练</strong>。</p>
+<p><strong>Task 5: 启动分布式管家 (Ray)</strong>
+*   <strong>原文对应：</strong> <code>echo "Starting Ray head node..." ... ray start ...</code>
+*   <strong>机器在想：</strong> “因为我们要用 8 张卡一起跑，需要一个管家来协调。我启动了 <strong>Ray</strong>，它是专门用来管理分布式计算的框架。”</p>
+<p><strong>Task 6: 运行强化学习训练脚本</strong>
+*   <strong>原文对应：</strong> <code>python3 -m verl.trainer.main_ppo ...</code>
+*   <strong>机器在想：</strong> “好戏开始了。我要运行 PPO（一种强化学习算法）的主程序。”
+    *   <strong>我们要训练谁？</strong>
+        *   <code>actor_rollout_ref.model.path=Qwen/Qwen2.5-3B-Instruct</code>: 我们用的底模是 <strong>Qwen2.5 (30亿参数版本)</strong>。
+    *   <strong>我们要怎么训练？(算法核心)</strong>
+        *   <code>algorithm.adv_estimator=grpo</code>: 这里用了一种叫 <strong>GRPO</strong> 的技术（DeepSeek-R1 背后也是类似的思路），它比传统的 PPO 更省显存，不需要额外的价值网络（Critic）或者价值网络更简单。
+        *   <code>actor_rollout_ref.actor.use_kl_loss=True</code>: 训练时要约束模型，不要让它为了由着性子乱改，变得完全不像原来的自己（保持语言通顺）。
+    *   <strong>我们要训练它干什么？(多轮工具使用)</strong>
+        *   <code>actor_rollout_ref.rollout.multi_turn.tool_config_path=...</code>: 这是重点！配置里提到了 <strong>Tool Config</strong>。
+        *   <strong>观点解读：</strong> 这不仅仅是让 AI 做数学题，而是让 AI <strong>学会使用工具</strong>（比如调用计算器、运行 Python 代码）来解决多轮对话中的数学题，而不是只能靠“心算”瞎猜。
+    *   <strong>硬件怎么分配？</strong>
+        *   <code>tensor_model_parallel_size=4</code>: 把模型切成 4 份跑。
+        *   <code>rollout.n=16</code>: 每次让模型尝试生成 16 个不同的答案，然后从中学习好的。</p>
+<hr />
+<h3>总结：这文件到底是干啥的？</h3>
+<p>如果你把这个文件丢给 SkyPilot 运行，它会做完以下所有事情：</p>
+<ol>
+<li><strong>租</strong> 一台 8卡 H100 的豪车服务器。</li>
+<li><strong>下</strong> 载 Qwen2.5-3B 模型和 GSM8K 数学题库。</li>
+<li><strong>跑</strong> 一个强化学习（RL）实验。</li>
+<li><strong>教</strong> 这个模型在做数学题时，如何使用外部工具（Tool Use），并通过 GRPO 算法奖励它做对的时候，惩罚它做错的时候。</li>
+</ol>
+<p><strong>一句话观点：</strong> 这是一个<strong>使用强化学习（GRPO/PPO）微调 Qwen2.5 模型，使其具备在多轮对话中调用工具解决数学问题能力</strong>的配置脚本。</p>

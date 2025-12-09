@@ -1,0 +1,81 @@
+<h1>docs/data/transfer_queue.md</h1>
+<p>这份文档确实涉及了很多分布式系统和AI训练的专业术语，读起来晦涩是很正常的。</p>
+<p>简单来说，<strong>TransferQueue 是一个专门为大模型“后训练”（Post-training，比如 RLHF 阶段）设计的“高效物流系统”。</strong></p>
+<p>为了让你彻底搞懂，我制定了一个 <strong>6步学习任务清单 (Todo List)</strong>。我们将通过比喻，一步步拆解这个系统。</p>
+<hr />
+<h3>📋 学习任务清单 (Task Todo List)</h3>
+<h4>✅ Task 1: 理解背景——为什么要造这个轮子？</h4>
+<p><strong>核心痛点：</strong> 以前的训练系统有个瓶颈。
+*   <strong>情景：</strong> 想象一个繁忙的餐厅（AI训练集群）。以前，所有的“食材”（训练数据，比如巨大的 Tensor/矩阵）和“菜单”（元数据，比如这是第几号数据）都要经过唯一的“餐厅经理”（Controller）。
+*   <strong>问题：</strong> 经理累死了。因为食材太重（数据量大），经理光是搬运食材就耗尽了精力，没时间去指挥（调度）了。这就是文档里提到的 <code>RayPPOTrainer</code> 的单点瓶颈。
+*   <strong>解决思路：</strong> 让经理只负责“管账和指挥”，找专门的搬运工和仓库去负责“搬东西和存东西”。</p>
+<h4>✅ Task 2: 理解核心架构——“大脑”与“肌肉”分离</h4>
+<p>TransferQueue 把系统分成了两个核心部分（控制面与数据面）：</p>
+<ol>
+<li>
+<p><strong>控制面 (Control Plane) —— 也就是“大脑”</strong></p>
+<ul>
+<li><strong>组件名：</strong> <code>TransferQueueController</code></li>
+<li><strong>职责：</strong> 它<strong>不碰</strong>真实的数据（Tensor）。它只记录“账本”（Metadata）：<ul>
+<li>“第100号数据生产出来了吗？”</li>
+<li>“第100号数据被‘生成任务’消费了吗？”</li>
+</ul>
+</li>
+<li><strong>功能：</strong> 全局视野，负责调度。</li>
+</ul>
+</li>
+<li>
+<p><strong>数据面 (Data Plane) —— 也就是“肌肉/仓库”</strong></p>
+<ul>
+<li><strong>组件名：</strong> <code>TransferQueueStorageManager</code></li>
+<li><strong>职责：</strong> 专门用来存放那些巨大的数据块。</li>
+<li><strong>特点：</strong> 它是“可插拔”的。你可以用简单的内存存（SimpleStorage），也可以用高性能的硬件存（Yuanrong, MoonCake），甚至用 Ray 的传输功能。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 3: 梳理工作流程——数据是怎么流动的？</h4>
+<p>文档中提到了“异步流式（Asynchronous Streaming）”，流程如下：</p>
+<ol>
+<li><strong>生产 (Put)：</strong> 一个计算节点（比如生成了新的文本）把<strong>重数据</strong>直接扔进“仓库”（Storage），然后给“经理”（Controller）打个电话说：“第X号数据放好了”。</li>
+<li><strong>调度 (Get Meta)：</strong> 下游任务（比如要算 Loss）问“经理”：“我现在能处理啥？”经理看一眼账本，说：“第X号数据准备好了，你去处理吧”。</li>
+<li><strong>消费 (Get Data)：</strong> 下游任务拿着经理给的单子，直接去“仓库”取数据，<strong>完全不经过经理的手</strong>。</li>
+</ol>
+<p><strong>结果：</strong> 经理（Controller）极其轻松，数据传输不再拥堵。</p>
+<h4>✅ Task 4: 理解“细粒度”与“采样器” (Sampler)</h4>
+<p>文档强调了 <strong>Sample-level（样本级）</strong> 管理和 <strong>Sampler（采样器）</strong>。</p>
+<ul>
+<li><strong>以前：</strong> 往往是一大批数据（Batch）打包处理，必须等整批都齐了才能动。</li>
+<li><strong>现在 (TransferQueue)：</strong> 我们可以精确到每一条数据。</li>
+<li><strong>自定义 Sampler：</strong> 就像你可以自定义“取餐逻辑”。<ul>
+<li>比如：你可以写一个逻辑，专门挑“最新的数据”先训练，或者“随机”挑数据。</li>
+<li>文档提到的 <code>SequentialSampler</code>（按顺序拿）和 <code>GRPOGroupNSampler</code>（按组拿）就是两种不同的取餐策略。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 看看实际案例——Verl 框架的集成</h4>
+<p>文档提到了 <strong>Verl</strong>（一个强化学习框架）。这是 TransferQueue 最主要的应用场景。</p>
+<ul>
+<li><strong>改造前：</strong> 所有数据（DataProto）都走单一控制器，堵车严重。</li>
+<li><strong>改造后：</strong><ul>
+<li><strong>元数据 (BatchMeta)</strong> 走控制器（路畅通了）。</li>
+<li><strong>真实数据 (TensorDict)</strong> 走 TransferQueue 的分布式存储（路宽了）。</li>
+<li>这就实现了文档里说的“解耦（Decouple）”。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 动手与扩展 (Customize)</h4>
+<p>如果你要用它，或者改它，文档提供了接口：</p>
+<ul>
+<li><strong>客户端 (Client)：</strong> 提供了 <code>AsyncTransferQueueClient</code>。就像给了你一个遥控器，上面有 <code>put</code>（存数据）和 <code>get</code>（取数据）按钮。</li>
+<li><strong>换存储后端：</strong> 如果你觉得默认的内存存储不够快，你可以写代码继承 <code>TransferQueueStorageManager</code>，对接你自己公司的高级存储系统（比如基于 RDMA 的存储）。</li>
+</ul>
+<hr />
+<h3>💡 总结 (Summary)</h3>
+<p><strong>TransferQueue 讲的就是一件事：</strong>
+为了让 AI 后训练（Post-training）更快，它把<strong>数据传输</strong>（搬运重物）和<strong>任务调度</strong>（指挥交通）分开了。</p>
+<ul>
+<li><strong>它是一个中间件：</strong> 左手接生成的数据，右手发给训练任务。</li>
+<li><strong>它是一个数据库：</strong> 存取巨大的 Tensor。</li>
+<li><strong>它是一个调度员：</strong> 决定谁在什么时候处理哪条数据。</li>
+</ul>
+<p>现在再回去看文档里的架构图（Overview 部分），你应该能看懂那个三角形关系了：Client 找 Controller 拿元数据，然后直接找 Storage 拿真实数据。</p>

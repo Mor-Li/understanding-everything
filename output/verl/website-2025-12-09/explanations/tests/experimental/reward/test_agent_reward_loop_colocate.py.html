@@ -1,0 +1,128 @@
+<h1>tests/experimental/reward/test_agent_reward_loop_colocate.py</h1>
+<p>这份代码确实涉及了很多分布式训练（Ray）、配置管理（Hydra）和强化学习（RLHF）的底层逻辑，看起来比较晦涩。</p>
+<p>简单来说，<strong>这个脚本是一个“集成测试”</strong>。它的目的是验证在一个特定的硬件配置下（Colocate，即共用资源），<strong>“模型生成答案（Agent Loop）”</strong> 和 <strong>“给答案打分（Reward Loop）”</strong> 这两个核心环节能不能顺利跑通。</p>
+<p>你可以把这看作是一个<strong>“模拟考场”</strong>：
+1.  <strong>准备考场</strong>（配置机器）。
+2.  <strong>请考生和阅卷老师入场</strong>（加载模型）。
+3.  <strong>发卷子</strong>（加载数据）。
+4.  <strong>考生做题</strong>（生成文本）。
+5.  <strong>老师打分</strong>（计算 Reward）。</p>
+<p>下面我为你列一个 <strong>Task To-Do List</strong>，并一步步拆解代码在做什么。</p>
+<hr />
+<h3>Task To-Do List (代码执行流程)</h3>
+<ol>
+<li><strong>[环境配置]</strong>: 初始化分布式系统 (Ray) 和读取配置文件。</li>
+<li><strong>[资源分配]</strong>: 划定显卡资源池 (Resource Pool)，决定谁用哪几张卡。</li>
+<li><strong>[角色初始化]</strong>:<ul>
+<li>启动 <strong>Agent (Actor)</strong>：负责“做题”的模型（这里用的是 Qwen-0.5B）。</li>
+<li>启动 <strong>Reward Manager</strong>：负责“打分”的管理器（这里用的是 Qwen-1.5B 或者是自定义评分函数）。</li>
+</ul>
+</li>
+<li><strong>[数据准备]</strong>: 加载题目（GSM8K 数学数据集）。</li>
+<li><strong>[核心流程 - Step 1]</strong>: 从数据集中拿出一批题目（Prompt）。</li>
+<li><strong>[核心流程 - Step 2]</strong>: 让 Agent 模型根据题目生成答案（Rollout/Generation）。</li>
+<li><strong>[核心流程 - Step 3]</strong>: 让 Reward 模型给生成的答案打分（Compute Score）。</li>
+<li><strong>[收尾]</strong>: 打印结果，关闭系统。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>1. [环境配置] 初始化与配置</h4>
+<p><strong>代码位置：</strong> 开头到 <code>config = compose("rm_config")</code> 以及随后的 config 设置。</p>
+<ul>
+<li><strong>讲人话：</strong>
+    这就好比考试前要先定好规则。比如用几张显卡（<code>n_gpus_per_node = 8</code>），模型路径在哪里（<code>~/models/Qwen...</code>），生成的长度限制是多少（<code>max_response_length</code>）。</li>
+<li><strong>关键点：</strong><ul>
+<li>它定义了两个模型路径：一个 <code>rollout_model</code> (考生)，一个 <code>reward_model</code> (阅卷老师)。</li>
+<li><code>config.actor_rollout_ref.rollout.tensor_model_parallel_size = 2</code>：意思是模型太大，把模型切成两半放在两张卡上跑。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [资源分配] 建立资源池</h4>
+<p><strong>代码位置：</strong> <code># 1. init reward model manager</code> 下方关于 <code>ResourcePoolManager</code> 的部分。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">resource_pool_manager</span> <span class="o">=</span> <span class="n">ResourcePoolManager</span><span class="p">(</span><span class="n">resource_pool_spec</span><span class="o">=</span><span class="n">resource_pool_spec</span><span class="p">,</span> <span class="n">mapping</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+<span class="n">resource_pool_manager</span><span class="o">.</span><span class="n">create_resource_pool</span><span class="p">()</span>
+<span class="n">resource_pool</span> <span class="o">=</span> <span class="n">resource_pool_manager</span><span class="o">.</span><span class="n">resource_pool_dict</span><span class="p">[</span><span class="n">global_pool_id</span><span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲人话：</strong>
+    这步是在“圈地”。虽然机器上有8张卡，但这几行代码把它们管理起来，形成一个 <code>resource_pool</code>。</li>
+<li><strong>Colocate (共置) 的含义：</strong> 文件名里的 <code>colocate</code> 暗示了 Agent 和 Reward 可能会共享这个资源池，或者在同一组硬件上协调运行，而不是完全隔离在不同的物理机上。</li>
+</ul>
+<h4>3. [角色初始化] 启动 Agent 和 Reward 管理器</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 启动负责生成的 Worker 组</span>
+<span class="n">actor_rollout_wg</span> <span class="o">=</span> <span class="n">RayWorkerGroup</span><span class="p">(</span><span class="n">resource_pool</span><span class="o">=</span><span class="n">resource_pool</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="n">actor_rollout_wg</span><span class="o">.</span><span class="n">init_model</span><span class="p">()</span>
+
+<span class="c1"># 初始化两个核心管理器</span>
+<span class="n">agent_loop_manager</span> <span class="o">=</span> <span class="n">AgentLoopManager</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">worker_group</span><span class="o">=</span><span class="n">actor_rollout_wg</span><span class="p">)</span>
+<span class="n">reward_loop_manager</span> <span class="o">=</span> <span class="n">RewardLoopManager</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">rm_resource_pool</span><span class="o">=</span><span class="n">resource_pool</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲人话：</strong><ul>
+<li><code>AgentLoopManager</code>：这是<strong>考务主任</strong>，手里管着 <code>actor_rollout_wg</code>（考生/生成模型）。</li>
+<li><code>RewardLoopManager</code>：这是<strong>阅卷组长</strong>，手里管着如何给题目打分（可能调用另一个模型，也可能运行一段代码脚本）。</li>
+</ul>
+</li>
+</ul>
+<h4>4. [数据准备] 加载试卷</h4>
+<p><strong>代码位置：</strong> <code># 2. init test data</code> 部分。</p>
+<ul>
+<li><strong>讲人话：</strong>
+    从 <code>~/data/gsm8k/</code> 读取数学题。<code>StatefulDataLoader</code> 是一个能记住发卷发到哪里的发卷机器。</li>
+</ul>
+<h4>5. [核心流程 - Step 1] 拿题 (Get Batch)</h4>
+<p><strong>代码位置：</strong> <code># 3. generate responses</code> 下方。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">batch_dict</span> <span class="o">=</span> <span class="nb">next</span><span class="p">(</span><span class="nb">iter</span><span class="p">(</span><span class="n">dataloader</span><span class="p">))</span>
+<span class="n">batch</span> <span class="o">=</span> <span class="n">DataProto</span><span class="o">.</span><span class="n">from_single_dict</span><span class="p">(</span><span class="n">batch_dict</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲人话：</strong>
+    从题库里拿出一摞卷子（Batch），比如 64 道题。</li>
+</ul>
+<h4>6. [核心流程 - Step 2] 做题 (Generate)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">gen_batch</span> <span class="o">=</span> <span class="n">agent_loop_manager</span><span class="o">.</span><span class="n">generate_sequences</span><span class="p">(</span><span class="n">gen_batch</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲人话：</strong>
+    <strong>这是最关键的一步之一。</strong>
+    <code>agent_loop_manager</code> 拿着只有题目的卷子 (<code>gen_batch</code>)，扔给 GPU 上的模型。模型开始“沙沙沙”写答案。
+    回来的时候，<code>gen_batch</code> 里就不仅有题目，还有模型生成的答案了。</li>
+</ul>
+<h4>7. [核心流程 - Step 3] 打分 (Score)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">batch</span> <span class="o">=</span> <span class="n">batch</span><span class="o">.</span><span class="n">union</span><span class="p">(</span><span class="n">gen_batch</span><span class="p">)</span> <span class="c1"># 把题目和答案拼在一起</span>
+<span class="n">rm_outputs</span> <span class="o">=</span> <span class="n">reward_loop_manager</span><span class="o">.</span><span class="n">compute_rm_score</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲人话：</strong>
+    <strong>这是最关键的另一半。</strong>
+    <code>reward_loop_manager</code> 拿着填好答案的卷子。
+    它会根据配置（可能是另一个大模型 Qwen-1.5B，也可能是代码里的 <code>compute_score_gsm8k</code> 函数）来判断答案对不对。
+    如果是数学题，它可能就是检查答案里的数字对不对；如果是对话，可能是让大模型打分。</li>
+</ul>
+<h4>8. [收尾] 检查结果</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">rm_outputs</span><span class="p">[:</span><span class="mi">5</span><span class="p">]:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">non_tensor_batch</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲人话：</strong>
+    抽查前 5 份卷子，看看打分结果（Reward Score）是多少，打印出来看看程序有没有报错。</li>
+</ul>
+<hr />
+<h3>总结：这篇代码在讲什么观点？</h3>
+<p>这篇代码<strong>不是在讲理论观点</strong>，而是在<strong>验证工程实现</strong>。它想证明：</p>
+<p>在 <code>verl</code> 这个框架下，我们可以把 <strong>生成（Actor）</strong> 和 <strong>奖励（Reward）</strong> 这两个本来很占资源的任务，通过 <code>Ray</code> 和 <code>ResourcePool</code> 灵活地调度起来。</p>
+<p><strong>如果你要运行它，你需要关注：</strong>
+1.  你有没有 8 张 GPU（配置里写了 <code>n_gpus_per_node = 8</code>）。
+2.  你的路径下有没有 Qwen 的模型文件。
+3.  你的路径下有没有 GSM8K 的数据。</p>
+<p>如果这些都有，运行这个脚本就能看到模型做了一批数学题，并且系统自动给这些题打了个分。</p>

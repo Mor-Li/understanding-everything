@@ -1,0 +1,76 @@
+<h1>recipe/one_step_off_policy/megatron_workers.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了<strong>大模型分布式训练（RLHF）中最复杂的一个环节：训练引擎（Megatron）和推理引擎（vLLM/SGLang）之间的权重同步</strong>。</p>
+<p>简单来说，在强化学习（RL）中，我们有一个模型负责“学习”（Actor），通过反向传播更新参数；还有一个模型负责“做题/生成”（Rollout），负责快速生成文本。为了效率，通常“学习”用 Megatron，“生成”用 vLLM。</p>
+<p><strong>核心痛点是：</strong> Actor 学完一步，参数变了，Rollout 必须立刻拿到新参数才能生成新的数据。</p>
+<p>我把这个文件的逻辑拆解成一个 <strong>“搬家任务清单” (Task List)</strong>，一步步带你看它是怎么工作的：</p>
+<hr />
+<h3>任务清单：如何把训练好的大脑同步给推理的大脑？</h3>
+<h4>Task 0: 分配角色 (定义类)</h4>
+<p>首先，代码定义了三个主要的类，相当于分配了工种：
+*   <strong><code>DetachSync</code></strong>: 这是个<strong>工头</strong>（基类）。它定义了同步的基本流程，不管是发货方还是收货方都得听它的。
+*   <strong><code>DetachActorWorker</code></strong>: 这是<strong>发货方</strong>（训练端）。它手里拿着刚刚训练更新过的模型参数（权重）。
+*   <strong><code>DetachAsyncRolloutWorker</code></strong>: 这是<strong>收货方</strong>（推理端）。它负责运行 vLLM 或 SGLang，等着新参数以此来生成文本。</p>
+<h4>Task 1: 建立通信管道 (组网)</h4>
+<p><strong>代码位置：</strong> <code>create_weight_sync_group</code>
+*   <strong>情景</strong>：发货方和收货方可能在不同的 GPU 上，甚至不同的机器上。
+*   <strong>动作</strong>：
+    1.  大家通过 <code>master_address</code> 和 <code>port</code> 握手。
+    2.  建立一个 <code>_weight_sync_group</code>（通信组）。
+    3.  <strong>目的</strong>：相当于拉了一根专线，后面传数据就走这条线。</p>
+<h4>Task 2: 对账单 (元数据同步)</h4>
+<p>在正式传几百 GB 的参数之前，收货方得知道“你要发给我什么？多大？什么形状？”
+*   <strong>发货方动作 (<code>DetachActorWorker.get_actor_weights_info</code>)</strong>:
+    1.  如果为了省显存把模型存到了 CPU (<code>offload</code>)，先把它加载回 GPU。
+    2.  遍历模型的所有层（比如 Attention 层、MLP 层）。
+    3.  生成一个清单：<code>[(层名, 形状, 数据类型), ...]</code>。
+    4.  把这个清单告诉收货方。
+*   <strong>收货方动作 (<code>DetachAsyncRolloutWorker.set_actor_weights_info</code>)</strong>:
+    1.  拿到清单，存下来。
+    2.  <strong>目的</strong>：收货方根据清单，提前在自己的显存里挖好坑（分配 <code>torch.empty</code>），等着填数据。</p>
+<h4>Task 3: 正式搬运权重 (核心逻辑)</h4>
+<p><strong>代码位置：</strong> <code>sync_rollout_weights</code> (这是最长、最重要的方法)
+这是一个循环过程，发货方和收货方配合默契：</p>
+<ul>
+<li>
+<p><strong>Step 3.1: 准备阶段</strong></p>
+<ul>
+<li><strong>发货方</strong>：如果用了 Megatron 的 <code>mcore</code> 格式，需要把参数转换一下，变成标准的 Tensor 格式 (<code>params_generator</code>)。</li>
+<li><strong>收货方</strong>：如果是 vLLM 或 SGLang，先准备好接收接口（打补丁 <code>patch</code> 或获取 <code>inference_model</code>）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2: 逐层传输 (Loop)</strong>
+    代码里有个 <code>for key, shape, dtype in self._weights_info:</code> 循环：</p>
+<ol>
+<li><strong>收货方</strong>：根据清单，在 GPU 上创建一个空的 Tensor（空盘子）。</li>
+<li><strong>发货方</strong>：从训练好的模型里拿出这一层的权重（热菜），放到盘子里。</li>
+<li><strong>广播 (<code>collective.broadcast</code>)</strong>：这是魔法时刻。发货方（Rank 0）把数据通过 Task 1 建立的管道，“广播”给所有收货方。<ul>
+<li><em>注意：这一步是同步的，发货方发完，收货方的空盘子瞬间就填满了数据。</em></li>
+</ul>
+</li>
+</ol>
+</li>
+<li>
+<p><strong>Step 3.3: 安装权重</strong>
+    收货方拿到数据后，不能直接用，得塞进推理引擎里：</p>
+<ul>
+<li><strong>如果是 vLLM</strong>：调用 <code>inference_model.load_weights</code>。</li>
+<li><strong>如果是 SGLang</strong>：调用 <code>update_weights</code>，因为 SGLang 可能涉及到底层更复杂的分布式推理（TP），所以需要特殊处理（代码末尾的 <code>update_weights</code> 函数）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.4: 清理</strong></p>
+<ul>
+<li><strong>发货方</strong>：如果为了省显存，传完数据后，把训练模型再次踢回 CPU (<code>offload_megatron_model_to_cpu</code>)。</li>
+<li><strong>收货方</strong>：SGLang 需要刷新缓存 (<code>flush_cache</code>)，确保下一轮推理用的是新权重。</li>
+</ul>
+</li>
+</ul>
+<h3>总结文中的核心观点</h3>
+<p>这段代码实际上是在解决 <strong>Verl 框架</strong>（字节跳动/美团开源的 RLHF 框架）中的一个核心工程难题：</p>
+<ol>
+<li><strong>异构架构共存</strong>：它让基于 Megatron-LM 的训练（重型、复杂）和基于 vLLM/SGLang 的推理（轻量、极速）能够在一个训练环路里共存。</li>
+<li><strong>Zero-Copy (或 Low-Copy) 通信</strong>：它没有把权重保存成文件再读取，而是直接通过网络/显存（Ray Collective / Torch Distributed）进行点对点的 Tensor 传输，极大提高了 RLHF 的训练效率。</li>
+<li><strong>动态权重加载</strong>：它展示了如何在不重启推理服务的情况下，动态地把新权重“注入”到 vLLM 或 SGLang 这种高度优化的推理引擎中。</li>
+</ol>
+<p><strong>一句话解释：</strong> 这是一个<strong>“快递员”脚本</strong>，负责在训练每一步结束后，把最新的模型参数从“训练部门”极速快递给“推理部门”，好让推理部门能用最新的脑子去干活。</p>

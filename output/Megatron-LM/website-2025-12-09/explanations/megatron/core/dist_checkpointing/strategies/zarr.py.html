@@ -1,0 +1,99 @@
+<h1>megatron/core/dist_checkpointing/strategies/zarr.py</h1>
+<p>这份代码文件 (<code>megatron/core/dist_checkpointing/strategies/zarr.py</code>) 是 <strong>Megatron-LM</strong> 框架中用于处理<strong>分布式模型检查点（Checkpoint）</strong>的一个模块。</p>
+<p>它的核心目的是：<strong>利用 Zarr 这种存储格式，来保存和加载被切分（Sharded）到多个 GPU 上的巨大的模型参数。</strong></p>
+<p>但是，<strong>最重要的一点是</strong>：这段代码目前的版本实际上是在<strong>劝退</strong>你。它保留了逻辑，但在运行时会报错，提示你改用 PyTorch 原生的格式。</p>
+<p>为了让你看懂，我把它拆解成一个开发者的 <strong>Task List (待办清单)</strong>，然后一步步给你讲解它是怎么实现的。</p>
+<hr />
+<h3>📝 开发者视角的 Task List (代码逻辑清单)</h3>
+<p>如果我是写这个文件的程序员，我的任务清单是这样的：</p>
+<ol>
+<li><strong>[环境准备]</strong>: 检查有没有安装 <code>zarr</code> 库，处理 <code>bfloat16</code> 这种特殊数据类型的兼容性。</li>
+<li><strong>[类型映射]</strong>: 建立 PyTorch Tensor 数据类型和 NumPy 数据类型之间的字典映射（因为 Zarr 基于 NumPy）。</li>
+<li><strong>[策略注册]</strong>: 告诉系统 "zarr" 是一种可选的保存/加载策略。</li>
+<li><strong>[⚠️ 废弃警告]</strong>: <strong>(当前版本重点)</strong> 在初始化保存或加载策略时，直接报错，告诉用户这个方法过时了，去用别的。</li>
+<li><strong>[保存逻辑 - Save]</strong>:<ul>
+<li>算出哪些 Tensor 需要存。</li>
+<li>协调多个 GPU：谁负责创建文件？谁负责写入数据？</li>
+<li>把 PyTorch Tensor 转成 NumPy 数组写入磁盘。</li>
+</ul>
+</li>
+<li><strong>[加载逻辑 - Load]</strong>:<ul>
+<li>找到磁盘上的 Zarr 数组。</li>
+<li>读取对应当前 GPU 需要的那一部分数据（切片）。</li>
+<li>把 NumPy 数组转回 PyTorch Tensor，处理形状不匹配（Padding）的情况。</li>
+</ul>
+</li>
+<li><strong>[元数据读取]</strong>: 扫描文件夹，看看里面存了哪些参数，形状是多大。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解 (文中的观点与逻辑)</h3>
+<p>下面我按照上面的清单，一步步给你讲代码里发生了什么。</p>
+<h4>第一步：准备工作与类型转换 (Type Mapping)</h4>
+<p>代码开头定义了 <code>numpy_to_torch_dtype_dict</code> 和 <code>torch_to_numpy_dtype_dict</code>。</p>
+<ul>
+<li><strong>观点</strong>：Zarr 是一个基于 Python NumPy 的存储库，而深度学习用的是 PyTorch Tensor。两者的数据类型定义不一样。</li>
+<li><strong>做法</strong>：比如 PyTorch 的 <code>torch.float32</code> 对应 NumPy 的 <code>np.dtype("float32")</code>。代码还特意处理了 <code>bfloat16</code>，因为 NumPy 原生对 <code>bfloat16</code> 支持不好，需要特殊处理（依赖 <code>tensorstore</code> 或自定义）。</li>
+</ul>
+<h4>第二步：核心观点 —— "此路不通" (Deprecation)</h4>
+<p>这是文件中最反直觉但最重要的部分。请看 <code>ZarrSaveShardedStrategy</code> 和 <code>ZarrLoadShardedStrategy</code> 类的 <code>__init__</code> 方法：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">ZarrSaveShardedStrategy</span><span class="p">(</span><span class="n">SaveShardedStrategy</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">version</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">backend</span><span class="p">,</span> <span class="n">version</span><span class="p">)</span>
+        <span class="c1"># 下面这句是重点！</span>
+        <span class="k">raise</span> <span class="n">CheckpointingException</span><span class="p">(</span>
+            <span class="s2">&quot;`zarr` distributed checkpoint backend is no longer supported. &quot;</span>
+            <span class="s2">&quot;Please switch to PyTorch Distributed format (`torch_dist`).&quot;</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：虽然这个文件里写满了保存和加载的逻辑，但官方<strong>已经不再支持</strong>用 Zarr 做后端了。</li>
+<li><strong>含义</strong>：如果你尝试在配置里设置 <code>backend='zarr'</code>，程序会直接崩溃并抛出异常，让你去用 <code>torch_dist</code>。这段代码现在更多是作为“遗产”或者参考逻辑存在。</li>
+</ul>
+<h4>第三步：保存逻辑 (如果它还能跑的话)</h4>
+<p>虽然被禁用了，但了解它原本是怎么设计的很有价值。逻辑在 <code>save</code> 和 <code>_create_or_open_zarr_arrays</code> 函数中。</p>
+<ul>
+<li><strong>挑战</strong>：在分布式训练中，一个巨大的参数矩阵（比如 <code>[8192, 8192]</code>）被切分成了很多小块散落在不同的 GPU 上。如何把它们拼成一个完整的文件存起来？</li>
+<li><strong>观点（Zarr 的优势）</strong>：Zarr 支持“分块写入”。我们不需要先把所有数据收集到一个 GPU 上（那样会爆显存），而是可以直接往硬盘上的同一个数组文件的不同位置写数据。</li>
+<li><strong>流程</strong>：<ol>
+<li><strong>创建文件</strong>：由主副本（Main Replica）且偏移量为 0 的那个进程（通常是 Rank 0 或者某个分片的头头）负责调用 <code>zarr.create</code> 创建一个空的数组文件。</li>
+<li><strong>同步</strong>：使用 <code>torch.distributed.barrier()</code>，让其他所有 GPU 等待，直到文件创建完成。</li>
+<li><strong>打开并写入</strong>：其他 GPU 打开这个已经创建好的文件。</li>
+<li><strong>写入数据</strong>：每个 GPU 计算自己手里的数据应该放在大矩阵的哪个坐标位置 (<code>global_slice</code>)，然后直接写进去。</li>
+</ol>
+</li>
+</ul>
+<h4>第四步：加载逻辑 (Loading)</h4>
+<p>逻辑在 <code>load</code> 和 <code>_load_from_array</code> 函数中。</p>
+<ul>
+<li><strong>观点</strong>：加载时，每个 GPU 只需要大矩阵中的一小块。</li>
+<li><strong>流程</strong>：<ol>
+<li>打开 Zarr 数组。</li>
+<li>根据当前 GPU 负责的 <code>global_slice</code>（全局切片位置），只读取这一部分数据到内存。</li>
+<li><strong>后处理 (<code>postprocess_numpy_array</code>)</strong>：<ul>
+<li>把读出来的 NumPy 数组转成 PyTorch Tensor。</li>
+<li><strong>Padding（填充）</strong>：有时候模型结构变了（比如词表变大了），或者并行度变了，导致读取的数据形状比预期的要小。代码里的 <code>pad_to_expected_shape</code> 函数会自动用 0 或者复制最后一行来填充数据，保证程序不报错。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>第五步：处理 bfloat16 的特殊逻辑</h4>
+<p>你会发现代码里到处都在检查 <code>HAS_BFLOAT16</code>。</p>
+<ul>
+<li><strong>痛点</strong>：<code>bfloat16</code> 是大模型训练常用的格式，但它是 Google TPU 搞出来的标准，NumPy 很长一段时间不支持。</li>
+<li><strong>解决</strong>：<ul>
+<li><strong>存的时候</strong>：先把 <code>bfloat16</code> 转成 <code>float32</code> (为了兼容 NumPy) 或者利用 <code>tensorstore</code> 的黑科技强行存。</li>
+<li><strong>取的时候</strong>：读出来如果是 <code>bfloat16</code> 的字节流，要小心翼翼地转回 PyTorch 的 <code>bfloat16</code>，防止精度丢失或类型错误。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件讲了这样一个故事：</p>
+<ol>
+<li><strong>曾经</strong>：Megatron 觉得 Zarr 是个好东西，因为它支持分块读写，适合存超大模型。</li>
+<li><strong>实现</strong>：他们写了一套复杂的逻辑，让几百个 GPU 能够协作，把各自手里的碎片拼成一个完整的 Zarr 数组存到硬盘上。</li>
+<li><strong>现在</strong>：官方决定<strong>弃用</strong>这套方案（可能是因为性能、维护成本或 PyTorch 官方出了更好的 <code>torch_dist</code> 方案）。</li>
+<li><strong>结果</strong>：代码虽然还在，逻辑清晰，但入口处放了一把“锁”（Exception），禁止你使用。</li>
+</ol>
+<p><strong>一句话概括：</strong> 这是一个<strong>已废弃</strong>的、基于 Zarr 格式的、支持分布式并行读写的模型检查点保存与加载策略实现。</p>

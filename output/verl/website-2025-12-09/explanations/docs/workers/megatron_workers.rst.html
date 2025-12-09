@@ -1,0 +1,72 @@
+<h1>docs/workers/megatron_workers.rst</h1>
+<p>这份文档确实非常硬核，它是 <strong>verl</strong>（一个大模型强化学习训练框架）中关于 <strong>底层算力后端（Backend）</strong> 的技术说明书。</p>
+<p>简单来说，这份文档在讲：<strong>“我们是如何利用 Megatron-LM（一个超大模型训练工具）和 vLLM（一个超快推理工具）来训练巨大的 AI 模型的。”</strong></p>
+<p>为了让你看懂，我把这份文档拆解成一个 <strong>“项目经理的任务清单 (Todo List)”</strong>，带你一步步理解它的逻辑。</p>
+<hr />
+<h3>核心背景：我们在做什么？</h3>
+<p>我们要训练一个像 DeepSeek 或 GPT-4 这种巨大的模型（RLHF 强化学习阶段）。
+*   <strong>难点：</strong> 模型太大，一张显卡放不下，需要切分（并行计算）。
+*   <strong>解决方案：</strong> 用 <strong>Megatron-LM</strong> 来切分模型进行训练，用 <strong>vLLM</strong> 来加速生成文本。
+*   <strong>创新点：</strong> 文档里提到的 <strong><code>3DHybridEngine</code></strong>，就是把这两个工具“缝合”在一起，让它们共用显存，省钱又快。</p>
+<hr />
+<h3>任务清单 (Todo List) 解读</h3>
+<h4>Task 1: 搭建基础设施 (Megatron Backend)</h4>
+<p><strong>文档对应部分：</strong> <code>Megatron-LM Backend</code> 开头部分 &amp; <code>Pros/Cons</code>
+*   <strong>目标：</strong> 搞定超大模型的分布式训练环境。
+*   <strong>要点：</strong>
+    *   <strong>支持 5D 并行：</strong> 也就是把模型横着切、竖着切、斜着切（TP, EP, CP, DP, PP），分散到几百张显卡上跑。
+    *   <strong>混合引擎 (HybridEngine)：</strong> 这是核心卖点。以前训练和推理（生成文本）通常需要加载两份模型，显存直接爆炸。现在通过这个引擎，<strong>Actor（负责学习的模型）</strong> 和 <strong>Rollout（负责生成的模型）</strong> 可以无缝切换，不用搬运数据，极大降低显存占用。
+    *   <strong>缺点：</strong> 模型格式转换有点麻烦（Huggingface 格式转 Megatron 格式）。</p>
+<h4>Task 2: 确定开发进度 (Development Progress)</h4>
+<p><strong>文档对应部分：</strong> <code>Development Progress</code> 表格
+*   <strong>目标：</strong> 看看现在能用啥，不能用啥。
+*   <strong>现状清单：</strong>
+    *   ✅ <strong>已完成 (Done)：</strong> 支持 Qwen2MoE 模型、vLLM 推理加速、Context Parallel（长文本并行）、Megatron 分析器。
+    *   🚧 <strong>正在做 (WIP)：</strong> 支持 <strong>DeepSeek-V3</strong> 模型、专家并行 (Expert Parallel)、动态 Batch size。
+    *   🛠 <strong>待优化 (To-Optimize)：</strong> 检查点 (Checkpoint) 的转换和加载速度。</p>
+<h4>Task 3: 分配工种 (Utils of Megatron Workers)</h4>
+<p><strong>文档对应部分：</strong> <code>MegatronWorker</code>, <code>ActorRolloutRefWorker</code>, <code>CriticWorker</code>
+在强化学习（RLHF）中，我们需要几个不同的“工种”。文档解释了如何用代码实现这些工种：</p>
+<ul>
+<li>
+<p><strong>工种 A：工头基类 (MegatronWorker)</strong></p>
+<ul>
+<li>这是所有工人的“爸爸”。它负责搞清楚自己在哪个 GPU 上（Rank几），一共有多少个兄弟（World Size）。</li>
+</ul>
+</li>
+<li>
+<p><strong>工种 B：身兼数职的主角 (ActorRolloutRefWorker)</strong></p>
+<ul>
+<li>这是最复杂的角色。它包含三个功能：<ol>
+<li><strong>Actor (演员)：</strong> 也就是我们要训练的那个模型。它负责计算概率，更新参数。</li>
+<li><strong>Rollout (推演)：</strong> 使用 <strong>vLLM</strong> 快速生成文本（比如让模型写个回答）。</li>
+<li><strong>Reference (参考)：</strong> 一个不更新的模型，用来对比，防止新模型练“歪”了。</li>
+</ol>
+</li>
+<li><strong>关键技术点 (<code>generate_sequences</code>)：</strong> 这里提到了 <code>Dispatch.MEGATRON_PP_AS_DP_PROTO</code>。简单说，<strong>训练时</strong>模型是按流水线切分的（PP），但<strong>推理时</strong>（用 vLLM）数据切分方式不一样。这个函数负责在两种模式间“变魔术”，把数据重新排列组合，让 vLLM 能跑起来。</li>
+</ul>
+</li>
+<li>
+<p><strong>工种 C：打分员 (CriticWorker &amp; RewardWorker)</strong></p>
+<ul>
+<li><strong>Critic (评论家)：</strong> 估计当前状态的价值（Value Function）。</li>
+<li><strong>Reward (奖励模型)：</strong> 给生成的回答打分。</li>
+<li>它们的任务比较简单：初始化模型 -&gt; 算分 -&gt; 更新参数（Critic 需要更新，Reward 通常不用）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 解决显存不足 (Utils of Train Optimization)</h4>
+<p><strong>文档对应部分：</strong> <code>Offload</code>
+*   <strong>痛点：</strong> 显卡显存（VRAM）太贵且有限。
+*   <strong>大招 (Offload)：</strong> 当显存不够时，把暂时不用的参数、梯度、优化器状态<strong>踢到 CPU 内存</strong>里去。等要用的时候再拉回显卡。
+*   <strong>操作：</strong> 文档列出了怎么在配置里开启这个功能（<code>param_offload=True</code> 等）。</p>
+<hr />
+<h3>总结：这篇文档到底在说什么？</h3>
+<p>如果你是一个开发者，想用 <code>verl</code> 框架跑 DeepSeek 671B 这种超大模型，这篇文档告诉你：</p>
+<ol>
+<li><strong>我们底层用了 Megatron + vLLM，支持超大规模并行。</strong></li>
+<li><strong>我们设计了一个特殊的 Worker 类，让训练和推理共享权重，省显存。</strong></li>
+<li><strong>数据在 GPU 之间传输时，我们有特殊的协议（Dispatch Mode）来处理切分逻辑。</strong></li>
+<li><strong>如果显存还不够，请开启 Offload 功能。</strong></li>
+<li><strong>目前 DeepSeek-V3 的支持还在开发中 (WIP)。</strong></li>
+</ol>

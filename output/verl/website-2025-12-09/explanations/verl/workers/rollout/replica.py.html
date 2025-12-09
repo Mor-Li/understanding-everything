@@ -1,0 +1,120 @@
+<h1>verl/workers/rollout/replica.py</h1>
+<p>这个文件 <code>replica.py</code> 是一个强化学习（RLHF）框架中非常核心的组件，它负责管理 <strong>“Rollout（采样/生成）”</strong> 阶段的资源和逻辑。</p>
+<p>简单来说，在训练大模型时，我们需要模型先“生成”一些文本（这叫 Rollout），然后对这些文本打分（Reward），最后更新模型。这个文件定义了一个<strong>通用的管理器</strong>，用来控制那些负责生成文本的服务器（比如 vLLM 或 SGLang）。</p>
+<p>为了让你看懂，我们将这个任务拆解成一个 <strong>TODO List</strong>，一步步来理解它的设计思路。</p>
+<hr />
+<h3>📝 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>理解核心概念</strong>：什么是 <code>RolloutReplica</code>？</li>
+<li><strong>理解三种部署模式</strong>：<code>RolloutMode</code> 是什么？为什么要分三种？</li>
+<li><strong>理解初始化流程</strong>：如何根据不同模式启动生成引擎？</li>
+<li><strong>理解控制操作</strong>：启动后，怎么控制它（唤醒、休眠、清空缓存）？</li>
+<li><strong>理解插件机制</strong>：如何支持不同的推理后端（vLLM, SGLang）？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 理解核心概念 (<code>RolloutReplica</code>)</h4>
+<p><strong>代码位置</strong>: <code>class RolloutReplica(ABC):</code></p>
+<p>你可以把 <code>RolloutReplica</code> 想象成一个 <strong>“工头”</strong>。
+*   <strong>它的工作</strong>：管理一组 GPU 资源，在上面运行一个大模型推理引擎（比如 vLLM）。
+*   <strong>它的目标</strong>：接收 Prompt，吐出生成的 Token。
+*   <strong>为什么叫 Replica（副本）</strong>：在大规模训练中，我们可能需要几十个这样的“工头”并行工作，每一个就是一个 Replica。</p>
+<p>代码中定义了 <code>TokenOutput</code> 类，这就是“工头”交出来的作业（生成的 token ID，概率等）。</p>
+<h4>Task 2: 理解三种部署模式 (<code>RolloutMode</code>)</h4>
+<p><strong>代码位置</strong>: <code>class RolloutMode(Enum):</code></p>
+<p>这是新手最容易晕的地方。这个枚举定义了“生成引擎”和“训练引擎”在物理硬件上怎么相处。</p>
+<ol>
+<li>
+<p><strong>HYBRID (混合模式)</strong>:</p>
+<ul>
+<li><strong>含义</strong>：生成（Rollout）和训练（Training）用<strong>同一组进程</strong>，<strong>共享显存</strong>。</li>
+<li><strong>场景</strong>：资源有限，或者 On-policy 训练。</li>
+<li><strong>特点</strong>：省显存，但需要频繁切换状态（一会训练，一会生成，需要同步权重）。</li>
+</ul>
+</li>
+<li>
+<p><strong>COLOCATED (共置模式)</strong>:</p>
+<ul>
+<li><strong>含义</strong>：生成和训练在<strong>同一组物理 GPU</strong> 上，但是是<strong>不同的进程</strong>。</li>
+<li><strong>场景</strong>：比如 LLM-as-a-Judge（用大模型当裁判）。</li>
+<li><strong>特点</strong>：不用同步权重，但是显存竞争比较激烈。</li>
+</ul>
+</li>
+<li>
+<p><strong>STANDALONE (独立模式)</strong>:</p>
+<ul>
+<li><strong>含义</strong>：生成引擎在<strong>完全独立的一组 GPU</strong> 上运行。</li>
+<li><strong>场景</strong>：Off-policy 训练，或者资源非常充足。</li>
+<li><strong>特点</strong>：互不干扰，效率最高，但最费钱（需要两波显卡）。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 3: 理解初始化流程 (Init Methods)</h4>
+<p><code>RolloutReplica</code> 类里有三个 <code>init_</code> 开头的异步函数，对应上面的三种模式。它们都利用了 <strong>Ray</strong>（一个分布式计算框架）来管理进程。</p>
+<ol>
+<li>
+<p><strong><code>init_hybrid</code></strong>:</p>
+<ul>
+<li>直接复用传进来的 <code>worker_group</code>（训练用的那些进程）。</li>
+<li>因为它不需要新开进程，直接在现有进程上启动 HTTP Server。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>init_colocated</code></strong>:</p>
+<ul>
+<li>在现有的 <code>resource_pool</code>（资源池）上，申请一组<strong>新</strong>的进程 (<code>RayWorkerGroup</code>)。</li>
+<li>虽然在同一台机器上，但是是新开的进程。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>init_standalone</code></strong>:</p>
+<ul>
+<li>最土豪的做法。创建一个全新的 <code>ResourcePoolManager</code>。</li>
+<li>申请全新的 GPU 资源，建立全新的 Worker Group。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 4: 理解控制操作 (Abstract Methods &amp; Utilities)</h4>
+<p>工头（Replica）建好后，我们需要指挥它干活。</p>
+<ul>
+<li>
+<p><strong><code>launch_servers</code> (抽象方法)</strong>:</p>
+<ul>
+<li>这是一个命令，要求所有 Worker 节点启动 HTTP 服务（比如 vLLM 的 API server）。因为是 <code>abstractmethod</code>，具体怎么启动由子类（vLLMReplica 或 SGLangReplica）决定。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>wake_up</code> / <code>sleep</code></strong>:</p>
+<ul>
+<li><strong>Sleep</strong>: 比如在 Hybrid 模式下，现在轮到“训练”阶段了，生成引擎就需要“休眠”（比如把显存里的 KV Cache 释放掉，甚至卸载模型权重）。</li>
+<li><strong>Wake Up</strong>: 轮到生成阶段了，重新加载权重或热身。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>clear_kv_cache</code></strong>:</p>
+<ul>
+<li>生成完一批数据后，清理显存中的缓存，防止爆显存。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 理解插件机制 (Registry)</h4>
+<p><strong>代码位置</strong>: <code>class RolloutReplicaRegistry</code> 和底部的 <code>_load_...</code> 函数。</p>
+<p>这个框架不想绑定死某一个推理引擎。它想既能用 vLLM，也能用 SGLang。</p>
+<ul>
+<li><strong>注册表模式</strong>：<code>RolloutReplicaRegistry</code> 是一个字典，存着名字到类的映射。</li>
+<li><strong>动态加载</strong>：<ul>
+<li>如果你配置写了 <code>rollout: vllm</code>，它就去加载 <code>verl.workers.rollout.vllm_rollout...</code>。</li>
+<li>如果你配置写了 <code>rollout: sglang</code>，它就去加载 SGLang 的相关代码。</li>
+</ul>
+</li>
+<li><strong>Hack 技巧</strong>：在 <code>_load_sglang</code> 里，你看到了一段 <code>mock_vllm</code> 的代码。这是因为 SGLang 依赖 vLLM，但有时候环境里可能没装完整，或者为了绕过某些检查，这里做了一些兼容性处理（Mock）。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这段代码讲了这样一个故事：</p>
+<blockquote>
+<p>“我们需要一个<strong>管家 (RolloutReplica)</strong> 来管理大模型生成文本的任务。</p>
+<p>这个管家很灵活，可以根据你的<strong>预算和需求 (RolloutMode)</strong>，决定是和训练任务<strong>挤在同一个进程里 (Hybrid)</strong>，还是<strong>挤在同一张显卡的不同进程里 (Colocated)</strong>，又或是<strong>独占一套豪宅 (Standalone)</strong>。</p>
+<p>无论选哪种，管家都会利用 <strong>Ray</strong> 帮我们招募工人，并提供统一的接口让我们能命令工人<strong>开工 (launch)</strong>、<strong>休息 (sleep)</strong> 或 <strong>打扫卫生 (clear_kv_cache)</strong>。</p>
+<p>最后，这个管家支持<strong>换内核</strong>，你可以随意切换使用 <strong>vLLM</strong> 还是 <strong>SGLang</strong> 来作为底层的生成工具。”</p>
+</blockquote>

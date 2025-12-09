@@ -1,0 +1,120 @@
+<h1>examples/tuning/14b/qwen2-14b_grpo-lora_2_h100_fsdp_vllm.sh</h1>
+<p>完全没问题。这段代码确实看起来很吓人，因为它把<strong>强化学习（RL）</strong>、<strong>大模型微调（Fine-tuning）</strong>和<strong>底层显存优化</strong>的所有参数都堆在一起了。</p>
+<p>我们可以把它想象成是在<strong>给一个已经在数学方面不错的学生（Qwen2.5-14B）请私教，进行特训</strong>。</p>
+<p>我为你列了一个 <strong>“特训计划清单” (To-Do List)</strong>，我们一步一步来拆解这个文件到底在干什么。</p>
+<hr />
+<h3>📋 任务清单：读懂 Qwen2.5-14B 的 GRPO 特训脚本</h3>
+<h4>✅ Task 1: 搞清楚我们在做什么 (Overview)</h4>
+<ul>
+<li><strong>目标</strong>：训练 <code>Qwen2.5-14B-Instruct</code> 这个模型。</li>
+<li><strong>教材</strong>：<code>GSM8K</code>（一套经典的小学数学应用题数据集）。</li>
+<li><strong>教学方法</strong>：<code>GRPO</code> (Group Relative Policy Optimization)。这是一种比传统的 PPO 更省显存的强化学习算法，专门用来让模型学会“推理”。</li>
+<li><strong>硬件环境</strong>：使用了 2 张 H100 显卡（虽然系统看见8张，但脚本逻辑里主要用2张）。</li>
+</ul>
+<hr />
+<h4>✅ Task 2: 准备工作 (环境设置)</h4>
+<p>看脚本最开头的部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">0</span>,1,2,3,4,5,6,7<span class="w">  </span><span class="c1"># 告诉系统我有8张卡备用</span>
+<span class="nb">export</span><span class="w"> </span>WANDB_...<span class="w">                             </span><span class="c1"># 设置 WandB，这是一个监控面板，用来画图看训练曲线的</span>
+<span class="nv">MODEL_PATH</span><span class="o">=</span>Qwen/Qwen2.5-14B-Instruct<span class="w">         </span><span class="c1"># 指定我们要训练的“底模”路径</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这就是在铺桌子、准备笔记本，准备开始干活。</li>
+</ul>
+<hr />
+<h4>✅ Task 3: 算数 (计算批次大小)</h4>
+<p>这部分最有意思，也是脚本里那个注释 <code>32√ → 64×</code> 的来源：</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">nproc_per_gpu</span><span class="o">=</span><span class="m">58</span><span class="w">  </span><span class="c1"># 这是一个“魔法数字”</span>
+<span class="nv">nnodes</span><span class="o">=</span><span class="m">1</span>
+<span class="nv">ngpu_per_node</span><span class="o">=</span><span class="m">2</span>
+<span class="nv">total_procs</span><span class="o">=</span><span class="k">$((</span><span class="w"> </span><span class="nv">nproc_per_gpu</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nv">nnodes</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nv">ngpu_per_node</span><span class="w"> </span><span class="k">))</span><span class="w"> </span><span class="c1"># 总共处理多少数据 = 58 * 1 * 2 = 116</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li>作者在测试显卡的极限。<code>64×</code> 意味着设成 64 会爆显存（Out of Memory），<code>58√</code> 意味着 58 刚好能跑满显卡且不报错。</li>
+<li>这就像在往行李箱里塞衣服，试了好几次，发现塞 58 件是极限。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 启动训练引擎 (核心命令)</h4>
+<div class="codehilite"><pre><span></span><code>python3<span class="w"> </span>-m<span class="w"> </span>verl.trainer.main_ppo<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>algorithm.adv_estimator<span class="o">=</span>grpo<span class="w"> </span><span class="se">\</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li>启动 <code>verl</code> 库的 PPO 训练器。</li>
+<li><strong>关键点</strong>：<code>algorithm.adv_estimator=grpo</code>。虽然文件名叫 PPO，但这里指定了用 <strong>GRPO</strong> 算法。GRPO 的核心思想是：<strong>对于同一个问题，让模型生成好几个答案，然后对比这些答案的好坏，好的给予奖励，坏的给予惩罚，而不需要一个额外的庞大“裁判模型”（Critic）</strong>，这大大节省了显存。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 指定教材 (数据配置)</h4>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span>data.train_files<span class="o">=</span>data/gsm8k/train.parquet<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>data.max_prompt_length<span class="o">=</span><span class="m">512</span><span class="w"> </span><span class="se">\ </span><span class="w">   </span><span class="c1"># 题目最长多长</span>
+<span class="w">    </span>data.max_response_length<span class="o">=</span><span class="m">1024</span><span class="w"> </span><span class="se">\ </span><span class="c1"># 答案最长多长</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：告诉模型去哪里读数学题。如果题目太长或者模型废话太多（超过长度），就截断。</li>
+</ul>
+<hr />
+<h4>✅ Task 6: 显存优化魔法 (怎么把大象装进冰箱)</h4>
+<p>这是脚本里最长、最难懂的部分，主要是为了让 14B 的模型能在有限的显卡上跑起来：</p>
+<ol>
+<li>
+<p><strong>LoRA (低秩适应)</strong>:
+    <code>bash
+    actor_rollout_ref.model.lora_rank=32 \
+    actor_rollout_ref.model.target_modules=all-linear \</code></p>
+<ul>
+<li><strong>通俗解释</strong>：不重新训练整个大脑（全量微调），而是给大脑贴在这个“补丁”（LoRA），只训练这个补丁。这样需要的内存极小。</li>
+</ul>
+</li>
+<li>
+<p><strong>FSDP (Fully Sharded Data Parallel)</strong>:
+    <code>bash
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \</code></p>
+<ul>
+<li><strong>通俗解释</strong>：把模型切成小块，分散到不同的显卡上。<code>offload=True</code> 意思是如果显存不够，就把暂时不用的参数扔到 CPU 内存里去（虽然慢点，但能跑通）。</li>
+</ul>
+</li>
+<li>
+<p><strong>vLLM (推理加速)</strong>:
+    <code>bash
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.25 \</code></p>
+<ul>
+<li><strong>通俗解释</strong>：在强化学习中，模型需要不断地做题（生成答案）。这里用 <code>vLLM</code> 这个超快的引擎来负责“做题”环节，并限制它只能用 25% 的显存，剩下的显存留给训练。</li>
+</ul>
+</li>
+<li>
+<p><strong>Ulysses (序列并行)</strong>:
+    <code>bash
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=2 \</code></p>
+<ul>
+<li><strong>通俗解释</strong>：如果一句话特别长，一张卡放不下，就把这句话切成两半，两张卡各处理一半。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 7: 训练逻辑 (GRPO 的具体玩法)</h4>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span>actor_rollout_ref.rollout.n<span class="o">=</span><span class="m">5</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>algorithm.kl_ctrl.kl_coef<span class="o">=</span><span class="m">0</span>.001<span class="w"> </span><span class="se">\</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li><code>rollout.n=5</code>：对于每一道数学题，让模型生成 <strong>5 个</strong> 不同的解题过程。GRPO 会看这 5 个里哪个是对的、哪个步骤更简洁，然后以此来更新模型。</li>
+<li><code>kl_coef=0.001</code>：这是一个“紧箍咒”。防止模型为了做对题而变得说话方式很奇怪（比如乱码或者钻空子）。它强迫模型在变强的同时，保持原有的说话风格。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个脚本在干嘛？</h3>
+<p>一句话总结：
+<strong>这个脚本在使用 2 张 H100 显卡，通过 LoRA（省显存）和 vLLM（加速生成）技术，利用 GRPO 算法（通过对比多个输出），让 Qwen2.5-14B 模型反复做 GSM8K 数学题，从而提高它的数学推理能力。</strong></p>
+<p>那个 <code>nproc_per_gpu=58</code> 是作者经过多次失败（64x, 60x...）后试出来的最佳“压榨显卡性能”的参数。</p>

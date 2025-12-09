@@ -1,0 +1,109 @@
+<h1>tests/experimental/agent_loop/test_standalone_rollout.py</h1>
+<p>这个文件确实涉及了很多高阶概念：分布式计算（Ray）、强化学习（RL）中的Rollout（采样/生成）、大模型推理服务（vLLM/OpenAI API）以及复杂的并行策略（TP/DP/EP）。</p>
+<p>看不懂很正常，因为它不是一段简单的脚本，而是一个<strong>集成测试</strong>，用来验证一个庞大的强化学习框架中的“推理引擎”能不能正常工作。</p>
+<p>为了让你看懂，我把你当作这个项目的<strong>新入职测试工程师</strong>，给你列一个 <strong>Task To-Do List</strong>。我们按顺序执行这些任务，每完成一个任务，你就理解了代码的一部分。</p>
+<hr />
+<h3>🟢 Task 0：搞清楚我们在测什么 (全局背景)</h3>
+<ul>
+<li><strong>任务目标</strong>：理解 <code>verl</code> 是什么，以及 "Rollout" 是什么。</li>
+<li><strong>讲解</strong>：<ul>
+<li>这段代码属于一个叫 <code>verl</code> 的库（可能是 Bytedance 内部或开源的大模型强化学习库）。</li>
+<li>在强化学习（RLHF）中，模型需要先根据 Prompt 生成一堆回答，这步叫 <strong>Rollout（采样/推理）</strong>。</li>
+<li><strong>核心观点</strong>：这个文件的目的是<strong>测试“生成回答”这个模块能不能独立运行</strong>，以及能不能像 OpenAI 的 API 一样对外提供服务。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 1：准备测试环境 (Config Setup)</h3>
+<ul>
+<li><strong>对应代码</strong>：<code>@pytest.fixture def init_config(): ...</code></li>
+<li><strong>任务目标</strong>：配置好我们要跑多大的模型，用几张显卡。</li>
+<li><strong>讲解</strong>：<ul>
+<li>这里用了一个叫 <code>Hydra</code> 的工具来管理配置。</li>
+<li><strong>关键点</strong>：<ul>
+<li><code>n_gpus_per_node = 4</code>：假装咱们有4张显卡。</li>
+<li><code>model.path = ...Qwen...</code>：我们要测试的模型是 Qwen（通义千问）。</li>
+<li><code>rollout.mode = "async"</code>：我们要用异步模式，效率更高。</li>
+</ul>
+</li>
+<li><strong>观点</strong>：在跑测试前，必须把硬件资源和模型路径写死在配置里，模拟真实的训练环境。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 2：启动分布式引擎 (Ray Init)</h3>
+<ul>
+<li><strong>对应代码</strong>：<code>test_standalone_rollout</code> 函数开头的 <code>ray.init(...)</code> 和 <code>tp_size</code> 计算。</li>
+<li><strong>任务目标</strong>：大模型一张卡装不下，我们需要把模型切开放在不同卡上。</li>
+<li><strong>讲解</strong>：<ul>
+<li><code>ray.init</code>：启动 Ray，这是 Python 里最强的分布式计算框架。它负责管理所有的 GPU。</li>
+<li><code>tp_size</code> (Tensor Parallel)：<strong>张量并行</strong>。比如模型很大，我们把它横着切开，2张卡合起来算一次。</li>
+<li><code>num_replicas</code>：计算我们需要起几个服务实例。</li>
+<li><strong>观点</strong>：大模型推理通常需要多卡协作，代码必须先算好怎么分卡（切蛋糕）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 3：把推理变成 Web 服务 (Standalone Server)</h3>
+<ul>
+<li><strong>对应代码</strong>：
+    <code>python
+    rollout_server_class = get_rollout_replica_class(...)
+    rollout_servers = [ ... ]
+    await asyncio.gather(*[server.init_standalone() for server in rollout_servers])</code></li>
+<li><strong>任务目标</strong>：不仅要加载模型，还要把它变成一个 HTTP 服务器。</li>
+<li><strong>讲解</strong>：<ul>
+<li>这里没有直接调模型函数，而是启动了一个 <code>Server</code>。</li>
+<li><code>init_standalone()</code>：这个函数是关键。它告诉代码：“别等训练数据了，你自己先启动起来，监听一个端口（比如 8000），准备接收请求。”</li>
+<li>这通常背后用的是 <strong>vLLM</strong> 这样的推理加速引擎。</li>
+<li><strong>观点</strong>：为了解耦，现在的 RL 框架喜欢把“生成模块”做成一个独立的微服务。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 4：假装用户打电话 (OpenAI Client)</h3>
+<ul>
+<li><strong>对应代码</strong>：
+    <code>python
+    client = AsyncOpenAI(base_url=f"http://{server_addresses[0]}/v1", ...)
+    completion = await client.chat.completions.create(...)</code></li>
+<li><strong>任务目标</strong>：验证服务是不是真的通了。</li>
+<li><strong>讲解</strong>：<ul>
+<li>代码在这里实例化了一个 <code>AsyncOpenAI</code> 客户端。注意，它连接的不是 ChatGPT 官网，而是 <code>base_url</code> —— 也就是刚才我们在 Task 3 里启动的那个本地服务。</li>
+<li>发送消息："What can you do?"。</li>
+<li>如果能打印出 <code>completion</code>，说明：<strong>模型加载成功 -&gt; 服务启动成功 -&gt; 接口兼容 OpenAI 格式 -&gt; 推理成功</strong>。</li>
+<li><strong>观点</strong>：使用 OpenAI 标准接口（API）作为内部通信协议，可以方便地替换底层模型引擎。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 5：进阶挑战 - 混合部署 (Hybrid Rollout - 被 Skip 的那个测试)</h3>
+<ul>
+<li><strong>对应代码</strong>：<code>test_hybrid_rollout_with_ep</code></li>
+<li><strong>任务目标</strong>：测试更复杂的场景——训练和推理抢资源怎么办？</li>
+<li><strong>讲解</strong>：<ul>
+<li>这个测试被标记为 <code>skip</code>（跳过），说明它很难跑或者只在特定机器跑。</li>
+<li><strong>核心概念</strong>：<ul>
+<li><strong>EP (Expert Parallel)</strong>：混合专家模型（MoE），模型巨大，需要切分得更细。</li>
+<li><strong>FSDP (Fully Sharded Data Parallel)</strong>：这是训练时用的并行策略。</li>
+<li><strong>Wake up / Sleep</strong>：这是最精彩的地方。显存是有限的。<ul>
+<li>训练时，把推理引擎“催眠”（卸载权重）。</li>
+<li>需要生成数据时，把训练引擎“挂起”，<strong>Wake up</strong> 推理引擎（加载权重），跑完再切回去。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>观点</strong>：这个测试是为了验证<strong>显存复用机制</strong>。在同一组 GPU 上，能不能灵活地在“训练模式”和“推理模式”之间无缝切换。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇代码讲的故事是：</p>
+<ol>
+<li>我想跑一个大模型强化学习任务。</li>
+<li>为了验证我的环境（GPU、Ray、模型路径）没问题。</li>
+<li>我先跑一个测试：把模型加载起来，变成一个类似 ChatGPT 的本地 API 服务。</li>
+<li>我用代码发一条 "Hello" 过去，看它能不能回我。</li>
+<li>如果能回，说明<strong>推理模块（Rollout Worker）</strong>是稳的，可以开始后续的训练流程了。</li>
+</ol>

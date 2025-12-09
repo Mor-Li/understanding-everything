@@ -1,0 +1,58 @@
+<h1>recipe/dapo/run_dapo_qwen2.5_32b_rollout_corr.sh</h1>
+<p>这份脚本确实包含了很多术语，看起来非常硬核。简单来说，这是一份<strong>在大模型上进行强化学习（RL）训练的启动脚本</strong>。</p>
+<p>它的核心目的是：<strong>使用 DAPO 算法（配合 GRPO 估计器）来训练 Qwen2.5-32B 模型，并专门加上了一种叫做“Rollout Correction（采样修正）”的技术来防止训练崩溃。</strong></p>
+<p>为了让你看懂，我把它拆解成一个<strong>“项目经理的任务清单 (Todo List)”</strong>，每一步对应脚本里的一块内容：</p>
+<hr />
+<h3>📋 任务清单：训练 Qwen2.5-32B 模型</h3>
+<h4>✅ Task 1: 定义项目身份 (起名字)</h4>
+<p><strong>脚本位置：</strong> 开头的 <code>project_name</code> 和 <code>exp_name</code>
+*   <strong>内容：</strong> 我们要把这次训练叫 <code>DAPO</code>，具体实验叫 <code>DAPO-Qwen2.5-32B-RolloutCorr</code>。
+*   <strong>目的：</strong> 方便以后在日志和保存的模型里找到它。</p>
+<h4>✅ Task 2: 确定教学方法 (核心算法)</h4>
+<p><strong>脚本位置：</strong> <code>adv_estimator=grpo</code>, <code>use_kl_in_reward=False</code>
+*   <strong>内容：</strong>
+    *   使用 <strong>GRPO</strong> (Group Relative Policy Optimization)。这是一种最近很火的强化学习方法（类似 DeepSeek-R1 背后的思路），它不需要额外的“裁判模型（Critic）”，比较省显存。
+    *   <strong>KL 惩罚设为 0</strong>：通常 RL 会惩罚模型偏离原始模型太远，但这里似乎为了探索性，暂时关掉了这个约束。</p>
+<h4>✅ Task 3: 配置“纠错机制” (Rollout Correction - 最关键的部分)</h4>
+<p><strong>脚本位置：</strong> <code># Rollout Correction parameters</code> 下面的一大段 (<code>rollout_is</code>, <code>rollout_rs</code> 等)
+*   <strong>背景：</strong> 在强化学习中，模型生成数据（Rollout）和模型更新参数之间有时间差。如果模型更新太快，旧的数据就不准了，会导致训练崩溃。
+*   <strong>内容：</strong>
+    *   <strong>IS (Importance Sampling, 重要性采样)：</strong> 给数据加权重。如果旧数据和新模型差别不大，就保留；差别太大，就调整权重。阈值设为 <code>2.0</code>。
+    *   <strong>RS (Rejection Sampling, 拒绝采样)：</strong> 过滤数据。如果某条数据太离谱（<code>threshold=1.01</code>），直接丢掉，不让它误导模型。
+    *   <strong>Token Veto：</strong> 如果某个词的概率变化极剧烈（灾难性偏移），直接否决。
+*   <strong>人话解释：</strong> 这就像老师改卷子。如果卷子是学生上周做的（旧数据），而学生这周已经进步了（模型更新），老师在评分时要进行“修正”，把那些完全不符合现在水平的答案剔除掉，防止改错分。</p>
+<h4>✅ Task 4: 设定考试规则 (输入输出长度)</h4>
+<p><strong>脚本位置：</strong> <code>max_prompt_length</code>, <code>max_response_length</code>
+*   <strong>内容：</strong>
+    *   题目最长：2048 token。
+    *   回答最长：20480 token (20k)。
+    *   <strong>Overlong buffer</strong>：如果生成的太长，给一个缓冲区，但会给予惩罚 (<code>penalty_factor</code>)。
+*   <strong>目的：</strong> 这是一个针对长思维链（Chain of Thought）或者数学题的训练，允许模型写很长的推理过程。</p>
+<h4>✅ Task 5: 安排考场与硬件 (Ray &amp; GPU)</h4>
+<p><strong>脚本位置：</strong> <code># Ray</code>, <code># Paths</code>, <code>sp_size=8</code>, <code>gen_tp=4</code>
+*   <strong>内容：</strong>
+    *   使用 <strong>Ray</strong> 框架来管理多机多卡。
+    *   <strong>Sequence Parallel (sp_size=8)</strong>：序列并行。因为 20k 的长度太长了，一张显卡塞不下，需要把一句话切成 8 段，分给 8 张卡一起算。
+    *   <strong>Offload=True</strong>：为了省显存，把部分参数卸载到 CPU 内存里。
+    *   指定了训练数据 (<code>dapo-math-17k</code>) 和测试数据 (<code>aime-2024</code>)。</p>
+<h4>✅ Task 6: 设定训练强度 (超参数)</h4>
+<p><strong>脚本位置：</strong> <code>train_prompt_bsz</code>, <code>n_resp_per_prompt</code>, <code>lr=1e-6</code>
+*   <strong>内容：</strong>
+    *   <strong>Batch Size (512)</strong>：一次打包 512 个题目去训练。
+    *   <strong>N=16</strong>：每个题目让模型生成 16 个不同的回答（方便 GRPO 算法在组内比较好坏）。
+    *   <strong>Learning Rate (1e-6)</strong>：学习率很低，说明是微调，小心翼翼地改参数。</p>
+<h4>✅ Task 7: 按下启动按钮 (执行命令)</h4>
+<p><strong>脚本位置：</strong> 最后那一大串 <code>ray job submit ...</code>
+*   <strong>内容：</strong> 这一步是真正的执行。它把上面定义的所有变量（比如路径、长度、算法开关）全部填入 Python 命令 (<code>python3 -m recipe.dapo.main_dapo</code>) 中，并提交给 Ray 集群去跑。</p>
+<hr />
+<h3>💡 总结一下这篇文章的核心观点</h3>
+<p>这个脚本实际上在实践一个观点：<strong>“在大模型强化学习中，速度和稳定性是矛盾的，但可以通过数学修正来解决。”</strong></p>
+<ol>
+<li><strong>问题：</strong> 传统的 PPO/GRPO 训练中，如果数据采样（Rollout）和训练（Train）不同步，模型容易“学歪了”（Off-policy 导致分布偏移）。</li>
+<li><strong>普通解法：</strong> 每次训练完立刻重新生成数据（On-policy），但这<strong>非常慢</strong>且费钱。</li>
+<li><strong>文中解法 (Rollout Correction)：</strong> 允许使用稍微旧一点的数据（Off-policy），但是通过 <strong>数学公式（IS 和 RS）</strong> 来修正这些数据与当前模型的偏差。<ul>
+<li>这样既能跑得快（不用频繁生成数据），又能保证稳（防止训练崩溃）。</li>
+</ul>
+</li>
+</ol>
+<p>所以，这个脚本是为了<strong>高效、稳定地训练一个能做长逻辑推理（数学题）的 32B 大模型</strong>。</p>

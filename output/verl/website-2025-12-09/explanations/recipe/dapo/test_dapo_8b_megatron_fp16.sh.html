@@ -1,0 +1,116 @@
+<h1>recipe/dapo/test_dapo_8b_megatron_fp16.sh</h1>
+<p>这份文件确实包含了很多技术细节，看起来像是一个复杂的“天书”。别担心，我们把它想象成<strong>一道菜的烹饪清单（Recipe）</strong>。</p>
+<p>这个脚本（<code>.sh</code>文件）的作用是：<strong>指挥多张显卡，使用一种叫 GRPO 的强化学习算法，去训练一个 Qwen3-8B 的大模型，让它更擅长做数学题。</strong></p>
+<p>为了让你看懂，我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>，我们分成 5 个步骤，一步步拆解这个文件在干什么。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ul>
+<li>[ ] <strong>Task 1: 搞懂目标</strong> —— 我们到底要干什么？（宏观定位）</li>
+<li>[ ] <strong>Task 2: 准备食材</strong> —— 数据和模型从哪来？（路径配置）</li>
+<li>[ ] <strong>Task 3: 确定做法</strong> —— 用什么算法训练？（核心参数）</li>
+<li>[ ] <strong>Task 4: 安排厨具</strong> —— 显卡怎么分配工作？（分布式与加速）</li>
+<li>[ ] <strong>Task 5: 开始烹饪</strong> —— 把所有东西通过一条命令运行起来。（启动命令）</li>
+</ul>
+<hr />
+<h3>💡 逐步讲解 (Step-by-Step)</h3>
+<h4>✅ Task 1: 搞懂目标 (宏观定位)</h4>
+<p>首先看文件的开头和命名：
+*   <strong>文件名</strong>: <code>test_dapo_8b_megatron_fp16.sh</code>
+    *   <code>8b</code>: 模型大小是 80亿参数。
+    *   <code>megatron</code>: 使用了 Megatron 这种超强的分布式训练框架（通常用于训练超大模型）。
+    *   <code>fp16</code>: 使用半精度（Float16）计算，为了省显存、跑得快。
+*   <strong>脚本内容</strong>:
+    *   <code>project_name='DAPO-fp16'</code>
+    *   <code>exp_name='fp16'</code>
+    *   <strong>解读</strong>: 这是一个项目代号叫 DAPO 的实验，目的是用强化学习微调模型。</p>
+<h4>✅ Task 2: 准备食材 (数据和模型)</h4>
+<p>在脚本中间部分，定义了“食材”在哪里：</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">MODEL_PATH</span><span class="o">=</span><span class="si">${</span><span class="nv">MODEL_PATH</span><span class="k">:-</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">RAY_DATA_HOME</span><span class="si">}</span><span class="s2">/models/Qwen3-8B-Base&quot;</span><span class="si">}</span>
+<span class="nv">TRAIN_FILE</span><span class="o">=</span><span class="si">${</span><span class="nv">TRAIN_FILE</span><span class="k">:-</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">RAY_DATA_HOME</span><span class="si">}</span><span class="s2">/data/dapo-math-17k.parquet&quot;</span><span class="si">}</span>
+<span class="nv">TEST_FILE</span><span class="o">=</span><span class="si">${</span><span class="nv">TEST_FILE</span><span class="k">:-</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">RAY_DATA_HOME</span><span class="si">}</span><span class="s2">/data/aime-2024.parquet&quot;</span><span class="si">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>模型 (底座)</strong>: 用的是 <code>Qwen3-8B-Base</code>（通义千问3）。</li>
+<li><strong>训练数据</strong>: <code>dapo-math-17k</code>。注意 <code>math</code> 这个词，说明这是专门训练模型做<strong>数学题</strong>的。</li>
+<li><strong>测试数据</strong>: <code>aime-2024</code>（美国数学邀请赛题目），这是很高难度的数学竞赛题，用来测试模型变聪明了没有。</li>
+</ul>
+<h4>✅ Task 3: 确定做法 (核心算法 - 最重要！)</h4>
+<p>这是整个脚本的灵魂。它决定了模型怎么学习。</p>
+<ol>
+<li>
+<p><strong>算法选择</strong>:
+    <code>bash
+    adv_estimator=grpo</code></p>
+<ul>
+<li><strong>重点</strong>: 这里用的不是普通的 PPO，而是 <strong>GRPO (Group Relative Policy Optimization)</strong>。</li>
+<li><strong>通俗解释</strong>: 传统的老师（PPO）是模型每说一句话就打分。GRPO 是让模型针对同一个问题，一口气生成 <strong>16 个不同的答案</strong>（见下文），然后对比这 16 个答案，谁写得好谁就加分，谁写得差就扣分。这在最近的 DeepSeek-R1 等推理模型训练中非常流行。</li>
+</ul>
+</li>
+<li>
+<p><strong>生成采样</strong>:
+    <code>bash
+    n_resp_per_prompt=16  # 针对一个问题，生成16个回答
+    train_prompt_bsz=32   # 一次处理32个问题</code></p>
+</li>
+<li>
+<p><strong>奖励机制 (Reward)</strong>:
+    <code>bash
+    kl_coef=0.0
+    use_kl_loss=False</code></p>
+<ul>
+<li><strong>解读</strong>: 通常强化学习会惩罚模型“不要偏离原始模型太远”（KL 惩罚）。但这里设为 0，意味着<strong>彻底放飞自我</strong>，只要能把数学题做对，不管你怎么思考都行。这是推理模型训练的典型特征。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 4: 安排厨具 (硬件加速与并行)</h4>
+<p>大模型训练需要很多显卡配合，这里配置了如何“切分”模型：</p>
+<ol>
+<li>
+<p><strong>推理引擎 (vLLM)</strong>:
+    <code>bash
+    rollout_name="vllm"</code></p>
+<ul>
+<li><strong>解读</strong>: 在生成那 16 个答案时，使用 <code>vLLM</code> 这个工具。它比普通的生成方式快得多，能极大地加速训练。</li>
+</ul>
+</li>
+<li>
+<p><strong>切分策略 (Megatron)</strong>:
+    <code>bash
+    gen_tp=1    # 生成时，张量并行度为1
+    train_tp=2  # 训练时，张量并行度为2</code></p>
+<ul>
+<li><strong>解读</strong>: 训练时，把模型切成 2 份放在不同显卡上算（TP=2），这样单张卡显存压力小。</li>
+</ul>
+</li>
+<li>
+<p><strong>显存优化</strong>:
+    <code>bash
+    offload=True</code></p>
+<ul>
+<li><strong>解读</strong>: 显存不够时，把一部分数据暂时存到内存（CPU）里，虽然慢点但能防止爆显存。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 5: 开始烹饪 (启动命令)</h4>
+<p>脚本的最后一大段 <code>python3 -m verl.trainer.main_ppo ...</code> 就是真正的启动按钮。</p>
+<ul>
+<li>它把上面定义的所有变量（比如 <code>TRAIN_FILE</code>, <code>kl_coef</code>, <code>train_tp</code>）全部传给 Python 程序。</li>
+<li><code>verl</code>: 这是字节跳动（VolcEngine）开源的一个强化学习训练框架。</li>
+<li><code>reward_model.reward_manager=dapo</code>: 指定了一个叫 <code>dapo</code> 的裁判（Reward Manager），它负责判断模型生成的数学解题步骤对不对。</li>
+</ul>
+<hr />
+<h3>📝 总结：这个脚本讲了个什么故事？</h3>
+<p>如果把这个脚本翻译成人话，它是在对计算机说：</p>
+<blockquote>
+<p>“嘿，电脑！我们要开始训练了。</p>
+<ol>
+<li>请去加载 <strong>Qwen3-8B</strong> 这个模型。</li>
+<li>用 <strong>vLLM</strong> 引擎加速，让模型做 <strong>Math-17k</strong> 里的数学题。</li>
+<li>对于每道题，让模型一口气写 <strong>16 个不同的解题过程</strong>。</li>
+<li>用 <strong>GRPO 算法</strong> 来比较这 16 个答案，谁做对了就奖励谁，不要管它是不是在胡言乱语（KL=0），只要做对就行。</li>
+<li>为了跑得动，请把模型切开放在 <strong>2 张显卡</strong> 上并行训练，显存不够就借用内存。</li>
+<li>所有的日志都记下来，我要看它是不是越来越聪明了。”</li>
+</ol>
+</blockquote>
+<p>现在，你再回头看代码，是不是能对应上其中的几个关键词了？比如 <code>vllm</code>, <code>grpo</code>, <code>math</code>, <code>tp=2</code>。</p>

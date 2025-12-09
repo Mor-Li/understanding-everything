@@ -1,0 +1,119 @@
+<h1>tools/checkpoint/loader_legacy.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了 <strong>Megatron-LM</strong>（一个用于训练超大模型的框架）的底层机制。</p>
+<p>简单来说，这个脚本是一个 <strong>“搬运工”</strong>。它的任务是读取一个被切分得七零八落的分布式模型文件（Checkpoint），把它们拼凑回来，然后通过一个队列（Queue）传给主程序（通常是用来转换格式，比如转成 HuggingFace 格式）。</p>
+<p>为了让你好理解，我把这个脚本的工作流程拆解成一个 <strong>Task Todo List（任务清单）</strong>，然后一步步解释。</p>
+<hr />
+<h3>核心任务清单 (Todo List)</h3>
+<p>这个脚本的主要函数 <code>_load_checkpoint</code> 就像一个照着清单干活的工人，他的任务列表如下：</p>
+<ol>
+<li><strong>[准备环境]</strong>：找到 Megatron 的代码库，假装自己是一个训练程序。</li>
+<li><strong>[读取说明书]</strong>：从 Checkpoint 文件里读取模型的配置参数（层数、隐藏层大小等）。</li>
+<li><strong>[搭建骨架]</strong>：在内存里构建出空模型的架构（为了把权重填进去）。</li>
+<li><strong>[汇报配置]</strong>：把读到的模型参数（Metadata）发给主程序。</li>
+<li><strong>[搬运：词表层]</strong>：读取并拼接 Embedding 层，发走。</li>
+<li><strong>[搬运：中间层]</strong>：循环每一层 Transformer，把被切分的权重（Tensor Parallel）拼成完整的，一层层发走。</li>
+<li><strong>[搬运：收尾层]</strong>：读取并拼接最后的 LayerNorm 和输出层，发走。</li>
+<li><strong>[打卡下班]</strong>：发送 "done" 信号。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<p>下面我结合代码，一步步给你讲讲它是怎么完成这些 Task 的。</p>
+<h4>Task 1: 准备环境 (Setup)</h4>
+<p>代码开头部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">sys</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 找到 Megatron 路径</span>
+<span class="c1"># ... import 各种库 ...</span>
+<span class="n">sys</span><span class="o">.</span><span class="n">argv</span> <span class="o">=</span> <span class="p">[</span><span class="s1">&#39;script.py&#39;</span><span class="p">,</span> <span class="s1">&#39;--no-initialization&#39;</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="c1"># 伪造启动参数</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：Megatron 是一个为了训练而设计的库，很难单独拿出来“只读文件”。</li>
+<li><strong>操作</strong>：脚本强行修改了 <code>sys.path</code> 找到 Megatron 的源码，然后通过修改 <code>sys.argv</code> <strong>欺骗</strong> Megatron，让它以为自己正在启动一个训练任务（但是带了 <code>--no-initialization</code> 参数，防止它真的去初始化显存，只为了借用它的加载功能）。</li>
+</ul>
+<h4>Task 2: 读取说明书 (Load Arguments)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">margs</span> <span class="o">=</span> <span class="n">parse_args</span><span class="p">()</span>
+<span class="n">margs</span><span class="p">,</span> <span class="n">checkpoint_args</span> <span class="o">=</span> <span class="n">load_args_from_checkpoint</span><span class="p">(</span><span class="n">margs</span><span class="p">)</span>
+<span class="c1"># ... check_for_arg(...) ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：要加载模型，必须先知道模型长什么样。</li>
+<li><strong>操作</strong>：它调用 <code>load_args_from_checkpoint</code> 从保存的文件里读出原来的配置（比如 <code>num_layers</code> 有多少层，<code>hidden_size</code> 多大）。然后做了一堆 <code>check_for_arg</code> 检查，确保关键参数都在，不在就报错。</li>
+</ul>
+<h4>Task 3: 搭建骨架 (Build Model Skeleton)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">get_models</span><span class="p">(</span><span class="n">count</span><span class="p">,</span> <span class="n">dtype</span><span class="p">):</span>
+    <span class="c1"># ... 复杂的循环 ...</span>
+    <span class="n">load_checkpoint</span><span class="p">(</span><span class="n">model_</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：Megatron 的模型通常是 <strong>模型并行 (Model Parallelism)</strong> 的。这意味着一个大模型可能被切分在 8 张 GPU 上。</li>
+<li><strong>操作</strong>：<code>get_models</code> 函数非常复杂，它在单机上模拟了分布式的环境。它会循环遍历所有的“切片”（Rank），把原本分散在不同 GPU 上的权重文件全部加载到当前的内存里。</li>
+</ul>
+<h4>Task 4: 汇报配置 (Send Metadata)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">md</span> <span class="o">=</span> <span class="n">types</span><span class="o">.</span><span class="n">SimpleNamespace</span><span class="p">()</span>
+<span class="n">md</span><span class="o">.</span><span class="n">num_layers</span> <span class="o">=</span> <span class="n">margs</span><span class="o">.</span><span class="n">num_layers</span>
+<span class="c1"># ... 赋值一大堆属性 ...</span>
+<span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">md</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：接收方（主程序）需要先知道接下来会收到什么样的数据。</li>
+<li><strong>操作</strong>：把整理好的配置信息打包成 <code>md</code> 对象，放入 <code>queue</code>（队列）。这就像是发货前先发一张“发货单”。</li>
+</ul>
+<h4>Task 5: 搬运词表层 (Embeddings)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">message</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;word embeddings&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span>
+        <span class="p">[</span><span class="n">models</span><span class="p">[</span><span class="n">tp_rank</span><span class="p">]</span><span class="o">...</span><span class="n">word_embeddings</span><span class="o">...</span> <span class="k">for</span> <span class="n">tp_rank</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">tp_size</span><span class="p">)],</span>
+        <span class="n">dim</span> <span class="o">=</span> <span class="mi">0</span><span class="p">)</span>
+<span class="p">}</span>
+<span class="n">queue_put</span><span class="p">(</span><span class="s2">&quot;embeddings&quot;</span><span class="p">,</span> <span class="n">message</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：词表（Embedding）在 Megatron 中通常是被切分的（Tensor Parallel）。</li>
+<li><strong>操作</strong>：它遍历了所有切片 (<code>tp_rank</code>)，用 <code>torch.cat(..., dim=0)</code> 把它们<strong>拼接</strong>起来，还原成一个完整的词表矩阵，然后发出去。</li>
+</ul>
+<h4>Task 6: 搬运中间层 (Transformer Layers) - <strong>这是最核心的部分</strong></h4>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">layer_num</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="o">...</span><span class="p">)):</span> <span class="c1"># 循环每一层</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 收集 QKV 权重，MLP 权重等</span>
+    <span class="n">qkv_weight</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">tp_rank</span><span class="p">,</span> <span class="n">model</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">models</span><span class="p">):</span>
+        <span class="n">qkv_weight</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">layer</span><span class="o">...</span><span class="n">query_key_value</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">data</span><span class="p">)</span>
+
+    <span class="c1"># 拼接！</span>
+    <span class="n">message</span><span class="p">[</span><span class="s2">&quot;qkv weight&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">qkv_weight</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+    <span class="c1"># ...</span>
+    <span class="n">queue_put</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;transformer layer </span><span class="si">{</span><span class="n">total_layer_num</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span> <span class="n">message</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：Transformer 的每一层（Attention 和 MLP）里的矩阵乘法权重，在训练时都是切开存储的。现在要转换格式，必须拼回去。</li>
+<li><strong>操作</strong>：<ol>
+<li><strong>按层循环</strong>：第 1 层，第 2 层...</li>
+<li><strong>按切片循环</strong>：对于第 N 层，把 GPU 0, GPU 1, ... GPU 7 上的权重都拿出来。</li>
+<li><strong>拼接 (Concat)</strong>：<ul>
+<li>有的权重是按行切的（Row Parallel），有的按列切（Column Parallel）。</li>
+<li>代码里通过 <code>dim=0</code> 或 <code>dim=1</code> 把它们拼成一个完整的大矩阵。</li>
+</ul>
+</li>
+<li><strong>处理特殊情况</strong>：比如 <code>swiglu</code> 激活函数，需要特殊的拼接逻辑。</li>
+<li><strong>发送</strong>：拼好一层，就往队列里塞一层。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 7 &amp; 8: 收尾 (Final Layers &amp; Done)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">queue_put</span><span class="p">(</span><span class="s2">&quot;final norm&quot;</span><span class="p">,</span> <span class="n">message</span><span class="p">)</span>
+<span class="n">queue_put</span><span class="p">(</span><span class="s2">&quot;output layer&quot;</span><span class="p">,</span> <span class="n">message</span><span class="p">)</span>
+<span class="c1"># ... 处理 BERT 特有的头 ...</span>
+<span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="s2">&quot;done&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>操作</strong>：处理最后的 LayerNorm 层和输出层（通常和 Embedding 层共享权重，但也可能独立）。做完所有事情后，发送字符串 <code>"done"</code> 告诉主程序：“我干完了，你可以退出了”。</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>“伪装成 Megatron 训练程序 -&gt; 读取分布式 Checkpoint -&gt; 将切碎的权重拼接还原 -&gt; 通过队列流式传输给主程序”。</strong></p>
+<p>之所以看不懂，是因为它混合了 <strong>分布式训练的逻辑</strong>（Rank, Pipeline, Tensor Parallel）和 <strong>数据加载清洗的逻辑</strong>。你只需要关注 <code>torch.cat</code> 的地方，那就是它在做“拼图”还原工作的关键点。</p>

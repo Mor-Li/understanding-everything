@@ -1,0 +1,119 @@
+<h1>verl/models/llama/megatron/checkpoint_utils/llama_loader_depracated.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了<strong>深度学习大模型训练中最复杂的“分布式并行”</strong>概念（Megatron-LM 架构）。</p>
+<p>简单来说，这个脚本的任务是：<strong>把一个普通的、完整的 Llama 模型权重文件（比如从 Hugging Face 下载的），切碎并加载到分布在多张显卡上的 Megatron 模型中。</strong></p>
+<p>想象一下，你买了一个巨大的乐高城堡（模型权重），大到一张桌子（一张显卡）放不下。你需要把它拆散，分给 8 个人（8 张显卡），每个人负责拼一部分。这个人负责地基，那个人负责城墙，还有人负责塔尖。这个脚本就是那个<strong>“分发和组装指南”</strong>。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>Task Todo List</strong>，我们一步步来完成这个“分发”任务。</p>
+<hr />
+<h3>Task 1: 搞清楚“座位号” (环境初始化)</h3>
+<p><strong>目标</strong>：弄清楚当前代码运行在哪张显卡上，以及这张显卡负责模型的哪一部分。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>load_state_dict_to_megatron_llama</code> 函数的开头部分。</li>
+<li><strong>原理解析</strong>：<ul>
+<li><strong>DP (Data Parallel)</strong>: 所有人拼一样的模型，只是看不同的书（数据）。</li>
+<li><strong>PP (Pipeline Parallel)</strong>: 模型太高了，切成几段。显卡 A 负责第 1-10 层，显卡 B 负责第 11-20 层。</li>
+<li><strong>TP (Tensor Parallel)</strong>: 每一层太宽了，竖着切。比如一个矩阵乘法，显卡 A 算左半边，显卡 B 算右半边。</li>
+</ul>
+</li>
+<li><strong>代码行为</strong>：获取 <code>dp_rank</code>, <code>pp_rank</code>, <code>tp_rank</code>。如果是 Rank 0（主控），它负责读取完整的权重文件，然后分发给别人。</li>
+</ul>
+<h3>Task 2: 绘制“地图” (Layer Mapping)</h3>
+<p><strong>目标</strong>：计算出第 N 层模型到底应该放在哪张显卡上。</p>
+<ul>
+<li><strong>代码位置</strong>：函数 <code>_megatron_calc_layer_map</code>。</li>
+<li><strong>原理解析</strong>：<ul>
+<li>因为开启了流水线并行（PP），第 0 层可能在 GPU-0 上，但第 30 层可能在 GPU-3 上。</li>
+<li>如果开启了虚拟流水线（Virtual PP），情况更复杂，层是交错的（比如 GPU-0 负责第 1 层和第 9 层）。</li>
+</ul>
+</li>
+<li><strong>代码行为</strong>：生成一个字典 <code>layer_map</code>。<ul>
+<li>输入：全局第几层（比如 Layer 5）。</li>
+<li>输出：<code>(PP_RANK, Virtual_PP_RANK, Local_Layer_Index)</code>。即：“第 5 层归 第 2 号显卡管，是它显存里的第 0 个模块”。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 准备“切蛋糕”的刀 (定义分发函数)</h3>
+<p><strong>目标</strong>：定义不同的函数，用来处理不同形状权重的切割和发送。这是代码中最长、最难懂的部分（那一堆内部定义的 <code>_broadcast_...</code> 函数）。</p>
+<p>因为 Llama 模型里不同的权重，切分方式不一样：</p>
+<ol>
+<li>
+<p><strong>普通切法 (<code>_broadcast_tp_shard_tensor</code>)</strong>:</p>
+<ul>
+<li><strong>场景</strong>：普通的线性层（Linear Layer）。</li>
+<li><strong>动作</strong>：主控节点（Rank 0）把大矩阵切成几块（<code>torch.chunk</code>），然后通过网络发送（<code>dist.broadcast</code>）给对应的 TP 组显卡。</li>
+</ul>
+</li>
+<li>
+<p><strong>词表切法 (<code>_broadcast_tp_shard_tensor_vocab</code>)</strong>:</p>
+<ul>
+<li><strong>场景</strong>：Embedding 层（词向量）。</li>
+<li><strong>动作</strong>：把几万个单词的向量切分给不同显卡。</li>
+</ul>
+</li>
+<li>
+<p><strong>Llama 特供切法 1：QKV (<code>_broadcast_tp_shard_tensor_qkv</code>)</strong>:</p>
+<ul>
+<li><strong>场景</strong>：Attention 里的 Query, Key, Value 矩阵。</li>
+<li><strong>难点</strong>：在 Llama 中，Q、K、V 的头数（Heads）可能不一样（GQA 技术），而且为了计算效率，通常要把 Q、K、V 拼在一起存。</li>
+<li><strong>动作</strong>：代码里有一大段逻辑在算 <code>new_weight_qkv</code>。它在手动把 Q、K、V 按正确的顺序拼起来，再切分发给不同显卡。</li>
+</ul>
+</li>
+<li>
+<p><strong>Llama 特供切法 2：MLP (<code>_broadcast_tp_shard_tensor_gate_up</code>)</strong>:</p>
+<ul>
+<li><strong>场景</strong>：Llama 的 MLP 层用的是 SwiGLU 结构，有两个矩阵（Gate 和 Up）。</li>
+<li><strong>动作</strong>：Megatron 为了效率，把 Gate 和 Up 两个矩阵拼成了一个大矩阵。所以加载时，需要把原始权重的 Gate 和 Up 拿出来，拼好，再切分，再分发。</li>
+</ul>
+</li>
+</ol>
+<h3>Task 4: 开始流水线分发 (主加载循环)</h3>
+<p><strong>目标</strong>：Rank 0 拿着完整的说明书（state_dict），开始一层一层地喊话分发。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>if dp_rank == 0:</code> 下面的大循环。</li>
+<li><strong>流程</strong>：<ol>
+<li><strong>加载 Embedding</strong>：调用 Task 3 里的 <code>vocab</code> 切分函数。</li>
+<li><strong>循环每一层 (Loop layers)</strong>：<ul>
+<li>查 Task 2 的地图：这一层归谁管？(<code>dst_pp_rank</code>)</li>
+<li>如果在当前流水线阶段（<code>dst_pp_rank == pp_rank</code>），就准备接收。</li>
+<li><strong>加载 Attention</strong>：<ul>
+<li>QKV 权重 -&gt; 用 <code>_broadcast_tp_shard_tensor_qkv</code> 处理。</li>
+<li>Output 权重 -&gt; 用普通切法，但是切的维度不一样（<code>chunk_dim=1</code>），因为这是汇聚层。</li>
+</ul>
+</li>
+<li><strong>加载 MLP</strong>：<ul>
+<li>Gate/Up 权重 -&gt; 用 <code>_broadcast_tp_shard_tensor_gate_up</code> 处理。</li>
+<li>Down 权重 -&gt; 用普通切法 (<code>chunk_dim=1</code>)。</li>
+</ul>
+</li>
+<li><strong>加载 Norm</strong>：LayerNorm 不需要切分，直接复制 (<code>_broadcast_tensor</code>)。</li>
+</ul>
+</li>
+<li><strong>加载最后的 LM Head</strong>：输出层。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 5: 抄作业 (Data Parallel Sync)</h3>
+<p><strong>目标</strong>：把刚才那一组显卡（Model Parallel Group）辛苦加载好的权重，复制给其他数据并行的组。</p>
+<ul>
+<li><strong>代码位置</strong>：最后的 <code>broadcast_params(wrapped_model)</code>。</li>
+<li><strong>原理解析</strong>：<ul>
+<li>假设你有 16 张卡。8 张卡组成了一个完整的模型（MP size = 8）。另外 8 张卡是用来做数据并行（DP）加速训练的。</li>
+<li>刚才 Task 4 只把模型加载到了第 1 组（前 8 张卡）。</li>
+<li><strong>动作</strong>：第 1 组的显卡作为“老师”，通过 <code>torch.distributed.broadcast</code> 把自己显存里的参数，直接广播给第 2 组对应的“学生”显卡。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这段代码就是一个<strong>精密的搬运工</strong>：</p>
+<ol>
+<li><strong>输入</strong>：单机版的 Llama 权重。</li>
+<li><strong>处理</strong>：<ul>
+<li>遇到 QKV，先拼再切。</li>
+<li>遇到 Gate/Up，先拼再切。</li>
+<li>遇到普通层，直接切。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：完美填充到 Megatron 分布式架构中的每一个分片权重。</li>
+</ol>
+<p><strong>为什么你看不懂？</strong>
+因为它把<strong>模型结构逻辑</strong>（Llama 的特殊层）、<strong>分布式通信逻辑</strong>（Broadcast）、<strong>张量操作逻辑</strong>（Chunk/Cat）全部揉在了一起。如果你不熟悉 Megatron 是怎么切分矩阵的，看这段代码确实像看天书。</p>

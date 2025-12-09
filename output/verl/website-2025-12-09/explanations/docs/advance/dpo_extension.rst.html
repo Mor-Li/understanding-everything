@@ -1,0 +1,98 @@
+<h1>docs/advance/dpo_extension.rst</h1>
+<p>这篇文章的核心逻辑其实是教你<strong>如何利用 <code>verl</code> 框架现有的积木（PPO的基础设施），搭建一个新的算法（以Online DPO为例）</strong>。</p>
+<p>之所以难懂，是因为它涉及了分布式训练的架构设计。为了让你好理解，我们可以把这个过程想象成<strong>“一个主厨（控制进程）指挥多个切菜工/炒菜工（计算进程/GPU）”</strong>的过程。</p>
+<p>核心思想是：<strong>单进程控制，多进程计算</strong>。即：你写代码的时候感觉像是在写单机代码，但实际上 <code>verl</code> 帮你把任务分发到了几百张 GPU 上。</p>
+<p>下面我为你列一个 <strong>Todo List</strong>，并一步步拆解文中的观点：</p>
+<hr />
+<h3>核心任务 Todo List</h3>
+<p>要实现 Online DPO，你需要完成以下三个步骤：</p>
+<ol>
+<li><strong>[定义工种] 定义需要在 GPU 上跑的“重活”类</strong><ul>
+<li><em>任务：</em> 确定你需要哪些模型（Actor, Reference, Reward/Verifier）。</li>
+<li><em>操作：</em> 写几个 Python 类，继承 <code>Worker</code>，用来做生成、推理和反向传播。</li>
+</ul>
+</li>
+<li><strong>[定义物流] 解决“主厨”和“工人”之间的数据传输</strong><ul>
+<li><em>任务：</em> 解决怎么把一大份数据切分给多个 GPU，算完后再拼回来的问题。</li>
+<li><em>操作：</em> 使用 <code>verl</code> 的装饰器（<code>@register</code>），自动处理数据的切分（Dispatch）和合并（Collect）。</li>
+</ul>
+</li>
+<li><strong>[编写菜谱] 写主控逻辑串联流程</strong><ul>
+<li><em>任务：</em> 按照 DPO 的算法流程，指挥上述工种按顺序干活。</li>
+<li><em>操作：</em> 写一个 <code>main_task</code> 函数，按顺序调用 Worker 的方法。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤拆解</h3>
+<h4>第一步：定义工种（What are the computations）</h4>
+<p><strong>文中的观点：</strong>
+你需要把所有要在 GPU 上做的繁重计算（比如模型推理、梯度更新）封装成独立的类。这些类在 <code>verl</code> 里被称为 <code>Worker</code>。</p>
+<p><strong>Online DPO 需要三个工种：</strong></p>
+<ol>
+<li><strong>生成工 (Sample Generator):</strong><ul>
+<li><strong>职责：</strong> 拿着提示词（Prompt），用模型生成回复（Response）。</li>
+<li><strong>实现：</strong> 内部可以调用 vLLM 或 HuggingFace 来做推理。</li>
+</ul>
+</li>
+<li><strong>参考裁判 (Reference Policy):</strong><ul>
+<li><strong>职责：</strong> DPO 算法需要一个“参考模型”来计算 Log Probability（对数概率），防止模型跑偏。</li>
+<li><strong>实现：</strong> 只需要一个 <code>infer</code> 方法，输入数据，输出概率。</li>
+</ul>
+</li>
+<li><strong>训练工 (DPO Actor):</strong><ul>
+<li><strong>职责：</strong> 真正更新模型参数的人。</li>
+<li><strong>实现：</strong> 这里面会用到 FSDP 或 Megatron 等分布式并行策略。它需要一个 <code>update</code> 方法，计算 Loss 并反向传播。</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>注意：</strong> 这些类虽然写起来像普通 Python 类，但在运行时，它们会被 Ray（分布式框架）放到不同的 GPU 节点上运行。</p>
+</blockquote>
+<h4>第二步：定义物流（Data Interaction）</h4>
+<p><strong>文中的观点：</strong>
+这是最难理解的部分。问题在于：你的主控代码（主厨）只有一个，但 GPU（工人）有几十个。你手里有一批数据（比如 1024 条），你不能把这 1024 条全发给每一个 GPU，你需要把数据<strong>切分</strong>。</p>
+<p><strong>传统写法（很麻烦）：</strong>
+1. 主控进程把数据切成 N 份。
+2. 循环发送给 N 个 Worker。
+3. 等待 N 个 Worker 返回结果。
+4. 把结果拼起来。</p>
+<p><strong>Verl 的解法（文中的重点）：</strong>
+Verl 封装了一个叫 <code>RayWorkerGroup</code> 的东西。你只需要给 Worker 的方法加上一个装饰器 <code>@register</code>。</p>
+<ul>
+<li><strong>Dispatch (发货):</strong> 自动把数据切片分发给所有 GPU。</li>
+<li><strong>Collect (收货):</strong> 自动把所有 GPU 算出来的结果拼成一个大 Tensor 返回给你。</li>
+</ul>
+<p><strong>效果：</strong>
+你在写代码时，只需要写一行：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">output</span> <span class="o">=</span> <span class="n">worker_group</span><span class="o">.</span><span class="n">generate_sequences</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这就自动完成了“切分 -&gt; 传输 -&gt; 计算 -&gt; 回传 -&gt; 拼接”的全过程。</p>
+<h4>第三步：编写菜谱（Main training loop）</h4>
+<p><strong>文中的观点：</strong>
+有了上面的“工种”和“物流”，最后一步就是把它们串起来。这就是 Online DPO 的算法逻辑。</p>
+<p><strong>主控流程（main_task）：</strong></p>
+<ol>
+<li><strong>初始化：</strong> 启动 Ray，把上面定义的三个工种（Generator, Ref, Actor）分配到 GPU 资源池里。</li>
+<li><strong>循环（Training Loop）：</strong><ul>
+<li><strong>生成：</strong> 调用生成工，<code>data = sample_gen.generate(prompts)</code>。</li>
+<li><strong>打分：</strong> (文中简化了这步) 把生成的数据拿去打分，配对成 (好回复, 坏回复) 的格式。</li>
+<li><strong>参考计算：</strong> 调用参考裁判，<code>ref_log_prob = ref_policy.infer(data)</code>。</li>
+<li><strong>更新：</strong> 调用训练工，<code>dpo_policy.update(data)</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这篇文章其实就是在说：</p>
+<ol>
+<li><strong>不要</strong>去操心底层的分布式通信细节（怎么发数据，怎么同步）。</li>
+<li><strong>只要</strong>做三件事：<ul>
+<li>写好<strong>干活的类</strong>（Worker）。</li>
+<li>用<strong>装饰器</strong>告诉系统怎么切分数据。</li>
+<li>写一个<strong>主循环</strong>，像写单机脚本一样调用这些类。</li>
+</ul>
+</li>
+</ol>
+<p>这样你就能用 <code>verl</code> 扩展出任何你想要的 RL 算法（比如 DPO, PPO, GRPO 等）。</p>

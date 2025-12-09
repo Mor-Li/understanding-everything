@@ -1,0 +1,127 @@
+<h1>megatron/core/datasets/readme.md</h1>
+<p>这篇文章确实写得比较“硬核”，因为它描述的是Megatron-Core（一个用于训练超大模型的框架）底层如何处理数据的技术细节。</p>
+<p>简单来说，它讲的是：<strong>如何把成千上万个文本文件，高效地变成模型训练时能吃进去的一口一口的“数据粮草”。</strong></p>
+<p>为了让你看懂，我把这个过程拆解成一个 <strong>“任务清单 (Todo List)”</strong>，我们按顺序一步步来完成这个理解任务。</p>
+<hr />
+<h3>📋 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>任务一：理解原材料的处理 (Data Pre-processing)</strong><ul>
+<li>弄懂数据在硬盘上长什么样（<code>.bin</code> 和 <code>.idx</code> 文件）。</li>
+</ul>
+</li>
+<li><strong>任务二：理解施工队 (Data Loading Construction)</strong><ul>
+<li>弄懂是谁在负责组装数据（Builder 和 Config 的作用）。</li>
+</ul>
+</li>
+<li><strong>任务三：理解核心逻辑 (GPTDataset Implementation)</strong><ul>
+<li><strong>难点</strong>：弄懂怎么把长短不一的文章，切成固定长度的样本（3个索引的作用）。</li>
+</ul>
+</li>
+<li><strong>任务四：理解混合策略 (BlendedDataset)</strong><ul>
+<li>弄懂怎么同时吃“大米”和“面条”（如何按比例混合多个数据集）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>任务一：理解原材料的处理 (Data Pre-processing)</h4>
+<p>在训练大模型之前，直接读 <code>.txt</code> 文本文件太慢了。Megatron 选择把数据转换成一种特殊的二进制格式。</p>
+<ul>
+<li><strong>IndexedDataset (索引数据集)</strong>：这是最底层的概念。它把数据分成两个文件存：<ol>
+<li><strong><code>.bin</code> 文件 (数据)</strong>：这是干货。所有的文字内容都被转化成了数字（Token IDs），紧挨着存放在这里。</li>
+<li><strong><code>.idx</code> 文件 (目录)</strong>：这是地图。它记录了元数据（Metadata）。<ul>
+<li>比如：第3篇文章是从第几个字节开始，到第几个字节结束？</li>
+<li>整个数据集有多少篇文章？</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>IndexedDatasetBuilder</strong>：这是一个工具类，用来把原始数据制作成上面说的 <code>.bin</code> 和 <code>.idx</code> 文件。</li>
+</ul>
+<blockquote>
+<p><strong>也就是：</strong> 这一步把乱七八糟的文本，整理成了带目录的字典，方便快速查找。</p>
+</blockquote>
+<hr />
+<h4>任务二：理解施工队 (Construction)</h4>
+<p>数据在硬盘上准备好了，现在需要代码把它读进内存并喂给模型。这需要几个角色配合：</p>
+<ol>
+<li><strong>BlendedMegatronDatasetConfig (配置单)</strong>：<ul>
+<li>这是老板的需求单。比如：我要训练 GPT 模型，我要用哪些数据，混合比例是多少。</li>
+</ul>
+</li>
+<li><strong>BlendedMegatronDatasetBuilder (包工头)</strong>：<ul>
+<li>它拿着“配置单”，负责指挥并创建出最终的数据集对象。</li>
+<li><strong>注意</strong>：所有显卡（Ranks）必须一起干这件事，否则程序会卡死。</li>
+</ul>
+</li>
+<li><strong>MegatronDataset (通用模具)</strong>：<ul>
+<li>这是一个抽象概念，代表“一个数据集”。针对不同模型（如 GPT 或 BERT），会有不同的具体实现（如 <code>GPTDataset</code>）。</li>
+</ul>
+</li>
+<li><strong>BlendedDataset (混合大杂烩)</strong>：<ul>
+<li>如果你有多个数据源（比如 50% 维基百科 + 50% 代码库），这个类负责把它们揉在一起，变成一个逻辑上的大数据集。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>任务三：理解核心逻辑 (GPTDataset Implementation) —— <strong>这是最难懂的部分</strong></h4>
+<p>这里解决的问题是：<strong>文章长度不一，但模型每次输入的长度（比如 1024）是固定的，怎么切分？</strong></p>
+<p><code>GPTDataset</code> 也就是 GPT 专用的数据集类，它用了 <strong>3个索引表</strong> 来解决这个问题：</p>
+<ol>
+<li>
+<p><strong>Document Index (文档索引 <code>Do_idx</code>)</strong>：</p>
+<ul>
+<li><strong>作用</strong>：决定我们按什么顺序读文章。</li>
+<li><strong>逻辑</strong>：如果我们要训练 3 个 Epoch（轮次），它就把所有文章的 ID 复制 3 份，然后打乱顺序。</li>
+<li><em>例子</em>：<code>[文章8, 文章8, 文章9, 文章6...]</code>。这意味着我们先读文章8，过一会又读到文章8。</li>
+</ul>
+</li>
+<li>
+<p><strong>Sample Index (样本索引 <code>Sa_idx</code>)</strong>：</p>
+<ul>
+<li><strong>作用</strong>：决定每个“样本”（Sample）包含哪些内容。</li>
+<li><strong>逻辑</strong>：因为模型输入长度固定（比如 S=1024），而文章可能只有 500 字，也可能有 2000 字。<ul>
+<li>如果文章太长，就切断。</li>
+<li>如果文章太短，就读完这篇紧接着读下一篇（拼接），直到凑够 1024 个字。</li>
+</ul>
+</li>
+<li>这个索引表记录了：第 k 个样本，是从第几篇文章的什么位置开始，到哪篇文章的什么位置结束。</li>
+</ul>
+</li>
+<li>
+<p><strong>Shuffle Index (洗牌索引 <code>Sh_idx</code>)</strong>：</p>
+<ul>
+<li><strong>作用</strong>：虽然样本切好了，但我们不想按顺序训练，想随机抽样。</li>
+<li><strong>逻辑</strong>：这是一个乱序的数字列表，告诉程序：“第1步训练请取第4号样本，第2步请取第0号样本...”。</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>取数据的流程总结：</strong>
+1.  看 <strong>洗牌索引</strong>，决定现在要取第几个样本。
+2.  查 <strong>样本索引</strong>，找到这个样本对应哪几篇文章的哪几段。
+3.  查 <strong>文档索引</strong>，去硬盘里把那几段文字抓出来，拼成一个完整的输入。</p>
+</blockquote>
+<hr />
+<h4>任务四：理解混合策略 (BlendedDataset)</h4>
+<p>如果你只用一种数据，上面的 <code>GPTDataset</code> 就够了。但通常我们要混合多种数据（例如：权重 <code>W</code> = [50% 英文, 50% 中文]）。</p>
+<p><code>BlendedDataset</code> 负责在这个层面做调度，它也有两个索引：</p>
+<ol>
+<li><strong>Dataset Index (数据集索引 <code>Da_idx</code>)</strong>：<ul>
+<li>决定当前的样本该去哪个数据集里抓。</li>
+<li><em>例子</em>：根据权重，生成一个列表 <code>[数据集0, 数据集1, 数据集0, 数据集0...]</code>。</li>
+</ul>
+</li>
+<li><strong>Dataset Sample Index (数据集内样本索引 <code>Sa_idx</code>)</strong>：<ul>
+<li>决定了去那个数据集里抓第几个样本。</li>
+<li><em>例子</em>：<code>[第0个, 第0个, 第1个, 第2个...]</code>。</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>流程</strong>：程序问 <code>BlendedDataset</code> 要数据 -&gt; 它查表发现这次该用“数据集0” -&gt; 它去调用“数据集0”的 <code>GPTDataset</code> 逻辑取数据。</p>
+</blockquote>
+<hr />
+<h3>💡 总结一下</h3>
+<p>这篇文章其实就是在解释 <strong>Megatron 是如何保证在大规模分布式训练时，数据读取既高效（通过二进制索引），又能灵活混合（Blended），还能保证随机性（各种 Shuffle）的。</strong></p>
+<p>之所以难懂，是因为它花了很多篇幅去解释那几个数学数组（索引）是怎么生成的，你只需要理解这些数组是用来<strong>“定位数据”</strong>的地图即可。</p>

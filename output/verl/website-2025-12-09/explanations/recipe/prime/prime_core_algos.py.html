@@ -1,0 +1,126 @@
+<h1>recipe/prime/prime_core_algos.py</h1>
+<p>这份代码确实比较硬核，它是大模型强化学习（RLHF）中非常前沿的算法实现，主要涉及到 <strong>RLOO (REINFORCE Leave-One-Out)</strong> 和 <strong>DPO (Direct Preference Optimization)</strong> 的变体。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“学习任务清单 (To-Do List)”</strong>。我们不看具体的每一行代码，而是按照<strong>功能模块</strong>一步步来理解它的逻辑。</p>
+<hr />
+<h3>📝 任务清单：PRIME 核心算法理解指南</h3>
+<h4>✅ Task 1: 搞清楚这是在干什么 (Context)</h4>
+<ul>
+<li><strong>目标</strong>：这段代码是为了训练大模型，让模型生成的答案更符合人类偏好（或者数学/代码的正确性）。</li>
+<li><strong>场景</strong>：假设模型针对同一个问题生成了 <code>n_samples</code> 个不同的回答。我们需要给这些回答打分，算出谁好谁坏，然后更新模型。</li>
+<li><strong>核心角色</strong>：<ul>
+<li><strong>Reward (奖励)</strong>：这个回答得多少分？</li>
+<li><strong>Advantage (优势)</strong>：这个回答比平均水平好多少？</li>
+<li><strong>Loss (损失)</strong>：模型该怎么调整参数？</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 2: 理解 RLOO 优势计算 (核心函数 1)</h4>
+<p><strong>函数名</strong>：<code>compute_rloo_advantage_return</code></p>
+<p><strong>你的任务</strong>：理解如何“公平地”评价一个回答的好坏。</p>
+<ol>
+<li>
+<p><strong>什么是 RLOO (Leave-One-Out)?</strong></p>
+<ul>
+<li>想象一下，考试满分100。你考了80分，这算好还是坏？</li>
+<li>如果全班平均90分，你就是差生（Advantage是负的）。如果全班平均60分，你就是优等生（Advantage是正的）。</li>
+<li><strong>RLOO的做法</strong>：为了评价<strong>你</strong>的分数，它计算<strong>除了你之外</strong>所有人的平均分作为基准（Baseline）。</li>
+<li>公式逻辑：<code>你的优势 = 你的得分 - (除去你之外其他人的平均分)</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>代码里的具体操作</strong>：</p>
+<ul>
+<li>它处理了两种分数的来源：<ul>
+<li><strong>RM Scores</strong>: 奖励模型（Reward Model）打的分（比如一个专门的模型觉得你写的诗好不好）。</li>
+<li><strong>GT Accuracy</strong>: 真实准确率（比如做数学题，答案对就是1，错就是0）。</li>
+</ul>
+</li>
+<li><strong>加权求和</strong>：它把这两种分数按系数（<code>coef</code>）加起来，作为最终奖励。</li>
+<li><strong>计算回报 (Returns)</strong>：把每一步的奖励累加起来。</li>
+<li><strong>白化 (Whiten)</strong>：最后把优势值归一化（减均值除方差），让训练更稳定。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 3: 理解简单的训练目标 (核心函数 2)</h4>
+<p><strong>函数名</strong>：<code>compute_ce_dpo_loss_rm</code></p>
+<p><strong>你的任务</strong>：理解最简单的“二分类”训练方式。</p>
+<ol>
+<li><strong>逻辑</strong>：<ul>
+<li>这其实就是一个<strong>二元交叉熵 (Binary Cross Entropy)</strong>。</li>
+<li>它把“评分”看作是一个概率问题。</li>
+<li>如果这个回答是正确的 (<code>acc</code> 高)，模型预测的分数 (<code>token_level_scores</code>) 就应该高。</li>
+<li><strong>目的</strong>：训练一个模型（通常是Reward Model），让它能分辨出什么是对的，什么是错的。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 4: 理解复杂的对比训练目标 (核心函数 3)</h4>
+<p><strong>函数名</strong>：<code>compute_detach_dpo_loss_rm</code></p>
+<p><strong>你的任务</strong>：理解 DPO 如何通过“对比”来学习。</p>
+<ol>
+<li>
+<p><strong>DPO 的核心思想</strong>：</p>
+<ul>
+<li>不要只看一个答案，要看“在这个问题下，A比B好”。</li>
+<li>代码逻辑：计算当前样本的得分 <code>cur_Q</code>，然后找一个对比样本的得分 <code>other_Q</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>怎么找对比样本？</strong></p>
+<ul>
+<li>代码里有一个循环：<code>Q_chosen = Q_bc[i][acc_bc[i] &lt; acc[i]] ...</code></li>
+<li>意思就是：如果当前样本是好答案，就去那些坏答案里找一个作为对比（反之亦然）。</li>
+</ul>
+</li>
+<li>
+<p><strong>BoN (Best-of-N) 加权</strong>：</p>
+<ul>
+<li><code>bon_mode</code> 是一个高级技巧。</li>
+<li>如果在推理时我们会生成 N 个答案选最好的（Best-of-N），那么训练时的 Loss 也要考虑到这一点，给那些更可能被选中的样本更高的权重。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 5: 怎么知道模型练好了没？ (核心函数 4 &amp; 5)</h4>
+<p><strong>函数名</strong>：<code>compute_dpo_accuracy</code> 和 <code>compute_dpo_abs_accuracy</code></p>
+<p><strong>你的任务</strong>：理解评价指标。</p>
+<ol>
+<li>
+<p><strong>DPO Accuracy (成对准确率)</strong>：</p>
+<ul>
+<li><strong>逻辑</strong>：在生成的 N 个回答里，两两配对。</li>
+<li>如果回答 A 的真实准确率比 B 高，那么模型给 A 打的分数也应该比 B 高。</li>
+<li>如果一致，就是预测正确。这个函数算的就是这个比例。</li>
+</ul>
+</li>
+<li>
+<p><strong>Absolute Accuracy (绝对准确率)</strong>：</p>
+<ul>
+<li><strong>逻辑</strong>：简单粗暴。</li>
+<li>如果这个回答是对的（正样本），模型给的分数应该是正数。</li>
+<li>如果这个回答是错的（负样本），模型给的分数应该是负数。</li>
+<li>看符号对不对得上。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 总结 (Summary)</h3>
+<p>把这个文件看作是一个 <strong>“打分与裁判系统”</strong>：</p>
+<ol>
+<li><strong>裁判打分 (<code>compute_rloo_advantage_return</code>)</strong>：<ul>
+<li>利用 RLOO 算法，结合模型打分和真实结果，给生成的文本打出一个公正的“优势分”，告诉模型这句写得好不好。</li>
+</ul>
+</li>
+<li><strong>训练法则 (<code>compute_..._loss_rm</code>)</strong>：<ul>
+<li>定义了怎么惩罚模型。如果好答案分低，或者坏答案分高，就要产生 Loss，强迫模型改正。</li>
+</ul>
+</li>
+<li><strong>计分板 (<code>compute_..._accuracy</code>)</strong>：<ul>
+<li>用来监控训练进度，看模型是不是越来越懂“好坏”之分了。</li>
+</ul>
+</li>
+</ol>
+<p><strong>建议阅读顺序</strong>：
+先看 <code>compute_rloo_advantage_return</code> (理解它是怎么根据 N 个采样算分的)，再看 <code>compute_dpo_accuracy</code> (理解它是怎么验证算分准不准的)。中间的 Loss 函数是具体的数学优化手段，知道它是用来更新梯度的即可。</p>

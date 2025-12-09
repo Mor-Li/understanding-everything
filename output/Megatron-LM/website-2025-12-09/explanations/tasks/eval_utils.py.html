@@ -1,0 +1,173 @@
+<h1>tasks/eval_utils.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了 <strong>Megatron-LM</strong>（一个用于训练超大模型的框架）的分布式训练逻辑。</p>
+<p>简单来说，这个文件的作用是：<strong>在训练过程中或训练结束后，给模型“考试”，看看它做题（分类任务）的准确率是多少。</strong></p>
+<p>为了让你听懂，我把整个文件的逻辑拆解成一个 <strong>“老师（代码）给学生（模型）安排期末考试”</strong> 的 To-Do List。</p>
+<hr />
+<h3>📝 核心任务 To-Do List</h3>
+<p>我们将整个流程分为三个层级：</p>
+<ol>
+<li>
+<p><strong>Level 1：考务处安排考试</strong> (<code>accuracy_func_provider</code>)</p>
+<ul>
+<li>[ ] 拿到所有要考的科目（数据集）。</li>
+<li>[ ] 把试卷分发下去（建立 DataLoader）。</li>
+<li>[ ] 指定一个监考老师（定义 <code>metrics_func</code>），让他负责统筹整个考试过程。</li>
+</ul>
+</li>
+<li>
+<p><strong>Level 2：监考老师统筹考试</strong> (<code>metrics_func</code>)</p>
+<ul>
+<li>[ ] 宣布考试开始（打印 <code>calculating metrics</code>）。</li>
+<li>[ ] 依次进行每一门科目的考试（遍历 dataloaders）。</li>
+<li>[ ] 每一科考完后，记录那一科的成绩。</li>
+<li>[ ] 所有科目考完后，计算总平均分并公布（打印 <code>overall</code> 准确率）。</li>
+<li>[ ] (可选) 如果需要存档，把学生的具体答案保存成文件。</li>
+</ul>
+</li>
+<li>
+<p><strong>Level 3：具体的阅卷过程</strong> (<code>calculate_correct_answers</code>)</p>
+<ul>
+<li>[ ] <strong>考前准备</strong>：让学生把书收起来，不许学习，只能答题（<code>model.eval()</code>）。</li>
+<li>[ ] <strong>答题</strong>：学生一道题一道题地做（遍历 batch，执行 Forward 前向传播）。</li>
+<li>[ ] <strong>批改</strong>：<ul>
+<li>看学生选了哪个选项（<code>argmax</code> 获取预测结果）。</li>
+<li>看标准答案是什么（<code>labels</code>）。</li>
+<li>判断对错（<code>corrects</code>）。</li>
+</ul>
+</li>
+<li>[ ] <strong>汇总全班成绩</strong>：因为是分布式训练（很多张显卡一起算），需要把所有显卡上的“对题数”加在一起（<code>all_reduce</code>）。</li>
+<li>[ ] <strong>考后恢复</strong>：考试结束，允许学生继续学习（<code>model.train()</code>）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码详解</h3>
+<p>现在我们对照上面的 List，一步步看代码。</p>
+<h4>第一步：考务处安排 (函数 <code>accuracy_func_provider</code>)</h4>
+<p>这个函数不直接跑分，它是用来<strong>制造</strong>那个跑分函数的。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">accuracy_func_provider</span><span class="p">(</span><span class="n">single_dataset_provider</span><span class="p">):</span>
+    <span class="c1"># 1. 获取参数</span>
+    <span class="n">args</span> <span class="o">=</span> <span class="n">get_args</span><span class="p">()</span>
+
+    <span class="c1"># 2. 准备试卷（建立 DataLoader）</span>
+    <span class="c1"># 这里会循环读取所有验证集路径，把它们变成可以被代码读取的 dataloader</span>
+    <span class="n">dataloaders</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">datapath</span> <span class="ow">in</span> <span class="n">datapaths</span><span class="p">:</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">single_dataset_provider</span><span class="p">(</span><span class="n">datapath</span><span class="p">)</span>
+        <span class="n">dataloader</span> <span class="o">=</span> <span class="n">build_data_loader</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+        <span class="n">dataloaders</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">dataset</span><span class="o">.</span><span class="n">dataset_name</span><span class="p">,</span> <span class="n">dataloader</span><span class="p">))</span>
+
+    <span class="c1"># 3. 定义监考老师（metrics_func）</span>
+    <span class="c1"># 这个内部函数才是真正会被训练主循环调用的东西</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">metrics_func</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">epoch</span><span class="p">,</span> <span class="n">output_predictions</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+        <span class="c1"># ... (见下文)</span>
+
+    <span class="k">return</span> <span class="n">metrics_func</span>
+</code></pre></div>
+
+<h4>第二步：监考老师统筹 (内部函数 <code>metrics_func</code>)</h4>
+<p>这是当你想测试模型时，实际调用的入口。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">metrics_func</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">epoch</span><span class="p">,</span> <span class="n">output_predictions</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+        <span class="n">print_rank_last</span><span class="p">(</span><span class="s1">&#39;calculating metrics ...&#39;</span><span class="p">)</span>
+        <span class="n">correct</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="n">total</span> <span class="o">=</span> <span class="mi">0</span>
+
+        <span class="c1"># 1. 遍历每一门科目（每一个数据集）</span>
+        <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">dataloader</span> <span class="ow">in</span> <span class="n">dataloaders</span><span class="p">:</span>
+            <span class="c1"># 2. 调用 Level 3 的函数去具体算这一科的成绩</span>
+            <span class="n">output</span> <span class="o">=</span> <span class="n">calculate_correct_answers</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="n">dataloader</span><span class="p">,</span> <span class="n">epoch</span><span class="p">,</span> <span class="n">output_predictions</span><span class="p">)</span>
+
+            <span class="c1"># 3. 累加分科成绩到总成绩</span>
+            <span class="c1"># output 里包含了这一科答对了几道题，一共几道题</span>
+            <span class="n">correct_ans</span><span class="p">,</span> <span class="n">total_count</span> <span class="o">=</span> <span class="n">output</span>
+            <span class="n">correct</span> <span class="o">+=</span> <span class="n">correct_ans</span>
+            <span class="n">total</span> <span class="o">+=</span> <span class="n">total_count</span>
+
+        <span class="c1"># 4. 公布总成绩（只在最后一张显卡上打印，避免刷屏）</span>
+        <span class="k">if</span> <span class="n">is_last_rank</span><span class="p">():</span>
+            <span class="n">percent</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">correct</span><span class="p">)</span> <span class="o">*</span> <span class="mf">100.0</span> <span class="o">/</span> <span class="nb">float</span><span class="p">(</span><span class="n">total</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="s1">&#39; &gt;&gt; |epoch: </span><span class="si">{}</span><span class="s1">| overall: correct / total = </span><span class="si">{}</span><span class="s1"> / </span><span class="si">{}</span><span class="s1"> = </span><span class="si">{:.4f}</span><span class="s1"> %&#39;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="o">...</span><span class="p">))</span>
+</code></pre></div>
+
+<h4>第三步：具体的阅卷过程 (函数 <code>calculate_correct_answers</code>)</h4>
+<p>这是最复杂的部分，因为涉及到了具体的模型计算和分布式处理。</p>
+<p><strong>1. 考前准备：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">calculate_correct_answers</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 切换到评估模式。这很重要，因为像 Dropout 这种层在训练和测试时表现不一样。</span>
+    <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">model</span><span class="p">:</span>
+        <span class="n">m</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<p><strong>2. 定义怎么“批改”一道题 (定义 <code>loss_func</code>)：</strong>
+这也是一个内部函数，它定义了拿到模型输出（logits）后怎么算分。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">loss_func</span><span class="p">(</span><span class="n">output_predictions</span><span class="p">,</span> <span class="n">labels</span><span class="p">,</span> <span class="n">output_tensor</span><span class="p">):</span>
+        <span class="n">logits</span> <span class="o">=</span> <span class="n">output_tensor</span>
+        <span class="n">loss_dict</span> <span class="o">=</span> <span class="p">{}</span>
+
+        <span class="c1"># 找出概率最大的那个选项作为预测结果</span>
+        <span class="n">predicted</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="c1"># 和标准答案对比，生成 True/False 的列表</span>
+        <span class="n">corrects</span> <span class="o">=</span> <span class="p">(</span><span class="n">predicted</span> <span class="o">==</span> <span class="n">labels</span><span class="p">)</span>
+
+        <span class="c1"># 记录：这批数据一共有多少个，答对多少个</span>
+        <span class="n">loss_dict</span><span class="p">[</span><span class="s1">&#39;total&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">labels</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+        <span class="n">loss_dict</span><span class="p">[</span><span class="s1">&#39;correct&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">corrects</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+
+        <span class="k">return</span> <span class="mi">0</span><span class="p">,</span> <span class="n">loss_dict</span>
+</code></pre></div>
+
+<p><strong>3. 定义怎么“做”一道题 (定义 <code>correct_answers_forward_step</code>)：</strong>
+这是告诉 Megatron 的调度器：给我一个 batch 的数据，我该怎么喂给模型。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">correct_answers_forward_step</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">model</span><span class="p">):</span>
+        <span class="c1"># 处理数据，拿到 token, label 等</span>
+        <span class="n">tokens</span><span class="p">,</span> <span class="n">types</span><span class="p">,</span> <span class="n">labels</span><span class="p">,</span> <span class="n">attention_mask</span> <span class="o">=</span> <span class="n">process_batch</span><span class="p">(</span><span class="n">batch_</span><span class="p">)</span>
+
+        <span class="c1"># 模型前向传播（做题），得到 output_tensor</span>
+        <span class="n">output_tensor</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">tokens</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span> <span class="n">tokentype_ids</span><span class="o">=</span><span class="n">types</span><span class="p">)</span>
+
+        <span class="c1"># 返回结果，并挂载上面的 loss_func 准备计算</span>
+        <span class="k">return</span> <span class="n">output_tensor</span><span class="p">,</span> <span class="n">partial</span><span class="p">(</span><span class="n">loss_func</span><span class="p">,</span> <span class="n">output_predictions</span><span class="p">,</span> <span class="n">labels</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>4. 循环做题 (主循环)：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span> <span class="c1"># 考试期间不需要算梯度（不需要反向传播）</span>
+        <span class="k">for</span> <span class="n">_</span><span class="p">,</span> <span class="n">batch</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">dataloader</span><span class="p">):</span>
+            <span class="c1"># ... (中间有一些调整 batch_size 的代码，处理数据对齐问题) ...</span>
+
+            <span class="c1"># 这里调用 Megatron 的 forward_backward_func 来运行模型</span>
+            <span class="c1"># 实际上就是执行了上面的 correct_answers_forward_step</span>
+            <span class="n">loss_dicts</span> <span class="o">=</span> <span class="n">forward_backward_func</span><span class="p">(</span><span class="n">correct_answers_forward_step</span><span class="p">,</span> <span class="n">batch</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 统计这一个 batch 的结果</span>
+            <span class="k">for</span> <span class="n">loss_dict</span> <span class="ow">in</span> <span class="n">loss_dicts</span><span class="p">:</span>
+                <span class="n">total</span> <span class="o">+=</span> <span class="n">loss_dict</span><span class="p">[</span><span class="s1">&#39;total&#39;</span><span class="p">]</span>
+                <span class="n">correct</span> <span class="o">+=</span> <span class="n">loss_dict</span><span class="p">[</span><span class="s1">&#39;correct&#39;</span><span class="p">]</span>
+</code></pre></div>
+
+<p><strong>5. 汇总全班成绩 (All-Reduce)：</strong>
+在分布式训练中，数据是切分到不同显卡上的。显卡 A 算了 100 题，显卡 B 算了 100 题。我们需要把结果汇总。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 恢复训练模式</span>
+    <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">model</span><span class="p">:</span>
+        <span class="n">m</span><span class="o">.</span><span class="n">train</span><span class="p">()</span>
+
+    <span class="c1"># 如果是流水线并行的最后一个阶段（通常由它负责统计结果）</span>
+    <span class="k">if</span> <span class="n">mpu</span><span class="o">.</span><span class="n">is_pipeline_last_stage</span><span class="p">():</span>
+        <span class="c1"># 把“答对数”和“总数”打包成 tensor</span>
+        <span class="n">unreduced</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">correct</span><span class="p">,</span> <span class="n">total</span><span class="p">],</span> <span class="o">...</span><span class="p">)</span>
+
+        <span class="c1"># 分布式通信：把所有显卡的 unreduced 加起来</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">all_reduce</span><span class="p">(</span><span class="n">unreduced</span><span class="p">,</span> <span class="n">group</span><span class="o">=</span><span class="n">mpu</span><span class="o">.</span><span class="n">get_data_parallel_group</span><span class="p">())</span>
+
+        <span class="c1"># 打印这一科的成绩</span>
+        <span class="n">correct_ans</span> <span class="o">=</span> <span class="n">unreduced</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+        <span class="n">total_count</span> <span class="o">=</span> <span class="n">unreduced</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+        <span class="c1"># ... print(...)</span>
+
+        <span class="k">return</span> <span class="n">correct_ans</span><span class="p">,</span> <span class="n">total_count</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这个文件其实就在做一件事：
+<strong>利用 Megatron 复杂的分布式调度器（<code>forward_backward_func</code>），在不更新权重（<code>no_grad</code>）的情况下，把验证集的数据跑一遍，统计 <code>argmax(输出)</code> 和 <code>label</code> 一致的次数，最后把所有显卡统计的次数加起来算出准确率。</strong></p>

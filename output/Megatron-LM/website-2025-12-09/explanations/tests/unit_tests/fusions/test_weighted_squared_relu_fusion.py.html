@@ -1,0 +1,112 @@
+<h1>tests/unit_tests/fusions/test_weighted_squared_relu_fusion.py</h1>
+<p>完全没问题。这段代码其实是一个<strong>单元测试（Unit Test）</strong>文件。</p>
+<p>它的核心目的只有一个：<strong>验证一个新的“加速版”函数（Fused implementation）算出来的结果，和我们用普通方法（Baseline）算出来的结果是不是一模一样的。</strong></p>
+<p>如果结果一样，说明这个加速版函数是正确的，可以放心用在模型训练里。</p>
+<p>我们可以把理解这段代码的过程拆解成下面这 5 个 Task，一步步来看：</p>
+<hr />
+<h3>Task 1：搞懂“我们要测什么？”（核心数学逻辑）</h3>
+<p>在看代码前，先理解它要算的数学公式。
+这里涉及两个概念：
+1.  <strong>Squared ReLU</strong>: 就是把普通的 ReLU 激活函数平方一下。公式是 $y = \max(0, x)^2$。
+2.  <strong>Weighted</strong>: 加权，就是乘上一个权重 $w$。</p>
+<p><strong>结论</strong>：这个测试文件的核心数学逻辑就是算 $y = \text{SquaredReLU}(x) \times w$。</p>
+<ul>
+<li><strong>为什么要测它？</strong>
+    NVIDIA 写了一个<strong>融合算子（Fused Kernel）</strong>，把“平方”、“ReLU”、“乘权重”这几步合并成了一步操作（为了跑得更快）。这个测试就是为了证明这个“合体版”操作是准确的。</li>
+</ul>
+<hr />
+<h3>Task 2：准备工作（环境与精度）</h3>
+<p>现在看代码的前半部分。</p>
+<ol>
+<li><strong><code>@pytest.mark...</code></strong>: 这些是测试框架的标签。意思是：这个测试要在 CUDA（显卡）上跑，而且要分别测 <code>bfloat16</code> 和 <code>float32</code> 两种数据类型。</li>
+<li><strong>设定容忍度（Tolerances）</strong>:
+    <code>python
+    if input_dtype == torch.float32:
+        tols = dict(rtol=1.0e-6, atol=1.0e-6)
+    elif input_dtype == torch.bfloat16:
+        tols = dict(rtol=2.0e-2, atol=1.0e-3)</code><ul>
+<li><strong>解释</strong>：计算机算浮点数总有微小的误差。这里定义了“我们能容忍多大的误差”。<code>float32</code> 精度高，容忍度低（严苛）；<code>bfloat16</code> 精度低，容忍度高（宽松）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 3：造数据（输入是什么？）</h3>
+<p>代码段：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="o">...</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">weights</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">...</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">grad_output</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong><code>x</code></strong>: 模拟神经网络的输入数据。</li>
+<li><strong><code>weights</code></strong>: 模拟要乘上去的权重。</li>
+<li><strong><code>grad_output</code></strong>: 模拟反向传播时，从后面传回来的梯度（用于测试反向传播是否正确）。</li>
+<li><strong><code>requires_grad=True</code></strong>: 这是一个开关，告诉 PyTorch “我要追踪这些变量的计算过程，因为一会儿我要算它们的导数（梯度）”。</li>
+</ul>
+<hr />
+<h3>Task 4：跑“笨办法”（Baseline）</h3>
+<p>这是对照组。我们用最普通的 PyTorch 函数一步步算，作为标准答案。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Baseline: legacy squared_relu followed by weighting.</span>
+<span class="n">y_baseline</span> <span class="o">=</span> <span class="n">squared_relu</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="o">*</span> <span class="n">weights</span>  <span class="c1"># 1. 先做 SquaredReLU，再乘权重</span>
+<span class="n">y_baseline</span> <span class="o">=</span> <span class="n">y_baseline</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">input_dtype</span><span class="p">)</span>
+<span class="n">y_baseline</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">grad_output</span><span class="p">)</span>        <span class="c1"># 2. 触发反向传播，算出 x 和 weights 的梯度</span>
+</code></pre></div>
+
+<p>这里算出了三个重要的东西（标准答案）：
+1.  <code>y_baseline</code>: 前向计算的结果。
+2.  <code>x.grad</code>: 输入 $x$ 的梯度。
+3.  <code>weights.grad</code>: 权重 $w$ 的梯度。</p>
+<hr />
+<h3>Task 5：跑“新办法”（Fused Implementation）</h3>
+<p>这是实验组。测试我们要验证的那个加速函数 <code>weighted_squared_relu_impl</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 为了公平对比，把输入数据复制一份，甚至连梯度追踪状态也复制一份</span>
+<span class="n">x_fused</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">weights_fused</span> <span class="o">=</span> <span class="n">weights</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="o">...</span>
+
+<span class="c1"># 调用那个“合体版”加速函数</span>
+<span class="n">y_fused</span> <span class="o">=</span> <span class="n">weighted_squared_relu_impl</span><span class="p">(</span><span class="n">x_fused</span><span class="p">,</span> <span class="n">weights_fused</span><span class="p">)</span>
+<span class="n">y_fused</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">grad_output_fused</span><span class="p">)</span> <span class="c1"># 同样触发反向传播</span>
+</code></pre></div>
+
+<p>这里也算出了三个东西（待验证）：
+1.  <code>y_fused</code>: 加速版算出的结果。
+2.  <code>x_fused.grad</code>: 加速版算出的 $x$ 梯度。
+3.  <code>weights_fused.grad</code>: 加速版算出的 $w$ 梯度。</p>
+<hr />
+<h3>Task 6：当裁判（对比结果）</h3>
+<p>最后一步，用 <code>assert</code>（断言）来对比 Task 4 和 Task 5 的结果是否一致。</p>
+<ol>
+<li>
+<p><strong>比对前向计算结果</strong>：
+    <code>python
+    assert torch.allclose(y_fused, y_baseline, **tols)</code></p>
+<ul>
+<li><strong>翻译</strong>：新算出来的结果 <code>y_fused</code> 和标准答案 <code>y_baseline</code> 是不是足够接近？</li>
+</ul>
+</li>
+<li>
+<p><strong>比对输入梯度</strong>：
+    <code>python
+    assert torch.allclose(x_fused.grad, x.grad, **tols)</code></p>
+<ul>
+<li><strong>翻译</strong>：反向传播算的 $x$ 的梯度对不对？</li>
+</ul>
+</li>
+<li>
+<p><strong>比对权重梯度</strong>：
+    <code>python
+    assert torch.allclose(weights_fused.grad, weights.grad, **tols)</code></p>
+<ul>
+<li><strong>翻译</strong>：反向传播算的 $w$ 的梯度对不对？</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑链条是：
+1.  设定误差标准。
+2.  随机生成一些数据。
+3.  用<strong>普通慢速方法</strong>算一遍，记下答案（结果和梯度）。
+4.  用<strong>极速融合方法</strong>算一遍，记下答案。
+5.  <strong>对比</strong>两边的答案。如果一致，测试通过；如果不一致，报错，说明新写的加速代码有 Bug。</p>

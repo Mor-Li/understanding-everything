@@ -1,0 +1,106 @@
+<h1>recipe/entropy/7b_clip_cov.sh</h1>
+<p>这是一个非常典型的<strong>大模型强化学习（RLHF）训练启动脚本</strong>。</p>
+<p>为了让你更容易理解，我们可以把这个脚本看作是<strong>给“AI大厨”的一张详细烹饪清单（Recipe）</strong>。在这个清单里，我们规定了食材（数据）、厨具（GPU）、烹饪方法（算法）以及具体的火候（超参数）。</p>
+<p>这份脚本的目标是：<strong>使用一种叫 GRPO 的强化学习算法，配合一种特殊的“Clip Covariance”策略，来训练 Qwen2.5-7B 模型。</strong></p>
+<p>下面我把这份脚本拆解成一个 <strong>5步走的 Task List（任务清单）</strong>，带你一步步看懂它在干什么。</p>
+<hr />
+<h3>Task 1: 准备厨房环境 (设置环境变量)</h3>
+<p>在做饭前，得先确定水电气通了没，记录本在哪里。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>bash
+    export WANDB_API_KEY=YOUR_WANDB_API_KEY
+    project_name='Qwen2.5-7B'
+    exp_name='clipcov'
+    # Ray 相关设置
+    RAY_ADDRESS=...
+    NNODES=...</code></li>
+<li><strong>解读：</strong><ul>
+<li><code>WANDB_API_KEY</code>: 这是一个云端记分板（Weights &amp; Biases），用来记录模型训练过程中的 loss 曲线、分数等。</li>
+<li><code>project_name</code> &amp; <code>exp_name</code>: 给这次训练起个名字，叫“Qwen2.5-7B-clipcov”，方便以后查找。</li>
+<li><code>RAY_...</code>: 这里用到了 <strong>Ray</strong> 框架。因为大模型训练通常需要好几台机器（这里是 <code>NNODES=4</code>，即4台机器），Ray 负责把这些机器连起来一起工作。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 2: 挑选“参赛选手”和“食材” (指定模型与数据)</h3>
+<p>我们要训练谁？用什么书来教它？</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>bash
+    MODEL_PATH=${MODEL_PATH:-"/YOUR_MODELPATH"}  # 你的 Qwen 模型在哪里
+    TRAIN_FILE=${TRAIN_FILE:-"/YOUR_TRAIN_FILE_PATH"} # 训练题目在哪里
+    max_prompt_length=$((1024 * 2)) # 题目最长能有多长
+    max_response_length=$((1024 * 8)) # 回答最长能写多少字</code></li>
+<li><strong>解读：</strong><ul>
+<li>这里指定了基础模型（Base Model）的路径。</li>
+<li>指定了训练数据（Prompt），比如“请写一首诗”。</li>
+<li>规定了长度限制：题目最多 2048 token，回答最多 8192 token。如果超长了，后面会有处理机制。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 制定“比赛规则” (核心算法 GRPO)</h3>
+<p>这是最关键的部分。我们怎么教模型变聪明？这里用的是 <strong>GRPO (Group Relative Policy Optimization)</strong>。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>bash
+    adv_estimator=grpo          # 使用 GRPO 算法
+    n_resp_per_prompt=8         # 每一个题目，让模型生成 8 个不同的回答
+    train_prompt_bsz=256        # 一次训练看 256 个题目</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>GRPO 的逻辑是：</strong> 给模型一道题，让它像影分身一样生成 <strong>8 个</strong> 不同的回答 (<code>n_resp_per_prompt=8</code>)。</li>
+<li>然后有一个“裁判”（Reward Model，在脚本最后提到）给这 8 个回答打分。</li>
+<li>模型会学习那几个高分的回答是怎么写的，摒弃低分的写法。</li>
+<li>这就好比老师让学生对同一个问题写 8 个版本的作文，然后告诉他哪篇最好，让他照着学。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 添加“秘密佐料” (Entropy &amp; Clip Covariance)</h3>
+<p>这是这个脚本最独特的地方，也是文件名 <code>clip_cov</code> 的由来。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>bash
+    loss_mode="clip_cov"        # 损失函数模式：剪切协方差
+    clip_cov_ratio=0.0002       # 佐料放多少
+    clip_cov_lb=1.0             # 下界
+    clip_cov_ub=5.0             # 上界</code></li>
+<li><strong>解读：</strong><ul>
+<li>在强化学习中，模型很容易“走火入魔”（Mode Collapse），比如发现某个套路得分高，就只会说那一句话，失去了多样性。</li>
+<li><strong>Entropy (熵)</strong> 通常用来保持模型的多样性。</li>
+<li><strong>Clip Covariance</strong>: 这看起来是作者自研或特定的一种实验性方法。它可能是在计算 Loss 时，对模型的<strong>协方差（Covariance）</strong>或者<strong>覆盖率（Coverage）</strong>进行限制（Clip）。</li>
+<li><strong>目的：</strong> 既要模型学得好（分数高），又要模型保持思维活跃，不要变得死板。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 5: 启动“烹饪机器” (运行 Python 命令)</h3>
+<p>最后一大段 <code>HYDRA_FULL_ERROR=1 python -m recipe.entropy.main_entropy ...</code> 就是真正的启动按钮。</p>
+<ul>
+<li><strong>代码片段结构：</strong>
+    <code>bash
+    python -m recipe.entropy.main_entropy \
+        data.train_files="..." \
+        actor_rollout_ref.actor.loss_mode=${loss_mode} \
+        ...
+        trainer.n_gpus_per_node=8 \
+        ...</code></li>
+<li><strong>解读：</strong><ul>
+<li>这行命令把上面定义的所有变量（比如 <code>loss_mode</code>, <code>clip_cov_ratio</code>）通过命令行参数传给 Python 程序。</li>
+<li>它使用了 <strong>Hydra</strong> 配置系统（那些 <code>data.xxx=xxx</code> 的格式），这是一种在代码里管理复杂配置的工具。</li>
+<li>它告诉程序：<ol>
+<li><strong>Data</strong>: 数据在哪，怎么切分。</li>
+<li><strong>Actor/Rollout</strong>: 模型怎么生成答案（vLLM加速），怎么更新参数。</li>
+<li><strong>Algorithm</strong>: 用 GRPO，用 Clip Covariance Loss。</li>
+<li><strong>Trainer</strong>: 用多少个 GPU (8个)，跑多少轮 (1000 epochs)，多久存一次档。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个脚本到底在干嘛？</h3>
+<p><strong>一句话解释：</strong>
+这是一个配置脚本，用于在多台服务器上，利用 <strong>Ray</strong> 框架和 <strong>GRPO</strong> 算法，对 <strong>Qwen2.5-7B</strong> 模型进行强化学习训练，并且在训练中加入了一种特殊的 <strong>Clip Covariance (剪切协方差)</strong> 机制来控制模型的更新或多样性。</p>
+<p><strong>你的 Todo List (如果你要运行它)：</strong>
+1.  <strong>改路径</strong>：把 <code>YOUR_MODELPATH</code>, <code>YOUR_CKPTS_PATH</code>, <code>YOUR_TRAIN_FILE_PATH</code> 改成你硬盘上真实的路径。
+2.  <strong>填 Key</strong>：把 <code>YOUR_WANDB_API_KEY</code> 填上，或者注释掉。
+3.  <strong>查资源</strong>：确认你是否有 4 个节点（机器），每个节点有 8 张显卡。如果没有，需要修改 <code>NNODES</code> 和 <code>trainer.n_gpus_per_node</code>。
+4.  <strong>跑脚本</strong>：在终端运行 <code>bash recipe/entropy/7b_clip_cov.sh</code>。</p>

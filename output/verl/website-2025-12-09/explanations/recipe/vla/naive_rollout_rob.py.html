@@ -1,0 +1,107 @@
+<h1>recipe/vla/naive_rollout_rob.py</h1>
+<p>这份代码确实涉及到了强化学习（RL）工程实现的细节，如果对框架不熟悉，看起来会很晕。</p>
+<p>简单来说，这个文件的作用是<strong>充当一个“试玩员”或者“执行者”</strong>。在强化学习中，我们需要让模型（机器人）去尝试做任务，收集数据，然后才能根据结果去学习。这个脚本就是负责<strong>“让机器人看图、读指令，然后做出动作”</strong>这一过程的。</p>
+<p>为了让你听懂，我把这个代码的逻辑拆解成一个<strong>“机器人打工记”</strong>的任务清单（To-Do List），然后逐步讲解。</p>
+<hr />
+<h3>核心任务清单 (Task To-Do List)</h3>
+<p>想象你是一个负责管理机器人的工头，这个脚本就是你手里的操作手册。你需要按顺序完成以下任务：</p>
+<ol>
+<li><strong>【准备阶段】初始化机器人大脑</strong> (<code>__init__</code>)<ul>
+<li>把模型加载到显卡里，准备好处理图片的工具。</li>
+</ul>
+</li>
+<li><strong>【接单阶段】接收任务指令和环境画面</strong> (<code>generate_sequences</code>)<ul>
+<li>从系统那里拿到任务（比如“拿起苹果”）和当前看到的照片。</li>
+</ul>
+</li>
+<li><strong>【预处理】把素材加工成机器人能懂的格式</strong> (<code>process_input</code>)<ul>
+<li>图片要剪裁、缩放；文字要变成数字编码（Token）。</li>
+<li>要把这一批（Batch）数据对齐，长短不一的要补齐（Padding）。</li>
+</ul>
+</li>
+<li><strong>【执行阶段】让机器人思考并行动</strong> (<code>_generate_one_step</code>)<ul>
+<li>把处理好的数据喂给模型。</li>
+<li>模型吐出具体的动作（Action）和相关的概率数据。</li>
+</ul>
+</li>
+<li><strong>【交货阶段】打包数据</strong> (<code>generate_sequences</code> 的返回值)<ul>
+<li>把动作、原始输入、概率等打包好，返回给强化学习算法去打分。</li>
+</ul>
+</li>
+<li><strong>【维护阶段】更新大脑和休息</strong> (<code>update_weights</code>, <code>release</code>, <code>resume</code>)<ul>
+<li>训练过程中模型变强了，要更新这里的权重；或者没活干时释放显存。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步详细讲解 (Step-by-Step)</h3>
+<p>现在我们对应代码，一步步把上面的 To-Do List 展开讲讲：</p>
+<h4>1. 【准备阶段】初始化 (<code>__init__</code>)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>class NaiveRolloutRob</code> -&gt; <code>__init__</code></li>
+<li><strong>在干嘛</strong>：<ul>
+<li><code>OpenVLAForActionPrediction.from_pretrained(...)</code>: 这里加载了一个叫 <strong>OpenVLA</strong> 的模型。这是一个“视觉-语言-动作”模型，它能看图、听话，然后指挥机械臂。</li>
+<li><code>PrismaticProcessor</code>: 这是配套的“翻译官”，负责把图片和文字转换成模型能吃的张量（Tensor）。</li>
+<li>加载 <code>dataset_statistics.json</code>: 这是一个统计数据，用来把模型的输出（通常是归一化的数值）还原成真实的机械臂控制信号。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 【接单阶段】接收任务 (<code>generate_sequences</code>)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>generate_sequences</code> 方法</li>
+<li><strong>在干嘛</strong>：<ul>
+<li>这是外部调用的主入口。</li>
+<li><code>prompts</code> 包含了任务描述（<code>task_descriptions</code>，比如 "Put the block in the bowl"）和图像（<code>full_image</code>）。</li>
+<li>它从这里提取出数据，准备交给下一步处理。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 【预处理】加工素材 (<code>process_input</code>)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>process_input</code> 函数（在类外面定义的那个函数）</li>
+<li><strong>在干嘛</strong>：这是最繁琐的一步，因为模型很挑剔。<ul>
+<li><strong>处理图片</strong>：<code>resize_image</code> (变到224x224大小) -&gt; <code>center_crop_image</code> (居中裁剪)。</li>
+<li><strong>构建提示词</strong>：把任务变成固定格式：<code>In: What action should the robot take to {任务}? \nOut:</code>。</li>
+<li><strong>Tokenization</strong>：把上面的字和图变成数字 ID。</li>
+<li><strong>Padding (补齐)</strong>：因为是批量处理（比如一次处理4个任务），有的指令长有的短。<code>pad_sequence</code> 负责把短的补长，让它们长度一致，这样才能塞进显卡计算。</li>
+<li><strong>Left Padding</strong>：代码里有一些逻辑在处理 <code>attention_mask</code> 和 <code>input_ids</code> 的对齐，特别是为了适应大模型的生成模式，通常需要左侧补零（Left Padding）。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 【执行阶段】思考与行动 (<code>_generate_one_step</code>)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>_generate_one_step</code> 方法</li>
+<li><strong>在干嘛</strong>：<ul>
+<li><code>self.module.generate_action_verl(...)</code>: <strong>这是全篇最核心的一句</strong>。</li>
+<li>它把处理好的 <code>input_ids</code>（文字ID）和 <code>pixel_values</code>（图片像素）喂给模型。</li>
+<li><strong>输出结果</strong>：<ul>
+<li><code>actions</code>: 机器人实际要做的动作（比如机械臂移动的坐标 x,y,z, 旋转角度, 夹爪开合）。</li>
+<li><code>response</code>: 模型生成的原始序列（用于后续计算概率等）。</li>
+</ul>
+</li>
+<li><strong>再加工</strong>：拿到结果后，代码里又调用了 <code>pad_sequence_to_length</code>。这是为了保证输出的数据长度也是整齐划一的，方便后续计算。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 【交货阶段】打包返回</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>generate_sequences</code> 的最后几行</li>
+<li><strong>在干嘛</strong>：<ul>
+<li>把刚才生成的 <code>action</code>、<code>input_ids</code>、<code>attention_mask</code> 等塞进一个 <code>DataProto</code> 对象。</li>
+<li>这个对象会被发送给强化学习的算法（比如 PPO 算法），算法会根据这个动作的好坏（比如有没有成功抓起物体）来计算奖励，进而指导模型学习。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 【维护阶段】系统维护</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>update_weights</code>, <code>release</code>, <code>resume</code></li>
+<li><strong>在干嘛</strong>：<ul>
+<li><strong><code>update_weights</code></strong>: 强化学习是边做边学的。当训练节点（Learner）更新了模型参数后，这个“试玩员”也需要同步更新自己的脑子，这样它下次试玩时用的就是更强的版本。</li>
+<li><strong><code>release</code> / <code>resume</code></strong>: 显存很贵。如果这个进程暂时没事干，就把模型从 GPU 踢到 CPU（Release），省出显存给别人用；要干活了再挪回来（Resume）。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>“给我一张图和一句话，我帮你把图片切一切、文字排排版，喂给 OpenVLA 模型，然后告诉你机器人下一步该怎么动。”</strong></p>
+<p>它是一个标准的<strong>Rollout Worker（采样工兵）</strong>，负责在仿真环境或真实环境里不断地尝试，为训练提供数据弹药。</p>

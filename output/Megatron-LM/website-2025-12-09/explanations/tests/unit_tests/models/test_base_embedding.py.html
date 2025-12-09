@@ -1,0 +1,128 @@
+<h1>tests/unit_tests/models/test_base_embedding.py</h1>
+<p>这份代码其实不是“模型”本身，而是一份<strong>“质检报告”</strong>（单元测试）。</p>
+<p>它的作用是：<strong>检查 Megatron-Core 里的 <code>LanguageModelEmbedding</code>（语言模型嵌入层）这个组件是否正常工作。</strong></p>
+<p>为了让你彻底搞懂，我把阅读这份代码的过程拆解成一个 <strong>5步走的 Task Todo List</strong>。我们就像拆快递一样，一层一层把这个文件拆开看。</p>
+<hr />
+<h3>📋 你的学习任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>Task 1：搞懂背景</strong> —— 什么是 Embedding？为什么要测它？</li>
+<li><strong>Task 2：准备工作 (<code>setup</code>)</strong> —— 搭建一个迷你的测试环境。</li>
+<li><strong>Task 3：清点零件 (<code>test_constructor</code>)</strong> —— 检查参数数量对不对（数学题）。</li>
+<li><strong>Task 4：功能测试 A (<code>test_zero</code>)</strong> —— 测试“一键归零”功能。</li>
+<li><strong>Task 5：功能测试 B (<code>test_forward</code>)</strong> —— 测试 CPU 和 GPU 上的实际运转（输入输出形状）。</li>
+</ol>
+<hr />
+<h3>🟢 逐步讲解 (Step-by-Step)</h3>
+<h4>Task 1：搞懂背景</h4>
+<ul>
+<li><strong>什么是 Embedding？</strong>
+    在大模型里，电脑看不懂单词（比如 "apple"），它只能看懂数字。Embedding 层的作用就是把输入的数字 ID（代表单词）转换成一串向量（Vector）。<ul>
+<li>输入：<code>[0, 1]</code> (代表两个词的ID)</li>
+<li>输出：<code>[[0.1, 0.2...], [0.5, 0.9...]]</code> (代表这两个词含义的向量)</li>
+</ul>
+</li>
+<li><strong>这个文件在干嘛？</strong>
+    它在用 <code>pytest</code>（一个测试工具）来验证：如果我们造一个 Embedding 层，它能不能算出正确的结果？它的形状对不对？放到 GPU 上能不能跑？</li>
+</ul>
+<h4>Task 2：准备工作 (<code>setup_method</code>)</h4>
+<p>在测试开始前，我们需要先“造”一个小模型。代码里的 <code>setup_method</code> 就是在做这件事。</p>
+<ul>
+<li><strong>初始化环境：</strong> <code>Utils.initialize_model_parallel(1, 1)</code><ul>
+<li>这是 Megatron 特有的，模拟分布式训练环境。这里设为 1，意思是“咱们先别搞复杂的分布式，就在单卡上简单测测”。</li>
+</ul>
+</li>
+<li><strong>配置图纸 (<code>TransformerConfig</code>)：</strong><ul>
+<li><code>num_layers=2</code>: 只有2层（很小）。</li>
+<li><code>hidden_size=12</code>: 每个词变成一个长度为 12 的向量（通常大模型是 4096，这里为了测试方便设很小）。</li>
+<li><code>num_attention_heads=4</code>: 注意力头数。</li>
+</ul>
+</li>
+<li><strong>制造组件 (<code>LanguageModelEmbedding</code>)：</strong><ul>
+<li><code>vocab_size=100</code>: 假设字典里只有 100 个词。</li>
+<li><code>max_sequence_length=4</code>: 一句话最多只有 4 个词。</li>
+<li><code>position_embedding_type='learned_absolute'</code>: 使用绝对位置编码（记录词在句子中的位置）。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>结论：</strong> 我们造了一个超级迷你的 Embedding 层，准备对它“严刑拷打”。</p>
+</blockquote>
+<h4>Task 3：清点零件 (<code>test_constructor</code>)</h4>
+<p>这一步对应代码里的 <code>test_constructor</code>。我们要验证：<strong>这一层里的参数（权重）数量对不对？</strong></p>
+<ul>
+<li>
+<p><strong>代码逻辑：</strong>
+    <code>python
+    assert num_weights == 1248</code>
+    为什么必须是 <strong>1248</strong> 个参数？这其实是一道数学题：</p>
+<ol>
+<li><strong>词向量表 (Word Embeddings)：</strong>
+    字典大小 100 $\times$ 向量长度 12 = <strong>1200</strong> 个参数。</li>
+<li><strong>位置向量表 (Position Embeddings)：</strong>
+    最大长度 4 $\times$ 向量长度 12 = <strong>48</strong> 个参数。</li>
+<li><strong>总和：</strong>
+    1200 + 48 = <strong>1248</strong>。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>结论：</strong> 如果代码算出来不是 1248，说明模型构建出错了（比如漏了位置编码）。</p>
+</blockquote>
+<h4>Task 4：功能测试 A (<code>test_zero_parameters</code>)</h4>
+<p>这一步对应代码里的 <code>test_zero_parameters</code>。</p>
+<ul>
+<li><strong>测试目标：</strong> 验证 <code>zero_parameters()</code> 这个函数能不能把所有权重变成 0。</li>
+<li><strong>过程：</strong><ol>
+<li>先求和：<code>sum_weights != 0</code> （刚初始化的模型，权重是随机数，肯定不为0）。</li>
+<li>执行归零：<code>self.base_embedding.zero_parameters()</code>。</li>
+<li>再求和：<code>assert sum_weights == 0</code> （现在必须全是0了）。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>结论：</strong> 这是一个简单的功能开关测试。</p>
+</blockquote>
+<h4>Task 5：功能测试 B (<code>test_cpu_forward</code> &amp; <code>test_gpu_forward</code>)</h4>
+<p>这是最重要的部分。我们要真的把数据喂进去，看吐出来的东西对不对。分为 CPU 和 GPU 两个测试，逻辑是一样的。</p>
+<p>以 <code>test_cpu_forward</code> 为例：</p>
+<ol>
+<li>
+<p><strong>造假数据 (Input)：</strong></p>
+<ul>
+<li><code>input_ids</code>: <code>[0, 1, 2, 3]</code> (假装这是输入的4个词)。</li>
+<li><code>position_ids</code>: <code>[0, 1, 2, 3]</code> (假装这是位置索引)。</li>
+<li><code>.repeat((2, 1))</code> : 复制一份，凑成 Batch Size = 2。也就是说，现在有 <strong>2句话</strong>，每句话 <strong>4个词</strong>。</li>
+<li>输入形状是：<strong>(2, 4)</strong> -&gt; (Batch, Sequence)。</li>
+</ul>
+</li>
+<li>
+<p><strong>运行模型 (Forward)：</strong></p>
+<ul>
+<li><code>embeddings = self.base_embedding(input_ids, position_ids)</code></li>
+</ul>
+</li>
+<li>
+<p><strong>检查输出 (Check)：</strong></p>
+<ul>
+<li><code>assert embeddings.shape[0] == 4</code> (序列长度 Sequence Length)</li>
+<li><code>assert embeddings.shape[1] == 2</code> (批次大小 Batch Size)</li>
+<li><code>assert embeddings.shape[2] == 12</code> (隐藏层大小 Hidden Size)</li>
+</ul>
+<p><strong>⚠️ 注意点：</strong>
+你会发现输出形状是 <code>[4, 2, 12]</code>，也就是 <code>[Seq_Len, Batch, Hidden]</code>。
+这和我们常见的 HuggingFace 格式 <code>[Batch, Seq, Hidden]</code> 不一样！这是 Megatron 的特色（为了性能优化，把序列长度放在第一维）。</p>
+</li>
+</ol>
+<blockquote>
+<p><strong>结论：</strong> 测试通过意味着：输入 ID，模型成功吐出了正确形状的向量，且数据维度符合预期。</p>
+</blockquote>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>把这个文件看作是一个 <strong>“出厂质检员”</strong> 的工作日志：</p>
+<ol>
+<li><strong>Setup</strong>: 拿出一个迷你样品。</li>
+<li><strong>Constructor</strong>: 数一数里面的螺丝（参数）是不是 1248 个。</li>
+<li><strong>Zero</strong>: 按一下重置键，看是不是真的归零了。</li>
+<li><strong>Forward</strong>: 通上电（CPU/GPU），塞进两个假数据，看能不能吐出正确规格（形状）的产品。</li>
+</ol>
+<p>现在再回头看代码，是不是清晰多了？</p>

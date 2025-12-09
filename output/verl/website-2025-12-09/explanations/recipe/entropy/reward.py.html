@@ -1,0 +1,116 @@
+<h1>recipe/entropy/reward.py</h1>
+<p>这份代码看起来确实涉及了很多概念（Ray分布式计算、强化学习PPO、沙盒环境等）。为了让你能够轻松理解，我们把它想象成一个 <strong>“给AI写的作业打分”</strong> 的过程。</p>
+<p>这份文件的核心作用就是：<strong>配置并启动一个“阅卷老师”（Reward Manager），给AI生成的答案打分。</strong></p>
+<p>我为你列了一个由浅入深的 <strong>学习任务清单 (ToDo List)</strong>，我们一步步来拆解：</p>
+<hr />
+<h3>✅ Task 1: 理解大背景 —— 我们在做什么？</h3>
+<p><strong>目标</strong>：知道为什么需要这个文件。
+*   <strong>背景</strong>：在训练AI（比如用PPO算法）时，AI生成了一个回答，我们需要告诉它是好是坏。这个数值就是 <strong>Reward（奖励/分数）</strong>。
+*   <strong>代码角色</strong>：这个文件负责组装那个“打分器”。</p>
+<h3>✅ Task 2: 招聘阅卷组长 —— <code>load_reward_manager</code></h3>
+<p><strong>目标</strong>：理解代码的前半部分，如何选择并初始化一个管理器。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
+        # ...
+        reward_manager_name = config.reward_model.get("reward_manager", "naive")
+        reward_manager_cls = get_reward_manager_cls(reward_manager_name)
+        # ...</code></li>
+<li><strong>通俗解释</strong>：<ol>
+<li>系统里有很多种“阅卷风格”（即 <code>reward_manager</code>），比如“朴素风格(naive)”、“批量风格(batch)”等。</li>
+<li>这段代码根据配置文件（<code>config</code>），决定雇佣哪一种风格的阅卷组长。默认是 <code>naive</code>。</li>
+<li>这就像工厂里的<strong>工头</strong>，负责统筹打分这在这个流程。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 3: 制定评分标准 —— <code>compute_score</code></h3>
+<p><strong>目标</strong>：理解代码中间部分，如何决定具体的打分逻辑。</p>
+<ul>
+<li>
+<p><strong>代码对应</strong>：
+    ```python
+    # 尝试获取自定义的打分函数
+    compute_score = get_custom_reward_fn(config)
+    final_compute_score = compute_score</p>
+<p>if compute_score is None:
+    # 如果没有自定义，就看有没有配置 "沙盒(sandbox)"
+    sandbox_config = config.reward_model.get("sandbox_fusion")
+    # ...
+```
+*   <strong>通俗解释</strong>：
+1.  阅卷组长就位了，还得有<strong>标准答案</strong>或<strong>评分细则</strong>。
+2.  代码先看有没有“自定义评分函数”（比如：必须包含某个关键词才给分）。
+3.  如果没有自定义，它会检查是否需要用 <strong>Sandbox（沙盒）</strong> 来评分。</p>
+</li>
+</ul>
+<h3>✅ Task 4: 设置安全考场 —— Sandbox 与 信号量</h3>
+<p><strong>目标</strong>：理解代码中最复杂的 <code>if sandbox_url:</code> 部分。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    if sandbox_url:
+        sandbox_manager = multiprocessing.Manager()
+        # 创建一个信号量 (Semaphore)，限制最大并发数为 64
+        _concurrent_semaphore = sandbox_manager.Semaphore(sandbox_config.get("max_concurrent", 64))
+        final_compute_score = partial(
+            _default_compute_score, sandbox_fusion_url=sandbox_url, concurrent_semaphore=_concurrent_semaphore
+        )</code></li>
+<li><strong>通俗解释</strong>：<ul>
+<li><strong>什么是沙盒？</strong> 有些作业是写代码，必须把代码运行一遍才知道对错。为了防止AI写的代码把电脑搞坏，必须在“沙盒”（隔离环境）里运行。</li>
+<li><strong>为什么要信号量 (Semaphore)？</strong> 假设有1000个作业同时要进沙盒运行，沙盒服务器会崩掉。</li>
+<li><strong>逻辑</strong>：这里设置了一个“红绿灯”（Semaphore），比如每次只允许64个作业同时进沙盒跑分。<code>partial</code> 的作用是把这个红绿灯和沙盒地址“打包”进默认的评分函数里。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 5: 最终组装与返回</h3>
+<p><strong>目标</strong>：理解 <code>load_reward_manager</code> 的结尾。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    return reward_manager_cls(
+        tokenizer=tokenizer,
+        num_examine=num_examine,
+        compute_score=final_compute_score,
+        # ...
+    )</code></li>
+<li><strong>通俗解释</strong>：<ul>
+<li>把刚才选好的“阅卷组长”（<code>reward_manager_cls</code>）、“评分细则”（<code>final_compute_score</code>）以及“题目阅读器”（<code>tokenizer</code>）打包在一起，生成一个完整的实例返回回去。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 6: 开启多线程阅卷 —— <code>compute_reward_async</code></h3>
+<p><strong>目标</strong>：理解最后那个带 <code>@ray.remote</code> 的函数。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    @ray.remote(num_cpus=1)
+    def compute_reward_async(data: DataProto, config, tokenizer):
+        reward_fn = load_reward_manager(...)
+        return compute_reward(data, reward_fn)</code></li>
+<li><strong>通俗解释</strong>：<ul>
+<li><strong>痛点</strong>：打分很慢，如果主程序等着打完分再继续，训练就太慢了。</li>
+<li><strong>Ray的作用</strong>：<code>@ray.remote</code> 相当于告诉系统：“<strong>把这个任务扔到另一台机器或者另一个CPU核心上去跑，别卡住主线程。</strong>”</li>
+<li><strong>流程</strong>：这个函数在后台静默启动，调用上面定义的 <code>load_reward_manager</code> 组装好打分器，算出分数，然后返回结果。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下 (Summary)</h3>
+<p>这段代码其实就讲了两件事：</p>
+<ol>
+<li>
+<p><strong>怎么组装打分器 (<code>load_reward_manager</code>)</strong>：</p>
+<ul>
+<li>选经理 (Manager Class)。</li>
+<li>定规则 (Score Function)。</li>
+<li>如果是代码题，记得设置并发限制 (Semaphore)，防止沙盒爆炸。</li>
+</ul>
+</li>
+<li>
+<p><strong>怎么运行打分器 (<code>compute_reward_async</code>)</strong>：</p>
+<ul>
+<li>利用 Ray 框架，把组装和打分的过程放到<strong>后台异步</strong>执行，提高效率。</li>
+</ul>
+</li>
+</ol>

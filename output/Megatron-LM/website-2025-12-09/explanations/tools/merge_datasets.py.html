@@ -1,0 +1,93 @@
+<h1>tools/merge_datasets.py</h1>
+<p>这份代码看起来很专业，但它的核心逻辑其实非常简单。你可以把它想象成一个<strong>“档案装订员”</strong>。</p>
+<p>在训练大模型（如 Megatron-LM）时，数据通常被切分成很多小块（为了并行处理或下载方便）。但是有时候，我们需要把这些零散的小块合并成一个完整的大文件。</p>
+<p>这份代码的任务就是：<strong>把文件夹里的一堆零散数据文件，无缝拼接成一个整齐的大数据文件。</strong></p>
+<p>为了让你看懂，我把这个脚本的工作流程拆解成一个 <strong>6步的 To-Do List（任务清单）</strong>。代码就是按照这个清单一步步执行的。</p>
+<hr />
+<h3>📋 脚本执行任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>[准备工作]</strong>：搞清楚“原料”在哪里，“成品”放哪里。</li>
+<li><strong>[盘点库存]</strong>：扫描输入文件夹，看看有哪些数据碎片。</li>
+<li><strong>[质量检查]</strong>：确保每个数据碎片都是完整的（必须成对出现）。</li>
+<li><strong>[准备工具]</strong>：初始化一个“合并器” (Builder)。</li>
+<li><strong>[流水线作业]</strong>：按顺序把每一个数据碎片“喂”给合并器。</li>
+<li><strong>[完工封箱]</strong>：生成最终的索引文件，保存退出。</li>
+</ol>
+<hr />
+<h3>📝 详细步骤讲解</h3>
+<p>下面我把代码对应到上面的每一个任务中去：</p>
+<h4>任务 1：[准备工作] 搞清楚输入输出</h4>
+<p><strong>代码位置：</strong> <code>get_args()</code> 函数</p>
+<ul>
+<li><strong>讲人话：</strong>
+    这是脚本的入口。它会问你三个问题：<ol>
+<li><code>--input</code>: 零散的小文件放在哪个文件夹？</li>
+<li><code>--output-prefix</code>: 合并好的大文件叫什么名字？放在哪？</li>
+<li><code>--multimodal</code>: 这是纯文本数据，还是包含图片的多模态数据？</li>
+</ol>
+</li>
+<li><strong>代码行为：</strong>
+    使用 <code>argparse</code> 接收命令行参数，并检查你给的文件夹路径是否真的存在。如果不存在，直接报错停止。</li>
+</ul>
+<h4>任务 2：[盘点库存] 扫描文件夹</h4>
+<p><strong>代码位置：</strong> <code>main()</code> 函数开头部分 (<code>for basename in os.listdir(args.input):</code>)</p>
+<ul>
+<li><strong>讲人话：</strong>
+    脚本拿着本子走进你指定的 <code>input</code> 文件夹，把里面的所有文件名都看一遍。</li>
+<li><strong>核心概念 (.bin 和 .idx)：</strong>
+    Megatron 的数据格式很特殊，它是<strong>成对</strong>出现的：<ul>
+<li><code>xxx.bin</code>：这是<strong>内容</strong>（真正的二进制数据）。</li>
+<li><code>xxx.idx</code>：这是<strong>目录</strong>（索引，告诉程序哪句话在文件的第几行）。</li>
+<li><strong>这俩缺一不可。</strong></li>
+</ul>
+</li>
+<li><strong>代码行为：</strong>
+    它会提取文件的前缀名（比如 <code>data_part1</code>），用一个集合 <code>prefixes</code> 来记录我都找到了哪些数据块。</li>
+</ul>
+<h4>任务 3：[质量检查] 确保成对</h4>
+<p><strong>代码位置：</strong> <code>main()</code> 中的 <code>assert</code> 语句</p>
+<ul>
+<li><strong>讲人话：</strong>
+    脚本非常严谨。如果它发现了一个 <code>data_part1.idx</code>（目录），它会立刻检查旁边有没有 <code>data_part1.bin</code>（内容）。</li>
+<li><strong>代码行为：</strong>
+    <code>python
+    ext_pair = ".bin" if ext == ".idx" else ".idx"
+    assert os.path.isfile(...) # 如果找不到另一半，直接报错</code>
+    如果发现只有目录没有内容，或者只有内容没有目录，脚本会直接报错：“ERROR: file not provided”。</li>
+</ul>
+<h4>任务 4：[准备工具] 初始化合并器</h4>
+<p><strong>代码位置：</strong> <code>builder = None</code> 以及随后的 <code>if builder is None:</code> 代码块</p>
+<ul>
+<li><strong>讲人话：</strong>
+    现在确认原料没问题了。我们需要一个“胶水工具”来把它们粘起来。这个工具叫 <code>IndexedDatasetBuilder</code>（索引数据集构建器）。</li>
+<li><strong>代码行为：</strong>
+    它读取第一个数据块的格式信息（比如数据类型 <code>dtype</code>），然后按照这个格式创建一个空的 <code>builder</code>。这个 <code>builder</code> 就像一个新建的、空的 Word 文档，准备接收内容。</li>
+</ul>
+<h4>任务 5：[流水线作业] 逐个合并</h4>
+<p><strong>代码位置：</strong> <code>builder.add_index(os.path.join(args.input, prefix))</code></p>
+<ul>
+<li><strong>讲人话：</strong>
+    这是最关键的一步。脚本把刚才找到的所有文件前缀排好序（<code>sorted(prefixes)</code>），然后一个接一个地处理。</li>
+<li><strong>代码行为：</strong>
+    <code>builder.add_index(...)</code> 这行代码的意思是：把当前这个小文件的内容和索引，追加（Append）到我们正在构建的大文件中去。<ul>
+<li><em>比如：先把 Part 1 抄写进去，接着在屁股后面抄写 Part 2，以此类推。</em></li>
+</ul>
+</li>
+</ul>
+<h4>任务 6：[完工封箱] 保存文件</h4>
+<p><strong>代码位置：</strong> <code>builder.finalize(get_idx_path(args.output_prefix))</code></p>
+<ul>
+<li><strong>讲人话：</strong>
+    所有小文件都抄写完了。现在需要给这个巨大的新文件生成一个新的“总目录”。</li>
+<li><strong>代码行为：</strong>
+    <code>finalize</code> 函数会计算最终的偏移量，生成一个新的 <code>.idx</code> 文件，并关闭所有文件流。至此，合并完成。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是<strong>Megatron 框架下的“文件胶水”</strong>。</p>
+<ul>
+<li><strong>输入：</strong> 一文件夹的 <code>.bin</code> 和 <code>.idx</code> 小文件对。</li>
+<li><strong>过程：</strong> 检查配对 -&gt; 创建新容器 -&gt; 依次追加内容。</li>
+<li><strong>输出：</strong> 一个巨大的 <code>.bin</code> 和一个巨大的 <code>.idx</code> 文件。</li>
+</ul>
+<p>现在再回头看那段代码，是不是觉得逻辑清晰多了？</p>

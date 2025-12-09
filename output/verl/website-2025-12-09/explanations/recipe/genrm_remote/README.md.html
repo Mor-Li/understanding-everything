@@ -1,0 +1,87 @@
+<h1>recipe/genrm_remote/README.md</h1>
+<p>这份文档主要是在讲：<strong>如何使用一个“生成式奖励模型”（GenRM）来辅助强化学习（RL）训练。</strong></p>
+<p>简单来说，通常的强化学习需要一个“打分器”（Reward Model）给模型生成的答案打分。这里比较特殊的是，这个“打分器”本身也是一个大模型（生成式模型），而且它是部署在远程服务器上的（Remote），通过网络（API）来调用。</p>
+<p>为了让你更容易理解，我把文档内容拆解成一个 <strong>Todo List（任务清单）</strong>，然后一步步解释每个步骤在干什么。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>准备工作：启动“打分老师” (部署 GenRM 服务)</strong><ul>
+<li><em>对应文档：Step 1</em></li>
+</ul>
+</li>
+<li><strong>核心任务：开始“学生训练” (运行 RL 训练)</strong><ul>
+<li><em>对应文档：Step 2</em></li>
+</ul>
+</li>
+<li><strong>进阶优化：让“打分老师”批改得更快 (并行加速)</strong><ul>
+<li><em>对应文档：Advanced: Customizing Your GenRM (SGLang部分)</em></li>
+</ul>
+</li>
+<li><strong>高阶定制：修改“评分标准” (自定义奖励函数)</strong><ul>
+<li><em>对应文档：Advanced: Customizing Your GenRM (最后部分)</em></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 逐步详细讲解</h3>
+<h4>第一步：启动“打分老师” (Launch a vLLM Server)</h4>
+<p>在强化学习里，我们需要一个“老师”来判断模型生成的答案好不好。在这个方案里，“老师”是一个已经训练好的大模型（GenRM）。</p>
+<ul>
+<li><strong>为什么要这么做？</strong>
+    你需要先把这个模型跑起来，把它变成一个可以随时访问的服务（就像你访问 ChatGPT 的网页一样，只不过这里是给代码访问的 API）。</li>
+<li><strong>怎么做？</strong>
+    文档推荐使用 <code>vLLM</code> 这个工具来启动模型。
+    <code>bash
+    # 这一行命令就是启动一个服务，模型叫 verl-team/GenRM-CI-Test-1.5B
+    vllm serve verl-team/GenRM-CI-Test-1.5B --served-model-name genrm-demo</code>
+    <em>注意：如果你已经有现成的 API 服务（比如你买了别人的 API），这一步可以跳过。</em></li>
+</ul>
+<h4>第二步：开始“学生训练” (Perform RL using GenRM)</h4>
+<p>“老师”就位了，现在要让“学生”（你要训练的模型）开始做题，并让老师打分。</p>
+<ul>
+<li><strong>为什么要这么做？</strong>
+    这是核心步骤。训练脚本会生成文本 -&gt; 发送给第一步启动的服务器 -&gt; 服务器返回评价 -&gt; 训练脚本根据评价调整模型。</li>
+<li><strong>怎么做？</strong>
+    运行官方提供的脚本：
+    <code>bash
+    bash recipe/api-genrm/run_genrm_remote.sh</code></li>
+<li><strong>关键点解释：</strong>
+    文档特别提到了 <code>reward_function.py</code>。这是一个“翻译官”。<ul>
+<li>因为第一步启动的是一个通用的服务器，它只懂“输入文本，输出文本”。</li>
+<li>强化学习算法只懂“数字分数”。</li>
+<li><code>reward_function.py</code> 的作用就是：把训练数据发给服务器，拿到服务器生成的文本评价，然后把文本转化成数字分数传回给算法。</li>
+<li>如果你的服务器不在本地（比如在另一台机器上），你需要在这个文件里修改 <code>BASE_URL</code>（服务器地址）和 <code>API_KEY</code>（密码）。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：让“打分老师”批改得更快 (Advanced: SGLang)</h4>
+<p>如果你觉得 <code>vLLM</code> 还是不够快，或者你有好多张显卡想利用起来，文档提供了一个进阶方案。</p>
+<ul>
+<li><strong>观点：</strong>
+    使用 <code>SGLang</code> 配合数据并行（Data Parallel），可以大大提高推理速度。</li>
+<li><strong>怎么做？</strong>
+    用这个命令替代第一步的命令：
+    <code>bash
+    # --dp-size 4 表示用4张卡并行处理
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python -m sglang_router.launch_server --model-path verl-team/GenRM-CI-Test-1.5B --dp-size 4</code>
+    <em>记得改地址：</em> 换了工具后，记得去 <code>reward_function.py</code> 里更新一下服务器地址（BASE_URL）。</li>
+</ul>
+<h4>第四步：修改“评分标准” (Customizing Your GenRM)</h4>
+<p>最后，文档告诉你，官方提供的只是一个演示（Demo），你完全可以自己定义老师怎么打分。</p>
+<ul>
+<li><strong>观点：</strong>
+    你可以通过修改 <code>reward_function.py</code> 来控制两件事：<ol>
+<li><strong>Prompt (提示词)：</strong> 你怎么问这个打分模型？（例如：“请给下面这句话打分，范围1-5” vs “请判断这句话是否包含暴力内容”）。</li>
+<li><strong>Response Parsing (结果解析)：</strong> 打分模型回答了一大段话，你怎么从中提取出那个数字分数？</li>
+</ol>
+</li>
+<li><strong>总结：</strong>
+    这一部分是留给你自由发挥的，你需要写代码逻辑来实现从“文本回复”到“数值奖励”的转换。</li>
+</ul>
+<h3>总结一下</h3>
+<p>这个文档其实就是在教你搭建一套 <strong>“远程打分系统”</strong>。</p>
+<ol>
+<li>你不需要把巨大的奖励模型加载到训练进程里（那样太占显存了）。</li>
+<li>你把它单独部署成一个 <strong>Web 服务</strong>（Step 1）。</li>
+<li>然后在训练脚本里通过 <strong>写代码请求这个服务</strong> 来获得分数（Step 2 &amp; <code>reward_function.py</code>）。</li>
+</ol>

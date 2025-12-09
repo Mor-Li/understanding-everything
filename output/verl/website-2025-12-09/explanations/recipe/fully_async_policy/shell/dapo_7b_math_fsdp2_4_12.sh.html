@@ -1,0 +1,93 @@
+<h1>recipe/fully_async_policy/shell/dapo_7b_math_fsdp2_4_12.sh</h1>
+<p>这个脚本确实看起来很复杂，因为它不仅仅是一个简单的训练脚本，而是一个<strong>配置极其详细的分布式、异步强化学习（RL）训练启动脚本</strong>。</p>
+<p>为了让你更容易理解，我把它拆解成一个<strong>“项目经理的任务清单（Todo List）”</strong>。想象你是一个项目的总指挥，你需要完成以下 5 个阶段的任务，才能把这个模型训练起来。</p>
+<p>这个脚本的目标是：<strong>使用 DAPO/GRPO 算法，训练一个 Qwen2.5-7B 模型来做数学题（MATH 数据集），并且为了速度，采用了“完全异步（Fully Async）”的架构。</strong></p>
+<hr />
+<h3>📋 任务清单：从零开始理解这个脚本</h3>
+<h4>✅ Task 1: 准备原材料与场地 (环境与路径配置)</h4>
+<p>在开始做饭（训练）前，必须先把食材（数据）和锅具（模型）准备好。</p>
+<ul>
+<li><strong>设定身份</strong>：<ul>
+<li><code>project_name='DAPO'</code>: 项目叫 DAPO。</li>
+<li><code>exp_name=...</code>: 这次实验的具体名字，包含模型(Qwen2.5-7b)、数据集(MATH)、策略(fsdp2)等信息。</li>
+</ul>
+</li>
+<li><strong>指定路径</strong>：<ul>
+<li><code>MODEL_PATH</code>: 你的“底模”在哪里？这里用的是 Qwen2.5-Math-7B。</li>
+<li><code>TRAIN_FILE</code> / <code>TEST_FILE</code>: 你的“教材”和“考卷”在哪里？</li>
+<li><code>CKPTS_DIR</code>: 训练好的模型（存档）存哪里。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 分配工种 (核心架构：异步训练)</h4>
+<p>这是这个脚本<strong>最核心、最难懂</strong>的地方。
+传统的训练是：所有 GPU 一起生成数据 -&gt; 所有 GPU 一起训练 -&gt; 再生成。这很慢。
+这个脚本采用了 <strong>“完全异步 (Fully Async)”</strong> 模式，把 GPU 分成了两波人，互不干扰。</p>
+<ul>
+<li><strong>资源分配</strong>：<ul>
+<li><code>NNODES=2</code>: 假设你有 2 台服务器。</li>
+<li><code>NGPUS_PER_NODE=8</code>: 每台服务器有 8 张显卡。</li>
+<li><strong>关键点</strong> <code>n_gpus_rollout=2</code>: 每台机器划出 <strong>2张卡</strong> 专门负责“做题”（生成数据/Rollout）。</li>
+<li><strong>关键点</strong> <code>n_gpus_training=6</code>: 剩下的 <strong>6张卡</strong> ((8-2)=6) 专门负责“学习”（训练/更新参数/Actor）。</li>
+</ul>
+</li>
+<li><strong>工作模式</strong>：<ul>
+<li><code>rollout_mode="async"</code>: 开启异步模式。</li>
+<li><code>rollout_name="vllm"</code>: 负责做题的那组卡，使用 <code>vLLM</code> 这个超快的推理引擎来加速生成。</li>
+<li><code>staleness_threshold=0.1</code>: 因为是异步的，训练组拿到的数据可能是几秒钟前的“旧数据”。这里设置了一个容忍度，数据太旧就不要了。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 制定教学大纲 (算法与超参)</h4>
+<p>决定模型怎么学，学错了怎么罚。</p>
+<ul>
+<li><strong>算法选择</strong>：<ul>
+<li><code>adv_estimator=grpo</code>: 使用 <strong>GRPO</strong> (Group Relative Policy Optimization) 算法。这是 DeepSeek-R1 背后的核心算法之一，专门用于推理任务，不需要额外的 Value Model (Critic) 或者 Critic 很小。</li>
+</ul>
+</li>
+<li><strong>奖惩机制</strong>：<ul>
+<li><code>use_kl_in_reward=False</code>: 不把 KL 散度（模型变化幅度）直接加到奖励里。</li>
+<li><code>kl_coef=0.0</code>: 这里设为 0，说明 GRPO 主要靠组内对比来学习，而不是靠强行限制模型不许变。</li>
+</ul>
+</li>
+<li><strong>显存优化 (FSDP)</strong>：<ul>
+<li><code>actor.strategy=fsdp2</code>: 使用 PyTorch 的 FSDP2（全分片数据并行）技术。这能把巨大的模型切碎了放在显存里，防止 OOM（爆显存）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 规定作业格式 (长度与生成限制)</h4>
+<p>数学题通常很长，需要思维链（CoT），所以对长度限制很敏感。</p>
+<ul>
+<li><strong>长度限制</strong>：<ul>
+<li><code>max_prompt_length=2048</code>: 题目最长 2048 个 token。</li>
+<li><code>max_response_length=8192</code>: 答案允许非常长（8k token），为了让模型有足够的空间写解题步骤。</li>
+</ul>
+</li>
+<li><strong>惩罚机制</strong>：<ul>
+<li><code>enable_overlong_buffer=True</code>: 如果模型废话太多，超过了长度，会有一个缓冲机制。</li>
+<li><code>n_resp_per_prompt=16</code>: 每一道数学题，让模型生成 <strong>16 个不同的解法</strong>。GRPO 算法会对比这 16 个解法，奖励对的，惩罚错的。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 正式下达指令 (Python 启动命令)</h4>
+<p>脚本最后那一大段 <code>python -m ...</code> 其实就是把上面定义的所有变量，翻译成 Python 程序能看懂的参数，传给 <code>fully_async_main.py</code> 这个主程序。</p>
+<ul>
+<li><strong>翻译示例</strong>：<ul>
+<li><code>data.train_batch_size=${train_prompt_bsz}</code> -&gt; 告诉 Python 训练时的批次大小。</li>
+<li><code>actor_rollout_ref.model.path="${MODEL_PATH}"</code> -&gt; 告诉 Python 模型在哪。</li>
+<li><code>trainer.nnodes="${NNODES}"</code> -&gt; 告诉 Python 有几台机器在跑。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这个脚本到底在干嘛？</h3>
+<p>简单来说，这个脚本在指挥一个 <strong>2台机器、每台8卡</strong> 的集群：</p>
+<ol>
+<li><strong>分工</strong>：它把显卡分成了“做题组”（用 vLLM 快速生成数学题答案）和“学习组”（用 FSDP2 更新模型参数）。</li>
+<li><strong>流程</strong>：“做题组”拼命做题（每题做16遍），把数据扔给“学习组”；“学习组”拿到数据就立刻更新模型，不需要等“做题组”停下来。</li>
+<li><strong>目的</strong>：用这种异步流水线的方式，最大化显卡的利用率，训练出一个解数学题很厉害的 Qwen2.5 模型。</li>
+</ol>
+<p><strong>你需要关注的重点（如果要修改）：</strong>
+*   如果你显卡不够，要改 <code>NGPUS_PER_NODE</code> 和 <code>n_gpus_rollout</code>。
+*   如果你想换模型，改 <code>MODEL_PATH</code>。
+*   如果你显存爆了，可能要减小 <code>train_prompt_mini_bsz</code> 或者 <code>max_response_length</code>。</p>

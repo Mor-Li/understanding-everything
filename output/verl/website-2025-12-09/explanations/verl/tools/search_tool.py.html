@@ -1,0 +1,93 @@
+<h1>verl/tools/search_tool.py</h1>
+<p>这份代码确实涉及了一些并发编程（Ray）和系统设计的概念，初看容易晕。</p>
+<p>简单来说，这是一个<strong>让 AI 模型能够“上网搜索”的工具插件</strong>。不仅如此，它还设计了一套机制，防止搜索请求太多太快把服务器搞崩（限流）。</p>
+<p>为了让你读懂它，我把理解这份代码的过程拆解成了一个 <strong>5步走的 Task List（任务清单）</strong>。你可以把它想象成我们在搭建一个“超级搜索代理公司”。</p>
+<hr />
+<h3>Task 1：理解核心目标 —— “我们要开一家搜索中介所”</h3>
+<p><strong>目标</strong>：搞清楚这个文件的主要功能是什么。
+<strong>对应代码</strong>：<code>class SearchTool(BaseTool)</code></p>
+<ul>
+<li><strong>通俗解释</strong>：
+    想象你是一个 AI，但你不知道现在的天气或最新的新闻。你需要一个“中介”帮你去谷歌或必应搜索。
+    这个 <code>SearchTool</code> 就是那个中介。它的工作很简单：<ol>
+<li>收你的问题（<code>query_list</code>）。</li>
+<li>去外部搜索引擎查资料（<code>retrieval_service_url</code>）。</li>
+<li>把查到的文字结果（<code>result_text</code>）打包回传给你。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>Task 2：理解限流机制 —— “给门口装个检票闸机”</h3>
+<p><strong>目标</strong>：理解为什么要有 <code>TokenBucketWorker</code>。
+<strong>对应代码</strong>：<code>class TokenBucketWorker</code></p>
+<ul>
+<li><strong>通俗解释</strong>：
+    外部的搜索引擎 API 通常是要收费的，或者限制每秒只能访问几次（比如每秒限 10 次）。如果 AI 疯狂发请求，会被封号。
+    于是代码里写了一个“令牌桶（Token Bucket）”算法：<ul>
+<li>这就好比地铁站的<strong>闸机</strong>。</li>
+<li>桶里有“令牌”（Token）。</li>
+<li>每次要搜索前，必须先拿一个令牌（<code>acquire</code>）。</li>
+<li>如果桶空了，就得排队等。</li>
+<li>搜完了，或者过了一段时间，令牌会放回桶里（<code>release</code>）。</li>
+<li><strong>Ray Actor</strong>：这里用了 <code>ray.remote</code>，是为了让这个“闸机”在多线程/多进程环境下也能精准计数，不会算错。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3：理解并发工人 —— “招聘一堆业务员”</h3>
+<p><strong>目标</strong>：理解 <code>SearchExecutionWorker</code> 和 <code>init_search_execution_pool</code>。
+<strong>对应代码</strong>：<code>class SearchExecutionWorker</code></p>
+<ul>
+<li><strong>通俗解释</strong>：
+    如果只有一个人负责搜索，效率太低。<ul>
+<li><code>SearchExecutionWorker</code> 就是招聘来的<strong>业务员</strong>。</li>
+<li><code>init_search_execution_pool</code> 就是<strong>建立业务部</strong>，一次性招几十上百个业务员（<code>num_workers</code>）。</li>
+<li><strong>工作流程</strong>：<ol>
+<li>业务员接到任务。</li>
+<li>先去 Task 2 的“闸机”那里领令牌（<code>rate_limit_worker.acquire</code>）。</li>
+<li>领到令牌后，执行真正的搜索任务（<code>fn</code>）。</li>
+<li>做完后把令牌还回去。</li>
+</ol>
+</li>
+<li>这里用 <code>Ray</code> 是为了让这些业务员可以分布在不同的 CPU 核心甚至不同的机器上并行工作，速度极快。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4：理解具体执行 —— “业务员怎么干活”</h3>
+<p><strong>目标</strong>：理解 <code>execute</code> 和 <code>execute_search</code>。
+<strong>对应代码</strong>：<code>SearchTool.execute</code> 和 <code>SearchTool.execute_search</code></p>
+<ul>
+<li><strong>通俗解释</strong>：
+    这是整个流程跑通的关键步骤：<ol>
+<li><strong>AI 发话</strong>：调用 <code>execute</code> 函数，传入参数 <code>query_list</code>（比如 <code>["今天北京天气", "苹果股价"]</code>）。</li>
+<li><strong>派单</strong>：<code>SearchTool</code> 把这个任务扔给 Task 3 里的业务员池子（<code>self.execution_pool.execute.remote(...)</code>）。</li>
+<li><strong>干活</strong>：业务员运行 <code>execute_search</code>，它会调用底层的 <code>perform_single_search_batch</code>（这行代码去真的发 HTTP 请求给搜索引擎）。</li>
+<li><strong>交差</strong>：拿到结果文本，打包成 <code>ToolResponse</code> 格式，告诉 AI “我查到了，结果是...”。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>Task 5：理解辅助功能 —— “记账和绩效考核”</h3>
+<p><strong>目标</strong>：理解 <code>create</code>, <code>calc_reward</code>, <code>release</code>。
+<strong>对应代码</strong>：<code>create</code>, <code>calc_reward</code></p>
+<ul>
+<li><strong>通俗解释</strong>：
+    这个工具是给强化学习（RL）用的，所以需要记录状态：<ul>
+<li><strong><code>create</code></strong>：每次开始一段新的对话或任务，先建个档案（<code>instance_id</code>），准备记录这次任务用了几次搜索。</li>
+<li><strong><code>calc_reward</code></strong>：这是给 AI 打分的。虽然这里代码只写了返回 <code>reward</code> 列表，但在强化学习里，如果 AI 搜得准、搜得好，可能会给高分；如果乱搜，给低分。</li>
+<li><strong><code>release</code></strong>：任务结束，销毁档案，释放内存。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下完整剧情</h3>
+<ol>
+<li><strong>初始化</strong>：程序启动，<code>SearchTool</code> 建立，同时建立了一个“闸机”（TokenBucket）和招聘了 120 个“业务员”（Worker Pool）。</li>
+<li><strong>接单</strong>：AI 说：“帮我查查 xxx”。</li>
+<li><strong>调度</strong>：<code>SearchTool</code> 找一个空闲的业务员。</li>
+<li><strong>限流</strong>：业务员去闸机看有没有票，有票就通过。</li>
+<li><strong>执行</strong>：业务员去外部网站搜索，拿到数据。</li>
+<li><strong>返回</strong>：把数据整理好给 AI，同时记录这次操作的日志（用于后续训练分析）。</li>
+</ol>
+<p><strong>你看懂了吗？核心就是：一个带“限流闸机”和“多线程并发”的搜索中介。</strong></p>

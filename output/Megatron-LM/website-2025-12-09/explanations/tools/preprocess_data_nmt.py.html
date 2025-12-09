@@ -1,0 +1,71 @@
+<h1>tools/preprocess_data_nmt.py</h1>
+<p>这份代码完全看不懂是很正常的，因为它涉及到了<strong>深度学习训练前的数据预处理</strong>，而且是用在 <strong>Megatron-LM</strong>（NVIDIA 开发的一个超大规模语言模型训练框架）里的。</p>
+<p>简单来说，<strong>这个脚本的目标是将人类能读懂的文本文件（比如一行行的句子），转换成机器能读懂的、紧凑的二进制格式（.bin 和 .idx），以便后续模型训练时能飞快地读取。</strong></p>
+<p>我们可以把这个脚本看作一个<strong>“翻译工厂的流水线经理”</strong>。我为你列了一个 Task To-Do List，带你一步步看它是怎么工作的：</p>
+<h3>任务清单 (Task To-Do List)</h3>
+<h4>Task 1: 接收指令 (配置参数)</h4>
+<p><strong>目标：</strong> 搞清楚老板（用户）想要处理哪个文件？用什么规则处理？存到哪里？
+*   <strong>代码位置：</strong> <code>get_args()</code> 函数。
+*   <strong>详细解释：</strong>
+    *   脚本首先运行 <code>parser = argparse.ArgumentParser()</code>。
+    *   它会问你：
+        *   <code>--input</code>: 原始文本在哪里？
+        *   <code>--tokenizer-type</code>: 用哪本“字典”（分词器）把文字转成数字？(比如 GPT2BPETokenizer)。
+        *   <code>--vocab-file</code>: 字典文件具体路径在哪？
+        *   <code>--output-prefix</code>: 处理好的结果文件叫什么名字？
+        *   <code>--workers</code>: 打算雇佣几个“工人”（CPU 进程）来干活？</p>
+<h4>Task 2: 准备工具 (初始化分词器)</h4>
+<p><strong>目标：</strong> 准备好把文字转换成数字 ID 的工具。
+*   <strong>代码位置：</strong> <code>main()</code> 函数开头 和 <code>Encoder</code> 类。
+*   <strong>详细解释：</strong>
+    *   <code>tokenizer = build_tokenizer(args)</code>: 根据刚才接收的指令，加载分词器。
+    *   你可以把分词器想象成一本字典，它能把“Hello”变成数字 <code>15496</code>。</p>
+<h4>Task 3: 招募工人 (设置多进程)</h4>
+<p><strong>目标：</strong> 因为数据量可能很大，一个人干太慢，需要利用多核 CPU 并行处理。
+*   <strong>代码位置：</strong>
+    <code>python
+    pool = multiprocessing.Pool(args.workers, initializer=encoder.initializer)</code>
+*   <strong>详细解释：</strong>
+    *   脚本创建了一个进程池 (<code>pool</code>)。
+    *   <code>encoder.initializer</code> 会确保每个工人都手里都拿到了那本“字典”（Tokenizer），这样他们就能独立工作了。</p>
+<h4>Task 4: 准备仓库 (创建输出文件构建器)</h4>
+<p><strong>目标：</strong> 准备好用来存放最终结果的容器。
+*   <strong>代码位置：</strong>
+    <code>python
+    builder = indexed_dataset.IndexedDatasetBuilder(output_bin_file, ...)</code>
+*   <strong>详细解释：</strong>
+    *   Megatron 需要特殊的二进制格式（<code>.bin</code> 存数据，<code>.idx</code> 存索引）。
+    *   这一步就是创建一个“构建器”，准备把处理好的数字往这个二进制文件里写。</p>
+<h4>Task 5: 流水线作业 (读取、转换、写入) —— <strong>这是核心步骤</strong></h4>
+<p><strong>目标：</strong> 一行行读数据，转成数字，存起来。
+*   <strong>代码位置：</strong> <code>main()</code> 中的 <code>for</code> 循环。
+*   <strong>详细流程：</strong>
+    1.  <strong>分配任务</strong>：<code>encoded_sentences = pool.imap(encoder.encode, fin, 25)</code>
+        *   <code>fin</code> 是输入文件。
+        *   <code>encoder.encode</code> 是具体动作：它把一行文本变成一串数字 ID。
+        *   <code>pool.imap</code> 意味着：把文件里的行分发给刚才招募的“工人”去并行转换。
+    2.  <strong>收集结果</strong>：主进程在一个循环里等待工人们把处理好的结果交回来。
+    3.  <strong>存入仓库</strong>：
+        <code>python
+        builder.add_item(torch.IntTensor(sentence))
+        builder.end_document()</code>
+        *   拿到一串数字（sentence），把它塞进二进制构建器里。
+    4.  <strong>汇报进度</strong>：每处理一定数量（<code>args.log_interval</code>），就打印一下“现在处理了多少句了，速度是多少 MB/s”。</p>
+<h4>Task 6: 完工封箱 (保存文件)</h4>
+<p><strong>目标：</strong> 所有数据处理完了，生成最终的索引文件，关闭程序。
+*   <strong>代码位置：</strong>
+    <code>python
+    builder.finalize(output_idx_file)</code>
+*   <strong>详细解释：</strong>
+    *   生成 <code>.idx</code> 文件。这个文件告诉模型：第 1 句话在 <code>.bin</code> 文件的第几个字节，第 2 句话在第几个字节……
+    *   这样训练的时候，模型想读第 100 万句话，就不需要从头扫描，直接查表就能跳过去读取。</p>
+<hr />
+<h3>总结一下</h3>
+<p><strong>这个脚本的逻辑是：</strong></p>
+<ol>
+<li><strong>Input</strong>: 给你一个巨大的 <code>data.txt</code>（里面是用于机器翻译 NMT 的句子）。</li>
+<li><strong>Process</strong>: 启动好几个 CPU 核心，大家一起查字典，把句子里的单词变成数字（Token IDs）。</li>
+<li><strong>Output</strong>: 把这些数字压缩并整齐地排列好，存成 <code>data.bin</code> 和 <code>data.idx</code>。</li>
+</ol>
+<p><strong>为什么要这么做？</strong>
+因为计算机（GPU）训练模型时，处理二进制数字比处理原始文本字符串要快得多，也省内存得多。这个脚本就是做这件“脏活累活”的。</p>

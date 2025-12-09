@@ -1,0 +1,90 @@
+<h1>tools/checkpoint/loader_base.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了 <strong>分布式深度学习框架（Megatron-LM）的底层加载逻辑</strong>。</p>
+<p>简单来说，这个脚本是一个 <strong>“搬运工”</strong>。它的任务是从硬盘上读取已经被切分（Sharded）成很多碎片的 Megatron 模型权重，把它们拼凑完整，然后通过一个“传送带”（Queue）发送给另一个程序去处理（比如转换成 HuggingFace 格式）。</p>
+<p>为了让你看懂，我把它想象成一个 <strong>“模型组装流水线”</strong> 的工头。下面是它的 <strong>To-Do List</strong>，对应代码中的执行逻辑（主要在 <code>load()</code> 方法中）：</p>
+<h3>📝 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>[准备] 伪造身份与读取说明书</strong> (<code>parse_megatron_args</code>)<ul>
+<li>因为 Megatron 原本是设计成通过命令行运行的，这里需要“欺骗”它，伪造一些命令行参数，以便读取模型的配置文件（config）。</li>
+</ul>
+</li>
+<li><strong>[检查] 核对零件清单</strong> (<code>ensure_required_arguments</code>)<ul>
+<li>确认模型层数、隐藏层大小、头数等关键参数是否存在。如果缺了关键信息，直接罢工（退出）。</li>
+</ul>
+</li>
+<li><strong>[招工] 确定模型类型</strong> (<code>import_model_provider</code>)<ul>
+<li>确定我们要搬运的是 GPT 还是 BERT（由子类实现）。</li>
+</ul>
+</li>
+<li><strong>[环境] 搭建虚拟车间</strong> (<code>initialize_megatron_env</code>)<ul>
+<li>Megatron 通常在多张 GPU 上运行。为了在单机（甚至 CPU）上加载，需要初始化一个“假的”分布式环境，欺骗代码以为自己在集群里运行。</li>
+</ul>
+</li>
+<li><strong>[加载] 搬运并读取碎片</strong> (<code>load_model_shards</code>)<ul>
+<li>这是最累的一步。遍历所有的“分片”（TP/PP rank），把硬盘上的碎片文件读取到内存里。</li>
+</ul>
+</li>
+<li><strong>[汇报] 发送整体概况</strong> (<code>send_metadata_over_queue</code>)<ul>
+<li>告诉接收方：“这个模型长什么样，有多少层，词表多大”。</li>
+</ul>
+</li>
+<li><strong>[组装] 拼图并发送</strong> (<code>send_llm_over_queue</code>)<ul>
+<li>把刚才读取的碎片（比如一个大矩阵被切成了两半），在内存里拼接回完整的矩阵，然后扔到传送带（Queue）上。</li>
+</ul>
+</li>
+<li><strong>[结束] 下班</strong><ul>
+<li>发送 "done" 信号。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 详细步骤讲解 (Step-by-Step)</h3>
+<p>下面我结合代码细节，给你一步步拆解文中的核心观点：</p>
+<h4>第一步：伪造身份 (Parsing Args)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>parse_megatron_args</code> 和 <code>build_sys_argv</code></li>
+<li><strong>观点</strong>: Megatron 代码库耦合度很高，它依赖 <code>sys.argv</code>（命令行参数）。</li>
+<li><strong>动作</strong>: 代码里直接暴力修改了 <code>sys.argv</code>（<code>sys.argv = self.build_sys_argv()</code>）。它填入了一堆参数，比如 <code>--no-load-optim</code>（不加载优化器状态，只加载模型权重），<code>--load</code>（指定路径）。这样调用 <code>megatron.training.arguments.parse_args()</code> 时，就能顺利拿到配置对象 <code>margs</code>。</li>
+</ul>
+<h4>第二步：搭建虚拟环境 (Fake Environment)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>initialize_megatron_env</code></li>
+<li><strong>观点</strong>: 加载分布式模型通常需要 GPU 通信（NCCL）。但我们只是为了转换格式，不需要真的通信。</li>
+<li><strong>动作</strong>:<ul>
+<li>引入 <code>_ConverterFakeProcessGroup</code>。这是一个假的通信组，让 Megatron 以为自己在通信，其实啥也没干。</li>
+<li>设置 <code>mpu</code> (Model Parallel Unit) 的各种 world size（张量并行大小、流水线并行大小），让代码知道模型被切成了几份。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：核心加载逻辑 (Loading Shards)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>load_model_shards</code></li>
+<li><strong>观点</strong>: 一个大模型可能被切分在不同的文件夹里（Pipeline Parallelism, PP）和不同的文件里（Tensor Parallelism, TP）。</li>
+<li><strong>动作</strong>:<ul>
+<li>这是一个双重循环：外层循环遍历 Pipeline 阶段 (PP)，内层循环遍历 Tensor 并行分片 (TP)。</li>
+<li>它会临时设置当前的 rank (<code>mpu.set_tensor_model_parallel_rank(tp_rank)</code>)。</li>
+<li>然后调用 Megatron 原生的 <code>load_checkpoint</code> 函数。</li>
+<li><strong>结果</strong>: <code>all_models</code> 变量变成了一个巨大的列表，里面存着模型的所有碎片（此时还是切分状态）。</li>
+</ul>
+</li>
+</ul>
+<h4>第四步：拼图与发送 (Merging &amp; Queueing)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>send_llm_over_queue</code></li>
+<li><strong>观点</strong>: 接收方（Consumer）通常需要一个完整的 PyTorch 权重（比如 HuggingFace 格式），而不是切碎的。</li>
+<li><strong>动作</strong>:<ul>
+<li><strong>Embeddings</strong>: 把不同 rank 的 Embedding 拼起来。</li>
+<li><strong>Transformer Layers</strong>: 这是最复杂的。代码遍历每一层。<ul>
+<li>对于 <code>Linear</code> 层（比如 QKV 投影，MLP），如果使用了张量并行（TP），权重是被切开的。</li>
+<li>代码使用 <code>torch.cat([w1, w2], dim=0)</code> 或 <code>dim=1</code> 把它们拼回去。</li>
+<li><em>例子</em>: <code>message["qkv weight"] = torch.cat(qkv_weight, dim=0)</code>。</li>
+</ul>
+</li>
+<li><strong>Queue</strong>: 每拼好一层，就调用 <code>self.queue_put</code> 扔进队列。这样可以节省内存，处理完一层扔一层，不用把整个完整模型都存在内存里。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的核心作用就是 <strong>“翻译”</strong>。
+它运行在一个特殊的模式下，假装自己是 Megatron 训练集群，把硬盘上 <strong>“切碎的、分布式的”</strong> 权重读进来，在内存里 <strong>“缝合”</strong> 好，然后通过 Python 的队列 <strong>“递出去”</strong> 给转换脚本。</p>
+<p>你看不懂很正常，因为它用了大量的 Hack 手段（修改 sys.argv，Mock 通信组）来复用 Megatron 的训练代码进行模型加载。</p>

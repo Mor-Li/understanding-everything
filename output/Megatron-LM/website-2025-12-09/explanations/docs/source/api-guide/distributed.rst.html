@@ -1,0 +1,65 @@
+<h1>docs/source/api-guide/distributed.rst</h1>
+<p>这份文档确实写得非常“硬核”，充满了深度学习系统开发的术语。它描述的是<strong>由多张显卡（GPU）协同训练大模型时，如何处理“梯度（Gradients）”的底层代码</strong>。</p>
+<p>为了让你听懂，我把这个过程想象成<strong>一个由多人协作完成的巨型拼图项目</strong>。</p>
+<p>以下是一个<strong>学习任务清单（Todo List）</strong>，我们一步步来拆解这份文档在讲什么：</p>
+<hr />
+<h3>✅ Task 1: 理解背景——什么是“Rank”和“Optimizer Step”？</h3>
+<p><strong>文档原文：</strong></p>
+<blockquote>
+<p>"...finalize model weight gradients on each rank before the optimizer step."</p>
+</blockquote>
+<p><strong>通俗解释：</strong>
+*   <strong>Rank（等级/排位）：</strong> 在分布式训练中，这就代表<strong>每一张显卡</strong>（或者每一个计算节点）。你可以把它想象成拼图团队里的<strong>每一个员工</strong>。
+*   <strong>Optimizer Step（优化器步骤）：</strong> 这是模型真正“学习”的那一瞬间（更新参数）。
+*   <strong>Gradients（梯度）：</strong> 这是员工们计算出来的“修改意见”（比如：这块拼图应该往左移一点）。</p>
+<p><strong>这一步的含义：</strong>
+这份文档里的代码，主要任务是在<strong>大家都正式动手修改拼图（更新参数）之前</strong>，先把所有人的<strong>修改意见（梯度）</strong> 收集起来并统一好。</p>
+<hr />
+<h3>✅ Task 2: 理解核心模块——<code>distributed_data_parallel</code> (DDP)</h3>
+<p><strong>文档原文：</strong></p>
+<blockquote>
+<p>"Model wrapper for distributed data parallelism... Stores gradients in a contiguous buffer..."</p>
+</blockquote>
+<p><strong>通俗解释：</strong>
+这是这个包里的第一个重要工具。
+*   <strong>Data Parallelism（数据并行）：</strong> 假设有1000个拼图要拼，一个人拼太慢。我们把任务分成10份，分给10个人（10个Rank）同时拼。这就是数据并行。
+*   <strong>Wrapper（包装器）：</strong> 给模型穿一件“马甲”。穿上这件马甲后，模型就知道自己是在团队合作，而不是单打独斗。
+*   <strong>Contiguous buffer（连续缓冲区）：</strong> 为了传输快，代码会把零散的修改意见（梯度）打包塞进一个连续的内存空间里，就像把散乱的信件装进一个大箱子里再寄送。</p>
+<hr />
+<h3>✅ Task 3: 理解效率优化——“Overlapping Communication” (通信重叠)</h3>
+<p><strong>文档原文：</strong></p>
+<blockquote>
+<p>"...overlapping communication ... with backprop computation by breaking up full model's gradients into smaller buckets..."</p>
+</blockquote>
+<p><strong>通俗解释：</strong>
+这是DDP里的一个高级技巧。
+*   <strong>笨办法：</strong> 员工A算完所有的修改意见，然后打电话告诉员工B，讲完电话再继续干活。这叫“串行”。
+*   <strong>聪明办法 (Overlapping)：</strong> 员工A把修改意见分成很多<strong>小桶 (Buckets)</strong>。算满一桶，就立刻丢给快递员去送给员工B（通信），同时自己立刻转头去算下一桶（计算）。
+*   <strong>结果：</strong> 计算和通信同时进行，谁也不闲着，速度变快。
+*   <strong>All-reduce / Reduce-scatter：</strong> 这是通信的具体数学操作，简单理解就是“把大家算出来的数加起来取平均值”。</p>
+<hr />
+<h3>✅ Task 4: 理解终极同步——<code>finalize_model_grads</code></h3>
+<p><strong>文档原文：</strong></p>
+<blockquote>
+<p>"Finalize model gradients for optimizer step across all used parallelism modes."</p>
+</blockquote>
+<p><strong>通俗解释：</strong>
+除了上面说的“数据并行”（大家做同样的题），大模型训练还有更复杂的模式，这个函数就是用来处理<strong>所有复杂情况下的最后同步</strong>。</p>
+<p>它要解决这几种特殊的“纠纷”：
+1.  <strong>DP Replicas：</strong> 也就是Task 2里说的数据并行同步。
+2.  <strong>Sequence Parallelism (Layernorm)：</strong> 如果一句话太长，被切开分给不同显卡处理，这里的LayerNorm层需要把梯度同步一下。
+3.  <strong>Pipeline Parallelism (Embedding)：</strong> 如果模型太大，被切成几段（流水线并行），第一段（输入层）和最后一段（输出层）的词表（Embedding）往往是共享的，需要跨显卡同步它们的修改意见。
+4.  <strong>MoE (Expert Parallelism)：</strong> 混合专家模型。不同的“专家”网络分布在不同的卡上，需要专门同步这些专家的梯度。</p>
+<p><strong>这一步的含义：</strong>
+不管你用了多么花哨的并行策略（数据并行、流水线并行、MoE并行），在真正按下“更新模型”按钮之前，<strong>必须运行这个函数</strong>，确保所有显卡上的数据是完全对齐、同步完毕的。</p>
+<hr />
+<h3>📝 总结：这个文件到底是干啥的？</h3>
+<p>如果你要给这个文件写一句人话总结：</p>
+<blockquote>
+<p><strong>这是一个“交通指挥官”工具包。</strong></p>
+<p>当几十几百张显卡一起训练一个大模型时，每张卡都会算出自己的“修改意见（梯度）”。
+这个包负责在<strong>更新模型之前</strong>，高效地、异步地、分门别类地把这些“修改意见”在所有显卡之间<strong>互通有无、取平均值</strong>，确保所有显卡达成共识。</p>
+</blockquote>
+<p><strong>你需要关注的重点：</strong>
+1.  它包含一个 <strong>DDP Wrapper</strong>（用于普通的数据并行，带加速技巧）。
+2.  它包含一个 <strong>Finalize 函数</strong>（用于处理所有复杂的并行模式下的梯度收尾工作）。</p>

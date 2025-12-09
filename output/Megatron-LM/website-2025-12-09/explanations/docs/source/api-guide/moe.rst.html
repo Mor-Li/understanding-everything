@@ -1,0 +1,68 @@
+<h1>docs/source/api-guide/moe.rst</h1>
+<p>首先，<strong>请不要因为看不懂而感到焦虑</strong>。</p>
+<p>事实上，你提供的这个文件（<code>docs/source/api-guide/moe.rst</code>）本身<strong>并没有包含具体的知识点</strong>。</p>
+<h3>1. 这个文件在干什么？</h3>
+<p>这个文件只有一行核心代码：
+<code>.. mdinclude :: ../../../megatron/core/transformer/moe/README.md</code></p>
+<p>这意味着：<strong>这个文件只是一个“传送门”</strong>。它的作用是在生成文档网页时，把另一个路径下的 <code>README.md</code> 文件的内容“抓取”过来显示在这里。所以你看到的只是一个外壳。</p>
+<p>不过，既然你想了解的是 <strong>MoE (Mixture of Experts，混合专家模型)</strong>（这是 Megatron-Core 里的一个核心高级功能），我为你制定了一个<strong>学习任务清单 (Todo List)</strong>，并按照这个清单一步步给你讲解它的核心逻辑。</p>
+<hr />
+<h3>2. 你的 MoE 学习任务清单 (Todo List)</h3>
+<p>我们将把理解 MoE 拆解为以下 5 个步骤，每一步理解了，打个勾，再往下走：</p>
+<ul>
+<li>[ ] <strong>Task 01：理解核心理念</strong> —— 为什么要用 MoE？（从“全科医生”到“专家会诊”）</li>
+<li>[ ] <strong>Task 02：理解架构变化</strong> —— 传统的 Transformer 和 MoE 有什么不同？</li>
+<li>[ ] <strong>Task 03：理解运作流程</strong> —— 一个词（Token）进来后发生了什么？（路由机制）</li>
+<li>[ ] <strong>Task 04：理解“稀疏性”</strong> —— 为什么它参数巨大但速度很快？</li>
+<li>[ ] <strong>Task 05：Megatron 的角色</strong> —— 为什么这个代码在 Megatron 库里？（并行计算）</li>
+</ul>
+<hr />
+<h3>3. 逐步讲解</h3>
+<h4>✅ Task 01：理解核心理念 —— 为什么要用 MoE？</h4>
+<p><strong>场景类比：</strong>
+*   <strong>传统模型 (Dense Model)：</strong> 想象一个<strong>超级全科医生</strong>。无论病人是来看感冒、骨折还是心脏病，这个医生都要调用大脑里所有的知识来诊断。随着医学知识越来越多，这个医生的脑子必须长得巨大无比，反应也越来越慢。
+*   <strong>MoE 模型：</strong> 想象一个<strong>专家会诊医院</strong>。这里有一个前台（Router），后面坐着 8 个不同领域的专家（Experts）。
+    *   病人来了，前台看一眼：“哦，你是骨折，去 3 号诊室找骨科专家。”
+    *   <strong>优势：</strong> 虽然医院整体很大（有很多专家），但对于<strong>每一个</strong>病人，只需要动用<strong>一个</strong>专家。效率极高，且能容纳更多知识。</p>
+<p><strong>结论：</strong> MoE 旨在在不增加计算成本（算力）的前提下，极大地增加模型的参数量（知识容量）。</p>
+<h4>✅ Task 02：理解架构变化</h4>
+<p>在 Transformer 模型（如 GPT）中，每一层主要由两部分组成：
+1.  Attention（注意力机制）
+2.  <strong>MLP / FFN（前馈神经网络）</strong> &lt;--- MoE 改的就是这里！</p>
+<ul>
+<li><strong>传统做法：</strong> 每一层只有一个巨大的 MLP 模块。所有数据都要穿过它。</li>
+<li><strong>MoE 做法：</strong> 把这个巨大的 MLP 拆成了很多个小 MLP（比如 8 个、16 个甚至更多）。这些小 MLP 就被称为 <strong>“专家 (Experts)”</strong>。同时，前面加了一个 <strong>“路由器 (Router / Gate)”</strong>。</li>
+</ul>
+<h4>✅ Task 03：理解运作流程 —— 路由机制</h4>
+<p>当你在 Megatron 中运行 MoE 时，数据流是这样的：</p>
+<ol>
+<li><strong>输入：</strong> 一句话“我喜欢吃苹果”，其中的“苹果”这个词（Token）进入了 MoE 层。</li>
+<li><strong>路由 (Router)：</strong> 路由器是一个小型的神经网络，它看了一眼“苹果”这个词的特征，计算出它应该去哪里。<ul>
+<li><em>策略：</em> 通常采用 <strong>Top-K</strong> 策略（比如 Top-2）。这意味着路由器会说：“我觉得‘苹果’这个词，应该由 <strong>2号专家（饮食类）</strong> 和 <strong>5号专家（植物类）</strong> 共同处理。”</li>
+</ul>
+</li>
+<li><strong>分发：</strong> “苹果”这个词的数据只会被发送给 2号 和 5号 专家。其他的 1、3、4、6、7、8 号专家都在休息，完全不参与计算。</li>
+<li><strong>计算与融合：</strong> 2号和5号专家计算完后，结果会根据路由器给的权重（比如 2号占70%，5号占30%）加在一起，输出到下一层。</li>
+</ol>
+<h4>✅ Task 04：理解“稀疏性” (Sparsity)</h4>
+<p>这是 MoE 最重要的概念。</p>
+<ul>
+<li><strong>总参数量 (Total Parameters)：</strong> 非常大。比如 GPT-4 传说有 1.8 万亿参数，是因为它有很多专家。</li>
+<li><strong>激活参数量 (Active Parameters)：</strong> 非常小。因为对于每一个词，只用到了 Top-2 的专家，其他 90% 的参数都没动。</li>
+<li><strong>效果：</strong> 你拥有了一个万亿参数级别的“脑容量”，但每次思考只需要花费百亿参数级别的“脑力”。这就是<strong>稀疏激活</strong>。</li>
+</ul>
+<h4>✅ Task 05：Megatron 的角色 —— 并行计算</h4>
+<p>你看到的文件路径包含 <code>megatron/core</code>。Megatron 是专门做<strong>超大规模模型并行训练</strong>的。</p>
+<p>在 MoE 中，由于专家数量很多，显存放不下怎么办？
+Megatron 引入了 <strong>Expert Parallelism (EP，专家并行)</strong>：
+*   GPU 1 负责存放：专家 1、专家 2
+*   GPU 2 负责存放：专家 3、专家 4
+*   ...</p>
+<p>当 GPU 1 上的数据需要用到“专家 3”时，Megatron 会负责在显卡之间快速传输数据，让 GPU 2 帮忙算一下，再把结果传回来。这个文件所在的包，就是负责处理这些复杂的<strong>路由逻辑</strong>、<strong>负载均衡</strong>（防止所有任务都压给同一个专家）以及<strong>并行通信</strong>的。</p>
+<hr />
+<h3>总结</h3>
+<p>那个看不懂的文件，其实就是在介绍 Megatron 如何实现上述的 <strong>“专家分诊系统”</strong>。</p>
+<p>它让模型变得：
+1.  <strong>更博学</strong>（总参数量暴增）。
+2.  <strong>反应不慢</strong>（每次只用一小部分参数）。
+3.  <strong>需要复杂的工程实现</strong>（这就是 Megatron 库存在的意义）。</p>

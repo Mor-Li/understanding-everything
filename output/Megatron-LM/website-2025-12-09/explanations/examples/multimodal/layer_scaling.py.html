@@ -1,0 +1,87 @@
+<h1>examples/multimodal/layer_scaling.py</h1>
+<p>这段代码确实比较底层，涉及到了<strong>深度学习模型架构的微调</strong>和<strong>工程实现</strong>。看不懂很正常，因为它是在修改 Transformer 最核心的计算逻辑。</p>
+<p>为了让你彻底搞懂，我制定了一个 <strong>5步走的 Task List</strong>。我们不直接看代码，而是先看它想干什么，最后再回来看代码实现。</p>
+<hr />
+<h3>📋 学习路径 Task List</h3>
+<ol>
+<li><strong>Task 1：回顾 Transformer 的“残差连接” (Residual Connection)</strong> - 理解基础。</li>
+<li><strong>Task 2：引入核心概念 "Layer Scaling"</strong> - 理解为什么要写这个文件。</li>
+<li><strong>Task 3：拆解数学逻辑 (Bias-Dropout-Add)</strong> - 看懂核心计算函数。</li>
+<li><strong>Task 4：理解类结构 (The Class)</strong> - 看懂参数 <code>ls1</code> 和 <code>ls2</code> 是哪来的。</li>
+<li><strong>Task 5：Python 技巧 (Partial)</strong> - 看懂它是怎么把参数塞进去的。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1：回顾 Transformer 的“残差连接”</h4>
+<p>在标准的 Transformer 层（比如 GPT、BERT）中，有一个非常重要的结构叫 <strong>残差连接（Residual Connection）</strong>。
+它的公式大概是这样的：
+$$ \text{Output} = \text{Input} + \text{SubLayer}(\text{Input}) $$</p>
+<p>简单说就是：<strong>原来的信号（Input）保留，加上经过处理的新信号（SubLayer结果）。</strong>
+这个结构防止了网络太深时梯度消失，让模型能训练得更深。</p>
+<h4>✅ Task 2：引入核心概念 "Layer Scaling"</h4>
+<p>这个文件的核心就在于 <strong>Layer Scaling (层缩放)</strong>。
+随着模型越来越大（特别是多模态模型），训练会变得不稳定。为了解决这个问题，研究人员提出了一个小技巧：<strong>在把新信号加回去之前，先乘一个很小的系数（或者可学习的系数）。</strong></p>
+<p>新的公式变成了：
+$$ \text{Output} = \text{Input} + \text{SubLayer}(\text{Input}) \times \mathbf{ls} $$</p>
+<p>这里的 <strong><code>ls</code></strong> 就是 Layer Scaling 的缩放因子。
+*   这个文件就是为了<strong>强行</strong>把这个 <code>* ls</code> 的操作，塞进标准的 Transformer 里面去。</p>
+<h4>✅ Task 3：拆解数学逻辑 (Bias-Dropout-Add)</h4>
+<p>现在我们看代码的前半部分：<code>_bias_dropout_add_func_layer_scaling</code>。
+在 Megatron（NVIDIA 的框架）里，为了快，它通常把 "加偏置(Bias) + Dropout + 残差相加(Add)" 这三步合并在一起做。</p>
+<p>让我们看看代码做了什么修改：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_bias_dropout_add_func_layer_scaling</span><span class="p">(</span><span class="n">ls</span><span class="p">,</span> <span class="n">x_with_bias</span><span class="p">,</span> <span class="n">residual</span><span class="p">,</span> <span class="n">prob</span><span class="p">,</span> <span class="n">training</span><span class="p">):</span>
+    <span class="c1"># ... 省略解包代码 ...</span>
+
+    <span class="c1"># 1. 加上偏置 Bias</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="n">bias</span> 
+
+    <span class="c1"># 2. 做 Dropout (随机丢弃神经元，防止过拟合)</span>
+    <span class="n">out</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">dropout</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">p</span><span class="o">=</span><span class="n">prob</span><span class="p">,</span> <span class="n">training</span><span class="o">=</span><span class="n">training</span><span class="p">)</span>
+
+    <span class="c1"># 3. 【关键点来了！】</span>
+    <span class="c1"># 原来的逻辑是： out = residual + out</span>
+    <span class="c1"># 现在的逻辑是： out = residual + out * ls </span>
+    <span class="n">out</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">out</span> <span class="o">*</span> <span class="n">ls</span>  <span class="c1"># &lt;--- 看这里！这就是 Layer Scaling</span>
+    <span class="k">return</span> <span class="n">out</span>
+</code></pre></div>
+
+<p><strong>结论：</strong> 这个函数唯一的目的，就是在把处理后的结果（<code>out</code>）加回 <code>residual</code> 之前，先乘了一个 <code>ls</code>。</p>
+<h4>✅ Task 4：理解类结构 (The Class)</h4>
+<p>现在看代码的后半部分：<code>class LayerScalingTransformerLayer</code>。
+这个类继承自标准的 <code>TransformerLayer</code>，它做了两件事：</p>
+<ol>
+<li>
+<p><strong>定义缩放参数 (<code>ls</code>)</strong>：
+    Transformer 一层里有两个主要部分：Attention（注意力机制）和 MLP（前馈网络）。所以它定义了两个参数：
+    <code>python
+    # ls1 用于 Attention 部分，ls2 用于 MLP 部分
+    # 初始化为 1 (torch.ones)，意味着初始状态下不缩放，让模型自己去学这个参数
+    self.ls1 = torch.nn.Parameter(torch.ones(self.config.hidden_size))
+    self.ls2 = torch.nn.Parameter(torch.ones(self.config.hidden_size))</code></p>
+</li>
+<li>
+<p><strong>替换原有逻辑</strong>：
+    它需要把这两个参数传给 Task 3 中定义的那个函数。</p>
+</li>
+</ol>
+<h4>✅ Task 5：Python 技巧 (Partial)</h4>
+<p>最后一点困惑可能在于 <code>partial</code>。
+在标准的 <code>TransformerLayer</code> 里，计算逻辑是写死的。为了把我们自定义的 <code>ls1</code> 和 <code>ls2</code> 塞进去，代码使用了 <code>functools.partial</code>（偏函数）。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 意思就是：把 self.ls1 这个参数，提前“绑定”给 self_attn_bda 这个函数</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">self_attn_bda</span> <span class="o">=</span> <span class="n">partial</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">self_attn_bda</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">ls1</span><span class="p">)</span>
+
+<span class="c1"># 把 self.ls2 绑定给 mlp_bda</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">mlp_bda</span> <span class="o">=</span> <span class="n">partial</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mlp_bda</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">ls2</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>翻译成人话：</strong>
+以后调用 <code>self_attn_bda(...)</code> 的时候，不需要手动传 <code>ls</code> 了，程序会自动把 <code>self.ls1</code> 作为第一个参数传进去，从而触发 Task 3 中的那个 <code>out * ls</code> 的逻辑。</p>
+<hr />
+<h3>🎯 总结：这个文件到底讲了啥？</h3>
+<p>这个文件实现了一个<strong>“带层缩放（Layer Scaling）功能的 Transformer 层”</strong>。</p>
+<ol>
+<li>它<strong>继承</strong>了标准的 Transformer 层。</li>
+<li>它<strong>增加</strong>了两个可学习的参数 <code>ls1</code> 和 <code>ls2</code>。</li>
+<li>它<strong>修改</strong>了底层的加法逻辑：在残差连接相加之前，先把新计算出的特征乘以 <code>ls</code>。</li>
+</ol>
+<p><strong>目的：</strong> 为了让这种超大规模的多模态模型训练起来更稳定，不容易炸梯度。</p>

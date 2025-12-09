@@ -1,0 +1,84 @@
+<h1>docs/perf/dpsk.md</h1>
+<p>这份文档确实非常硬核，它是关于<strong>如何使用 <code>verl</code> 这个框架，结合 <code>Megatron</code> 后端，来训练超大参数量的模型（主要是 DeepSeek-V3 671B 和 Qwen3）</strong>的技术指南。</p>
+<p>简单来说，这是一份给 AI 基础设施工程师看的“操作手册”。</p>
+<p>为了让你读懂，我把这份文档拆解成一个<strong>“训练 DeepSeek 671B 的任务清单 (To-Do List)”</strong>。假设你现在就是那个工程师，我们要一步步完成这个大工程。</p>
+<hr />
+<h3>📋 任务清单：从零开始训练 DeepSeek 671B</h3>
+<h4>✅ Task 1: 搞清楚我们在做什么 (背景知识)</h4>
+<ul>
+<li><strong>文档核心：</strong> <code>verl</code>（一个强化学习训练框架）现在通过集成 <code>Megatron</code>（NVIDIA开发的高性能训练框架），具备了训练超大模型的能力。</li>
+<li><strong>目标模型：</strong> 主要是 <strong>DeepSeek-V3 (671B参数)</strong> 和 <strong>Qwen3 (235B参数)</strong>。这些是目前最顶级的 Mixture-of-Experts (MoE) 模型。</li>
+<li><strong>技术难点：</strong> 模型太大，单张显卡甚至单台服务器都装不下，必须用几十甚至几百张显卡通过各种复杂的“切分”技术并行训练。</li>
+</ul>
+<h4>✅ Task 2: 准备环境 (软硬件准备)</h4>
+<ul>
+<li><strong>软件环境 (Docker)：</strong><ul>
+<li>文档推荐直接用官方打好的镜像：<code>verlai/verl:app-verl0.4...</code>。</li>
+<li><strong>注意：</strong> 这个镜像主要是为 <strong>Hopper 架构</strong> (如 H100, H800, H20) 优化的。</li>
+<li><strong>坑：</strong> 如果你用的是 A100 (Non-Hopper)，直接用可能会报错，需要重新安装 <code>DeepEP</code> 这个组件。</li>
+</ul>
+</li>
+<li><strong>硬件门槛：</strong><ul>
+<li>文档直言不讳：<strong>DeepSeek-V3 最少需要 96 张 H20 (96GB) 显卡</strong>。</li>
+<li>如果显卡不够多（比如只有96张），你需要把显存里的东西“卸载” (Offload) 到 CPU 内存里。这会导致每台机器需要 <strong>1.6TB 的内存</strong>。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 配置 DeepSeek 671B 的训练参数 (核心步骤)</h4>
+<p>文档给出了一个表格，教你根据你手头有多少张显卡，来设置不同的并行策略。这是文档最难懂的部分，我给你翻译一下：</p>
+<ul>
+<li>
+<p><strong>你需要设置的环境变量：</strong></p>
+<ul>
+<li><code>TP</code> (Tensor Parallel): 张量并行（把一层网络切开）。</li>
+<li><code>PP</code> (Pipeline Parallel): 流水线并行（把不同层分给不同卡）。</li>
+<li><code>EP</code> (Expert Parallel): 专家并行（MoE模型特有的，把不同的专家分给不同卡）。</li>
+<li><code>OFFLOAD_FRACTION</code>: 卸载比例（1.0 表示全扔到 CPU 内存，0 表示全在 GPU 显存）。</li>
+</ul>
+</li>
+<li>
+<p><strong>文档推荐的几种配置 (由穷到富)：</strong></p>
+<ol>
+<li><strong>如果你有 96 张卡 (入门级):</strong><ul>
+<li>设置 <code>OFFLOAD_FRACTION=1.</code> (显存不够，全靠 CPU 内存顶)。</li>
+<li>设置 <code>PP=12</code> (切成12段流水线)。</li>
+</ul>
+</li>
+<li><strong>如果你有 128 张卡:</strong><ul>
+<li>设置 <code>OFFLOAD_FRACTION=0.5</code> (一半放显存，一半放内存)。</li>
+</ul>
+</li>
+<li><strong>如果你有 256 张卡:</strong><ul>
+<li>设置 <code>OFFLOAD_FRACTION=0.</code> (显存够了，不用借用内存了，速度会起飞)。</li>
+</ul>
+</li>
+<li><strong>如果你有 512 张卡 (土豪级):</strong><ul>
+<li>可以开启大规模的 <code>EP=32</code> (32路专家并行)，训练速度最快。</li>
+</ul>
+</li>
+</ol>
+</li>
+<li>
+<p><strong>运行脚本：</strong></p>
+<ul>
+<li>文档指路：去运行 <code>examples/grpo_trainer/run_deepseek671b_math_megatron_96gb.sh</code> 这个脚本。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 配置 Qwen3 系列模型 (备选方案)</h4>
+<p>如果你不训练 DeepSeek，而是训练 Qwen3，逻辑是一样的：
+*   <strong>Qwen3-235B:</strong> 门槛低一点，最少 <strong>32 张卡</strong> 就能跑（但也需要把数据全卸载到 CPU 内存）。
+*   <strong>Qwen3-30B:</strong> 小模型，<strong>8 张卡</strong> 就能跑。</p>
+<h4>✅ Task 5: 预期结果 (Benchmark)</h4>
+<p>当你跑起来之后，怎么知道正不正常？文档给了一个参考数据：
+*   <strong>配置：</strong> 96张卡跑 DeepSeek 671B。
+*   <strong>速度：</strong> 每一步 (step) 大约需要 <strong>1700秒</strong> (这就很慢了，因为用了 CPU 内存卸载)。
+*   <strong>资源：</strong> 单卡显存占用 66GB，但 CPU 内存吃掉了 1500GB。</p>
+<h4>✅ Task 6: 了解未来的优化方向 (画大饼)</h4>
+<p>社区还在努力做的事：
+*   进一步降低内存消耗。
+*   优化长文本训练。
+*   结合 SGLang 提升速度。</p>
+<hr />
+<h3>💡 总结一下</h3>
+<p>这篇文档主要在说：<strong>“兄弟，如果你想用 <code>verl</code> 训练 DeepSeek-V3 这种巨无霸，你需要准备很多 H100/H20 显卡。如果显卡不够多（比如只有96张），我们就得牺牲速度，借用 CPU 内存来硬跑。具体的参数配置表我都给你列好了，照着填就行。”</strong></p>

@@ -1,0 +1,127 @@
+<h1>examples/inference/gpt/gpt_dynamic_inference_12b.sh</h1>
+<p>这份文件是一个 <strong>Shell 脚本 (<code>.sh</code>)</strong>，它的核心目的是：<strong>使用 NVIDIA 的工具（Megatron-LM）在 GPU 上启动一个 120 亿参数（12B）的 GPT 模型，并进行“动态批处理”推理测试。</strong></p>
+<p>你可以把它想象成是一个<strong>复杂的启动器</strong>，就像启动一个大型游戏前，需要先配置画质、按键、网络连接，最后才点击“开始游戏”。</p>
+<p>为了让你能看懂，我制定了一个 <strong>5 步学习任务清单 (To-Do List)</strong>。我们将按照这个顺序，把脚本拆解开来阅读。</p>
+<hr />
+<h3>📋 学习任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>Task 01: 检查“原材料” (环境与路径)</strong><ul>
+<li><em>目标：</em> 搞清楚运行这个模型需要安装什么库，以及需要哪些核心文件。</li>
+</ul>
+</li>
+<li><strong>Task 02: 确认“机器规格” (模型参数)</strong><ul>
+<li><em>目标：</em> 理解脚本是如何定义这个 GPT 模型的（多大、什么结构）。</li>
+</ul>
+</li>
+<li><strong>Task 03: 配置“发动机” (推理优化)</strong><ul>
+<li><em>目标：</em> 了解它是如何让模型跑得更快的（动态批处理、CUDA Graph）。</li>
+</ul>
+</li>
+<li><strong>Task 04: 设定“测试考题” (输入数据)</strong><ul>
+<li><em>目标：</em> 搞清楚模型启动后，我们要问它什么问题（Prompt），或者如何模拟用户请求。</li>
+</ul>
+</li>
+<li><strong>Task 05: 按下“启动键” (执行命令)</strong><ul>
+<li><em>目标：</em> 看懂脚本最后是如何把上面所有配置组合成一条命令并运行的。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 01: 检查“原材料” (环境与路径)</h4>
+<p>在脚本的最开头，它在做准备工作。就像做饭前要洗菜、拿锅。</p>
+<ul>
+<li><strong>安装库 (<code>pip install ...</code>)</strong>:<ul>
+<li><code>simpy</code>, <code>sentencepiece</code>, <code>tiktoken</code>: 这些是 Python 的工具包，主要用于处理文本（分词）和模拟系统行为。</li>
+</ul>
+</li>
+<li><strong>设置环境变量</strong>:<ul>
+<li><code>export CUDA_DEVICE_MAX_CONNECTIONS=1</code>: 这是一个针对 GPU 通信的优化设置。</li>
+</ul>
+</li>
+<li><strong>检查核心文件 (关键点)</strong>:
+    <code>bash
+    : ${CHECKPOINT_DIR:?"CHECKPOINT_DIR is not set"}
+    : ${TOKENIZER_MODEL:?"TOKENIZER_MODEL is not set"}</code><ul>
+<li>这两行代码的意思是：<strong>“如果你没有告诉我模型权重在哪 (Checkpoint) 或者分词器在哪 (Tokenizer)，我就报错退出！”</strong></li>
+<li>这是运行模型最不可或缺的两个文件。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 02: 确认“机器规格” (模型参数)</h4>
+<p>脚本中间那一大段 <code>ARGS=" ... "</code> 是最长的部分，它定义了这个 12B 模型的<strong>具体长相</strong>。如果参数不对，加载权重时就会报错。</p>
+<ul>
+<li><strong>模型架构参数</strong>:<ul>
+<li><code>--num-layers 40</code>: 这个模型有 40 层神经网络。</li>
+<li><code>--hidden-size 5120</code>: 每一层的神经元宽度是 5120。</li>
+<li><code>--num-attention-heads 32</code>: 注意力头数是 32。</li>
+<li><em>(注：这些数字组合起来，构成了约 120 亿参数的规模)</em>。</li>
+</ul>
+</li>
+<li><strong>高级技术细节 (不用深究，知道是“高级配置”即可)</strong>:<ul>
+<li><code>--position-embedding-type rope</code>: 使用了 RoPE 位置编码（现在的 Llama 等模型都用这个）。</li>
+<li><code>--swiglu</code>: 使用 SwiGLU 激活函数（比老的 ReLU 更好）。</li>
+<li><code>--bf16</code>: 使用 <code>bfloat16</code> 精度，比传统的 <code>fp32</code> 更省显存，比 <code>fp16</code> 训练更稳定。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 03: 配置“发动机” (推理优化)</h4>
+<p>这部分是这个脚本的<strong>核心亮点</strong>（看文件名 <code>dynamic_inference</code> 就知道）。它不仅仅是跑起来，还要跑得快、跑得高效。</p>
+<ul>
+<li><strong>动态批处理 (Dynamic Batching)</strong>:
+    <code>bash
+    --inference-dynamic-batching</code><ul>
+<li><em>通俗解释</em>：这就好比坐公交车。以前的模式是“必须凑齐 8 个人才发车”，现在的<strong>动态批处理</strong>是“随时有人上车，随时有人下车，司机动态调整”，这样能极大提高 GPU 的利用率，减少排队时间。</li>
+</ul>
+</li>
+<li><strong>CUDA Graphs</strong>:
+    <code>bash
+    --inference-dynamic-batching-num-cuda-graphs ${NUM_CUDA_GRAPHS}</code><ul>
+<li><em>通俗解释</em>：这是一种 GPU 加速技术。相当于把常用的计算路径“背下来”，下次走这条路时不用再查地图，直接飞过去。脚本里默认设置了 16 个这样的图。</li>
+</ul>
+</li>
+<li><strong>Flash Attention</strong>:
+    <code>bash
+    --use-flash-attn</code><ul>
+<li>这是现在大模型标配的加速技术，大幅提升注意力机制的计算速度。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 04: 设定“测试考题” (输入数据)</h4>
+<p>模型跑起来后，总得干活。脚本里有两种模式：</p>
+<ol>
+<li><strong>指定考题</strong>: 如果你设置了 <code>PROMPTS</code> 变量，它就按你写的具体内容去生成。</li>
+<li><strong>压力测试 (默认模式)</strong>:
+    <code>bash
+    --num-tokens-to-prompt ${NUM_TOKENS_TO_PROMPT}   # 比如：每个请求输入 8 到 32 个字
+    --incoming-requests-per-sec ${INCOMING_REQUESTS_PER_SEC} # 比如：每秒模拟 100 个用户请求</code><ul>
+<li><em>通俗解释</em>：脚本会自动生成一堆随机的请求，像机关枪一样打给模型，看看模型能不能扛得住每秒 100 个请求的压力。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 05: 按下“启动键” (执行命令)</h4>
+<p>脚本的最后几行是“组装”和“发射”。</p>
+<ul>
+<li><strong>组装命令</strong>:
+    <code>bash
+    CMD="python -m examples.inference.gpt.gpt_${ENGINE}_inference ${ARGS}"</code><ul>
+<li>它把前面定义的 <code>ARGS</code>（模型参数+优化参数）全部拼接到 <code>python</code> 命令后面。</li>
+<li>它调用的 Python 程序是 <code>gpt_dynamic_inference.py</code>。</li>
+</ul>
+</li>
+<li><strong>执行</strong>:
+    <code>bash
+    eval ${CMD}</code><ul>
+<li>这就是按下回车键，真正开始运行程序。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结一下 (Executive Summary)</h3>
+<p><strong>这个脚本讲了啥？</strong>
+这是一个<strong>压力测试脚本</strong>。它配置了一个 <strong>12B 参数的 GPT 模型</strong>，开启了最先进的 <strong>动态批处理 (Dynamic Batching)</strong> 和 <strong>CUDA Graph</strong> 加速技术，然后模拟 <strong>高并发的用户请求</strong>（默认每秒 100 个），用来测试这个模型在 NVIDIA GPU 上的推理性能（速度和吞吐量）。</p>
+<p><strong>你需要做什么？</strong>
+如果你要运行它，你只需要做两件事：
+1.  把 <code>CHECKPOINT_DIR</code> 改成你硬盘上实际的模型权重路径。
+2.  把 <code>TOKENIZER_MODEL</code> 改成你硬盘上分词器文件的路径。
+然后运行脚本即可。</p>

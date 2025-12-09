@@ -1,0 +1,104 @@
+<h1>megatron/core/inference/text_generation_controllers/text_generation_controller.py</h1>
+<p>这份代码确实非常硬核，它是 <strong>Megatron-Core</strong>（NVIDIA 开发的大模型训练/推理框架）中负责 <strong>推理（Inference）控制逻辑</strong> 的核心文件。</p>
+<p>简单来说，这个类 <code>TextGenerationController</code> 就像是一个<strong>指挥官</strong>。它手里拿着模型（Model）和分词器（Tokenizer），负责接收用户的输入，一步步指挥模型生成文本，直到结束。</p>
+<p>为了让你读懂它，我为你列了一个 <strong>“6步通关 Task List”</strong>。你可以按照这个顺序，一步步去代码里找对应的部分，就能看懂了。</p>
+<hr />
+<h3>🟢 Task 1: 理解基础 —— 输入与输出 (Tokenizer)</h3>
+<p><strong>目标：</strong> 搞清楚文本是怎么变成数字（Token），以及生成的数字怎么变回文本的。</p>
+<ul>
+<li><strong>大白话解释：</strong> 计算机不认识字，只认识数字。模型推理前要把 "你好" 变成 <code>[101, 233]</code>，推理完拿到 <code>[500]</code> 要变回 "吗"。</li>
+<li><strong>看代码哪里：</strong><ol>
+<li><code>tokenize_prompt(self, prompt, ...)</code>: 负责把用户输入的字符串变成 Token ID 列表。</li>
+<li><code>_detokenize(self, tokens, ...)</code> 和 <code>detokenize_generations(...)</code>: 负责把模型生成的 Token ID 列表变回人类能读的字符串。</li>
+</ol>
+</li>
+</ul>
+<h3>🟡 Task 2: 理解核心魔法 —— 采样 (Sampling)</h3>
+<p><strong>目标：</strong> 搞清楚模型算出概率后，到底是怎么选出下一个字的。</p>
+<ul>
+<li><strong>大白话解释：</strong> 模型预测下一个字时，会给出一堆候选词的概率（Logits）。我们是选概率最大的那个（Greedy）？还是随机选一个（Random）？还是只在概率最高的前K个里选（Top-K）？</li>
+<li><strong>看代码哪里：</strong><ol>
+<li><code>_torch_sampling_func(...)</code>: 这是最核心的数学函数。<ul>
+<li><strong>Temperature (温度):</strong> 代码里有 <code>last_token_logits.div_(temperature)</code>。温度越高，概率分布越平缓，生成的字越“疯狂”；温度越低，越保守。</li>
+<li><strong>Top-K:</strong> 代码里有 <code>modify_logits_for_top_k_filtering</code>。只保留概率最高的前 K 个，其他的设为负无穷（不选）。</li>
+<li><strong>Top-P (Nucleus Sampling):</strong> 代码里有 <code>modify_logits_for_top_p_filtering</code>。累加概率直到达到 P 值，保留这部分的词。</li>
+</ul>
+</li>
+<li><code>sample_from_logits(...)</code>: 这是一个包装函数，它调用上面的函数来获得最终的 Token ID。</li>
+</ol>
+</li>
+</ul>
+<h3>🟠 Task 3: 传统模式 —— 静态批处理 (Static Batching)</h3>
+<p><strong>目标：</strong> 理解最基础的“一批一批”生成逻辑。</p>
+<ul>
+<li><strong>大白话解释：</strong> 假设来了 4 个人的请求。即使有人问得短，有人问得长，我们也把他们强行凑成一组（Batch）。大家一起开始，必须等最慢的那个人说完，这一批才算结束。</li>
+<li><strong>看代码哪里：</strong><ul>
+<li>函数：<code>generate_all_output_tokens_static_batch(...)</code> (这个函数很长，是重点)</li>
+<li><strong>流程拆解：</strong><ol>
+<li><strong>Padding (<code>pad_input_prompt_tokens</code>):</strong> 因为大家的输入长度不一样，要用空白符（Pad）把短的补齐，变成矩阵。</li>
+<li><strong>Prefill (预填充):</strong> 把整个 Prompt（提示词）一次性喂给模型，算出第一个生成的字。</li>
+<li><strong>Decode Loop (<code>while True:</code> 循环):</strong><ul>
+<li>这是生成的死循环。</li>
+<li><code>run_one_forward_step</code>: 模型算一步。</li>
+<li><code>sample_from_logits</code>: 算出下一个 Token。</li>
+<li><code>update_generation_status</code>: 检查谁生成完了（遇到了结束符 EOS），谁还需要继续。</li>
+<li>直到所有人都生成完，或者达到最大长度，<code>break</code> 跳出循环。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h3>🔵 Task 4: 进阶模式 —— 动态批处理 (Dynamic Batching / Continuous Batching)</h3>
+<p><strong>目标：</strong> 理解现在高性能服务（如 ChatGPT 背后的服务）是怎么做的。</p>
+<ul>
+<li><strong>大白话解释：</strong> 静态批处理效率太低（快的人要等慢的人）。动态批处理是：有人生成完了立马走，新的人立马插进来。不需要等所有人一起结束。</li>
+<li><strong>看代码哪里：</strong><ul>
+<li>函数：<code>async_generate_output_tokens_dynamic_batch(...)</code></li>
+<li><strong>关键词：</strong> <code>async</code> (异步)。</li>
+<li><strong>逻辑：</strong><ol>
+<li>它不再是一个巨大的 <code>while</code> 循环，而是只负责 <strong>“生成一步”</strong> 的逻辑。外部调度器会不断调用它。</li>
+<li><code>_dynamic_step_context_init</code>: 准备当前这一步的数据（哪些请求是活跃的）。</li>
+<li><code>_dynamic_step_forward_logits</code>: 跑一次模型。</li>
+<li><code>_dynamic_step_sample_logits</code>: 采样出结果。</li>
+<li><code>_dynamic_step_context_bookkeeping</code>: <strong>记账</strong>。把生成完的请求踢出去，标记新生成的 Token，更新状态。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h3>🟣 Task 5: 搞定多卡通信 —— 流水线并行 (Pipeline Parallelism)</h3>
+<p><strong>目标：</strong> 理解为什么代码里总是在“广播” (Broadcast)。</p>
+<ul>
+<li><strong>大白话解释：</strong> 模型太大了，一张显卡装不下，切成了好几段放在不同显卡上（流水线）。<ul>
+<li>GPU 1 算前几层 -&gt; 传给 GPU 2 -&gt; ... -&gt; GPU 8 算最后几层。</li>
+<li>采样需要最后的 Logits（概率），但这数据只在 GPU 8 上。</li>
+<li>所以 GPU 8 必须把结果 <strong>广播</strong> 告诉 GPU 1~7，大家才能同步状态，知道下一个字是啥。</li>
+</ul>
+</li>
+<li><strong>看代码哪里：</strong><ul>
+<li>搜索 <code>broadcast_from_last_pipeline_stage</code>。</li>
+<li>你会发现它经常出现在算出 logits 之后。</li>
+</ul>
+</li>
+</ul>
+<h3>🟤 Task 6: 细节 —— Log Probabilities (对数概率)</h3>
+<p><strong>目标：</strong> 很多时候我们需要知道模型生成这个字的“自信程度”。</p>
+<ul>
+<li><strong>大白话解释：</strong> 用户不仅想要生成的文本，还想知道每个字生成的概率是多少（比如用于评估模型质量）。</li>
+<li><strong>看代码哪里：</strong><ul>
+<li>搜索 <code>log_probs</code> 或 <code>return_log_probs</code>。</li>
+<li><code>_update_top_n_logprobs_dict</code>: 这个函数负责记录每一步生成的前 N 个可能的词及其概率。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：如何阅读这个文件？</h3>
+<p>不要试图从第一行读到最后一行。请按以下顺序阅读：</p>
+<ol>
+<li>先看 <strong><code>_torch_sampling_func</code></strong>：搞懂怎么从概率选字的。</li>
+<li>再看 <strong><code>generate_all_output_tokens_static_batch</code></strong> 的 <code>while True</code> 循环部分：搞懂生成文本的主循环结构（模型计算 -&gt; 采样 -&gt; 检查结束 -&gt; 循环）。</li>
+<li>最后看 <strong><code>async_generate_output_tokens_dynamic_batch</code></strong>：看它如何把上面的循环拆解成异步的单步操作，以支持更高并发。</li>
+</ol>
+<p>希望这个 List 能帮你建立起代码的骨架！</p>

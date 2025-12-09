@@ -1,0 +1,140 @@
+<h1>megatron/core/datasets/bert_dataset.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到了 <strong>BERT 模型预训练（Pre-training）</strong> 中最核心的数据处理逻辑。如果不了解 BERT 的训练原理，看这份代码就像看天书。</p>
+<p>为了让你读懂，我们把这份代码想象成一个 <strong>“出题老师”</strong>。它的任务是：<strong>把原始的文本，加工成 BERT 模型可以用来做“填空题”和“判断题”的考卷。</strong></p>
+<p>我为你列了一个 <strong>Task List（任务清单）</strong>，我们将通过完成这 6 个任务，一步步拆解这份代码。</p>
+<hr />
+<h3>任务清单：BERT 考卷制作流程</h3>
+<ol>
+<li><strong>Task 1: 确定考试大纲 (Configuration)</strong><ul>
+<li><em>代码对应：</em> <code>BERTMaskedWordPieceDatasetConfig</code> 类</li>
+</ul>
+</li>
+<li><strong>Task 2: 准备题库 (Initialization)</strong><ul>
+<li><em>代码对应：</em> <code>__init__</code> 方法</li>
+</ul>
+</li>
+<li><strong>Task 3: 抽取并拼接题目 (NSP - Next Sentence Prediction)</strong><ul>
+<li><em>代码对应：</em> <code>__getitem__</code> 中的前半部分</li>
+</ul>
+</li>
+<li><strong>Task 4: 裁剪长度 (Truncation)</strong><ul>
+<li><em>代码对应：</em> <code>__getitem__</code> 中的中间部分</li>
+</ul>
+</li>
+<li><strong>Task 5: 挖空文本 (MLM - Masked Language Model)</strong><ul>
+<li><em>代码对应：</em> <code>_create_masked_lm_predictions</code> 和 <code>_get_token_mask</code></li>
+</ul>
+</li>
+<li><strong>Task 6: 统一格式与打包 (Padding &amp; Output)</strong><ul>
+<li><em>代码对应：</em> <code>__getitem__</code> 的最后部分</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细拆解</h3>
+<h4>Task 1: 确定考试大纲 (Configuration)</h4>
+<p><strong>目标：</strong> 设置这次数据处理的基本规则。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>BERTMaskedWordPieceDatasetConfig</code> 类。</li>
+<li><strong>核心点：</strong> <code>classification_head: bool</code>。</li>
+<li><strong>解释：</strong> BERT 训练有两个任务：<ol>
+<li>填空（MLM）。</li>
+<li>判断下一句是不是真的下一句（NSP）。
+这里的 <code>classification_head</code> 就是开关。如果打开（True），说明我们要生成包含“下一句预测”的数据。代码里强制要求 <code>assert self.classification_head is not None</code>，说明必须明确指定要不要做这个任务。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 2: 准备题库 (Initialization)</h4>
+<p><strong>目标：</strong> 加载原始数据，建立索引，方便后续随机抽题。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>__init__</code> 方法。</li>
+<li><strong>核心点：</strong><ul>
+<li><code>indexed_dataset</code>: 这里面存着海量的原始文章。</li>
+<li><code>self.sample_index</code>: 建立一个目录。</li>
+<li><code>sequence_length - 3</code>: 为什么要减 3？因为 BERT 需要 3 个特殊标记：<code>[CLS]</code>（开头），<code>[SEP]</code>（第一句结束），<code>[SEP]</code>（第二句结束）。预留好位置。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 抽取并拼接题目 (NSP 逻辑)</h4>
+<p><strong>目标：</strong> 为了训练 BERT 理解句子关系，我们需要准备两个句子（A 和 B）。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>__getitem__</code> 方法开头到 <code>if is_next_random:</code> 结束。</li>
+<li><strong>流程：</strong><ol>
+<li><strong>取样：</strong> 从数据库里拿出一大段文本 <code>sample</code>。</li>
+<li><strong>切分 (Pivot)：</strong> 把这段文本切成两半，前半部分叫 <code>split_A</code>，后半部分叫 <code>split_B</code>。</li>
+<li><strong>搞点破坏 (NSP核心)：</strong><ul>
+<li>如果 <code>is_next_random</code> 是 True（50%的概率）：把 <code>split_A</code> 和 <code>split_B</code> 的顺序打乱，或者随机换掉其中一段。</li>
+<li><strong>目的：</strong> 让模型去猜“B 到底是不是 A 的下一句”。</li>
+<li><code>is_next_random</code> 变量记录了“是不是随机拼凑的”，这也就是最后的标签之一。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 4: 裁剪长度 (Truncation)</h4>
+<p><strong>目标：</strong> 题目不能太长，超过模型限制就要剪掉。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>__getitem__</code> 中 <code>while length_A + length_B &gt; target_sequence_length:</code> 循环。</li>
+<li><strong>逻辑：</strong><ul>
+<li>如果 A + B 的长度超过了设定限制。</li>
+<li><strong>谁长剪谁：</strong> 比较 A 和 B 哪个长。</li>
+<li><strong>随机剪：</strong> 随机决定是剪掉开头的一个词，还是剪掉末尾的一个词。</li>
+<li>一直剪到长度符合要求为止。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 挖空文本 (MLM 逻辑)</h4>
+<p><strong>目标：</strong> 制作“完形填空”题。这是 BERT 最强大的地方。</p>
+<ul>
+<li><strong>代码位置：</strong><ul>
+<li><code>__getitem__</code> 中的 <code>tokens = [self.config.tokenizer.cls, ...]</code> (构建结构)</li>
+<li><code>self._create_masked_lm_predictions</code> (实际挖空动作)</li>
+<li><code>_get_token_mask</code> (决定怎么挖)</li>
+</ul>
+</li>
+<li><strong>流程：</strong><ol>
+<li><strong>组装：</strong> 把句子拼成标准格式：<code>[CLS] 句子A [SEP] 句子B [SEP]</code>。</li>
+<li><strong>标记类型：</strong> 这是一个 <code>assignments</code> 数组，全是 0 代表句子 A，全是 1 代表句子 B。</li>
+<li><strong>挖空 (<code>_get_token_mask</code>)：</strong> 这一步非常经典，代码里写了 80/10/10 策略：<ul>
+<li>80% 的概率：把词替换成 <code>[MASK]</code>。</li>
+<li>10% 的概率：把词替换成一个随机的错误词（迷惑模型）。</li>
+<li>10% 的概率：什么都不改（让模型学会保持原样）。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 6: 统一格式与打包 (Padding &amp; Output)</h4>
+<p><strong>目标：</strong> 所有的考卷必须一样长（比如都是 512 个格子），不够的补齐，并生成答案。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>__getitem__</code> 的后半部分（Padding 和 return）。</li>
+<li><strong>流程：</strong><ol>
+<li><strong>Padding（填充）：</strong> 如果刚才剪完的句子不够长，用 <code>_pad_token_id</code>（通常是 0）把后面填满。</li>
+<li><strong>生成 Mask 矩阵：</strong><ul>
+<li><code>padding_mask</code>: 告诉模型哪些是真字，哪些是刚才填的废料。</li>
+<li><code>loss_mask</code>: 告诉模型只需要预测被“挖空”的那些位置，没挖空的地方不用算 Loss（不用负责）。</li>
+</ul>
+</li>
+<li><strong>Labels（答案）：</strong><ul>
+<li><code>labels</code> 数组里存放的是被挖掉的那个词原本是什么。</li>
+<li>没被挖掉的地方填 <code>-1</code>（表示忽略）。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底输出了啥？</h3>
+<p><code>__getitem__</code> 最后返回的那个字典就是喂给 BERT 模型的一条数据：</p>
+<ul>
+<li><code>text</code>: <strong>题目</strong>。例如：<code>[CLS] 今天 天气 [MASK] 好 [SEP] 我 去 [MASK] 球 [SEP] [PAD]...</code></li>
+<li><code>types</code>: <strong>句子区分</strong>。例如：<code>0 0 0 0 0 0 1 1 1 1 1 ...</code> (0是第一句，1是第二句)</li>
+<li><code>labels</code>: <strong>填空题答案</strong>。例如：对应 <code>[MASK]</code> 的位置是“真”、“打”，其他位置是 -1。</li>
+<li><code>is_random</code>: <strong>判断题答案</strong>。0 表示 B 是 A 的下一句，1 表示不是。</li>
+<li><code>loss_mask</code>: <strong>判卷范围</strong>。只在有 <code>[MASK]</code> 的地方算分。</li>
+</ul>
+<h3>你的阅读建议</h3>
+<p>不要试图一行行读懂 <code>numpy</code> 的操作。你只需要关注：
+1.  <strong><code>__getitem__</code></strong> 是主入口。
+2.  它先处理 <strong>NSP</strong> (拼两个句子)，再处理 <strong>MLM</strong> (挖空)。
+3.  最后把这一堆东西变成 Tensor 返回出去。</p>

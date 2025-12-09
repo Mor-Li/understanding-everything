@@ -1,0 +1,80 @@
+<h1>tests/special_npu/run_qwen2_5_05b_sft_peft_sp2.sh</h1>
+<p>这段代码确实包含了很多术语。你可以把它想象成<strong>一份给机器人的“任务清单”</strong>（Shell 脚本），它的目的是<strong>测试</strong>在一个特定的硬件环境（NPU）下，如何通过一种高效的方法（PEFT/LoRA）来微调（SFT）一个大模型。</p>
+<p>为了让你看懂，我把这段代码拆解成一个 <strong>6步走的 Task List（任务清单）</strong>，每一步都对应代码里的具体行和背后的逻辑：</p>
+<hr />
+<h3>📋 任务清单：微调 Qwen2.5 模型 (测试版)</h3>
+<h4>Task 1: 准备工作 (Preparation)</h4>
+<p><strong>目标</strong>：清理桌面，准备好存放“作业成果”的文件夹，并确认我们要训练哪个模型。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>bash
+    set -x  # 开启调试模式，打印执行的每一行命令
+    mkdir -p ./save_ckpts  # 创建一个文件夹，用来存训练好的模型存档
+    MODEL_ID=${...} # 确认模型名字：Qwen2.5-0.5B-Instruct（通义千问的小参数版本）
+    MODEL_PATH=${...} # 确认模型在硬盘上的位置</code></li>
+<li><strong>白话解释</strong>：先建个文件夹存档。如果没指定模型，就默认用 Qwen 2.5 的 0.5B 版本（这是一个很小的模型，适合测试）。</li>
+</ul>
+<h4>Task 2: 召集算力 (Resource Allocation)</h4>
+<p><strong>目标</strong>：呼叫 8 个计算单元（显卡/NPU）一起来干活。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>bash
+    torchrun --standalone --nnodes=1 --nproc_per_node=8 \</code></li>
+<li><strong>白话解释</strong>：<code>torchrun</code> 是启动器。<code>--nproc_per_node=8</code> 意思是“我要用 8 张卡并行跑这个任务”。</li>
+</ul>
+<h4>Task 3: 指定教材 (Data Configuration)</h4>
+<p><strong>目标</strong>：告诉模型这次要学什么书（数据），以及书里的哪部分是问题，哪部分是答案。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>bash
+    -m verl.trainer.fsdp_sft_trainer \  # 运行 verl 库里的 SFT 训练程序
+    data.train_files=$HOME/data/gsm8k/train.parquet \ # 训练教材：GSM8K（小学数学题库）
+    data.prompt_key=extra_info \ # 提示词在哪一列
+    data.response_key=extra_info \ # 答案在哪一列
+    data.prompt_dict_keys=['question'] \ # 具体的问题字段
+    +data.response_dict_keys=['answer'] \ # 具体的答案字段</code></li>
+<li><strong>白话解释</strong>：这次微调的任务是<strong>SFT（有监督微调）</strong>。用的教材是 <strong>GSM8K</strong>（数学题）。我们要教模型看到 <code>question</code>（问题）后，能写出 <code>answer</code>（答案）。</li>
+</ul>
+<h4>Task 4: 设定“省钱”的学习策略 (Training Strategy)</h4>
+<p><strong>目标</strong>：这是最核心的部分。因为模型很大，显存很贵，我们要用各种“省显存”的技巧。</p>
+<ul>
+<li><strong>代码对应</strong>：<ul>
+<li><strong>PEFT (LoRA)</strong>:
+    <code>bash
+    model.lora_rank=32 \
+    model.lora_alpha=16 \
+    model.target_modules=all-linear \</code>
+    <strong>解释</strong>：全量微调太贵了。这里用了 <strong>LoRA</strong> 技术。想象一下，与其重写整本教科书（全量微调），不如只在书的边角贴几张便利贴（LoRA）。这样训练速度快，显存占用极小。</li>
+<li><strong>FSDP</strong>:
+    <code>bash
+    model.strategy=fsdp \</code>
+    <strong>解释</strong>：Fully Sharded Data Parallel。把巨大的模型切碎，分给 8 张卡，每张卡只拿一部分，计算时再凑起来。</li>
+<li><strong>SP (Sequence Parallel)</strong>:
+    <code>bash
+    ulysses_sequence_parallel_size=2 \</code>
+    <strong>解释</strong>：这就是文件名里 <code>sp2</code> 的含义。<strong>Ulysses</strong> 是一种“序列并行”技术。如果一句话特别长，一张卡装不下，就把它切成 2 段（<code>size=2</code>），分给不同的卡处理。这对于处理长文本非常重要。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 快速试跑 (Dry Run)</h4>
+<p><strong>目标</strong>：因为这只是一个测试脚本（在 <code>tests</code> 目录下），我们不想真的一跑好几天，只要跑两步确认代码不报错就行。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>bash
+    trainer.total_epochs=1 \
+    trainer.total_training_steps=2 \ # 关键：只跑 2 步！
+    trainer.device=npu \ # 关键：指定使用 NPU（华为昇腾芯片）而不是英伟达 GPU</code></li>
+<li><strong>白话解释</strong>：虽然设置了 1 个周期（Epoch），但强制限制只跑 <strong>2 步（Steps）</strong> 就停。这证明了这个脚本是用来<strong>跑通流程</strong>的，用来验证 NPU 硬件和 SP2 并行策略是否兼容。</li>
+</ul>
+<h4>Task 6: 打扫战场 (Cleanup)</h4>
+<p><strong>目标</strong>：测试完了，把生成的垃圾文件删掉。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>bash
+    rm -rf ./outputs ./save_ckpts</code></li>
+<li><strong>白话解释</strong>：删掉刚才生成的输出和存档，保持环境干净。</li>
+</ul>
+<hr />
+<h3>总结：这脚本到底是干啥的？</h3>
+<p>用一句话概括：
+<strong>这是一个“冒烟测试”脚本，用于验证在华为 NPU 芯片上，使用 8 卡并行，结合 LoRA（省参微调）和 Ulysses SP=2（序列并行）技术，能否成功启动并运行 Qwen2.5 模型的微调任务（哪怕只跑两步）。</strong></p>

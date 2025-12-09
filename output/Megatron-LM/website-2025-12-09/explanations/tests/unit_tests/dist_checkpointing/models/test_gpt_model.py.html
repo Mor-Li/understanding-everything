@@ -1,0 +1,56 @@
+<h1>tests/unit_tests/dist_checkpointing/models/test_gpt_model.py</h1>
+<p>这份代码是一个 <strong>单元测试（Unit Test）</strong> 文件。</p>
+<p>它的核心目的是：<strong>验证 Megatron-LM 框架中的 GPT 模型能否正确地进行“分布式检查点（Distributed Checkpointing）”的保存和读取。</strong></p>
+<p>特别是，它要验证一个非常关键的功能：<strong>Resharding（重分布）</strong>。也就是，我能不能用 2 张卡训练的模型保存下来，然后加载到 4 张卡上继续跑？或者从 8 张卡变回 1 张卡？</p>
+<p>为了让你看懂，我把你当成这个测试的编写者，列一份 <strong>“开发任务清单 (Task Todo List)”</strong>。按照这个清单，我们一步步看代码是怎么实现的。</p>
+<hr />
+<h3>📝 任务清单：编写 GPT 模型分布式存储测试</h3>
+<h4>✅ Task 1: 准备造模型的工具 (Define Model Factory)</h4>
+<p><strong>目标</strong>：我们需要频繁地创建一个小型的 GPT 模型用来测试，不能每次都手写一堆配置。
+*   <strong>代码对应</strong>：<code>initialize_gpt_model</code> 函数 (第 36-63 行)。
+*   <strong>解读</strong>：
+    *   这个函数接收 <code>seed</code>（种子）、<code>layer_spec</code>（是用普通 Transformer 还是 NVIDIA 优化的 Transformer Engine）、<code>vocab_size</code> 等参数。
+    *   它配置了一个很小的 GPT（只有 8 层，hidden_size 16），因为我们只测保存读取，不需要大模型。
+    *   最后调用 <code>GPTModel(...)</code> 创建模型并随机初始化参数。</p>
+<h4>✅ Task 2: 准备不同的模型层实现 (Prepare Layer Specs)</h4>
+<p><strong>目标</strong>：Megatron 支持两种后端：普通的 PyTorch 实现 (<code>gpt_local_spec</code>) 和 NVIDIA 加速的 Transformer Engine (<code>gpt_te_spec</code>)。我们要确保这两种都能测。
+*   <strong>代码对应</strong>：<code>_spec_fn_list</code> 变量 (第 29-33 行)。
+*   <strong>解读</strong>：
+    *   把这两种实现放在一个列表里，后面测试时会轮询它们。
+    *   代码还检查了 TE 版本，如果版本够新，还会加入 <code>_gpt_te_spec_op_fuser</code>（算子融合版本）。</p>
+<h4>✅ Task 3: 测试最基本的“原样存取” (Basic Save/Load)</h4>
+<p><strong>目标</strong>：最简单的测试。如果我用同样的配置保存，再用同样的配置加载，能不能成功？
+*   <strong>代码对应</strong>：<code>class TestGPTModel</code> -&gt; <code>test_sharded_state_dict_save_load</code> (第 66-77 行)。
+*   <strong>解读</strong>：
+    *   使用了 <code>common_test_simple_sharded_state_dict_save_load</code>（这显示实际的保存/加载逻辑封装在 common 文件夹里，这里只是调用）。
+    *   它验证：存进去的权重 == 取出来的权重。</p>
+<h4>✅ Task 4: 测试“拓扑重构” (Parallel Reconfiguration - <strong>核心任务</strong>)</h4>
+<p><strong>目标</strong>：这是此文件最重要的部分。测试在改变 <strong>Tensor Parallel (TP)</strong> 和 <strong>Pipeline Parallel (PP)</strong> 大小时，检查点是否兼容。
+*   <strong>代码对应</strong>：<code>class TestGPTModelReconfiguration</code> -&gt; <code>test_parallel_reconfiguration_e2e</code> (第 80-159 行)。
+*   <strong>解读</strong>：
+    *   <strong>参数化测试 (<code>@pytest.mark.parametrize</code>)</strong>：你可以看到那一长串的列表 (第 98-129 行)。
+        *   例如：<code>src_tp_pp=(2, 4), dest_tp_pp=(4, 2)</code>。意思是：原本是 TP=2, PP=4（共8卡），保存后，加载到 TP=4, PP=2（也是8卡）的环境中。
+        *   或者：<code>(1, 8) -&gt; (8, 1)</code>。
+        *   还测试了从 TE 实现保存，加载到 Local 实现（跨后端兼容性）。
+    *   <strong>执行逻辑</strong>：先初始化源环境 -&gt; 保存 -&gt; 初始化目标环境 -&gt; 加载 -&gt; 对比权重。</p>
+<h4>✅ Task 5: 测试词表填充 (Vocab Padding)</h4>
+<p><strong>目标</strong>：在 Tensor Parallel 中，词表大小 (Vocab Size) 必须能被 GPU 数量整除。如果不能，框架会自动补 0 (Padding)。如果 GPU 数量变了，Padding 的大小也会变，加载时会不会报错？
+*   <strong>代码对应</strong>：<code>test_vocab_size_padding_change</code> (第 164-184 行)。
+*   <strong>解读</strong>：
+    *   比如 <code>vocab_size_base=127</code>，TP=1 时不需要 padding。
+    *   如果变成 TP=8，127 不能被 8 整除，就需要 pad 到 128。
+    *   这个测试确保检查点加载机制能自动处理这种形状变化。</p>
+<h4>✅ Task 6: 测试特殊结构 GLU (MLP with GLU)</h4>
+<p><strong>目标</strong>：GPT 有时候会用 SwiGLU 激活函数。这种结构下的 MLP 层权重形状和普通 MLP 不一样（通常有两个投影层）。我们需要专门测一下这种情况下的重分布。
+*   <strong>代码对应</strong>：<code>test_mlp_with_glu</code> (第 186-216 行)。
+*   <strong>解读</strong>：
+    *   通过 <code>functools.partial(initialize_gpt_model, gated_linear_unit=True)</code> 强制开启 GLU 模式。
+    *   再次运行 TP/PP 变换测试，确保 GLU 结构的权重切分和合并是正确的。</p>
+<hr />
+<h3>总结：这篇文章到底讲了啥观点？</h3>
+<p>它其实没有讲“观点”，而是在验证一个<strong>事实</strong>：</p>
+<blockquote>
+<p><strong>Megatron-Core 的分布式检查点系统 (Dist Checkpointing) 足够健壮，支持用户在任意改变 GPU 数量、并行策略（TP/PP）甚至底层算子实现（TE vs Local）的情况下，无损地保存和恢复 GPT 模型。</strong></p>
+</blockquote>
+<p><strong>一句话人话总结：</strong>
+“这个文件就是一堆自动化测试，用来保证：不管你怎么改显卡数量，训练好的 GPT 模型存档都能读得出来，不会报错。”</p>

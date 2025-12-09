@@ -1,0 +1,52 @@
+<h1>tests/unit_tests/dist_checkpointing/test_optimizer.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了深度学习框架中最底层、最复杂的<strong>分布式训练基础设施</strong>。</p>
+<p>简单来说，这个文件的核心目的是：<strong>测试 Megatron-Core 框架在不同分布式配置（TP/PP/DP）之间，能否正确地保存和加载优化器（Optimizer）的状态。</strong></p>
+<p>为了让你听懂，我们假设你是一个 Megatron 的核心开发者，你的老板给你派了一个任务：<strong>“我们要开发一个超强的断点续训功能，无论用户怎么改变显卡数量，都能接着训练。”</strong></p>
+<p>下面是你为了完成这个任务，列出的 <strong>Todo List (开发与测试清单)</strong>，这也就是代码中一步步在做的事情：</p>
+<h3>📝 Task List: 开发分布式优化器检查点系统</h3>
+<h4>Phase 1: 准备工作 (造假数据)</h4>
+<p><strong>任务：</strong> 我们需要一些简单的“假模型”来做测试，不能每次都跑几十亿参数的大模型。
+*   <strong>代码对应：</strong> <code>class Model</code>, <code>class SwigluFactoryModel</code>, <code>class Model1dFlattenTensor</code>
+*   <strong>解读：</strong>
+    *   这些类定义了简单的神经网络。
+    *   关键在于 <code>sharded_state_dict</code> 方法。这相当于给模型写了一本“说明书”，告诉系统：我的这个权重矩阵是被切分过的，哪部分在第几号显卡上。这是后续能把拼图拼回去的基础。</p>
+<h4>Phase 2: 基础功能验证 (能不能存？)</h4>
+<p><strong>任务：</strong> 最基本的，我得确保优化器（比如 Adam）里的 <code>exp_avg</code>（动量）和 <code>exp_avg_sq</code>（方差）能被正确识别和保存。
+*   <strong>代码对应：</strong> <code>TestOptimizer</code> 类 -&gt; <code>test_optimizer_params</code>
+*   <strong>解读：</strong>
+    *   跑一步训练，产生梯度。
+    *   检查系统是否正确识别出了优化器里所有的状态张量，并且能把它们和模型参数对应起来。</p>
+<h4>Phase 3: 分布式一致性测试 (存下来再读进去，得是一样的)</h4>
+<p><strong>任务：</strong> 在分布式环境下（比如用 2 张卡做张量并行 TP，2 张卡做流水线并行 PP），我存个档，然后马上读档，数据不能变。
+*   <strong>代码对应：</strong> <code>TestDistributedOptimizer</code> -&gt; <code>test_optimizer_common_state_dict</code>
+*   <strong>解读：</strong>
+    *   <strong>Step 1:</strong> 启动一个 <code>TP=2, PP=2</code> 的环境，训练几步，保存 Checkpoint A。
+    *   <strong>Step 2:</strong> 清除内存，重新启动一个一模一样的环境。
+    *   <strong>Step 3:</strong> 加载 Checkpoint A。
+    *   <strong>Step 4:</strong> <strong>关键点</strong>：对比加载后的状态和保存前的状态（代码里的 <code>diff</code> 函数）。如果不完全一致，测试失败。
+    *   <em>注：这里还顺便测试了 MoE（混合专家模型）和 MLA（多头潜在注意力）这种复杂架构。</em></p>
+<h4>Phase 4: 微调场景测试 (Finetune 别乱加载)</h4>
+<p><strong>任务：</strong> 用户拿预训练模型去微调时，通常只加载<strong>模型权重</strong>，而<strong>丢弃旧的优化器状态</strong>。我们要确保系统支持这个逻辑。
+*   <strong>代码对应：</strong> <code>test_finetune_doesnt_load_optimizer</code>
+*   <strong>解读：</strong>
+    *   如果我们设置了 <code>finetune=True</code> 或者 <code>no_load_optim=True</code>。
+    *   测试系统尝试加载 Checkpoint 时，必须<strong>报错</strong>或者<strong>忽略</strong>优化器部分，只加载模型参数。如果它强行把旧的优化器状态加载进来，那测试就挂了。</p>
+<h4>Phase 5: <strong>核心挑战</strong> —— 动态重切分 (Resharding)</h4>
+<p><strong>任务：</strong> 这是最难的一步。老板要求：用户昨天用 <strong>8张卡 (TP=2, PP=4)</strong> 训练，今天想换成 <strong>4张卡 (TP=2, PP=2)</strong> 接着跑。我们的系统必须能自动把优化器状态“捏”成新的形状。
+*   <strong>代码对应：</strong> <code>TestOptimizerResharding</code> 类
+*   <strong>解读：</strong>
+    *   <strong>场景 A (保存)：</strong> 初始化环境 <code>src_tp_pp</code> (例如 2, 4)，保存 Checkpoint A。
+    *   <strong>场景 B (加载)：</strong> 初始化环境 <code>dest_tp_pp</code> (例如 4, 2)，显卡拓扑变了！
+    *   <strong>验证：</strong> 在场景 B 中加载 Checkpoint A。系统需要自动把原本散落在不同显卡上的张量碎片收集起来，按新的规则重新切分。
+    *   最后对比数值是否完全一致。代码里测试了 FP32 模式、BF16 模式、以及包含 MoE 的复杂情况。</p>
+<h4>Phase 6: 高级优化器格式 (Bucket Space)</h4>
+<p><strong>任务：</strong> 为了省显存，分布式优化器（Distributed Optimizer）会把参数打成一个个“桶（Bucket）”来存。这种格式更难重切分，我们需要专门测试。
+*   <strong>代码对应：</strong> <code>test_bucket_space_optimizer_save_load</code>
+*   <strong>解读：</strong>
+    *   这是针对 PyTorch 2.6+ 新特性的测试。
+    *   测试当数据并行（DP）的大小发生变化时，这些“参数桶”能不能正确地合并或拆分。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就是在反复做一件事：
+<strong>“存一个档 -&gt; 换个姿势（改变并行度 TP/PP/DP） -&gt; 读档 -&gt; 检查数据有没有丢或者错。”</strong></p>
+<p>如果这个文件里的测试都跑通了，就意味着 Megatron-Core 支持<strong>弹性训练</strong>，用户可以随意增减显卡数量而不需要从头开始训练。</p>

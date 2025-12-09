@@ -1,0 +1,90 @@
+<h1>recipe/dapo/run_dapo_qwen2.5_32b_npu.sh</h1>
+<p>这份脚本确实看起来很复杂，因为它涉及到了<strong>大模型训练</strong>中最前沿且复杂的领域：<strong>强化学习（RL）</strong>，而且是在<strong>NPU（通常指华为昇腾芯片）集群</strong>上运行的。</p>
+<p>为了让你能够看懂，我把阅读这份代码拆解成一个 <strong>“5步走”的 Todo List</strong>。我们把这个脚本想象成一份 <strong>“超级大餐的烹饪清单”</strong>。</p>
+<hr />
+<h3>✅ Task 1：搞清楚“我们要煮什么菜？”（核心目标）</h3>
+<p>首先看脚本最开头的几行，定义了这次任务的宏观目标。</p>
+<ul>
+<li><strong>项目名 (<code>project_name</code>)</strong>: <code>DAPO-Qwen2.5-32B</code>。<ul>
+<li><strong>含义</strong>：你要训练的模型是 <strong>Qwen2.5-32B</strong>（通义千问320亿参数版本）。<code>DAPO</code> 是具体的训练算法名称（类似于最近很火的 DeepSeek-R1 用的 GRPO 算法的一种变体）。</li>
+</ul>
+</li>
+<li><strong>实验名 (<code>exp_name</code>)</strong>: <code>...npu-32rank...</code><ul>
+<li><strong>含义</strong>：这次实验是在 <strong>NPU</strong> 硬件上跑的。</li>
+</ul>
+</li>
+<li><strong>核心算法 (<code>adv_estimator</code>)</strong>: <code>grpo</code>。<ul>
+<li><strong>含义</strong>：<strong>GRPO</strong> (Group Relative Policy Optimization)。简单说，就是给模型一道题，让它生成好几个答案，然后对比这组答案哪个好，哪个坏，以此来优化模型。</li>
+</ul>
+</li>
+</ul>
+<p><strong>小结</strong>：这是一个用 GRPO 算法，在 NPU 芯片上训练 Qwen2.5-32B 数学推理能力的脚本。</p>
+<hr />
+<h3>✅ Task 2：准备“食材”和“厨具”（数据与路径）</h3>
+<p>接下来脚本定义了一堆路径变量，告诉程序东西都在哪。</p>
+<ul>
+<li><strong>模型路径 (<code>MODEL_PATH</code>)</strong>: 指向 <code>Qwen2.5-32B</code> 的文件夹。这是你的“底料”。</li>
+<li><strong>训练数据 (<code>TRAIN_FILE</code>)</strong>: <code>dapo-math-17k.parquet</code>。这是“主菜”，主要是数学题。</li>
+<li><strong>测试数据 (<code>TEST_FILE</code>)</strong>: <code>aime-2024.parquet</code>。这是用来尝咸淡的，AIME 是美国数学邀请赛的题目，很难。</li>
+<li><strong>Ray 地址 (<code>RAY_ADDRESS</code>)</strong>: <code>localhost:8265</code>。<ul>
+<li><strong>含义</strong>：这个训练任务是跑在 <strong>Ray</strong> 这个分布式计算框架上的。你可以把 Ray 想象成一个“中央厨房调度系统”，它负责管理所有的机器。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3：设定“烹饪手法”（算法超参数）</h3>
+<p>这部分是脚本里最难懂的数字，决定了模型怎么学。</p>
+<ul>
+<li><strong>生成策略</strong>:<ul>
+<li><code>n_resp_per_prompt=16</code>: <strong>关键参数</strong>。对于每一道数学题，模型要一次性生成 <strong>16个</strong> 不同的解题过程。</li>
+<li><code>max_response_length=$((1024 * 20))</code>: <strong>2万的长度</strong>。允许模型进行非常长的“思维链”（Chain of Thought），写很长的步骤。</li>
+</ul>
+</li>
+<li><strong>奖惩机制 (Reward)</strong>:<ul>
+<li><code>kl_coef=0.0</code>: <strong>KL 散度系数为0</strong>。</li>
+<li><strong>通俗解释</strong>：通常训练大模型会限制它不要偏离原来的说话方式太远（KL惩罚）。但这里设为0，意思是：“<strong>放飞自我吧！</strong> 只要你能把数学题做对，不管你的说话风格怎么变都行。” 这是近期推理模型（如R1）的一个重要特征。</li>
+</ul>
+</li>
+<li><strong>批次大小 (Batch Size)</strong>:<ul>
+<li><code>train_prompt_bsz=128</code>: 每次训练拿128个问题出来。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4：安排“流水线工位”（硬件与并行优化）</h3>
+<p>因为模型太大（32B），显存放不下，计算也慢，所以需要极其复杂的切分和优化。</p>
+<ul>
+<li><strong>硬件规模</strong>:<ul>
+<li><code>NNODES=2</code>: 用 2 台服务器。</li>
+<li><code>trainer.n_gpus_per_node=16</code>: 每台机器有 16 张 NPU 卡。</li>
+<li><strong>总计</strong>：这是一个 <strong>32卡并行</strong> 的大任务。</li>
+</ul>
+</li>
+<li><strong>切分策略 (Parallelism)</strong>:<ul>
+<li><code>sp_size=8</code> (Sequence Parallelism): <strong>序列并行</strong>。因为允许模型输出 2万字 (20k tokens)，这太长了，单张卡存不下这么长的上下文。所以把<strong>一句话切成8段</strong>，分别放在8张卡上处理。</li>
+<li><code>gen_tp=4</code> (Tensor Parallelism): <strong>张量并行</strong>。在生成答案时，把模型的<strong>层切开</strong>，放在4张卡上一起算。</li>
+</ul>
+</li>
+<li><strong>省钱技巧</strong>:<ul>
+<li><code>offload=True</code>: <strong>显存卸载</strong>。当显存不够时，把暂时不用的参数搬到 CPU 内存里去，用时间换空间。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5：按下“启动按钮”（执行命令）</h3>
+<p>脚本的最后一段 <code>ray job submit ...</code> 是真正的执行动作。</p>
+<ul>
+<li>它把上面定义的所有变量（<code>$变量名</code>），通过 <code>--</code> 参数的形式，填入到一个 Python 程序 <code>recipe.dapo.main_dapo</code> 中。</li>
+<li>你可以看到很多 <code>actor_rollout_ref...</code> 这样的参数。这是在配置强化学习的三个角色：<ol>
+<li><strong>Actor (演员)</strong>: 正在学习的模型。</li>
+<li><strong>Rollout (采样员)</strong>: 负责做题、生成数据的模型（通常就是 Actor 自己）。</li>
+<li><strong>Ref (参考员)</strong>: 原始模型，用来做对比（虽然这里 KL 设为 0，可能作用被弱化了）。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这个脚本在干嘛？</h3>
+<p>如果用一句话说给老板听：</p>
+<blockquote>
+<p><strong>“这是一个启动脚本，它调用了两台服务器共32张NPU芯片，使用 Ray 框架和 GRPO 算法，让 Qwen2.5-32B 模型通过大量做数学题（每题做16遍）来自我进化，目标是提升它的长思维链数学解题能力。”</strong></p>
+</blockquote>

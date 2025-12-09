@@ -1,0 +1,78 @@
+<h1>verl/trainer/config/ref/ref.yaml</h1>
+<p>这个文件看起来很复杂，主要是因为它包含了很多<strong>参数引用</strong>（比如 <code>${...}</code>）和<strong>性能分析工具</strong>（Profiler）的配置。</p>
+<p>其实，这个文件是用来配置 <strong>强化学习（RLHF/PPO）中的 Reference Model（参考模型）</strong> 的。</p>
+<p>为了让你更容易理解，我把理解这个文件拆解成一个 <strong>5步走的 Todo List</strong>。你只需要按顺序理解这五个任务，就能搞懂它的核心逻辑。</p>
+<hr />
+<h3>核心背景知识（先读这个）</h3>
+<p>在 PPO 训练中，我们需要两个模型：
+1.  <strong>Actor Model（演员模型）</strong>：正在被训练、不断进步的模型。
+2.  <strong>Reference Model（参考模型，简称 Ref）</strong>：<strong>这就是本文件配置的对象。</strong> 它是 Actor 训练前的原始版本，完全冻结不更新。它的作用是给 Actor 提供一个“基准”，防止 Actor 训练过头（通过计算 KL Divergence 惩罚）。</p>
+<hr />
+<h3>任务清单 (Todo List)</h3>
+<h4>✅ Task 1: 搞定“显存与并行策略” (最重要)</h4>
+<p><strong>目标</strong>：决定 Ref 模型怎么加载，怎么省显存。</p>
+<ul>
+<li><strong><code>strategy</code></strong>:<ul>
+<li><strong>原文</strong>：<code>${actor_rollout_ref.actor.strategy}</code></li>
+<li><strong>解释</strong>：这里直接<strong>照抄</strong> Actor 模型的并行策略（FSDP）。</li>
+<li><strong>关键点</strong>：注释里写了建议——如果你的模型大于 7B，建议给 Ref 模型开启 <strong>Offload</strong>（把参数卸载到 CPU 内存），因为 Ref 模型不需要反向传播，只做推理，放 CPU 上能给 Actor 腾出宝贵的 GPU 显存。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 搞定“推理计算设置”</h4>
+<p><strong>目标</strong>：Ref 模型主要工作是算“概率”（Log Prob），这里配置它一次算多少数据。</p>
+<ul>
+<li><strong><code>rollout_n</code></strong>:<ul>
+<li><strong>解释</strong>：每次更新需要生成多少条数据？这里默认跟 Actor 保持一致。</li>
+</ul>
+</li>
+<li><strong><code>log_prob_micro_batch_size_per_gpu</code></strong>:<ul>
+<li><strong>解释</strong>：每张显卡一次处理多少条数据来计算概率。如果显存爆了（OOM），就把这个数调小。</li>
+</ul>
+</li>
+<li><strong><code>log_prob_use_dynamic_bsz</code></strong>:<ul>
+<li><strong>解释</strong>：是否启用动态批处理（Sequence Packing）。简单说就是把短句子拼在一起塞进显卡，不浪费计算力。默认是关的或者跟随 Actor 设置。</li>
+</ul>
+</li>
+<li><strong><code>log_prob_max_token_len_per_gpu</code></strong>:<ul>
+<li><strong>解释</strong>：显卡一次能处理的最大 Token 总长度（比如 16384）。防止句子太长把显存撑爆。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 搞定“加速开关”</h4>
+<p><strong>目标</strong>：开启 PyTorch 的黑科技让速度变快。</p>
+<ul>
+<li><strong><code>use_torch_compile</code></strong>:<ul>
+<li><strong>解释</strong>：是否启用 <code>torch.compile</code>。这是一个 PyTorch 2.0 的功能，能把模型代码编译成更快的机器码。默认是 <code>true</code>（开启）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 性能体检 (Profiler) - <strong>这部分看着最长，但平时不需要管</strong></h4>
+<p><strong>目标</strong>：如果你发现训练特别慢，才需要看这里，否则<strong>直接跳过</strong>。</p>
+<ul>
+<li><strong><code>profiler</code></strong>:<ul>
+<li><strong>解释</strong>：这一大坨代码全是配置“性能分析器”的。比如你想知道 GPU 到底卡在哪里，或者哪个函数耗时最长。</li>
+<li><strong><code>enable: False</code></strong>：<strong>重点看这行</strong>。默认是关闭的。</li>
+<li><strong>下面的 <code>nsys</code>, <code>npu</code>, <code>torch</code></strong>：这些是不同的分析工具（NVIDIA Nsight, Torch Profiler 等）。除非你是开发人员在修 Bug 或调优性能，否则这部分配置完全不用动。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 专家模型特供 (MoE)</h4>
+<p><strong>目标</strong>：如果你用的不是普通模型，而是 MoE（混合专家模型，如 Mixtral 8x7B, DeepSeek-MoE），才看这里。</p>
+<ul>
+<li><strong><code>router_replay</code></strong>:<ul>
+<li><strong>解释</strong>：MoE 模型在推理时会选择不同的“专家”网络。</li>
+<li><strong><code>mode: disabled</code></strong>：默认关闭。</li>
+<li><strong>作用</strong>：如果是为了调试或复现特定的路由路径（Router），才会用到录制（record）和回放（replay）功能。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：我该怎么看这个文件？</h3>
+<p>你只需要关注前三个 Task：</p>
+<ol>
+<li><strong>Ref 模型怎么放？</strong> (看 <code>strategy</code>，通常跟随 Actor，大模型记得 Offload)。</li>
+<li><strong>一次算多少？</strong> (看 <code>log_prob_micro_batch_size</code>，显存不够就调小)。</li>
+<li><strong>要不要加速？</strong> (看 <code>use_torch_compile</code>，通常保持 True)。</li>
+</ol>
+<p><strong>剩下的那一大半内容（Profiler 和 Router Replay），只要你不做底层性能调试，完全可以当它们不存在。</strong></p>

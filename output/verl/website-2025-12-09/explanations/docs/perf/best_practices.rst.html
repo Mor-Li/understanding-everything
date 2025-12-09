@@ -1,0 +1,94 @@
+<h1>docs/perf/best_practices.rst</h1>
+<p>这份文档确实非常硬核，它本质上是一份<strong>“数学公式到代码配置的映射表”</strong>，专门针对使用 <strong>Verl</strong> 框架训练超大模型（如 Qwen3-235B）的高级指南。</p>
+<p>为了让你看懂，我们可以把训练一个大模型（RLHF/RL 阶段）想象成<strong>“教一个学生（模型）做数学题”</strong>。</p>
+<p>我把文档中的观点拆解成一个 <strong>5步走的 Task List（任务清单）</strong>，每一步对应文档中的一部分，告诉你我们在干什么，以及文档建议怎么配置。</p>
+<hr />
+<h3>Task 1: 准备教材 (Data Setup)</h3>
+<p><strong>目标</strong>：告诉模型题目是什么，标准答案是什么。
+<strong>文档对应符号</strong>：$(q,a) \sim D$</p>
+<ul>
+<li><strong>你需要做什么</strong>：<ul>
+<li>准备好 <code>.parquet</code> 格式的数据文件。</li>
+<li><strong>关键配置</strong>：<ul>
+<li><code>data.max_prompt_length</code>：<strong>题目长度上限</strong>。文档建议设大一点，覆盖最长的题目。</li>
+<li><code>data.truncation</code>：<strong>截断策略</strong>。如果题目太长怎么办？文档建议选 <code>left</code>（保留后半部分）通常没问题，但如果想要严格验证数据质量，就设为 <code>error</code>（报错）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h3>Task 2: 让学生批量做题 (Rollout / Generation)</h3>
+<p><strong>目标</strong>：给模型一道题，让它生成好几个不同的解法（为了对比哪个好）。
+<strong>文档对应符号</strong>：$G$ (Group Size), $\pi$ (Sampling Strategy)</p>
+<ul>
+<li><strong>你需要做什么</strong>：<ul>
+<li><strong>决定做几遍</strong>：文档建议 DAPO 算法设为 <strong>16</strong> 遍 (<code>rollout.n=16</code>)，GRPO 算法设为 <strong>64</strong> 遍。</li>
+<li><strong>选择做题引擎</strong>：因为模型很大，生成速度很慢。文档强烈建议使用 <strong>vLLM</strong> 或 <strong>sglang</strong> 这种高性能推理引擎。</li>
+<li><strong>显存管理 (最头疼的部分)</strong>：<ul>
+<li><code>gpu_memory_utilization</code>：设为 0.8-0.9。尽量榨干 GPU 显存，但别炸（OOM）。</li>
+<li><code>tensor_model_parallel_size (TP)</code>：模型太大，单卡放不下。你需要把模型切开。文档提醒：确保你的显存够放模型参数 + 缓存 (KV Cache)。</li>
+</ul>
+</li>
+<li><strong>怎么生成</strong>：<ul>
+<li><code>temperature=1.0</code>：保持一定的随机性，这样学生才能写出不同的解法供我们挑选。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 老师批改与算法更新 (Algorithm &amp; Optimization)</h3>
+<p><strong>目标</strong>：根据学生做题的好坏（Reward），更新学生的大脑（参数），让他下次做得更好。这里主要讲 <strong>DAPO</strong> 和 <strong>GRPO</strong> 两种教学方法。
+<strong>文档对应符号</strong>：$\mathcal{J}_{DAPO}$, $\hat{A}$ (Advantage), $\theta$ (Parameters)</p>
+<ul>
+<li><strong>你需要做什么</strong>：<ul>
+<li><strong>选择算法</strong>：<ul>
+<li>如果你用 <strong>DAPO</strong>（文档主推）：配置 <code>reward_manager=dapo</code>，<code>clip_ratio_low=0.2</code>, <code>clip_ratio_high=0.28</code>。意思是：如果模型进步太快或退步太快，我们要限制一下（Clip），防止它“走火入魔”。</li>
+<li>如果你用 <strong>GRPO</strong>：配置 <code>reward_manager=naive</code>，并且需要开启 KL 散度惩罚（防止模型乱说话，偏离原始能力太远）。</li>
+</ul>
+</li>
+<li><strong>批次大小 (Batch Size)</strong>：<ul>
+<li><code>train_batch_size</code>：总批次大小。</li>
+<li><code>ppo_micro_batch_size_per_gpu</code>：每张卡每次处理多少数据。文档建议：<strong>能开多大开多大</strong>，直到显存撑不住为止。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 处理超大模型的“体型”问题 (Megatron / Parallelism)</h3>
+<p><strong>目标</strong>：Qwen3-235B 是个巨无霸（2350亿参数），普通服务器根本跑不动。文档花了很多篇幅讲如何把这个大象装进冰箱。
+<strong>文档对应符号</strong>：$\pi_{\theta}$ (Actor Policy), Megatron parameters</p>
+<ul>
+<li><strong>你需要做什么</strong>：<ul>
+<li><strong>切分模型</strong>：利用 Megatron 技术。<ul>
+<li><strong>TP (张量并行)</strong>：优先增加这个。</li>
+<li><strong>PP (流水线并行)</strong>：如果 TP 开满了还放不下，再开这个。</li>
+</ul>
+</li>
+<li><strong>卸载 (Offload)</strong>：显存不够用怎么办？<ul>
+<li><code>param_offload</code>, <code>optimizer_offload</code>：把参数、优化器状态扔到 <strong>CPU 内存</strong>里去，虽然慢点，但能跑起来。文档建议对大模型开启这个。</li>
+</ul>
+</li>
+<li><strong>混合专家 (MoE) 特调</strong>：Qwen3 是 MoE 模型。文档给了一堆 <code>moe_*</code> 开头的配置（如 <code>moe_enable_deepep</code>），建议照抄文档的推荐值（如 <code>True</code>），否则效率很低。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 5: 监控与验证 (Validation &amp; Logging)</h3>
+<p><strong>目标</strong>：训练过程中，要时不时停下来考试，看看学生是不是真的变聪明了。</p>
+<ul>
+<li><strong>你需要做什么</strong>：<ul>
+<li><strong>验证采样</strong>：<code>val_kwargs.n=64</code>。验证时，对一道题生成 64 个答案，看看准确率。</li>
+<li><strong>记录日志</strong>：使用 WandB (<code>trainer.logger=['console', 'wandb']</code>) 来看图表。</li>
+<li><strong>频率</strong>：<code>trainer.test_freq</code>。不要太频繁，因为验证也很花时间。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇文档在说什么？</h3>
+<p>简单来说，这篇文档就是告诉你：</p>
+<ol>
+<li><strong>我们要用 DAPO 算法</strong>（一种改进的强化学习算法）来训练。</li>
+<li><strong>我们要训练 Qwen3-235B</strong>（一个超大 MoE 模型）。</li>
+<li><strong>难点在于</strong>：数学公式里的每一项（比如优势函数、KL散度、裁剪范围）对应到代码里是哪个参数？</li>
+<li><strong>痛点在于</strong>：模型太大，显存不够。文档给出了经过实战验证的<strong>“省显存 + 高性能”</strong>参数组合（比如怎么切分模型、怎么利用 CPU 内存）。</li>
+</ol>
+<p>如果你要跑这个代码，<strong>直接复制文档里的 <code>Parameter Reference</code> 部分的推荐值</strong>通常是让代码跑通的最快路径。</p>

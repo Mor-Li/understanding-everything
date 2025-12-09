@@ -1,0 +1,76 @@
+<h1>docs/advance/checkpoint.rst</h1>
+<p>这篇文档充满了技术术语（如 FSDP, Megatron, Checkpoint, Sharding），如果你不熟悉分布式训练，确实很难懂。</p>
+<p>简单来说，这篇文档的核心目的是：<strong>在大规模模型训练（特别是 RLHF）容易崩溃的情况下，如何安全地“存盘”（保存进度）和“读盘”（恢复进度或导出模型）。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“从训练前准备 -&gt; 训练中存盘 -&gt; 训练后使用”</strong> 的任务清单（To-Do List），一步步解释。</p>
+<hr />
+<h3>任务清单：玩转模型训练的“存盘”与“读盘”</h3>
+<h4>📋 Task 1: 搞清楚为什么要存 Checkpoint (基本概念)</h4>
+<ul>
+<li><strong>背景</strong>：训练大模型通常需要很久，机器可能会坏，或者训练会报错。</li>
+<li><strong>你的行动</strong>：必须开启 Checkpoint 功能。</li>
+<li><strong>文档观点</strong>：<ul>
+<li>建议保存 <code>model</code>（模型参数）、<code>optimizer</code>（优化器状态，用于断点续训）和 <code>extra</code>（额外状态）。</li>
+<li>虽然可以存 <code>hf_model</code>（HuggingFace格式），但在大规模分布式训练中，<strong>不建议</strong>每次都存这个，因为它太慢且占空间。建议只存“切片化”（Sharded）的数据。</li>
+</ul>
+</li>
+</ul>
+<h4>📋 Task 2: 检查存档存哪里了 (目录结构)</h4>
+<ul>
+<li><strong>背景</strong>：当你开启存盘后，文件夹里会出现什么？</li>
+<li><strong>你的行动</strong>：去 <code>checkpoints/${项目名}/${实验名}</code> 目录下查看。</li>
+<li><strong>文档观点</strong>：<ul>
+<li>你会看到类似 <code>global_steps_100</code> 这样的文件夹，代表第100步的存档。</li>
+<li>里面分了 <code>actor</code>（生成回复的模型）和 <code>critic</code>（打分的模型）。</li>
+<li><strong>关键点</strong>：里面的文件不是一个大的 <code>.bin</code> 文件，而是<strong>碎的</strong>。<ul>
+<li><strong>FSDP模式</strong>：你会看到很多 <code>rank_0.pt</code>, <code>rank_1.pt</code>... 这是因为模型被切分到了不同的显卡上，每张卡只存自己那部分。</li>
+<li><strong>Megatron模式</strong>：结构类似，有一个 <code>dist_ckpt</code> 文件夹，里面也是切碎的参数。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>📋 Task 3: 训练完了，怎么把碎文件拼成能用的模型？ (模型合并)</h4>
+<ul>
+<li><strong>背景</strong>：你训练出的存档是碎的（Sharded），但如果你想拿去评测或者部署，需要标准的 HuggingFace 格式。</li>
+<li><strong>你的行动</strong>：使用文档提供的 <strong>Model Merger（模型合并工具）</strong>。</li>
+<li><strong>文档观点</strong>：<ul>
+<li>工具路径：<code>verl/model_merger</code>。</li>
+<li><strong>怎么做</strong>：运行一个 Python 命令（<code>merge</code>），告诉它你是用什么后端训练的（FSDP 还是 Megatron），源文件在哪，想存到哪。</li>
+<li><strong>例子</strong>：
+    <code>bash
+    # 这是一个把 Megatron 碎片合并成 HuggingFace 格式的例子
+    python -m verl.model_merger merge \
+        --backend megatron \
+        --local_dir checkpoints/.../actor \
+        --target_dir /path/to/merged_hf_model</code></li>
+<li><em>小细节</em>：Megatron 的层索引处理比较麻烦，但工具已经帮你自动处理好了（Solution 2）。</li>
+</ul>
+</li>
+</ul>
+<h4>📋 Task 4: (进阶) 如果模型太大，怎么加载进去训练？ (HF 转 Megatron)</h4>
+<ul>
+<li><strong>背景</strong>：如果你要训练像 DeepSeek-V3 (671B) 这种巨型模型，直接用 HuggingFace 格式加载会非常慢甚至内存溢出。</li>
+<li><strong>你的行动</strong>：先把 HuggingFace 的标准模型，“切碎”成 Megatron 的分布式格式，然后再开始训练。</li>
+<li><strong>文档观点</strong>：<ul>
+<li>使用脚本 <code>scripts/converter_hf_to_mcore.py</code>。</li>
+<li>这相当于在训练开始前，先做一个预处理，把数据转换成训练框架喜欢的格式，以提高加载速度。</li>
+<li>支持 CPU 初始化（防止显存爆了）。</li>
+</ul>
+</li>
+</ul>
+<h4>📋 Task 5: 了解加载机制 (原理补充)</h4>
+<ul>
+<li><strong>背景</strong>：了解一下底层的加载逻辑（选读）。</li>
+<li><strong>文档观点</strong>：<ul>
+<li><strong>推荐方式 (Sharded Load)</strong>：每张显卡只读取自己需要的那部分参数。这要求存储系统必须能被所有计算节点访问。速度快，省内存。</li>
+<li><strong>不推荐方式 (Deprecated)</strong>：先由一张卡读入整个大模型，然后广播给其他卡。容易内存溢出（OOM），只在特殊受限环境下使用。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：你只需要关注这三步</h3>
+<ol>
+<li><strong>训练时</strong>：开启 Checkpoint，它会自动把模型切碎了存起来（为了快）。</li>
+<li><strong>导出时</strong>：用 <code>verl.model_merger</code> 把碎文件拼回成完整的 HuggingFace 模型（为了用）。</li>
+<li><strong>载入巨型模型时</strong>：用 <code>converter_hf_to_mcore.py</code> 把别人的 HuggingFace 模型切碎成 Megatron 格式（为了能跑起来）。</li>
+</ol>

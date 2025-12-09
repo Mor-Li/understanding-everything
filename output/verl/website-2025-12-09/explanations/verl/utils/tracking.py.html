@@ -1,0 +1,85 @@
+<h1>verl/utils/tracking.py</h1>
+<p>这份代码其实就是一个<strong>“实验日志的大管家”</strong>（Universal Experiment Tracker）。</p>
+<p>为了让你读懂它，我们把它想象成你在<strong>开一家公司（训练AI模型）</strong>，你需要向<strong>不同的投资人和监管机构（各种可视化工具，如 WandB, TensorBoard）</strong>汇报工作进度。</p>
+<p>如果不使用这份代码，你每做完一步，都要分别给张三打电话，给李四发邮件，给王五写信，非常麻烦。这份代码的作用就是：<strong>你只管汇报一次，剩下的分发工作它全包了。</strong></p>
+<p>下面我列一个 <strong>Task To-Do List</strong>，带你一步步拆解这份代码在做什么：</p>
+<hr />
+<h3>Task 1: 确定我们要向谁汇报？（初始化）</h3>
+<p><strong>代码对应：</strong> <code>class Tracking</code> 的 <code>__init__</code> 方法</p>
+<ul>
+<li><strong>场景：</strong> 你的实验开始前，你需要决定把数据存到哪里。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li><code>supported_backend</code>: 这里列出了所有支持的“汇报对象”，比如 <code>wandb</code>（最常用的在线看板）、<code>tensorboard</code>（本地看板）、<code>console</code>（直接打印在屏幕上）、<code>file</code>（存成文件）等。</li>
+<li><strong>初始化过程：</strong> 当你创建 <code>Tracking</code> 对象时，你会传入一个列表（比如 <code>['wandb', 'console']</code>）。代码会遍历这个列表：<ul>
+<li>如果是 <code>wandb</code>：它会调用 <code>wandb.init()</code> 帮你登录并创建项目。</li>
+<li>如果是 <code>tensorboard</code>：它会创建一个 <code>SummaryWriter</code> 帮你准备写文件。</li>
+<li>如果是 <code>console</code>：它会准备好直接 print 出来。</li>
+</ul>
+</li>
+<li><strong>结果：</strong> 所有的“汇报对象”都被存到了 <code>self.logger</code> 这个字典里，随时待命。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 2: 解决语言不通的问题（适配器模式）</h3>
+<p><strong>代码对应：</strong> <code>ClearMLLogger</code>, <code>FileLogger</code>, <code>_TensorboardAdapter</code>, <code>_MlflowLoggingAdapter</code> 等类</p>
+<ul>
+<li><strong>场景：</strong> 不同的工具“听得懂”的指令不一样。<ul>
+<li>WandB 喜欢听 <code>wandb.log({'loss': 0.1})</code></li>
+<li>TensorBoard 喜欢听 <code>writer.add_scalar('loss', 0.1)</code></li>
+<li>MLflow 对变量名的字符有限制（不能有特殊符号）。</li>
+</ul>
+</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>为了不让你在训练代码里写一堆 <code>if...else...</code>，这个文件为每个复杂的工具写了一个<strong>“翻译官”（Adapter）</strong>。</li>
+<li>比如 <code>_TensorboardAdapter</code> 类：它把通用的 <code>log</code> 调用，内部转化成了 TensorBoard 专用的 <code>add_scalar</code>。</li>
+<li>比如 <code>_MlflowLoggingAdapter</code> 类：它会把你的变量名里的非法字符（如 <code>@</code>）清洗掉，换成下划线，防止报错。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 只有一种汇报方式（统一接口）</h3>
+<p><strong>代码对应：</strong> <code>Tracking</code> 类的 <code>log</code> 方法</p>
+<ul>
+<li><strong>场景：</strong> 你的模型训练了一步（Step 100），产生了一个 <code>loss: 2.5</code>。你现在要记录它。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>你只需要调用主管家的 <code>tracking.log(data={'loss': 2.5}, step=100)</code>。</li>
+<li><strong>广播机制：</strong> 这个 <code>log</code> 函数内部写了一个 <code>for</code> 循环，遍历 Task 1 中初始化的所有 logger（比如既有 wandb 又有 tensorboard），挨个调用它们的 <code>log</code> 方法。</li>
+<li><strong>好处：</strong> 你的训练主代码非常干净，不需要关心底层用的是什么工具。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 处理复杂的“生成结果”（验证集日志）</h3>
+<p><strong>代码对应：</strong> <code>class ValidationGenerationsLogger</code></p>
+<ul>
+<li><strong>场景：</strong> 训练大模型（LLM）时，光看 Loss（数字）是不够的，你还要看模型生成的<strong>文本</strong>（比如问它“你好”，它回答什么）。这比存数字复杂多了。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>这个类专门处理<strong>文本生成任务</strong>的记录。</li>
+<li>它接收 <code>samples</code>（包含输入 prompt、模型输出 output、打分 score）。</li>
+<li><strong>针对不同工具的美化：</strong><ul>
+<li><strong>WandB:</strong> 它会把这些文本做成一个漂亮的 <strong>Table（表格）</strong>，你可以直接在网页上筛选查看。</li>
+<li><strong>TensorBoard:</strong> 它把表格转成 <strong>Markdown 格式的文本</strong>，因为 TensorBoard 对表格支持不好。</li>
+<li><strong>SwanLab / ClearML:</strong> 同样转换成它们支持的表格格式。</li>
+</ul>
+</li>
+<li><strong>增量记录：</strong> 注意看 WandB 的部分，它会保留旧的数据，把新的数据加进去，形成一个完整的历史记录表。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 5: 实验结束，打卡下班（资源清理）</h3>
+<p><strong>代码对应：</strong> <code>__del__</code> 方法 和 各个类的 <code>finish</code> 方法</p>
+<ul>
+<li><strong>场景：</strong> 实验跑完了，或者程序被杀掉了。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>必须告诉那些工具“我结束了”，否则有些在线工具（如 WandB）会以为你掉线了，一直显示“Running”，或者文件没保存完整。</li>
+<li><code>finish()</code> 会关闭文件流、上传最后的数据、关闭网络连接。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件讲了啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>“多合一”的实验记录器</strong>。它让你在训练代码里只需要写一行 <code>log()</code>，就能同时把实验数据发送给 WandB、TensorBoard、MLflow 等多个平台，并且自动处理了格式转换和文本生成的展示问题。</p>
+<p><strong>你的学习路线（Todo List）：</strong>
+1.  <strong>看 <code>Tracking</code> 类：</strong> 理解它是入口，负责分发任务。
+2.  <strong>看 <code>log</code> 函数：</strong> 理解它是如何把数据广播出去的。
+3.  <strong>看 <code>ValidationGenerationsLogger</code>：</strong> 理解它是如何专门处理“文本生成结果”这种复杂数据的。
+4.  <strong>忽略细节：</strong> 那些 <code>_TensorboardAdapter</code> 或 <code>_transform_params</code> 具体的实现细节不用深究，知道它们是负责“格式转换”的苦力就行。</p>

@@ -1,0 +1,95 @@
+<h1>megatron/core/transformer/moe/experts.py</h1>
+<p>这份代码确实比较硬核，它是 <strong>NVIDIA Megatron-LM</strong> 项目的核心代码之一。简单来说，这个文件定义了 <strong>MoE（混合专家模型）架构中“专家（Experts）”层的具体实现方式</strong>。</p>
+<p>为了让你听懂，我们把这个文件想象成一个<strong>“任务清单（To-Do List）”</strong>。你的任务是构建一个 MoE 模型的“大脑”部分。</p>
+<p>MoE 的核心思想是：把一个巨大的全连接层（MLP）拆分成很多个小的 MLP（专家）。对于每个输入的字（Token），路由器（Router）会决定把它派发给哪个专家去处理。</p>
+<p><strong>这个文件就是定义这些“专家”是怎么干活的。</strong></p>
+<p>下面是按难度和逻辑顺序排列的学习/阅读任务清单：</p>
+<hr />
+<h3>✅ Task 1: 理解最笨的办法 —— <code>SequentialMLP</code></h3>
+<p><strong>目标</strong>：看懂代码最下面的 <code>SequentialMLP</code> 类。
+<strong>难度</strong>：⭐️⭐️</p>
+<ul>
+<li><strong>概念</strong>：这是最直观的实现。假设你的 GPU 上分到了 8 个专家。在这个类里，代码就真的创建了一个列表（List），里面放了 8 个普通的 MLP 层。</li>
+<li><strong>代码逻辑</strong>：<ol>
+<li><code>__init__</code>：用 <code>self.local_experts = torch.nn.ModuleList()</code> 创建一堆 MLP。</li>
+<li><code>forward</code>（前向传播）：<ul>
+<li>输入进来了，路由器已经告诉我们要把哪些数据给哪个专家（<code>tokens_per_expert</code>）。</li>
+<li>代码用 <code>torch.split</code> 把数据切开。</li>
+<li><strong>关键点</strong>：它使用了一个 Python 的 <code>for</code> 循环：<code>for expert, tokens in zip(self.local_experts, tokens_list): ...</code>。</li>
+<li><strong>翻译</strong>：数据来了，我先给专家1算一下，算完再给专家2算一下，再给专家3……</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>缺点</strong>：慢。因为 Python 循环加上频繁启动 GPU 内核（Kernel Launch）效率低。</li>
+<li><strong>总结</strong>：这是“串行”执行，用来做基准测试或调试的，逻辑最简单。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 理解高效的办法 —— <code>GroupedMLP</code></h3>
+<p><strong>目标</strong>：看懂代码开头的 <code>GroupedMLP</code> 类。
+<strong>难度</strong>：⭐️⭐️⭐️⭐️</p>
+<ul>
+<li><strong>概念</strong>：为了解决上面那个“慢”的问题。NVIDIA 搞了个黑科技叫 <strong>Grouped GEMM（分组矩阵乘法）</strong>。</li>
+<li><strong>核心区别</strong>：<ul>
+<li>它不再存一个 <code>ModuleList</code> 了。</li>
+<li>它把所有专家的权重（Weights）拼成两个巨大的张量：<code>self.weight1</code> 和 <code>self.weight2</code>。</li>
+</ul>
+</li>
+<li><strong>代码逻辑</strong>：<ol>
+<li><code>forward</code>（前向传播）：<ul>
+<li>不再用 <code>for</code> 循环。</li>
+<li>直接调用 <code>gg.ops.gmm</code> (Grouped GEMM)。</li>
+<li><strong>翻译</strong>：它一次性命令 GPU：“把这堆乱七八糟的数据，分别跟这堆乱七八糟的权重做乘法，但我不想写循环，你底层帮我并行搞定。”</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>优点</strong>：非常快，吞吐量高。</li>
+<li><strong>总结</strong>：这是 Megatron 训练 MoE 的主力实现方式，利用底层算子加速。</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 理解给 H100 显卡用的办法 —— <code>TEGroupedMLP</code></h3>
+<p><strong>目标</strong>：看懂中间的 <code>TEGroupedMLP</code> 类。
+<strong>难度</strong>：⭐️⭐️⭐️⭐️</p>
+<ul>
+<li><strong>概念</strong>：<code>TE</code> 代表 <strong>Transformer Engine</strong>。这是 NVIDIA 专门为 H100/H800 这种新显卡出的库，专门用来加速 <strong>FP8（8位浮点数）</strong> 计算的。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>结构和 <code>GroupedMLP</code> 类似，但里面的全连接层换成了 <code>submodules.linear_fc1</code> (来自 Transformer Engine)。</li>
+<li><strong>关键点</strong>：你会看到很多关于 <code>fp8</code>、<code>padding</code>（填充）的代码。</li>
+<li><strong>为什么？</strong> 因为 FP8 计算对数据形状有要求（比如必须是 16 的倍数），所以如果某个专家分到的数据量不够，得先补 0（Pad），算完再把 0 去掉（Unpad）。</li>
+</ul>
+</li>
+<li><strong>总结</strong>：这是为了在最新硬件上榨干性能的 FP8 版本实现。</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 理解怎么存盘 —— 分布式检查点 (Checkpointing)</h3>
+<p><strong>目标</strong>：看懂 <code>expert_dist_ckpt_decorator</code> 和类里面的 <code>sharded_state_dict</code> 方法。
+<strong>难度</strong>：⭐️⭐️⭐️⭐️⭐️</p>
+<ul>
+<li><strong>概念</strong>：这是最让人头大的部分。<ul>
+<li><strong>问题</strong>：在大模型训练中，模型是切碎了放在几百张显卡上的。</li>
+<li><strong>Expert Parallel (EP)</strong>：不同的显卡存不同的专家（比如卡1存专家1-4，卡2存专家5-8）。</li>
+<li><strong>Tensor Parallel (TP)</strong>：同一个专家的权重甚至可能被切开放在不同卡上。</li>
+</ul>
+</li>
+<li><strong>装饰器 (<code>expert_dist_ckpt_decorator</code>)</strong>：<ul>
+<li>它的作用是“骗”保存系统。</li>
+<li>在保存模型的一瞬间，它把当前的并行状态（Rank, World Size）临时修改成专家并行的状态，保存完再改回来。</li>
+</ul>
+</li>
+<li><strong><code>sharded_state_dict</code></strong>：<ul>
+<li>这个函数定义了“我的本地权重”对应“全局大模型文件”里的哪一块。</li>
+<li>比如：要把 <code>GroupedMLP</code> 里拼在一起的大权重，切开并在保存时标记为 <code>experts.0</code>, <code>experts.1</code> 等等，以便下次加载或者转成 HuggingFace 格式。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：整个文件的故事线</h3>
+<ol>
+<li><strong>Decorator</strong>：这里有个工具人装饰器，专门负责处理保存模型时的乱七八糟的并行关系。</li>
+<li><strong>GroupedMLP</strong>：这是主角。把所有专家捆在一起，用优化的算子（Grouped GEMM）一次性并行算完，速度最快。</li>
+<li><strong>TEGroupedMLP</strong>：这是给土豪（有 H100 显卡）用的主角。支持 FP8 低精度训练，有一堆处理数据填充（Padding）的逻辑。</li>
+<li><strong>SequentialMLP</strong>：这是备胎。用简单的 <code>for</code> 循环一个一个算，慢但是逻辑简单，用来兜底或测试。</li>
+</ol>
+<p><strong>建议阅读顺序：</strong>
+先看 <code>SequentialMLP</code> 的 <code>forward</code> 函数（理解 MoE 的基本逻辑：切分数据 -&gt; 算 -&gt; 拼回去），再看 <code>GroupedMLP</code> 怎么把循环优化掉的。其他的细节（FP8、保存模型）看不懂可以先跳过。</p>

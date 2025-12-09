@@ -1,0 +1,126 @@
+<h1>docs/algo/rollout_corr_math.md</h1>
+<p>这份文档确实涉及了很多强化学习（RL）的硬核数学推导，直接看公式很容易晕。</p>
+<p>为了帮你理解，我把它拆解成一个<strong>“学习任务清单”（To-Do List）</strong>。你可以把这看作是你作为一名算法工程师，为了解决 LLM 训练中的一个核心难题，需要一步步攻克的关卡。</p>
+<hr />
+<h3>任务一：搞清楚“我们在解决什么问题？”（背景）</h3>
+<p><strong>你的目标</strong>：理解为什么要搞这么复杂的数学，而不是直接训练。</p>
+<ul>
+<li><strong>现状</strong>：在训练大模型（LLM）时，生成数据（Rollout）的过程很慢，而训练（Training）很快。</li>
+<li><strong>问题</strong>：当你拿回数据准备更新模型时，模型可能已经更新了好几轮了，或者产生数据的环境（比如用 vLLM 推理）和训练的环境（比如 PyTorch 训练）有细微差别。</li>
+<li><strong>术语</strong>：这叫 <strong>Off-policy（异策略）</strong> 问题。简单说就是：“用来学习的数据，不是现在的我生成的，而是‘过去的我’或‘另一个我’生成的。”</li>
+<li><strong>风险</strong>：如果直接强行学，模型会崩溃（Collapse），因为数据有偏差。</li>
+</ul>
+<blockquote>
+<p><strong>✅ 任务一总结</strong>：这篇文档就是一套数学工具，用来修正这种“数据偏差”，让模型能安全地利用“旧数据”或“异构数据”进行学习。</p>
+</blockquote>
+<hr />
+<h3>任务二：理清“三个角色的关系”（核心架构）</h3>
+<p><strong>你的目标</strong>：文档中反复提到的三个 $\pi$ (策略) 是什么鬼？这是理解 <code>verl</code> 框架的核心。</p>
+<p>请想象一个<strong>“师徒传承”</strong>的场景：</p>
+<ol>
+<li>
+<p><strong>$\pi_{\text{rollout}}$ (打工仔/行为策略)</strong>：</p>
+<ul>
+<li><strong>身份</strong>：负责干脏活累活，去生成数据。</li>
+<li><strong>特点</strong>：可能版本比较老，或者为了速度用了量化（FP8），精度稍差。</li>
+<li><strong>任务</strong>：产生轨迹 $\tau$。</li>
+</ul>
+</li>
+<li>
+<p><strong>$\pi_{\text{old}}$ (教导主任/近端策略)</strong>：</p>
+<ul>
+<li><strong>身份</strong>：PPO 算法中的“参考系”。</li>
+<li><strong>特点</strong>：在每一轮训练开始时固定下来。</li>
+<li><strong>任务</strong>：限制模型不要更新得太猛（Trust Region），作为对比基准。</li>
+</ul>
+</li>
+<li>
+<p><strong>$\pi_{\theta}$ (学生/当前策略)</strong>：</p>
+<ul>
+<li><strong>身份</strong>：我们正在训练的那个模型。</li>
+<li><strong>特点</strong>：每一步梯度下降都在变。</li>
+<li><strong>任务</strong>：不断学习，试图超越老师。</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>✅ 任务二总结</strong>：传统的 PPO 假设“打工仔”和“教导主任”是同一个人。但 <code>verl</code> 的 <strong>Decoupled PPO（解耦 PPO）</strong> 认为它们可以是不同的人。
+*   <strong>偏差 1 (Drift 1)</strong>：打工仔 vs 教导主任（数据太旧了，需要修正）。
+*   <strong>偏差 2 (Drift 2)</strong>：教导主任 vs 学生（学生步子迈太大了，需要限制）。</p>
+</blockquote>
+<hr />
+<h3>任务三：掌握“修正工具箱”（数学方法）</h3>
+<p><strong>你的目标</strong>：既然有偏差，怎么用数学方法修回来？</p>
+<p>文档列出了几种修正工具，你可以理解为“过滤器”或“加权器”：</p>
+<ol>
+<li>
+<p><strong>重要性采样 (Importance Sampling, IS)</strong>：</p>
+<ul>
+<li><strong>直觉</strong>：如果“打工仔”生成了一个样本，而在“教导主任”看来这个样本发生的概率很低，那这个样本的权重就该调低（因为它不代表当前的情况）。</li>
+<li><strong>数学</strong>：计算比率 $\rho = \frac{\pi_{\text{old}}}{\pi_{\text{rollout}}}$。</li>
+<li><strong>Token-level vs Sequence-level</strong>：是按每个字（Token）算权重，还是按整句话（Sequence）算？<ul>
+<li><em>Token级</em>：方差小，但有偏差。</li>
+<li><em>Sequence级</em>：无偏差，但方差大（容易出现极端权重）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>拒绝采样 (Rejection Sampling, RS)</strong>：</p>
+<ul>
+<li><strong>直觉</strong>：如果“打工仔”生成的数据太离谱了，权重修正都救不回来，那就直接<strong>扔掉</strong>（Mask 掉）。</li>
+<li><strong>数学</strong>：如果比率 $\rho$ 超过某个阈值（比如 2.0），就不学这条数据了。</li>
+</ul>
+</li>
+<li>
+<p><strong>几何平均修正 (Geometric-level RS)</strong>：</p>
+<ul>
+<li><strong>痛点</strong>：对于很长的推理链（CoT），累乘概率会导致数值爆炸，导致长回复总是被扔掉（Length Trap）。</li>
+<li><strong>解决</strong>：开根号（取几何平均），消除长度的偏见。</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>✅ 任务三总结</strong>：
+*   <strong>IS</strong> = “这个数据有点偏，我给它打个折。”
+*   <strong>RS</strong> = “这个数据太烂了，我不要了。”
+*   <strong>Geo-RS</strong> = “不管长短，公平地判断数据烂不烂。”</p>
+</blockquote>
+<hr />
+<h3>任务四：选择“操作模式”（实战配置）</h3>
+<p><strong>你的目标</strong>：在代码里怎么选？文档提到了两种主要模式。</p>
+<ol>
+<li>
+<p><strong>Decoupled Mode (解耦模式 - 三策略)</strong>：</p>
+<ul>
+<li><strong>做法</strong>：严格区分三个角色。需要多算一次 <code>log_prob</code>。</li>
+<li><strong>优点</strong>：数学上最严谨，不管 Batch Size 多大、数据多旧都能稳。</li>
+<li><strong>缺点</strong>：慢一点点（要多算一次）。</li>
+<li><strong>适用</strong>：追求极致稳定，或者数据非常旧（Replay Buffer）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Bypass Mode (旁路模式 - 双策略)</strong>：</p>
+<ul>
+<li><strong>做法</strong>：偷懒，强制设 $\pi_{\text{old}} = \pi_{\text{rollout}}$。</li>
+<li><strong>优点</strong>：算得快。</li>
+<li><strong>缺点</strong>：如果数据真的很旧，修正就不准确了。</li>
+<li><strong>适用</strong>：数据很新鲜，或者为了省计算资源。</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>✅ 任务四总结</strong>：想稳选 Decoupled，想快选 Bypass。</p>
+</blockquote>
+<hr />
+<h3>最终总结：这篇文档到底讲了啥？</h3>
+<p>如果你现在回头看文档，可以这样串起来：</p>
+<ol>
+<li><strong>Abstract</strong>: 告诉你我们为了解决训练和推理不一致（Mismatch）的问题。</li>
+<li><strong>Section 1 (Theory)</strong>: 回顾历史，从 REINFORCE 到 PPO，最后引出 <strong>Decoupled PPO</strong>（把参考策略和行为策略分开）。</li>
+<li><strong>Section 2 (Implementation)</strong>: 介绍了 <code>verl</code> 里的三个角色 ($\pi_{\text{rollout}}, \pi_{\text{old}}, \pi_{\theta}$)。</li>
+<li><strong>Section 3 (Components)</strong>: 介绍了具体的数学积木（IS 权重怎么算、RS 怎么扔数据、几何平均怎么做）。</li>
+<li><strong>Section 5 (Guide)</strong>: 给你一个菜单，告诉你不同情况该用哪种组合（比如 <code>decoupled_geo_rs</code> 适合长文本推理）。</li>
+</ol>
+<p><strong>一句话人话总结</strong>：
+这篇文档解释了 <code>verl</code> 框架如何通过<strong>引入第三个策略角色</strong>和<strong>各种加权/过滤算法</strong>，让大模型即使吃的是“隔夜饭”（旧数据/异构数据），也能不拉肚子（训练稳定），并且还能消化得很好（数学正确）。</p>

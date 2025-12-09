@@ -1,0 +1,68 @@
+<h1>megatron/core/models/gpt/fine_grained_callables.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到大模型训练中非常底层的<strong>性能优化</strong>和<strong>并行调度</strong>逻辑。</p>
+<p>简单来说，这个文件的核心目的是：<strong>把原本是一个整体的 Transformer 层（Layer），像切蛋糕一样切成更细碎的小块（Fine-grained），以便让显卡在计算的同时也能进行通信（Overlap），从而提升训练速度。</strong></p>
+<p>为了让你听懂，我把阅读这份代码的任务拆解成一个 <strong>TODO List</strong>，我们一步一步来完成这个思维任务。</p>
+<hr />
+<h3>📋 任务清单：理解 <code>fine_grained_callables.py</code></h3>
+<h4>✅ Task 1: 理解核心背景 —— 为什么要“切碎”模型层？</h4>
+<ul>
+<li><strong>现状</strong>：通常我们在写 PyTorch 模型时，一个 Transformer Layer 的 <code>forward</code> 函数是一口气跑完的（先做 Attention，再做 MLP）。</li>
+<li><strong>问题</strong>：在训练超大模型（特别是 MoE，混合专家模型）时，数据需要在不同显卡之间传输（通信）。如果一口气跑，显卡在传输数据时，计算单元就在“干等”，浪费了时间。</li>
+<li><strong>解决方案</strong>：把一层切成多个小步骤。比如，“计算步骤A” -&gt; “通信步骤B” -&gt; “计算步骤C”。这样调度器就可以安排：<strong>在处理这批数据的“通信步骤B”时，同时处理下一批数据的“计算步骤A”</strong>。这就是所谓的“掩盖通信延迟”。</li>
+</ul>
+<h4>✅ Task 2: 核心拆解 —— MoE 层被切成了哪 5 份？</h4>
+<p>这是文件中最重要的函数 <code>build_transformer_layer_callables</code> (约第 250 行) 的观点。它把一个 MoE 层拆成了 5 个独立的函数（Callable）：</p>
+<ol>
+<li><strong><code>submodule_attn_forward</code> (纯计算)</strong>:<ul>
+<li>做 Self-Attention（自注意力机制）。这是个纯计算密集型的活。</li>
+</ul>
+</li>
+<li><strong><code>submodule_post_attn_forward</code> (计算 + 准备)</strong>:<ul>
+<li>做 MLP 之前的 LayerNorm。</li>
+<li><strong>关键点</strong>：如果是 MoE 模型，这里会运行 Router（路由器），决定每个 Token 该去哪个专家那里。</li>
+</ul>
+</li>
+<li><strong><code>submodule_dispatch_forward</code> (通信 - 耗时)</strong>:<ul>
+<li><strong>Dispatch（分发）</strong>：根据路由结果，把 Token 发送到其他显卡上的专家那里（All-to-All 通信）。这步很慢，所以把它单独拎出来，方便和其他计算任务并行。</li>
+</ul>
+</li>
+<li><strong><code>submodule_moe_forward</code> (纯计算)</strong>:<ul>
+<li><strong>Experts Compute</strong>：专家模型开始干活（计算 MLP）。</li>
+</ul>
+</li>
+<li><strong><code>submodule_combine_forward</code> (通信 - 耗时)</strong>:<ul>
+<li><strong>Combine（聚合）</strong>：把各个专家算好的结果，再通过通信传回来（All-to-All 通信），并拼回去。</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>总结</strong>：通过把 1 个大函数拆成 5 个小函数，Megatron 的调度器就可以玩“俄罗斯方块”，把空隙填满。</p>
+</blockquote>
+<h4>✅ Task 3: 理解“节点”包装器 —— <code>TransformerLayerNode</code></h4>
+<ul>
+<li>代码中定义了一个类叫 <code>TransformerLayerNode</code>。</li>
+<li><strong>观点</strong>：既然把层切碎了，每一个碎片（比如上面的 Attention 碎片）都需要被包装成一个独立的“节点”交给调度器管理。</li>
+<li><strong>功能</strong>：<ul>
+<li>它记录了输入和输出。</li>
+<li>它负责管理<strong>内存释放</strong>（<code>should_free_input</code> 函数）：因为切碎了，有些中间变量用完就可以扔了，省显存。</li>
+<li>它负责<strong>反向传播</strong>（Backward）：记录了怎么算梯度。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 理解预处理和后处理 —— <code>PreProcessNode</code> &amp; <code>PostProcessNode</code></h4>
+<p>除了中间的 Transformer 层，模型的开头和结尾也被单独封装了：
+*   <strong><code>PreProcessNode</code></strong>: 负责把输入的 token 变成向量（Embedding），并计算位置编码（Rotary Embedding）。
+*   <strong><code>PostProcessNode</code></strong>: 负责最后一层的 LayerNorm，计算 Loss（损失函数），并把 fp16 转回 fp32。</p>
+<h4>✅ Task 5: 高级特性 —— MTP (Multi-Token Prediction)</h4>
+<ul>
+<li>代码末尾的 <code>build_mtp_layer_callables</code> 是针对一种新的预测技术（一次预测多个 token）做的适配。</li>
+<li><strong>观点</strong>：逻辑和上面一样，也是拆解。但是 MTP 结构更复杂，需要处理额外的 <code>mtp_hidden_states</code>，所以单独写了一套拆解逻辑。</li>
+</ul>
+<hr />
+<h3>💡 总结一下全篇讲了啥</h3>
+<p>如果把训练大模型比作做饭：
+1.  <strong>以前的代码</strong>：厨师（显卡）必须先把菜切完（Attention），再把肉腌好（Dispatch），再炒菜（MLP）。腌肉的时候厨师只能干看着等待。
+2.  <strong>这份代码 (<code>fine_grained_callables.py</code>)</strong>：把做饭流程标准化切分为“切菜工序”、“腌制工序”、“炒菜工序”。
+3.  <strong>目的</strong>：这样就可以引入流水线管理。当第一盘菜在“腌制”（通信）的时候，厨师立刻转头去搞第二盘菜的“切菜”（计算）。</p>
+<p><strong>一句话概括：</strong>
+这份文件定义了如何将 GPT/MoE 模型的<strong>层（Layer）拆解为微小的执行单元（Callables）</strong>，并封装成调度节点，以便实现计算与通信的完美重叠（Overlap），压榨显卡的每一滴性能。</p>

@@ -1,0 +1,105 @@
+<h1>examples/multimodal/combine_state_dicts.py</h1>
+<p>没问题，这段代码乍一看全是循环和字典操作，确实容易晕。</p>
+<p>简单来说，这个脚本的作用就是<strong>“拼装模型”</strong>。</p>
+<p>想象一下，你现在要造一个<strong>多模态模型（Multimodal Model）</strong>，比如一个能看图说话的机器人。通常你不会从头训练，而是找来两个已经训练好的“部件”：
+1.  <strong>视觉模型（眼睛）</strong>：比如 CLIP 或 ViT。
+2.  <strong>语言模型（大脑）</strong>：比如 Llama 或 GPT。</p>
+<p>这两个部件存在两个不同的文件里（<code>.pt</code> 文件）。这个脚本的任务就是把这两个文件<strong>合并成一个文件</strong>，并且给它们贴上标签，防止里面的参数搞混。</p>
+<p>下面我列一个 <strong>“学习任务清单 (To-Do List)”</strong>，我们一步一步拆解它的逻辑。</p>
+<hr />
+<h3>✅ Task 1：理解“原材料” (Inputs)</h3>
+<p>首先看代码底部的 <code>argparse</code> 部分，这是脚本的入口。你需要准备三样东西：</p>
+<ol>
+<li><strong><code>--input</code> (输入文件)</strong>：你要合并哪几个模型文件？<ul>
+<li><em>例子</em>：<code>language_model.pt</code> 和 <code>vision_model.pt</code>。</li>
+</ul>
+</li>
+<li><strong><code>--prefixes</code> (前缀/标签)</strong>：为了防止重名，你要给每个模型起个“前缀名”。<ul>
+<li><em>例子</em>：给语言模型起名 <code>language_model</code>，给视觉模型起名 <code>vision_model</code>。</li>
+</ul>
+</li>
+<li><strong><code>--output</code> (输出文件)</strong>：合并好的文件存到哪？<ul>
+<li><em>例子</em>：<code>multimodal.pt</code>。</li>
+</ul>
+</li>
+</ol>
+<p><strong>为什么需要前缀？</strong>
+假设两个模型里都有一个层叫 <code>layer1.weight</code>。如果直接合并，后一个就会覆盖前一个。
+加上前缀后，它们就变成了：
+*   <code>language_model.layer1.weight</code>
+*   <code>vision_model.layer1.weight</code>
+这样就能在一个文件里和平共处了。</p>
+<hr />
+<h3>✅ Task 2：初始化容器 (The Setup)</h3>
+<p>现在进入 <code>combine</code> 函数内部。</p>
+<p>代码逻辑是从第一个输入文件开始的：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 i 是序号，input_file 是第一个模型文件</span>
+<span class="k">if</span> <span class="n">i</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="c1"># 1. 加载第一个模型文件</span>
+    <span class="n">current_state_dict</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">input_file</span><span class="p">)</span>
+    <span class="c1"># 2. 复制一份作为基础，准备往里填东西</span>
+    <span class="n">combined_state_dict</span> <span class="o">=</span> <span class="n">current_state_dict</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
+    <span class="c1"># 3. 把里面的 &#39;model&#39; 字典清空，我们要重新填</span>
+    <span class="n">combined_state_dict</span><span class="p">[</span><span class="s2">&quot;model&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>这一步做了什么？</strong>
+它拿了第一个文件做“底板”，保留了除参数以外的元数据（比如版本号、配置等），但把装参数的箱子（<code>combined_state_dict["model"]</code>）清空了，准备装新的。</p>
+<hr />
+<h3>✅ Task 3：核心操作——改名与搬运 (Renaming &amp; Copying)</h3>
+<p>这是整个脚本最重要的一段代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 遍历当前模型的所有参数 (k是参数名, v是参数数值)</span>
+<span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">current_state_dict</span><span class="p">[</span><span class="s2">&quot;model&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+    <span class="c1"># 拼装新名字：前缀 + &quot;.&quot; + 原来的名字</span>
+    <span class="c1"># 比如: &quot;vision_model&quot; + &quot;.&quot; + &quot;encoder.weight&quot;</span>
+    <span class="n">new_key</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="si">%s</span><span class="s2">.</span><span class="si">%s</span><span class="s2">&quot;</span> <span class="o">%</span> <span class="p">(</span><span class="n">module_prefix</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span>
+
+    <span class="c1"># 存入大容器</span>
+    <span class="n">combined_state_dict</span><span class="p">[</span><span class="s2">&quot;model&quot;</span><span class="p">][</span><span class="n">new_key</span><span class="p">]</span> <span class="o">=</span> <span class="n">v</span>
+</code></pre></div>
+
+<p><strong>这一步做了什么？</strong>
+它把每个输入文件里的每一个参数拿出来，给名字前面加个前缀（例如 <code>vision_model.</code>），然后扔进那个大的 <code>combined_state_dict</code> 容器里。</p>
+<hr />
+<h3>✅ Task 4：循环处理所有文件 (Looping)</h3>
+<p>代码里有两层循环，逻辑是这样的：</p>
+<ol>
+<li><strong>外层循环 (<code>for output_idx...</code>)</strong>：<ul>
+<li>通常我们只生成 1 个输出文件，所以这个循环通常只跑 1 次。</li>
+<li><em>高级用法</em>：如果你想一次性把 10 个文件合并成 5 个文件（2合1，2合1...），这个循环才会跑多次。</li>
+</ul>
+</li>
+<li><strong>内层循环 (<code>for i, (input_file, module_prefix)...</code>)</strong>：<ul>
+<li>这就是在遍历你输入的每一个模型（比如先处理语言模型，再处理视觉模型）。</li>
+<li>它不断重复 <strong>Task 3</strong> 的搬运过程，直到所有模型的参数都搬进了同一个大容器。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5：保存成果 (Saving)</h3>
+<p>最后一步很简单：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 确保文件夹存在</span>
+<span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">output_dir</span><span class="p">):</span>
+    <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">output_dir</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="c1"># 把那个装满的大容器保存成文件</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">combined_state_dict</span><span class="p">,</span> <span class="n">output_file</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这就生成了最终的 <code>.pt</code> 文件。</p>
+<hr />
+<h3>总结：实际操作演示</h3>
+<p>假设你想运行这个脚本，你的命令大概长这样（对应代码里的 <code>Example usage</code>）：</p>
+<div class="codehilite"><pre><span></span><code>python<span class="w"> </span>combine_state_dicts.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--input<span class="w">  </span>bert_model.pt<span class="w">  </span>vit_model.pt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--prefixes<span class="w">  </span>lang_encoder<span class="w">  </span>visual_encoder<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output<span class="w">  </span>my_multimodal_model.pt
+</code></pre></div>
+
+<p><strong>脚本内部发生了什么：</strong>
+1.  读取 <code>bert_model.pt</code>。
+2.  把里面的参数 <code>layer1.weight</code> 改名为 <code>lang_encoder.layer1.weight</code>。
+3.  读取 <code>vit_model.pt</code>。
+4.  把里面的参数 <code>conv1.weight</code> 改名为 <code>visual_encoder.conv1.weight</code>。
+5.  把改名后的所有参数打包，保存为 <code>my_multimodal_model.pt</code>。</p>
+<p><strong>一句话总结：</strong>
+这是一个<strong>“模型参数打包器”</strong>，它把多个独立的模型文件，通过加前缀改名的方式，合并保存到一个文件里，方便后续的多模态训练。</p>

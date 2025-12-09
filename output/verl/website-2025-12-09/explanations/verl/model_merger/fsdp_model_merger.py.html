@@ -1,0 +1,58 @@
+<h1>verl/model_merger/fsdp_model_merger.py</h1>
+<p>这份代码 <code>fsdp_model_merger.py</code> 的核心作用非常简单，可以用一句话概括：</p>
+<p><strong>把训练时被“切碎”的模型碎片，重新“拼好”成一个完整的模型文件。</strong></p>
+<h3>背景知识（通俗版）</h3>
+<p>在大模型训练（FSDP, Fully Sharded Data Parallel）中，为了显存放得下，模型参数会被切成很多小块（Shards），分散存储在不同的显卡（Rank）上。
+比如你用了 8 张卡训练，最后保存的文件不是一个大文件，而是 <code>rank_0.pt</code>, <code>rank_1.pt</code> ... <code>rank_7.pt</code> 这样一堆小文件。
+这个脚本就是要把这 8 个小文件读进来，按正确的顺序拼回去，变成一个 HuggingFace 格式的通用模型文件。</p>
+<hr />
+<h3>任务清单 (Todo List)</h3>
+<p>为了完成这个“拼图”任务，这个脚本执行了以下逻辑步骤。你可以把它想象成一个流水线工人的操作手册：</p>
+<ol>
+<li><strong>【情报收集】</strong>：查一下当初训练用了多少张卡（World Size）。</li>
+<li><strong>【样本分析】</strong>：先拿第 1 个碎片（Rank 0）看看，搞清楚大家是怎么被切分的（切分策略）。</li>
+<li><strong>【批量进货】</strong>：开启多线程，把所有碎片文件全部读到内存里。</li>
+<li><strong>【组装拼接】</strong>：这是最核心的一步。根据切分策略，把分散的参数张量（Tensor）拼成完整的大张量。</li>
+<li><strong>【质检或出库】</strong>：<ul>
+<li>如果是测试模式：拿拼好的模型和标准答案比对，看对不对。</li>
+<li>如果是合并模式：把拼好的模型保存成 HuggingFace 格式，甚至上传到网上。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步代码详解</h3>
+<p>下面我按照上面的 Todo List，带你一步步看代码里是怎么实现的。</p>
+<h4>第一步：情报收集</h4>
+<p><strong>代码位置</strong>：<code>_get_world_size(self)</code>
+*   <strong>在做什么</strong>：它去读一个叫 <code>fsdp_config.json</code> 的配置文件。
+*   <strong>目的</strong>：找到 <code>world_size</code> 这个数字。比如是 8，就知道待会要找 0 到 7 号文件。</p>
+<h4>第二步：样本分析</h4>
+<p><strong>代码位置</strong>：<code>_load_rank_zero_state_dict</code> 和 <code>_extract_device_mesh_info</code>
+*   <strong>在做什么</strong>：
+    1.  先只加载 <code>rank_0.pt</code> 这个文件。
+    2.  查看里面的参数类型。如果是 <code>DTensor</code>（分布式张量），它里面自带了“我是怎么被切分的”说明书（<code>device_mesh</code>）。
+    3.  如果是普通张量，就假设是简单的 FSDP 切分。
+*   <strong>目的</strong>：确定拼接规则。是横着切的？竖着切的？还是既横又竖（FSDP+DDP）？</p>
+<h4>第三步：批量进货</h4>
+<p><strong>代码位置</strong>：<code>_load_and_merge_state_dicts</code> (前半部分)
+*   <strong>在做什么</strong>：
+    *   代码里有一个 <code>process_one_shard</code> 函数，用来读取单个文件。
+    *   使用 <code>ThreadPoolExecutor</code>（线程池），同时并发读取所有的 <code>rank_*.pt</code> 文件。
+*   <strong>目的</strong>：文件很大，一个一个读太慢了，多线程并发读是为了速度。读完后，内存里就有了一个列表 <code>model_state_dict_lst</code>，装着所有碎片的参数。</p>
+<h4>第三步：组装拼接 (核心难点)</h4>
+<p><strong>代码位置</strong>：<code>_load_and_merge_state_dicts</code> (后半部分) 和 <code>_merge_by_placement</code>
+*   <strong>在做什么</strong>：
+    1.  遍历模型的每一个参数名（比如 <code>layer.0.attention.weight</code>）。
+    2.  从所有碎片里把这个参数对应的部分拿出来，组成一个列表。
+    3.  <strong>关键判断</strong>：
+        *   如果是 <strong>FSDP</strong> 切分（<code>Placement</code> 是 <code>Shard</code>）：通常意味着要把大家按顺序连起来。代码调用 <code>torch.cat(tensors, dim=placement.dim)</code>。
+        *   如果是 <strong>DDP</strong>（数据并行）：大家存的参数其实是一样的（Replicate），那就不需要拼，直接取第 1 个就行。
+*   <strong>目的</strong>：把碎片化的 <code>Tensor</code> 列表，还原成一个完整的 <code>Tensor</code>。</p>
+<h4>第五步：质检或出库</h4>
+<p><strong>代码位置</strong>：<code>merge_and_save</code> 的最后部分
+*   <strong>在做什么</strong>：
+    *   <strong>Test (质检)</strong>：调用 <code>_validate_state_dict</code>。它会加载一个原本就完整的 HuggingFace 模型作为“标准答案”，然后对比每一个参数的形状（Shape）和数值。如果误差极小（<code>torch.testing.assert_close</code>），说明拼接成功。
+    *   <strong>Merge (出库)</strong>：调用 <code>save_hf_model_and_tokenizer</code>。把拼好的大字典保存成 <code>.bin</code> 或 <code>.safetensors</code> 文件，这就是我们平时用的模型文件了。</p>
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>自动化的拼图机器</strong>。
+如果不运行它，你手里的模型就是一堆没法用的碎片文件；运行它之后，你就得到了一个可以用来推理、微调的标准模型文件。</p>

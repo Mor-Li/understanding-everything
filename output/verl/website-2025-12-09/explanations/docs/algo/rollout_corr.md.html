@@ -1,0 +1,118 @@
+<h1>docs/algo/rollout_corr.md</h1>
+<p>这份文档确实涉及了强化学习（RL）中非常硬核的工程和数学细节，特别是在大模型（LLM）训练场景下。看不懂是很正常的，因为它解决的是一个很容易被忽视但又很致命的“隐形”问题。</p>
+<p>为了让你能够消化这份文档，我为你制定了一个 <strong>5步走的 To-Do List</strong>。我们将从“为什么要解决这个问题”开始，一步步深入到“怎么配置”。</p>
+<hr />
+<h3>✅ Task 1: 理解核心痛点 —— “由于环境不同导致的精神分裂”</h3>
+<p><strong>目标</strong>：明白文档开头提到的 <code>Training-Inference Mismatch</code>（训练-推理不匹配）是什么。</p>
+<ul>
+<li><strong>背景</strong>：在训练 LLM 的 PPO 过程中，通常分为两步：<ol>
+<li><strong>Rollout（采样/做题）</strong>：让模型生成一些文本（数据收集）。为了快，通常用 <code>vLLM</code> 引擎，可能用 <code>FP8</code> 低精度。</li>
+<li><strong>Training（训练/改题）</strong>：用收集的数据更新参数。为了准，通常用 <code>FSDP</code> 框架，用 <code>BF16</code> 高精度。</li>
+</ol>
+</li>
+<li><strong>问题</strong>：虽然模型权重是一样的，但因为推理引擎（vLLM vs FSDP）和精度（FP8 vs BF16）不同，导致<strong>同一个模型在两个阶段的表现微小不同</strong>。</li>
+<li><strong>后果</strong>：PPO 算法默认这两个阶段的模型行为是完全一致的。如果不一致，数学假设就不成立，导致训练崩塌（RL Collapse）。</li>
+<li><strong>文档的作用</strong>：这个 <code>Rollout Correction</code> 模块就是用来<strong>修正</strong>这种不一致的补丁。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 掌握两大修正武器 —— “软修正”与“硬拒绝”</h3>
+<p><strong>目标</strong>：理解文档中反复出现的 <code>IS</code> (Importance Sampling) 和 <code>RS</code> (Rejection Sampling)。</p>
+<p>你可以把这想象成老师批改作业：</p>
+<ol>
+<li>
+<p><strong>IS Weights (重要性采样权重) —— “软修正”</strong>：</p>
+<ul>
+<li><strong>概念</strong>：如果 Rollout 阶段生成的某个词，在 Training 阶段看来概率很低（觉得不该这么生成），我们就降低这个样本在计算梯度时的权重。</li>
+<li><strong>文档中的 <code>rollout_is</code></strong>：就是计算这个权重的。</li>
+<li><strong>特点</strong>：数据留着，但把它的影响力变小（或变大）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Rejection Sampling (拒绝采样) —— “硬拒绝”</strong>：</p>
+<ul>
+<li><strong>概念</strong>：如果 Rollout 生成的数据太离谱了，Training 模型觉得完全不可接受（差异过大），直接把这条数据扔掉，不参与训练。</li>
+<li><strong>文档中的 <code>rollout_rs</code></strong>：就是用来把关扔数据的。</li>
+<li><strong>特点</strong>：直接丢弃数据，防止“有毒”数据污染模型。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 理解两种工作模式 —— “严谨派”与“效率派”</h3>
+<p><strong>目标</strong>：看懂文档中的 <code>Decoupled Mode</code> 和 <code>Bypass Mode</code>。</p>
+<p>这是工程实现的两种路径：</p>
+<ol>
+<li>
+<p><strong>Decoupled Mode (解耦模式) —— 严谨派</strong>：</p>
+<ul>
+<li><strong>做法</strong>：把 Rollout 策略、旧策略（Old Policy）、新策略（Current Policy）分得清清楚楚。</li>
+<li><strong>优点</strong>：数学上最准确。</li>
+<li><strong>缺点</strong>：慢，需要多算一次概率。</li>
+<li><strong>配置</strong>：<code>bypass_mode: false</code></li>
+</ul>
+</li>
+<li>
+<p><strong>Bypass Mode (旁路模式) —— 效率派 (推荐)</strong>：</p>
+<ul>
+<li><strong>做法</strong>：偷懒，假定 Rollout 策略就是旧策略。然后通过上面的 IS/RS 来修补因为偷懒产生的误差。</li>
+<li><strong>优点</strong>：快，省去了一次繁重的计算。</li>
+<li><strong>缺点</strong>：必须配合 IS/RS 修正，否则容易崩。</li>
+<li><strong>配置</strong>：<code>bypass_mode: true</code></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 选择修正的粒度 —— “扣字眼”还是“看整体”</h3>
+<p><strong>目标</strong>：理解 <code>Token-level</code> vs <code>Sequence-level</code> vs <code>Geometric</code>。</p>
+<p>当我们计算修正权重时，应该怎么算？</p>
+<ol>
+<li>
+<p><strong>Token-level (词级别)</strong>：</p>
+<ul>
+<li>每个 Token 独立计算权重。</li>
+<li><strong>适用</strong>：大多数通用场景。</li>
+</ul>
+</li>
+<li>
+<p><strong>Sequence-level (句子级别)</strong>：</p>
+<ul>
+<li>把整个句子的所有 Token 概率乘起来算一个总权重。</li>
+<li><strong>问题</strong>：句子越长，权重波动越剧烈（Length Trap，长度陷阱）。长思维链（CoT）容易被误杀。</li>
+</ul>
+</li>
+<li>
+<p><strong>Geometric (几何平均) —— 专治长文本</strong>：</p>
+<ul>
+<li>为了解决句子太长导致权重数值爆炸的问题，使用几何平均数来平滑。</li>
+<li><strong>适用</strong>：推理模型、CoT、Agent 等长文本场景。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 动手配置与监控 —— “怎么抄作业”</h3>
+<p><strong>目标</strong>：根据你的需求选择 Preset（预设配置）并看懂 Log。</p>
+<p><strong>1. 抄作业（选择配置）：</strong>
+文档给了很多 <code>config</code> 代码，你只需要关注这一段 <strong>Preset Configuration Guide</strong>。</p>
+<ul>
+<li><strong>如果你想求稳，且资源足够</strong>：用 <code>Decoupled</code> 模式。</li>
+<li><strong>如果你想快（推荐）</strong>：用 <code>Bypass</code> 模式 + <code>Policy Gradient</code>。<ul>
+<li><strong>普通对话模型</strong>：用 <code>pg_is()</code> (序列级修正)。</li>
+<li><strong>推理/数学模型 (CoT)</strong>：用 <code>pg_geo_rs_seq_tis()</code> (几何级拒绝采样 + 序列级修正)，防止长文本被误杀。</li>
+</ul>
+</li>
+</ul>
+<p><strong>2. 监控指标（看 Log）：</strong>
+训练时盯着 TensorBoard 里的 <code>rollout_corr/</code> 开头的指标：</p>
+<ul>
+<li><code>rollout_is_mean</code>：应该接近 <strong>1.0</strong>。如果变成 0.1 或 100，说明模型崩了或配置错了。</li>
+<li><code>rollout_is_eff_sample_size</code>：有效样本量。如果太低（比如 &lt; 0.1），说明大部分数据都被抛弃或权重极低，训练效率差。</li>
+<li><code>rollout_rs_masked_fraction</code>：被扔掉的数据比例。如果太高（比如 &gt; 50%），说明 Rollout 和 Training 差异大到没法训练了。</li>
+</ul>
+<hr />
+<h3>总结你的行动路线：</h3>
+<ol>
+<li>先承认 <strong>Rollout（采样）</strong> 和 <strong>Training（训练）</strong> 环境存在微小差异（精度/框架）。</li>
+<li>决定使用 <strong>Bypass Mode</strong> 来省时间。</li>
+<li>为了弥补 Bypass 带来的误差，开启 <strong>Rollout Correction</strong>。</li>
+<li>如果是<strong>长文本任务</strong>，配置选 <code>Geometric</code> 相关的预设；如果是<strong>短文本</strong>，选 <code>Token</code> 或 <code>Sequence</code> 相关的预设。</li>
+<li>跑起来后，盯着 <code>rollout_is_mean</code> 看它是不是在 <strong>1.0</strong> 附近晃悠。</li>
+</ol>

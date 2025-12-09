@@ -1,0 +1,121 @@
+<h1>megatron/core/inference/scheduler.py</h1>
+<p>这份代码 <code>scheduler.py</code> 就像是一个繁忙餐厅的<strong>领班（Host/Manager）</strong>。</p>
+<p>它的核心任务不是“做菜”（那是 GPU/模型的工作），而是<strong>管理客流</strong>。它决定谁可以现在坐下吃饭，谁需要在门口排队，以及谁吃完了该腾位置。</p>
+<p>为了让你听懂，我把这个 Scheduler（调度器）的工作拆解成一个 <strong>“领班的每日任务清单 (To-Do List)”</strong>，我们一步一步来看。</p>
+<hr />
+<h3>任务清单 Task 1: 开店准备 (初始化)</h3>
+<p><strong>对应代码：</strong> <code>__init__</code></p>
+<ul>
+<li><strong>目标</strong>：准备好记录本，设定餐厅能容纳多少人。</li>
+<li><strong>动作</strong>：<ol>
+<li><strong>设定 <code>max_batch_size</code></strong>：这是餐厅的座位数。比如一次最多只能服务 8 个请求（Batch Size = 8）。</li>
+<li><strong>准备三个“池子” (Pools)</strong>：<ul>
+<li><code>active_request_pool</code> (正在用餐区)：目前正在被 GPU 计算的任务。</li>
+<li><code>waiting_request_pool</code> (排队等候区)：因为座位满了，在门口排队的任务。</li>
+<li><code>completed_request_pool</code> (已结账区)：已经生成完文本的任务。</li>
+</ul>
+</li>
+<li><strong>准备 <code>requests</code> 大账本</strong>：记录所有来过的任务，不管它在哪个区。</li>
+</ol>
+</li>
+</ul>
+<h3>任务清单 Task 2: 接待新客人 (添加请求)</h3>
+<p><strong>对应代码：</strong> <code>add_request</code></p>
+<ul>
+<li><strong>目标</strong>：当一个新的 Prompt（提示词）发过来时，决定把它安排在哪。</li>
+<li><strong>动作</strong>：<ol>
+<li><strong>发号牌</strong>：用 <code>get_new_request_id()</code> 给这个请求一个唯一的 ID。</li>
+<li><strong>打包需求</strong>：把用户的 Prompt、参数（比如采样参数）打包成一个 <code>InferenceRequest</code> 对象。</li>
+<li><strong>判断座位</strong>：<ul>
+<li>如果“正在用餐区”的人数 <strong>小于</strong> <code>max_batch_size</code>（还有空位）：<ul>
+<li>把状态设为 <code>ACTIVE</code>。</li>
+<li>直接把它放进 <code>active_request_pool</code>（立刻开始处理）。</li>
+</ul>
+</li>
+<li>如果“正在用餐区” <strong>满了</strong>：<ul>
+<li>把状态设为 <code>WAITING</code>。</li>
+<li>把它扔进 <code>waiting_request_pool</code>（去排队）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>处理流式输出 (Streaming)</strong>：如果用户要求像 ChatGPT 那样一个字一个字蹦（Streaming），这里会给它分配一个 <code>AsyncStream</code> 通道。</li>
+</ol>
+</li>
+</ul>
+<h3>任务清单 Task 3: 叫号 (从排队区捞人)</h3>
+<p><strong>对应代码：</strong> <code>add_earliest_waiting_request_to_active_pool</code></p>
+<ul>
+<li><strong>目标</strong>：如果有空位了，把排队最久的人叫进来。</li>
+<li><strong>动作</strong>：<ol>
+<li>检查 <code>active_request_pool</code> 确实没满。</li>
+<li>从 <code>waiting_request_pool</code> 里拿出最早进来的那个任务（FIFO，先进先出）。</li>
+<li>把它的状态改为 <code>ACTIVE</code>。</li>
+<li>把它移进 <code>active_request_pool</code>。</li>
+</ol>
+</li>
+</ul>
+<h3>任务清单 Task 4: 巡视餐桌 &amp; 翻台 (更新池子状态)</h3>
+<p><strong>对应代码：</strong> <code>update_requests_pools</code></p>
+<p>这是最核心的<strong>循环维护</strong>工作，通常在模型每生成一个 Token 后调用一次。</p>
+<ul>
+<li><strong>目标</strong>：把吃完的人送走，把排队的人迎进来。</li>
+<li><strong>动作</strong>：<ol>
+<li><strong>检查完工的人</strong>：<ul>
+<li>拿着 <code>result_dict</code>（模型刚算完的结果）去核对。</li>
+<li>如果某个任务的状态变成了 <code>COMPLETED</code>（生成结束了，比如遇到了句号或达到长度限制）：<ul>
+<li>把它从 <code>active_request_pool</code> 踢出去。</li>
+<li>放进 <code>completed_request_pool</code>。</li>
+<li><em>（潜台词：这个座位空出来了！）</em></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>填补空位</strong>：<ul>
+<li>只要 <code>active_request_pool</code> 没满 <strong>并且</strong> <code>waiting_request_pool</code> 还有人在排队：<ul>
+<li>疯狂调用 Task 3 (叫号)，直到座位坐满或者没人排队为止。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>任务清单 Task 5: 盘点人数 (查询状态)</h3>
+<p><strong>对应代码：</strong> <code>num_requests_pending</code> 和 <code>have_requests_pending</code></p>
+<ul>
+<li><strong>目标</strong>：老板来视察了，问还有多少活没干完？</li>
+<li><strong>动作</strong>：<ul>
+<li>计算“正在吃的” + “在排队的”总人数。只要大于 0，就说明机器不能停，还得继续转。</li>
+</ul>
+</li>
+</ul>
+<h3>任务清单 Task 6: 应对突发状况 (取消任务)</h3>
+<p><strong>对应代码：</strong> <code>abort_request</code></p>
+<ul>
+<li><strong>目标</strong>：用户不耐烦了，或者断网了，要取消任务。</li>
+<li><strong>动作</strong>：<ul>
+<li>找到对应的流（Stream），直接调用 <code>finish</code> 结束它，抛出异常或停止生成。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个 Scheduler 在干嘛？</h3>
+<p>想象一个传送带模型：</p>
+<ol>
+<li><strong>入口</strong>：用户不断扔进来 Prompt (<code>add_request</code>)。</li>
+<li><strong>分流</strong>：<ul>
+<li>有空位 -&gt; 直接上 <strong>GPU 传送带</strong> (<code>active</code>)。</li>
+<li>没空位 -&gt; 进 <strong>仓库</strong> (<code>waiting</code>)。</li>
+</ul>
+</li>
+<li><strong>循环</strong>：<ul>
+<li>GPU 转一圈（生成一个 Token）。</li>
+<li>Scheduler 检查：谁生成完了？移走。</li>
+<li>Scheduler 检查：有空位了吗？去仓库把最早的货拿出来填上。</li>
+</ul>
+</li>
+<li><strong>出口</strong>：任务完成，放入完成区。</li>
+</ol>
+<p><strong>核心逻辑就是一句话：</strong>
+<strong>维持 GPU 永远有 <code>max_batch_size</code> 这么多任务在跑，旧的走一个，新的补一个，绝不让 GPU 闲着，也不让 GPU 撑死。</strong></p>

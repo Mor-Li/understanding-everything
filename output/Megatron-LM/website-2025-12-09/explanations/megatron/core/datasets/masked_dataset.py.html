@@ -1,0 +1,82 @@
+<h1>megatron/core/datasets/masked_dataset.py</h1>
+<p>这份代码确实比较晦涩，因为它属于 <strong>Megatron-Core</strong> 的底层数据处理部分，专门用于为 <strong>BERT、RoBERTa 或 T5</strong> 这类模型准备“完形填空”（Masked Language Modeling）的训练数据。</p>
+<p>简单来说，这个文件的作用就像是一个<strong>“出题老师”</strong>。它拿着一篇完整的课文，按照既定的规则把某些词挖掉（变成 <code>[MASK]</code>），或者打乱顺序，然后把“挖空后的课文”和“正确答案”交给模型去训练。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>“出题流水线” (Task List)</strong>，我们一步步来看它是怎么工作的。</p>
+<hr />
+<h3>Task List: 打造一个“完形填空”生成器</h3>
+<h4>✅ Task 1: 设定出题规则 (配置 Config)</h4>
+<p>在开始处理数据前，我们需要先定好规则。这就是 <code>MaskedWordPieceDatasetConfig</code> 类做的事情。
+你需要关注其中的几个关键开关：
+*   <strong><code>masking_probability</code></strong>: 挖空的比例是多少？（通常 BERT 是 15%）。
+*   <strong><code>masking_do_full_word</code></strong>: 是否整词挖空？
+    *   <em>背景知识</em>: 现在的分词器（Tokenizer）会把 "playing" 分成 "play" 和 "##ing"。如果这个开关是 True，我们要么把这两个都挖掉，要么都不挖，不能只挖一半，否则太容易猜了。
+*   <strong><code>masking_max_ngram</code></strong>: 一次最多挖掉连续的几个词？（比如一次挖掉 "New York City" 3个词）。
+*   <strong><code>masking_use_geometric_distribution</code></strong>: 挖空的长度是否遵循几何分布？（这是 SpanBERT 论文提出的一种更高级的挖空策略，为了让模型更聪明）。</p>
+<h4>✅ Task 2: 建立索引 (构建 Sample Index)</h4>
+<p>对应代码：<code>_build_sample_index</code> 方法。
+*   <strong>目标</strong>: 面对海量的语料数据（几百 GB），我们不能一次性读入内存。
+*   <strong>做法</strong>:
+    *   这个方法会创建一个“地图”（索引文件）。
+    *   它计算出每一个样本（Sample）在原始大文件中的起始位置和结束位置。
+    *   它还会处理缓存（Cache），如果之前算过这个地图，就直接读取，节省时间。
+    *   <strong>结果</strong>: 即使数据再多，我们也能通过索引快速定位到具体的句子。</p>
+<h4>✅ Task 3: 识别“单词”边界 (处理 WordPiece)</h4>
+<p>对应代码：<code>_create_masked_lm_predictions</code> 函数的开头部分。
+*   <strong>目标</strong>: 找出哪些 Token 是完整的词，哪些是词的碎片。
+*   <strong>逻辑</strong>:
+    *   代码遍历 <code>token_ids</code>。
+    *   如果一个 Token 以 <code>##</code> 开头（例如 <code>##ing</code>），说明它是附属于前一个词的。
+    *   <strong><code>candidates</code> (候选列表)</strong>: 代码把属于同一个单词的所有 Token 归类到一个小组里。
+        *   例如：<code>["un", "##friend", "##ly"]</code> 会被视为一个整体候选者 <code>[index1, index2, index3]</code>。
+    *   这样后续挖空时，就能实现 Task 1 中提到的“整词挖空”。</p>
+<h4>✅ Task 4: 挑选要挖掉的词 (核心算法)</h4>
+<p>对应代码：<code>_create_masked_lm_predictions</code> 中间的 <code>while</code> 循环。
+*   <strong>目标</strong>: 随机挑出 15% 的词准备挖掉。
+*   <strong>逻辑</strong>:
+    1.  计算总共需要挖掉多少个 Token (<code>n_maskings</code>)。
+    2.  打乱所有候选词的顺序 (<code>numpy_random_state.shuffle</code>)。
+    3.  <strong>决定挖多长 (N-gram)</strong>:
+        *   如果是普通模式，可能倾向于挖短的。
+        *   如果是 <code>geometric_distribution</code> (SpanBERT模式)，会用几何分布随机算出一个长度 <code>n</code>（比如这次决定挖掉连续的3个词）。
+    4.  <strong>选词</strong>:
+        *   遍历候选词，检查它和它后面的词是否还没被挖过。
+        *   如果符合条件，就选中它们，加入 <code>masked_spans</code>。
+        *   直到凑够了 15% 的数量为止。</p>
+<h4>✅ Task 5: 执行“挖空”动作 (应用 Mask)</h4>
+<p>对应代码：<code>_create_masked_lm_predictions</code> 里的 <code>mask = self._get_token_mask(...)</code>。
+*   <strong>目标</strong>: 把选中的词真正替换掉。
+*   <strong>逻辑</strong>:
+    *   这里调用了一个抽象方法 <code>_get_token_mask</code>。
+    *   在 BERT 的原论文中，这里有三种策略：
+        1.  80% 的情况替换成 <code>[MASK]</code> 特殊字符。
+        2.  10% 的情况替换成一个<strong>随机的错误单词</strong>（迷惑模型）。
+        3.  10% 的情况<strong>保持不变</strong>（让模型学会判断这个词到底对不对）。
+    *   代码记录下：
+        *   <code>masked_positions</code>: 哪里被改了？
+        *   <code>masked_labels</code>: 原来的正确答案是什么？</p>
+<h4>✅ Task 6: 额外的“乱序”任务 (Permutation - 可选)</h4>
+<p>对应代码：<code>if self.config.masking_do_permutation:</code> 块。
+*   <strong>目标</strong>: 除了挖空，还要把一部分词的顺序打乱（类似 XLNet 的做法）。
+*   <strong>逻辑</strong>:
+    *   如果配置开启了这个功能，代码会再选出一批词。
+    *   把这些词的位置索引打乱 (<code>shuffle</code>)。
+    *   把 A 位置的词放到 B 位置，制造语序混乱的样本。
+    *   这也算作一种“Masking”，因为模型需要预测出原始的正确顺序。</p>
+<h4>✅ Task 7: 打包输出</h4>
+<p>对应代码：<code>return</code> 部分。
+*   <strong>最终产出</strong>:
+    1.  <code>masked_token_ids</code>: 被挖空/篡改后的句子（给模型看的题）。
+    2.  <code>masked_positions</code>: 哪些位置被改了（告诉 Loss 函数去算哪里）。
+    3.  <code>masked_labels</code>: 正确答案（用于计算 Loss）。
+    4.  <code>boundaries</code>: 句子边界信息。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件不涉及网络结构，它是一个<strong>数据预处理引擎</strong>。</p>
+<p><strong>它的核心工作流是：</strong>
+1.  <strong>读配置</strong> (要挖多少？怎么挖？)
+2.  <strong>读数据</strong> (利用 Index)
+3.  <strong>找单词</strong> (处理 <code>##</code> 分词)
+4.  <strong>选目标</strong> (随机挑出要霍霍的词)
+5.  <strong>下黑手</strong> (替换成 <code>[MASK]</code> 或打乱顺序)
+6.  <strong>给答案</strong> (返回题目和标准答案)</p>
+<p>你看懂这个逻辑后，再回看代码中的 <code>_create_masked_lm_predictions</code> 函数，就会发现它只是在用复杂的 NumPy 操作来实现上述的随机挑选逻辑。</p>

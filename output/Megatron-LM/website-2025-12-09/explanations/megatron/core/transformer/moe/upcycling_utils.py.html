@@ -1,0 +1,67 @@
+<h1>megatron/core/transformer/moe/upcycling_utils.py</h1>
+<p>这份代码的核心功能术语叫做 <strong>"Upcycling" (升级/复用)</strong>。</p>
+<p>简单来说，它的作用是：<strong>把一个已经训练好的普通大模型（Dense Model，比如 Llama-7B），直接“改造”成一个混合专家模型（MoE Model），而不需要从头开始训练。</strong></p>
+<p>想象一下：你原本有一个巨大的“全能部门”（Dense MLP），现在你想把它拆分成很多个“特种小分队”（Experts），并且给他们配一个“调度员”（Router）。这份代码就是执行这个<strong>拆分、复制和初始化</strong>过程的施工说明书。</p>
+<p>下面我为你列一个 <strong>Task Todo List</strong>，按照代码的逻辑一步步拆解它是怎么做的：</p>
+<h3>📝 任务清单：从 Dense 变身 MoE 的五步走</h3>
+<h4>✅ Task 1: 摸底调查 (配置检查与参数计算)</h4>
+<p><strong>对应代码函数：</strong> <code>_get_config</code></p>
+<p>在开始改造前，必须先确认原来的模型能不能拆，以及怎么拆。
+*   <strong>检查点 1：</strong> 找到原模型（Dense）和新模型（MoE）里的 MLP 层（全连接层）。
+*   <strong>检查点 2：</strong> 确定“拆分粒度” (<code>granularity</code>)。
+    *   比如：原模型的 MLP 宽 4096，新模型的每个专家宽 1024。那么粒度就是 $4096 / 1024 = 4$。意味着原模型的一块肉可以切成 4 个小专家的肉。
+*   <strong>检查点 3：</strong> 确定“扩张倍数” (<code>expansion_rate</code>)。
+    *   MoE 模型通常有很多专家（比如 8 个）。如果粒度是 4，说明原来的参数只够填满 4 个专家，剩下的 4 个专家怎么办？就需要“复制”。
+*   <strong>Todo:</strong> 算出怎么切（Granularity）、切完怎么复制（Expansion Rate），以及确认激活函数类型（GELU, Swish 等）。</p>
+<h4>✅ Task 2: 基础搬运 (复制非 MLP 层的参数)</h4>
+<p><strong>对应代码函数：</strong> <code>_convert_to_moe_state_dict</code> (Step 1 &amp; 2)</p>
+<p>模型里不只有 MLP，还有 Attention（注意力机制）、Embedding（词嵌入）等。这些层在 MoE 改造中通常保持不变。
+*   <strong>Todo:</strong> 把原模型里所有<strong>不属于</strong> MLP 的参数（比如 Attention 的 QKV 权重、LayerNorm 的权重），原封不动地 <code>deepcopy</code> 到新模型里。
+*   <strong>细节:</strong> 代码中专门处理了 LayerNorm 的名字替换（从 <code>mlp.linear_fc1.layer_norm</code> 变成 <code>pre_mlp_layernorm</code>），因为 MoE 的结构命名可能不太一样。</p>
+<h4>✅ Task 3: 核心改造 - 权重切分与缩放 (Upcycling Math)</h4>
+<p><strong>对应代码函数：</strong> <code>_get_weight_scale</code>, <code>_process_fc1_weight_param</code>, <code>_process_fc2_weight_param</code></p>
+<p>这是整个文件最难懂、也是最核心的部分。直接把大模型的权重切开塞给小专家，模型的输出数值会乱套（变大或变小），所以需要数学上的缩放（Scaling）。</p>
+<ul>
+<li><strong>Step 3.1: 计算缩放因子 (<code>scale</code>)</strong><ul>
+<li>根据论文（通常指 Solar 或类似的 Upcycling 论文），为了保证改造后激活值的大小和原来差不多，需要给权重乘上一个系数。</li>
+<li>代码逻辑：<code>scale</code> 跟粒度、扩张倍数以及激活函数类型有关（开根号或立方根）。</li>
+</ul>
+</li>
+<li><strong>Step 3.2: 处理第一层全连接 (FC1 / Up Projection)</strong><ul>
+<li><strong>动作:</strong> 先把原权重乘上 <code>scale</code> -&gt; 然后按“粒度”切成几块 -&gt; 再按“扩张倍数”进行复制。</li>
+<li><strong>结果:</strong> 原本一个大的矩阵，变成了多个小的矩阵，分发给不同的专家。</li>
+</ul>
+</li>
+<li><strong>Step 3.3: 处理第二层全连接 (FC2 / Down Projection)</strong><ul>
+<li><strong>动作:</strong> 同样先乘 <code>scale</code> -&gt; 切分 -&gt; 复制。</li>
+<li><strong>区别:</strong> FC1 通常是按行切（输入维度），FC2 通常是按列切（输出维度），代码里体现为 <code>dim=0</code> 和 <code>dim=1</code> 的区别。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 招聘调度员 (初始化 Router)</h4>
+<p><strong>对应代码函数：</strong> <code>_process_router_param</code> (Step 3)</p>
+<p>MoE 模型需要一个 Router（路由器/门控网络）来决定把 token 发给哪个专家。原模型没有这个东西，怎么办？
+*   <strong>Todo:</strong> 利用原模型的一些参数来“热启动”Router，或者进行简单的初始化。
+*   <strong>代码逻辑:</strong> 代码中似乎是取了原模型的一部分权重，进行切分和重复 (<code>repeat</code>)，用来初始化 Router 的权重。这样比随机初始化可能收敛得更快一点。</p>
+<h4>✅ Task 5: 组装上线 (加载与赋值)</h4>
+<p><strong>对应代码函数：</strong> <code>_expand_key_value</code>, <code>upcycle_state_dict</code>, <code>load_and_upcycle_model</code></p>
+<p>所有的零件（复制的旧零件、切分改造的新专家、新招聘的调度员）都准备好了，现在要装进新的 MoE 模型架构里。
+*   <strong>Todo:</strong> 遍历新模型的字典键（Keys）。
+*   <strong>逻辑:</strong>
+    *   如果是 <code>SequentialMLP</code> 类型的专家，把刚才切好的权重塞进 <code>mlp.experts.local_experts.{id}</code>。
+    *   如果是 <code>TEGroupedMLP</code> (Transformer Engine 加速版)，塞进对应的分组权重里。
+*   <strong>最终输出:</strong> 返回一个完整的 <code>state_dict</code>（参数字典），这个字典可以直接被 <code>moe_model.load_state_dict()</code> 加载。</p>
+<hr />
+<h3>总结一下它的“心路历程”</h3>
+<ol>
+<li><strong>原模型说</strong>：“我是一个 4096 宽度的胖子。”</li>
+<li><strong>新模型说</strong>：“我要变成 8 个 1024 宽度的瘦子组成的团队。”</li>
+<li><strong>脚本逻辑</strong>：<ul>
+<li>4096 / 1024 = 4。原来的胖子只能切成 4 个瘦子。</li>
+<li>但是我们要 8 个瘦子，所以把这 4 个瘦子每人克隆一份（Expansion Rate = 2）。</li>
+<li>直接切会导致力量（数值）不对，所以切之前先做个数学运算（Scaling）调整一下“内力”。</li>
+<li>把切好、克隆好、调整好的肉，填进 8 个瘦子的躯壳里。</li>
+<li>最后，给这个团队配个指挥官（Router），改造完成！</li>
+</ul>
+</li>
+</ol>

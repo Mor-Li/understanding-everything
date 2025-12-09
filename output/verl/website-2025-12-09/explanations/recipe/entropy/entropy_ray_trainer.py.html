@@ -1,0 +1,66 @@
+<h1>recipe/entropy/entropy_ray_trainer.py</h1>
+<p>这份代码文件 <code>entropy_ray_trainer.py</code> 是一个基于 <strong>Ray</strong> 框架的 <strong>PPO（强化学习）训练器</strong>。它的核心逻辑是用来训练大模型（LLM），让模型通过强化学习（RLHF）变得更好。</p>
+<p>之所以叫 <code>EntropyTrainer</code>，是因为它在标准的 PPO 流程中加入了一个特殊的<strong>过滤机制</strong>（Filtering），用来筛选那些“有价值”的训练数据（即模型表现出差异性/熵的数据）。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“训练大模型的 Todo List”</strong>。想象你是一个监考老师，正在通过不断的“考试-评分-讲解”来教一个学生（AI模型）。</p>
+<p>以下是代码 <code>fit()</code> 函数中每一步执行的任务清单：</p>
+<hr />
+<h3>📋 任务清单：AI 强化学习训练流水线</h3>
+<h4>Phase 1: 准备阶段 (Setup)</h4>
+<ol>
+<li><strong>[ ] 加载存档 (Load Checkpoint):</strong> 如果之前训练过，先加载之前的进度，别从头开始。</li>
+<li><strong>[ ] 考前摸底 (Validation):</strong> 在正式训练前，先拿一组题考考模型，看看它现在的水平（Reward分数）怎么样。</li>
+<li><strong>[ ] 启动进度条:</strong> 设置好我们要训练多少个 Epoch（轮次）。</li>
+</ol>
+<h4>Phase 2: 循环训练阶段 (The Loop) - 核心逻辑</h4>
+<p><em>这是代码中 <code>for epoch in range...</code> 和 <code>for batch_dict in ...</code> 的部分。</em></p>
+<p><strong>Step 1: 出题与答题 (Rollout / Generation)</strong>
+*   <strong>[ ] 拿到试卷 (Get Batch):</strong> 从数据加载器里取出一批 Prompt（提示词/问题）。
+*   <strong>[ ] 学生作答 (Generate):</strong>
+    *   代码：<code>self.actor_rollout_wg.generate_sequences(...)</code>
+    *   解释：让当前的 Actor 模型（也就是我们要训练的 AI）根据问题生成回答。通常同一个问题会生成多个不同的回答（<code>n</code> 个），方便对比。
+*   <strong>[ ] (可选) 对照组作答 (ReMax Baseline):</strong> 如果使用了 ReMax 算法，还会让模型生成一个“贪婪解码”（不带随机性）的答案作为基准线。</p>
+<p><strong>Step 2: 老师批改 (Reward Computation)</strong>
+*   <strong>[ ] 机器打分 (Reward Model):</strong>
+    *   代码：<code>self.rm_wg.compute_rm_score(...)</code>
+    *   解释：用奖励模型（RM）给刚才生成的每一个回答打分。
+*   <strong>[ ] 规则打分 (Rule-based Reward):</strong>
+    *   代码：<code>compute_reward(..., self.reward_fn)</code>
+    *   解释：结合一些硬性规则（比如格式是否正确、长度是否达标）调整分数。
+*   <strong>[ ] 加上惩罚项 (KL Penalty):</strong>
+    *   代码：<code>apply_kl_penalty(...)</code>
+    *   解释：如果 AI 的回答偏离“参考模型”（原始模型）太远，就扣分。这是为了防止模型为了拿高分而“胡言乱语”（Reward Hacking）。</p>
+<p><strong>Step 3: 筛选题目 (The "Entropy" Logic - 重点！)</strong>
+<em>这部分是这个文件特有的逻辑，位于 <code>if not self.config.algorithm.filter_groups.enable: ... else: ...</code></em>
+*   <strong>[ ] 检查差异性 (Check Variance/Entropy):</strong>
+    *   逻辑：代码计算了同一个问题下，生成的多个回答的得分的<strong>标准差 (std)</strong>。
+    *   <strong>[ ] 过滤无效数据:</strong> 如果标准差是 0（<code>std == 0</code>），说明模型对这个问题的回答完全一样，或者得分完全一样，没有“对比学习”的价值。这种数据会被丢弃。
+    *   <strong>[ ] 补题:</strong> 如果丢弃的数据太多，导致凑不够一个 Batch，系统会报错或者继续生成，直到凑够足够多“有差异”的数据。
+    *   <em>目的：只训练那些模型感到“纠结”或者能产生好坏差异的题目，提高训练效率。</em></p>
+<p><strong>Step 4: 整理考卷 (Batch Processing)</strong>
+*   <strong>[ ] 重新计算概率 (Compute Log Probs):</strong> 计算模型生成这些词的概率。
+*   <strong>[ ] 计算参考概率 (Ref Log Probs):</strong> 计算“参考模型”生成这些词的概率（用于计算 KL 散度）。
+*   <strong>[ ] 负载均衡 (Balance Batch):</strong> 如果是在多卡训练，确保每张显卡分到的数据量差不多。</p>
+<p><strong>Step 5: 考后分析 (Advantage &amp; Value)</strong>
+*   <strong>[ ] 预估价值 (Critic Values):</strong>
+    *   代码：<code>self.critic_wg.compute_values(...)</code>
+    *   解释：让 Critic 模型（评论员）预测每一个状态大概能拿多少分。
+*   <strong>[ ] 计算优势 (Compute Advantage):</strong>
+    *   代码：<code>compute_advantage(...)</code>
+    *   解释：计算“这个回答比预期的好多少”。如果比预期好，就鼓励；比预期差，就惩罚。</p>
+<p><strong>Step 6: 修正模型 (Update)</strong>
+*   <strong>[ ] 更新评论员 (Update Critic):</strong>
+    *   代码：<code>self.critic_wg.update_critic(...)</code>
+    *   解释：让 Critic 模型根据刚才的实际得分，调整自己的预测能力，下次估分更准。
+*   <strong>[ ] 更新学生 (Update Actor):</strong>
+    *   代码：<code>self.actor_rollout_wg.update_actor(...)</code>
+    *   解释：这是最关键的一步。根据“优势（Advantage）”，修改 Actor 模型的参数。让它下次更有可能生成高分答案，更少生成低分答案。</p>
+<h4>Phase 3: 收尾 (Logging &amp; Saving)</h4>
+<ol>
+<li><strong>[ ] 记录成绩 (Logging):</strong> 把这一轮的平均分、训练时长、Loss 值记下来，画到图表上。</li>
+<li><strong>[ ] 定期存档 (Save Checkpoint):</strong> 每隔一段时间保存模型文件，防止断电白跑。</li>
+</ol>
+<hr />
+<h3>总结：这个脚本在讲什么？</h3>
+<p>这个脚本就是一个 <strong>PPO 训练的大管家</strong>。</p>
+<p>它最特别的地方在于 <strong>Step 3（筛选）</strong>。普通的 PPO 可能会把所有生成的数据都拿来训练。但这个 <code>RayEntropyTrainer</code> 认为：<strong>如果模型对某个问题的回答千篇一律（Reward 没有波动），那这个数据对更新参数贡献不大，不如扔掉，只练那些有波动（有熵/Entropy）的数据。</strong></p>
+<p><strong>一句话概括：</strong> 这是一个带有“自动挑题”功能的分布式强化学习训练器。</p>

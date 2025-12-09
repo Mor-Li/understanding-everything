@@ -1,0 +1,119 @@
+<h1>verl/trainer/config/ref/dp_ref.yaml</h1>
+<p>这份文件确实充满了术语，因为它是一个用于 <strong>大模型训练（特别是 RLHF，即人类反馈强化学习）</strong> 的底层配置文件。</p>
+<p>为了让你读懂它，我们需要建立一个“学习任务清单”（To-Do List）。我们不直接翻译代码，而是通过这 5 个步骤，把背后的逻辑层层剥开。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂背景</strong> —— 什么是“Ref Model”？为什么需要它？</li>
+<li><strong>Task 2: 搞懂结构</strong> —— <code>defaults</code> 和 <code>_target_</code> 是什么意思？</li>
+<li><strong>Task 3: 核心引擎</strong> —— <code>fsdp</code> 是干嘛的？</li>
+<li><strong>Task 4: 关键设定</strong> —— 为什么是 <code>forward_only</code>？</li>
+<li><strong>Task 5: 高级优化</strong> —— <code>ulysses</code> 和 <code>entropy</code> 是什么黑科技？</li>
+</ol>
+<hr />
+<h3>🚀 开始执行任务</h3>
+<h4>✅ Task 1: 搞懂背景 (Ref Model)</h4>
+<p>在看代码前，你得知道这个文件配置的是什么角色。
+在 RLHF（比如 PPO 算法）训练中，通常有两个模型：
+1.  <strong>Actor Model（演员模型）</strong>：正在被训练的模型，它在不断学习如何写出更好的回答。
+2.  <strong>Reference Model（参考模型，简称 Ref）</strong>：这是原来的旧模型，<strong>它不参与训练，参数是锁死的</strong>。</p>
+<p><strong>为什么要用 Ref？</strong>
+为了防止 Actor 练“走火入魔”（比如为了拿高分开始乱说话），我们需要计算 Actor 和 Ref 之间的差异（KL 散度）。Ref 就像一个“基准线”或“老师”，告诉 Actor：“你别改得离我太远”。</p>
+<blockquote>
+<p><strong>结论</strong>：这个文件 <code>dp_ref.yaml</code> 就是用来配置这个<strong>只看不练的“参考模型”</strong>的。</p>
+</blockquote>
+<hr />
+<h4>✅ Task 2: 搞懂结构 (Hydra Config)</h4>
+<p>这个文件格式叫 <strong>YAML</strong>，配合一个叫 <strong>Hydra</strong> 的 Python 库使用。</p>
+<p>看这段代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">defaults</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ref</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">../engine@fsdp_config</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fsdp</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">_self_</span>
+
+<span class="nt">_target_</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">verl.workers.config.FSDPActorConfig</span>
+</code></pre></div>
+
+<ul>
+<li><strong><code>defaults</code> (继承/拼装)</strong>：这就像乐高积木。<ul>
+<li><code>- ref</code>：先去读 <code>ref.yaml</code>，把那里的通用设置拿过来。</li>
+<li><code>- ../engine@fsdp_config: fsdp</code>：去读 <code>fsdp</code> 引擎的配置，并把它挂载到 <code>fsdp_config</code> 这个名字下。</li>
+<li><code>- _self_</code>：最后应用本文件里的设置（如果有冲突，以本文件为准）。</li>
+</ul>
+</li>
+<li><strong><code>_target_</code> (目标)</strong>：这句话告诉程序：“读完这个配置后，请在 Python 里实例化 <code>verl.workers.config.FSDPActorConfig</code> 这个类”。</li>
+</ul>
+<blockquote>
+<p><strong>结论</strong>：这只是一个“组装说明书”，告诉程序如何拼凑出一个配置对象。</p>
+</blockquote>
+<hr />
+<h4>✅ Task 3: 核心引擎 (FSDP)</h4>
+<p>文件名里有 <code>dp</code> (Data Parallel)，内容里有 <code>fsdp</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">fsdp_config</span><span class="p">:</span>
+<span class="w">  </span><span class="c1"># ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>问题</strong>：大模型（比如 70B 参数）太大了，一张显卡装不下。</li>
+<li><strong>FSDP (Fully Sharded Data Parallel)</strong>：这是一种显存节省技术。它把模型像切蛋糕一样切碎（Sharding），分散存储在多张显卡上。</li>
+<li><strong>DP (Data Parallel)</strong>：数据并行，即多张卡同时处理不同的数据，然后同步结果。</li>
+</ul>
+<blockquote>
+<p><strong>结论</strong>：这个 Ref 模型将使用 <strong>FSDP</strong> 技术加载，以便在有限的显存里跑起来。</p>
+</blockquote>
+<hr />
+<h4>✅ Task 4: 关键设定 (Forward Only)</h4>
+<p>这是本文件中<strong>最重要</strong>的一行配置：</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">fsdp_config</span><span class="p">:</span>
+<span class="w">  </span><span class="c1"># ref model is forward only</span>
+<span class="w">  </span><span class="nt">forward_only</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">True</span>
+</code></pre></div>
+
+<ul>
+<li><strong>Forward (前向传播)</strong>：模型输入数据 -&gt; 算出结果。</li>
+<li><strong>Backward (反向传播)</strong>：算出误差 -&gt; 更新模型参数（这是训练过程）。</li>
+</ul>
+<p>还记得 Task 1 说的吗？Ref 模型是“基准线”，<strong>它不需要学习</strong>。
+因此，我们开启 <code>forward_only: True</code>。这意味着：<strong>“只许推理，不许训练”</strong>。这能极大地节省显存，因为不需要存储梯度（Gradients）和优化器状态（Optimizer States）。</p>
+<blockquote>
+<p><strong>结论</strong>：Ref 模型是只读的工具人，这行配置确保它不浪费资源去“假装学习”。</p>
+</blockquote>
+<hr />
+<h4>✅ Task 5: 高级优化 (Ulysses &amp; Entropy)</h4>
+<p>最后是针对超长文本和内存的极限优化。</p>
+<p><strong>1. Ulysses (尤利西斯并行)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nt">ulysses_sequence_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">${oc.select:actor_rollout_ref.actor.ulysses_sequence_parallel_size,1}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>场景</strong>：如果你的 Prompt 特别长（比如 100k tokens），即便切分了模型，显存还是不够。</li>
+<li><strong>Ulysses</strong>：这是一种“序列并行”技术。它把<strong>长文本</strong>切成几段，分给不同显卡处理。</li>
+<li><strong>代码含义</strong>：这里的 <code>${...}</code> 是在说：“去看看 Actor 模型设了多少并行度，如果它设了，我就跟它一样；如果没设，就默认为 1（不切分）”。</li>
+</ul>
+<p><strong>2. Entropy (熵计算优化)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nt">entropy_from_logits_with_chunking</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">False</span>
+<span class="nt">entropy_checkpointing</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">False</span>
+</code></pre></div>
+
+<ul>
+<li><strong>场景</strong>：计算 Actor 和 Ref 的差异时，需要算“熵”（Entropy）。这涉及巨大的矩阵运算，瞬间显存占用很高。</li>
+<li><strong>Chunking (分块)</strong>：把大矩阵切成小块慢慢算，省显存但慢一点。这里设为 <code>False</code>（不切块，追求速度）。</li>
+<li><strong>Checkpointing (重计算)</strong>：为了省显存，算完就扔，需要时再算一遍。这里设为 <code>False</code>（不重算，直接存下来，追求速度）。</li>
+</ul>
+<blockquote>
+<p><strong>结论</strong>：这些是微调显存和速度平衡的高级旋钮。</p>
+</blockquote>
+<hr />
+<h3>🎯 总结：这一页纸到底说了啥？</h3>
+<p>如果把这段代码翻译成人类语言，它在对计算机说：</p>
+<blockquote>
+<p>“嘿，帮我准备一个 <strong>参考模型 (Ref Model)</strong>。</p>
+<ol>
+<li><strong>基础设置</strong>：照抄通用的 <code>ref</code> 配置。</li>
+<li><strong>运行方式</strong>：用 Python 的 <code>FSDPActorConfig</code> 类来启动。</li>
+<li><strong>显存策略</strong>：使用 <strong>FSDP</strong> 切分模型，分摊到多张卡上。</li>
+<li><strong>核心指令</strong>：记住，这个模型<strong>只做前向推理 (Forward Only)</strong>，绝对不要训练它！</li>
+<li><strong>并行细节</strong>：如果隔壁 Actor 模型用了‘尤利西斯’切分长文本，我们也跟着用。</li>
+<li><strong>计算细节</strong>：算熵的时候，不用为了省显存搞那些分块或重算的动作，直接算就行。”</li>
+</ol>
+</blockquote>

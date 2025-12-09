@@ -1,0 +1,66 @@
+<h1>verl/utils/dataset/rm_dataset.py</h1>
+<p>这份代码定义了一个 <strong>Reward Model Dataset (RMDataset)</strong>。</p>
+<p>简单来说，<strong>Reward Model (奖励模型)</strong> 的训练目的是让 AI 学会判断：“哪个回答更好？”。所以这个数据集的任务就是给模型提供成对的例子：
+*   <strong>Prompt (问题)</strong>
+*   <strong>Chosen (好的回答)</strong>
+*   <strong>Rejected (坏的回答)</strong></p>
+<p>为了让你看懂，我把这个脚本的工作流程拆解成一个 <strong>“待办事项清单 (To-Do List)”</strong>。每一步对应代码中的一段逻辑。</p>
+<hr />
+<h3>✅ Task List: 制作奖励模型数据集的步骤</h3>
+<h4>Task 1: 准备工作 (初始化)</h4>
+<p><strong>目标</strong>：告诉程序数据在哪里，用什么工具处理文字，最大长度是多少。
+*   <strong>代码位置</strong>：<code>__init__</code> 方法。
+*   <strong>解释</strong>：
+    *   当你创建 <code>RMDataset</code> 这个对象时，你需要传入文件路径 (<code>parquet_files</code>) 和分词器 (<code>tokenizer</code>)。
+    *   它设定了三个关键的列名：<code>prompt</code> (提示词), <code>chosen</code> (被选中的/好的), <code>rejected</code> (被拒绝的/坏的)。
+    *   设定 <code>max_length</code> (比如 1024)，超过这个长度会被截断，不足会被补齐。</p>
+<h4>Task 2: 把数据搞到本地 (下载)</h4>
+<p><strong>目标</strong>：如果数据在云端（比如 S3 或 HDFS），需要先把它下载到本地的缓存文件夹里。
+*   <strong>代码位置</strong>：<code>_download</code> 方法 和 <code>download_files_distributed</code> 函数。
+*   <strong>解释</strong>：
+    *   <strong>分布式处理</strong>：代码里有一个很聪明的细节 (<code>download_files_distributed</code>)。如果你是用多张显卡（多 GPU）训练，不能让所有显卡同时去下载同一个文件，那样会冲突或浪费带宽。
+    *   <strong>逻辑</strong>：它规定只有 <strong>Rank 0 (带头大哥)</strong> 去下载文件。其他显卡 (<code>torch.distributed.barrier()</code>) 就在原地等待，直到大哥下载完，大家再一起继续。</p>
+<h4>Task 3: 读取并筛选数据 (读取)</h4>
+<p><strong>目标</strong>：把下载好的 Parquet 文件读进内存，变成列表。
+*   <strong>代码位置</strong>：<code>_read_files_and_tokenize</code> 方法 (注：虽然名字里有 tokenize，但其实这一步主要是读取)。
+*   <strong>解释</strong>：
+    *   使用 <code>pandas</code> 读取 parquet 文件。
+    *   <strong>采样 (Sampling)</strong>：如果你设置了 <code>max_samples</code> (比如只想要 1000 条数据)，它会根据 <code>shuffle</code> 参数决定是“随机抽取 1000 条”还是“截取前 1000 条”。
+    *   <strong>提取内容</strong>：最后把 <code>prompt</code>, <code>chosen</code>, <code>rejected</code> 这三列的内容分别存成三个大列表。</p>
+<h4>Task 4: 制作单条训练样本 (核心加工)</h4>
+<p><strong>目标</strong>：当训练程序向数据集要“第 N 条数据”时，把文字变成模型能看懂的数字（Tensor）。
+*   <strong>代码位置</strong>：<code>__getitem__</code> 方法。
+*   <strong>解释</strong>：这是最关键的一步，每次训练循环都会调用这里。
+    1.  <strong>取文本</strong>：拿出第 N 个 <code>prompt</code>, <code>chosen</code>, <code>rejected</code>。
+    2.  <strong>数字化 (Tokenization)</strong>：用 <code>tokenizer</code> 把文字变成 ID 序列。
+    3.  <strong>加结尾符 (EOS)</strong>：在回答的末尾加上 <code>&lt;EOS&gt;</code> (End of Sentence) 标记，告诉模型话说完了。
+    4.  <strong>拼接 (Concat)</strong>：
+        *   <strong>好样本</strong> = Prompt + Chosen Response
+        *   <strong>坏样本</strong> = Prompt + Rejected Response
+    5.  <strong>生成 Mask</strong>：生成 Attention Mask (全是 1)，告诉模型这些字是有效的。</p>
+<h4>Task 5: 统一长度 (对齐)</h4>
+<p><strong>目标</strong>：因为模型需要固定长度的输入，长了要切，短了要补。
+*   <strong>代码位置</strong>：<code>_pad_to_length</code> 方法（在 <code>__getitem__</code> 内部被调用）。
+*   <strong>解释</strong>：
+    *   <strong>如果太短</strong>：在后面补 0 (Padding)，直到达到 <code>max_length</code>。
+    *   <strong>如果太长</strong>：直接切掉后面多余的部分 (Truncate)。
+    *   这一步确保了“好样本”和“坏样本”的长度都是规整的 1024 (或者你设定的其他长度)。</p>
+<h4>Task 6: 打包发货 (返回)</h4>
+<p><strong>目标</strong>：把处理好的“好样本”和“坏样本”堆叠在一起返回。
+*   <strong>代码位置</strong>：<code>__getitem__</code> 的最后部分。
+*   <strong>解释</strong>：
+    *   它使用了 <code>torch.stack</code>。
+    *   最终返回的 <code>input_ids</code> 形状是 <code>[2, max_length]</code>。
+        *   第 0 行是 <strong>Chosen (好)</strong>。
+        *   第 1 行是 <strong>Rejected (坏)</strong>。
+    *   这样模型一次就能拿到这一对数据，算出两个分数，然后去优化让“好”的分数比“坏”的高。</p>
+<hr />
+<h3>总结一下这段代码在干嘛</h3>
+<p>这就好比你是老师（Dataset），你要给学生（Model）准备复习题：</p>
+<ol>
+<li><strong>Task 1</strong>: 你确定复习资料在哪（文件路径）。</li>
+<li><strong>Task 2</strong>: 你去打印室把资料印回来（下载）。</li>
+<li><strong>Task 3</strong>: 你把资料整理好，可能只抽查其中 100 题（读取和采样）。</li>
+<li><strong>Task 4 &amp; 5</strong>: 当学生来要第 1 题时，你把题目（Prompt）和两个答案（好答案、坏答案）都整理成标准的答题卡格式（Tokenize &amp; Pad），长度必须一致。</li>
+<li><strong>Task 6</strong>: 你把这一对答题卡递给学生，让他去学习分辨好坏。</li>
+</ol>

@@ -1,0 +1,51 @@
+<h1>docs/advance/agent_loop.rst</h1>
+<p>这份文档主要介绍了一个叫 <strong>Agent Loop（智能体循环）</strong> 的模块。简单来说，这是为了让你的 AI 模型在训练（特别是强化学习 RL）时，能够进行<strong>多轮对话</strong>、<strong>调用工具</strong>、<strong>思考</strong>，而不仅仅是简单的“问一句答一句”。</p>
+<p>为了让你更直观地理解，我把它拆解成一个 <strong>“构建一个会思考、会用工具的 AI 训练系统”</strong> 的任务清单（Todo List）。</p>
+<p>我们按照<strong>从设计到运行</strong>的逻辑，一步步把勾打上：</p>
+<hr />
+<h3>✅ Task 1: 理解核心目标 (Design Goal)</h3>
+<p><strong>任务描述</strong>：搞清楚我们为什么要用这个模块？
+*   <strong>背景</strong>：普通的 RL 训练（比如 PPO）通常是“输入 Prompt -&gt; 模型生成 -&gt; 打分”。
+*   <strong>痛点</strong>：现在的 Agent 需要多步操作（比如：先思考 -&gt; 写代码 -&gt; 运行代码 -&gt; 根据报错修改 -&gt; 最终答案）。
+*   <strong>Agent Loop 的作用</strong>：它提供了一个<strong>通用的接口</strong>，允许你自定义这个复杂的“思考-行动”循环过程，并把它产生的所有数据（轨迹）收集起来用于训练。</p>
+<h3>✅ Task 2: 定义“大脑”怎么工作 (API Design)</h3>
+<p><strong>任务描述</strong>：你需要写代码告诉系统，Agent 具体该怎么动。
+*   <strong>你需要做的事</strong>：继承 <code>AgentLoopBase</code> 类，并实现一个 <code>run</code> 函数。
+*   <strong>在这个函数里写什么？</strong>：
+    1.  <strong>调用 LLM</strong>：让模型生成一段话。
+    2.  <strong>判断</strong>：模型是想说话还是想调用工具？
+    3.  <strong>执行工具</strong>：如果是调用工具（比如搜索、查库），在这里执行代码。
+    4.  <strong>循环</strong>：把工具的结果喂回给模型，让它继续生成。
+*   <strong>类比</strong>：这就像给机器人写一段脚本：“如果看到红灯就停，看到绿灯就走”。</p>
+<h3>✅ Task 3: 规范化“交作业”的格式 (Output)</h3>
+<p><strong>任务描述</strong>：Agent 跑完一轮后，需要把结果交上去计算奖励（Reward）。
+*   <strong>你需要返回什么</strong>：<code>AgentLoopOutput</code>。
+*   <strong>包含三个关键数据</strong>：
+    1.  <code>prompt_ids</code>: 题目的 Token ID。
+    2.  <code>response_ids</code>: 模型生成的回答 + 工具返回的结果（所有的 Token ID 串在一起）。
+    3.  <code>response_mask</code>: <strong>这很重要</strong>。你需要告诉系统，哪些 Token 是模型生成的（标为1），哪些是环境/工具返回的（标为0）。<strong>因为 RL 训练时，我们只奖励/惩罚模型生成的那些 Token，不能怪罪工具返回的内容。</strong></p>
+<h3>✅ Task 4: 理解系统如何调度 (Architecture)</h3>
+<p><strong>任务描述</strong>：了解当你按下“开始训练”时，后台发生了什么。
+*   <strong>Step 1 (唤醒)</strong>：训练开始，系统会把推理引擎（vLLM 或 SGLang）唤醒，并把最新的模型权重同步过去（保证推理用的是最新的脑子）。
+*   <strong>Step 2 (分发)</strong>：<code>AgentLoopManager</code> 把一大批 Prompt（题目）切分成小块，分给不同的 <code>Worker</code>。
+*   <strong>Step 3 (执行)</strong>：每个 <code>Worker</code> 运行你写的 <code>run</code> 函数（就是 Task 2 里写的逻辑）。
+*   <strong>Step 4 (休眠)</strong>：跑完数据后，推理引擎休眠，释放显存给训练引擎（FSDP/Megatron）去更新参数。</p>
+<h3>✅ Task 5: 搞定“模型服务”与“负载均衡” (AsyncLLMServer)</h3>
+<p><strong>任务描述</strong>：在 Task 2 的循环里，你需要频繁调用 LLM 生成文本，怎么保证速度快且不出错？
+*   <strong>系统提供的功能</strong>：<code>AsyncLLMServerManager</code>。
+*   <strong>功能点 1 (负载均衡)</strong>：如果你有多个 GPU 卡跑推理，系统会自动把请求发给最空闲的那个。
+*   <strong>功能点 2 (Sticky Session 粘性会话)</strong>：这是一个多轮对话。第一句话发给 GPU-0 了，第二句话系统会自动还发给 GPU-0，利用 KV Cache 缓存加速，不用每次都重新计算前文。</p>
+<h3>✅ Task 6: 避开“Token 不一致”的坑 (Warning)</h3>
+<p><strong>任务描述</strong>：这是文档特别强调的一个技术细节。
+*   <strong>陷阱</strong>：通常我们用 OpenAI 格式（Chat Completion）调用模型。但是在 RL 训练中，<strong>Token 必须精确对应</strong>。
+*   <strong>问题</strong>：如果你用 Chat 模板（template），可能加上一些特殊的标签（比如 <code>&lt;|im_start|&gt;</code>）。如果你手动拼接字符串，Token ID 可能和模板转出来的不一样。这会导致训练崩溃。
+*   <strong>解决方案</strong>：文档建议尽量使用 <strong>Token in token out</strong> 的模式，或者非常小心地处理 Chat Template，确保推理时的 Token 和训练时计算概率的 Token 完全一致。</p>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这就好比你要训练一个<strong>实习生（Agent）</strong>：</p>
+<ol>
+<li><strong>Task 2</strong> 是你给实习生写的<strong>工作手册</strong>（先查资料，再写报告）。</li>
+<li><strong>Task 3</strong> 是实习生交上来的<strong>工作日志</strong>（标红的部分是他写的，黑字是资料原文，只给红字部分打分）。</li>
+<li><strong>Task 4 &amp; 5</strong> 是<strong>公司的行政系统</strong>（自动分配电脑资源，保证实习生干活时电脑不卡，干完活把电脑关了省电）。</li>
+<li><strong>Task 6</strong> 是<strong>注意事项</strong>（不要改动原文里的标点符号，否则系统对不上号，没法发工资）。</li>
+</ol>

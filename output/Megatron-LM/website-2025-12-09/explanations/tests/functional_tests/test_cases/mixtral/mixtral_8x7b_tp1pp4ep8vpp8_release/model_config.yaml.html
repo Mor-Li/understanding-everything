@@ -1,0 +1,58 @@
+<h1>tests/functional_tests/test_cases/mixtral/mixtral_8x7b_tp1pp4ep8vpp8_release/model_config.yaml</h1>
+<p>这份文件其实是一个 <strong>“训练/测试 Mixtral 8x7b 大模型的详细施工图纸”</strong>。</p>
+<p>简单来说，如果你是一个大厨，想要做一道超级复杂的满汉全席（训练这个大模型），这张纸就是你的<strong>配方单</strong>和<strong>厨房分工表</strong>。它告诉计算机：用多少个炉灶（GPU）、怎么切菜（并行策略）、放什么调料（超参数）、以及怎么判断菜好没好（监控指标）。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>Task Todo List（任务清单）</strong>，我们一步步来完成这个模型的启动过程。</p>
+<hr />
+<h3>📋 任务清单：启动 Mixtral 8x7b 模型测试</h3>
+<h4>✅ Task 1: 准备厨房环境 (Environment Setup)</h4>
+<p><strong>目标</strong>：在开火之前，先设置好显卡（GPU）和通信环境，防止炸厨房。
+*   <strong>对应代码区域</strong>：<code>ENV_VARS</code>
+*   <strong>解读</strong>：
+    *   <code>CUDA_DEVICE_MAX_CONNECTIONS: 1</code>：限制显卡连接数，为了优化计算速度。
+    *   <code>NCCL_...</code>: 这些是关于显卡之间怎么“打电话”沟通数据的设置（NVIDIA NCCL 库）。
+    *   <code>PYTORCH_CUDA_ALLOC_CONF</code>: 告诉 PyTorch 怎么管理显存，避免显存碎片化（<code>expandable_segments:True</code>）。</p>
+<h4>✅ Task 2: 安排流水线与分工 (Parallelism Strategy)</h4>
+<p><strong>目标</strong>：模型太大了，一张显卡装不下，必须切开了分给不同的人干。
+*   <strong>对应代码区域</strong>：<code>Distributed args</code> (分布式参数)
+*   <strong>解读</strong>：
+    *   <code>--pipeline-model-parallel-size: 4</code> (<strong>PP</strong>): 把模型的 32 层切成 4 段，像流水线一样处理。
+    *   <code>--tensor-model-parallel-size: 2</code> (<strong>TP</strong>): 把每一层内部的矩阵切成 2 份并行计算。
+    *   <code>--expert-tensor-parallel-size: 1</code> &amp; <code>--expert-model-parallel-size: 8</code> (<strong>EP</strong>): <strong>这是重点</strong>。因为是 MoE 模型（混合专家模型），这里把“专家”分到了 8 个不同的地方去计算。</p>
+<h4>✅ Task 3: 搭建模型骨架 (Model Architecture)</h4>
+<p><strong>目标</strong>：告诉程序，我们要造的这个“大脑”长什么样。
+*   <strong>对应代码区域</strong>：<code>Network size args</code> (网络尺寸)
+*   <strong>解读</strong>：
+    *   <code>--num-layers: 32</code>: 这个大脑有 32 层深。
+    *   <code>--hidden-size: 4096</code>: 每一层的神经元宽度是 4096。
+    *   <code>--seq-length: 4096</code>: 一次能读入 4096 个 token（单词/字）。
+    *   <code>--position-embedding-type: rope</code>: 使用现在最流行的 RoPE 位置编码（让模型知道单词的顺序）。
+    *   <code>--swiglu: true</code>: 使用 SwiGLU 激活函数（一种让模型更聪明的数学变换）。</p>
+<h4>✅ Task 4: 注入灵魂 —— 混合专家系统 (MoE Configuration)</h4>
+<p><strong>目标</strong>：配置 Mixtral 模型最核心的“专家系统”。这是它区别于普通 Llama 模型的地方。
+*   <strong>对应代码区域</strong>：<code>MoE args</code>
+*   <strong>解读</strong>：
+    *   <code>--num-experts: 8</code>: 模型里住了 <strong>8 个专家</strong>（8 个不同的小神经网络）。
+    *   <code>--moe-router-topk: 2</code>: <strong>这句最关键</strong>。每处理一个单词，<strong>只挑 2 个</strong>最懂的专家来干活（而不是 8 个全上），这样速度快且效果好。
+    *   <code>--moe-grouped-gemm</code>: 一种加速运算的数学技巧。</p>
+<h4>✅ Task 5: 准备食材与烹饪火候 (Data &amp; Training Args)</h4>
+<p><strong>目标</strong>：决定给模型吃什么数据，以及学习的速度。
+*   <strong>对应代码区域</strong>：<code>Data args</code> 和 <code>Learning rate args</code>
+*   <strong>解读</strong>：
+    *   <code>--tokenizer-type: Llama2Tokenizer</code>: 切词器（把句子切成数字的工具）用的是 Llama2 的标准。
+    *   <code>--global-batch-size: 256</code>: 一次打包学 256 条数据。
+    *   <code>--lr: 1.2e-5</code>: <strong>学习率</strong>。这是火候，太大了模型学废了（发散），太小了学得慢。这里设得很小。
+    *   <code>--bf16: true</code>: 使用 <strong>BF16</strong> 格式（一种半精度浮点数），为了省显存且算得快。</p>
+<h4>✅ Task 6: 监控与保存 (Logging &amp; Checkpointing)</h4>
+<p><strong>目标</strong>：在训练过程中，每隔一会看一眼它学得怎么样，并把进度存盘。
+*   <strong>对应代码区域</strong>：<code>Logging args</code>, <code>Checkpointing args</code>, <code>METRICS</code>
+*   <strong>解读</strong>：
+    *   <code>--save-interval: 200</code>: 每跑 200 步，保存一次存档（Checkpoint）。
+    *   <code>--wandb-project</code>: 把训练曲线画到 Weights &amp; Biases 网站上，方便远程看图表。
+    *   <strong>METRICS (指标)</strong>:
+        *   <code>lm loss</code>: 语言模型损失值（越低越好，代表学懂了）。
+        *   <code>iteration-time</code>: 跑一步花多久（越快越好）。
+        *   <code>mem-allocated-bytes</code>: 显存用了多少（别爆显存就行）。</p>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件就是告诉测试程序：
+<strong>“请帮我启动一个 Mixtral 8x7b 模型，它有 8 个专家（每次用 2 个），把模型切碎了放在多张显卡上跑（PP=4, TP=2, EP=8），用 BF16 精度，跑 200 步存一次档，并告诉我它每一步的 Loss 是多少。”</strong></p>

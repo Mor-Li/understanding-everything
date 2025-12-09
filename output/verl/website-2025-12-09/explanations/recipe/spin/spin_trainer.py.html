@@ -1,0 +1,94 @@
+<h1>recipe/spin/spin_trainer.py</h1>
+<p>这份代码文件 <code>spin_trainer.py</code> 实现的是一种叫 <strong>SPIN (Self-Play Fine-Tuning)</strong> 或者 <strong>Online DPO</strong> 的训练流程。</p>
+<p>简单来说，它的核心思想是：<strong>“让模型自己生成数据，自己跟自己（或者跟过去的自己）比，然后通过 DPO 算法让自己变得更好。”</strong></p>
+<p>为了让你看懂，我把这个复杂的代码拆解成一个 <strong>“训练任务 To-Do List”</strong>。代码里的 <code>RaySPINTrainer</code> 类就是负责执行这个清单的“工头”。</p>
+<hr />
+<h3>📋 任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>准备阶段 (Setup)</strong>：<ul>
+<li>招聘工人（初始化 Ray 节点，分配 GPU）。</li>
+<li>准备教材（加载数据集）。</li>
+</ul>
+</li>
+<li><strong>开始循环 (Training Loop)</strong>：<ul>
+<li><strong>Step 1: 考试 (Generation)</strong> -&gt; 让模型针对题目（Prompt）写出答案。</li>
+<li><strong>Step 2: 评分 (Scoring)</strong> -&gt; 用奖励模型（Reward Model）给答案打分。</li>
+<li><strong>Step 3: 选优 (Preference Construction)</strong> -&gt; 挑出“好答案”和“坏答案”。</li>
+<li><strong>Step 4: 参考 (Reference Check)</strong> -&gt; 看一眼“参考书”（Reference Model），防止模型改得太离谱。</li>
+<li><strong>Step 5: 学习 (Update)</strong> -&gt; 根据好坏答案的对比，更新模型参数。</li>
+<li><strong>Step 6: 定期存档 (Checkpoint)</strong> -&gt; 保存进度。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 详细步骤讲解 (结合代码)</h3>
+<p>下面我按照上面的清单，一步步带你看代码里对应在干什么。</p>
+<h4>1. 准备阶段：招聘与分工</h4>
+<p><strong>代码位置</strong>：<code>init_workers</code> 方法
+<strong>通俗解释</strong>：
+训练这种大模型通常需要很多显卡，Ray 是用来管理这些显卡的工具。
+代码里定义了几个角色（Role）：
+*   <strong>Actor (演员)</strong>：负责写答案的学生（就是我们要训练的模型）。
+*   <strong>Ref Policy (参考策略)</strong>：以前的优等生（用来做对比，防止新模型跑偏）。
+*   <strong>Reward Model (评分员)</strong>：负责给答案打分的老师。
+*   <strong>Critic (评论家)</strong>：(在这个脚本里似乎没怎么用，或者作为辅助)。</p>
+<p>代码逻辑是：先看你有多少 GPU (<code>ResourcePoolManager</code>)，然后把这些角色分配到不同的 GPU 上去。</p>
+<h4>2. 核心循环：<code>fit_dpo</code> 方法</h4>
+<p>这是整个代码的<strong>心脏</strong>。所有的训练逻辑都在这个巨大的 <code>for</code> 循环里。</p>
+<p><strong>Step 1: 考试 (Generation)</strong>
+*   <strong>代码片段</strong>：
+    <code>python
+    gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)</code>
+*   <strong>解释</strong>：
+    工头（Trainer）拿出一批题目（<code>gen_batch</code>），扔给 Actor（模型），让它生成回答。
+    <em>注意：这里可能会让模型生成多次（<code>repeat</code>），为了后面能从里面挑出好的和坏的。</em></p>
+<p><strong>Step 2: 评分 (Scoring)</strong>
+*   <strong>代码片段</strong>：
+    <code>python
+    reward_tensor_rm = self.rm_wg.compute_rm_score(batch)
+    # 或者使用 reward_fn
+    reward_result = self.reward_fn(batch, return_dict=True)</code>
+*   <strong>解释</strong>：
+    生成的答案拿回来了，现在需要评分。
+    如果有专门的 <strong>Reward Model (RM)</strong>，就让 RM 跑一遍打分；如果没有，就用写好的脚本函数 (<code>reward_fn</code>) 打分。分数越高，代表答案越好。</p>
+<p><strong>Step 3: 选优 (Preference Construction)</strong>
+*   <strong>代码片段</strong>：
+    <code>python
+    batch = compute_onlineDPO_pref(batch)</code>
+*   <strong>解释</strong>：
+    这是 SPIN/Online DPO 的关键。
+    假设模型对同一个问题生成了两个答案 A 和 B。
+    评分阶段发现：A 得了 10 分，B 得了 5 分。
+    那么在这个步骤里，代码会标记：<strong>Chosen (胜者) = A</strong>，<strong>Rejected (败者) = B</strong>。
+    这样就凑成了一对训练数据 <code>(Prompt, Chosen, Rejected)</code>。</p>
+<p><strong>Step 4: 参考 (Reference Check)</strong>
+*   <strong>代码片段</strong>：
+    <code>python
+    ref_log_prob_output = self.ref_policy_wg.compute_ref_log_prob(batch)</code>
+*   <strong>解释</strong>：
+    为了防止模型为了高分“走火入魔”（比如乱输出乱码骗分），我们需要计算这些答案在 <strong>原始模型 (Reference Model)</strong> 眼里的概率。
+    这在 DPO 算法里是必须的，用来计算 KL 散度（一种衡量两个分布差异的指标），确保新模型不要偏离旧模型太远。</p>
+<p><strong>Step 5: 学习 (Update)</strong>
+*   <strong>代码片段</strong>：
+    <code>python
+    dpo_update_batch_proto = DataProto.from_dict(...) # 打包数据
+    actor_output = self.actor_rollout_wg.update_actor_dpo(dpo_update_batch_proto)</code>
+*   <strong>解释</strong>：
+    万事俱备。
+    工头把整理好的数据包（包含：题目、好答案、坏答案、参考概率）发给 Actor。
+    Actor 运行 <strong>DPO (Direct Preference Optimization)</strong> 算法进行反向传播，更新权重。
+    <strong>目的</strong>：让模型以后生成“好答案”的概率变大，生成“坏答案”的概率变小。</p>
+<p><strong>Step 6: 辅助功能 (Validation &amp; Checkpoint)</strong>
+*   <strong>代码片段</strong>：<code>_validate()</code> 和 <code>_save_checkpoint()</code>
+*   <strong>解释</strong>：
+    *   <strong>验证</strong>：每隔一段时间，拿出一套这就没见过的考卷做一下，看看水平有没有真的提高。
+    *   <strong>存档</strong>：防止电脑死机或者训练崩了，把当前的模型权重保存到硬盘上。</p>
+<hr />
+<h3>💡 总结一下文中的核心观点</h3>
+<p>这个脚本实现的是 <strong>Online DPO / SPIN</strong>。它的核心逻辑与传统的 PPO（强化学习）不同，也与传统的 SFT（监督微调）不同：</p>
+<ol>
+<li><strong>Online (在线)</strong>：它不是拿现成的数据集训练，而是<strong>边生成、边打分、边训练</strong>。数据是模型自己产出的。</li>
+<li><strong>Self-Play (自我博弈)</strong>：通过自己生成的答案进行优劣对比，自己打败自己，从而不断进化。</li>
+<li><strong>DPO (直接偏好优化)</strong>：它跳过了 PPO 中复杂的“价值函数估算”步骤，直接通过对比 loss 来优化模型，更稳定、更省显存。</li>
+</ol>
+<p><strong>你看代码时，只要抓住 <code>fit_dpo</code> 这个函数，看着数据在里面怎么流转（生成 -&gt; 打分 -&gt; 配对 -&gt; 更新），就能理解它在干嘛了。</strong></p>

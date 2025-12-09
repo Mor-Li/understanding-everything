@@ -1,0 +1,89 @@
+<h1>tests/test_utils/python_scripts/download_golden_values.py</h1>
+<p>没问题，这个脚本乍一看确实挺复杂的，因为它涉及到了 GitLab API、文件路径处理、压缩包操作等等。</p>
+<p>简单来说，这个脚本的<strong>核心目的</strong>是：<strong>自动从 GitLab 的云端测试流水线（Pipeline）中，把跑出来的“标准答案”（Golden Values），下载并更新到你本地的代码仓库里。</strong></p>
+<p>通常在开发中，如果代码改动导致测试结果变了（且你是故意的），你需要更新测试的“标准答案”文件。手动去网页下载、解压、复制粘贴很麻烦，这个脚本就是自动化做这件事的。</p>
+<p>我们可以把这个脚本看作一个<strong>“搬运工”</strong>。下面我列一个 <strong>To-Do List</strong>，带你一步步看懂它是怎么工作的：</p>
+<h3>📋 搬运工的任务清单 (To-Do List)</h3>
+<h4>1. 准备工作：登录与接收指令</h4>
+<ul>
+<li><strong>任务：</strong> 拿到进入 GitLab 仓库的“钥匙”和具体的“任务单号”。</li>
+<li><strong>代码对应：</strong> <code>main</code> 函数开头部分。</li>
+<li><strong>解释：</strong><ul>
+<li>它从环境变量里读取 <code>GITLAB_ENDPOINT</code>（网址）和 <code>RO_API_TOKEN</code>（密码/令牌）。</li>
+<li>它通过命令行参数 <code>--pipeline-id</code> 知道要去哪个流水线（Pipeline）干活。</li>
+<li>它还问了一句：<code>--only-failing</code>？意思是“我是要把所有测试结果都搬回来，还是只搬那些<strong>失败了</strong>的测试结果？”</li>
+</ul>
+</li>
+</ul>
+<h4>2. 寻找目标：找到“功能测试”的入口</h4>
+<ul>
+<li><strong>任务：</strong> 在主流水线里，找到那些负责跑“功能测试（Functional Tests）”的子任务（Bridges）。</li>
+<li><strong>代码对应：</strong>
+    <code>python
+    pipeline_bridges = [ ... if pipeline_bridge.name.startswith("functional") ... ]</code></li>
+<li><strong>解释：</strong> 一个大的 CI 任务通常会触发很多下游任务。脚本只关心名字以 <code>functional</code> 开头的下游流水线，因为那里才有我们要的测试数据。</li>
+</ul>
+<h4>3. 遍历任务：一个一个检查测试工作</h4>
+<ul>
+<li><strong>任务：</strong> 进入每一个功能测试流水线，查看里面的每一个具体的工作（Job）。</li>
+<li><strong>代码对应：</strong> <code>for pipeline_bridge in pipeline_bridges:</code> 和 <code>for functional_pipeline_job in functional_pipeline_jobs:</code></li>
+<li><strong>解释：</strong> 这是一个双层循环。外层是不同的测试环境（比如不同的 GPU 环境），内层是具体的测试用例。</li>
+</ul>
+<h4>4. 过滤筛选：跳过不需要的任务 (可选)</h4>
+<ul>
+<li><strong>任务：</strong> 如果用户说了“只搬失败的”，那看到成功的任务就直接跳过。</li>
+<li><strong>代码对应：</strong>
+    <code>python
+    if only_failing and job.status == "success":
+        continue</code></li>
+<li><strong>解释：</strong> 节省时间。如果你只是修 Bug，通常不需要更新那些已经通过的测试。</li>
+</ul>
+<h4>5. 获取包裹：下载并解压产物</h4>
+<ul>
+<li><strong>任务：</strong> 把云端该 Job 生成的文件包（Artifacts）下载下来，是个 zip 包，然后解压到 <code>tmp</code> 文件夹。</li>
+<li><strong>代码对应：</strong>
+    <code>python
+    job.artifacts(streamed=True, action=f.write)
+    zip.extractall("tmp")</code></li>
+<li><strong>解释：</strong> 就像从快递柜取件并拆开包裹。</li>
+</ul>
+<h4>6. 寻宝：在垃圾堆里找“金子” (关键步骤)</h4>
+<ul>
+<li><strong>任务：</strong> 在解压出来的一堆文件里，找到那个唯一的、名字匹配的 JSON 文件（即 Golden Value）。</li>
+<li><strong>代码对应：</strong>
+    <code>python
+    golden_values_sources = list((pathlib.Path(ASSETS_DIR) ... .glob("g*.json")))</code></li>
+<li><strong>解释：</strong><ul>
+<li>它拼凑了一个非常复杂的路径（包含 <code>iteration=0</code>, <code>assets</code>, <code>basic</code> 等）。</li>
+<li>它试图找到以 <code>g</code> 开头的 <code>.json</code> 文件。</li>
+<li>如果找不到或者找到好几个，它就懵了，选择跳过。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 确定新家：计算本地存放路径</h4>
+<ul>
+<li><strong>任务：</strong> 算出这个文件应该放在你本地项目的哪个文件夹里。</li>
+<li><strong>代码对应：</strong>
+    <code>python
+    golden_values_target = (pathlib.Path("tests") / "functional_tests" / ... )</code></li>
+<li><strong>解释：</strong> 比如云端跑的是 <code>test_llama</code>，它就知道这个文件应该放回你本地的 <code>tests/functional_tests/test_cases/test_llama/...</code> 目录下。</li>
+<li><strong>改名操作：</strong> 它顺便把文件名里的 <code>generations</code>（生成物）改成了 <code>golden_values</code>（标准值）。</li>
+</ul>
+<h4>8. 搬运归位：覆盖旧文件</h4>
+<ul>
+<li><strong>任务：</strong> 把刚才找到的文件，移动到算好的“新家”位置。</li>
+<li><strong>代码对应：</strong> <code>shutil.move(golden_values_source, golden_values_target)</code></li>
+<li><strong>解释：</strong> 这就是最终目的。用云端最新的运行结果，覆盖掉本地旧的测试标准。</li>
+</ul>
+<h4>9. 打扫卫生：清理现场</h4>
+<ul>
+<li><strong>任务：</strong> 删掉下载的 zip 包和解压出来的 <code>tmp</code> 文件夹。</li>
+<li><strong>代码对应：</strong> <code>os.unlink(file_name)</code> 和 <code>shutil.rmtree("tmp")</code></li>
+<li><strong>解释：</strong> 保持工作环境整洁，为处理下一个 Job 做准备。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>自动化的“同步器”</strong>。</p>
+<p><strong>场景举例：</strong>
+你修改了 AI 模型的一个算子，导致输出结果发生了微小的变化（比如精度变了）。这时候 CI 测试会挂掉，因为新结果和旧的 Golden Value 对不上。
+如果你确认你的修改是正确的，你就运行这个脚本。它会自动去 GitLab 把你刚才跑出来的新结果下载下来，替换掉本地旧的文件。然后你提交这些新文件，测试就通过了。</p>

@@ -1,0 +1,104 @@
+<h1>megatron/core/dist_checkpointing/strategies/checkpointable.py</h1>
+<p>这份代码确实非常底层，属于<strong>分布式训练基础设施</strong>的一部分。如果你不了解 PyTorch 的 Distributed Checkpoint (DCP) 机制，看这段代码就像看天书一样。</p>
+<p>简单来说，这个文件的作用是<strong>充当“翻译官”</strong>。它把 Megatron-LM 自己定义的切片张量（ShardedTensor），包装成 PyTorch 原生 Checkpoint 系统能看懂的格式，以便保存和加载模型。</p>
+<p>为了让你听懂，我把理解这份代码的过程拆解成 <strong>5 个待办任务 (Todo List)</strong>，我们一步步来打勾。</p>
+<hr />
+<h3>✅ Task 1: 理解背景场景 (Scenario)</h3>
+<p><strong>场景：</strong>
+你有一个巨大的模型参数（比如一个 100x100 的矩阵），它太大了，单张显卡放不下。
+*   <strong>Megatron 的做法：</strong> 把这个大矩阵切成小块（Shards），分散在不同的显卡上。Megatron 用 <code>ShardedTensor</code> 这个类来记录：“我是哪一块，我在全局大矩阵里的坐标是多少”。
+*   <strong>PyTorch DCP (Distributed Checkpoint) 的需求：</strong> PyTorch 官方提供了一套保存模型的工具。但是，它不认识 Megatron 的 <code>ShardedTensor</code>。它只认识遵守它特定协议（Protocol）的对象。</p>
+<p><strong>结论：</strong>
+我们需要写一个<strong>适配器（Adapter）</strong>，把 Megatron 的 <code>ShardedTensor</code> 包装一下，告诉 PyTorch DCP：“嘿，我虽然是 Megatron 的数据，但我遵守你的规则，你可以保存我。”</p>
+<blockquote>
+<p><strong>代码对应：</strong> 这个文件里的 <code>CheckpointableShardedTensor</code> 就是这个适配器。</p>
+</blockquote>
+<hr />
+<h3>✅ Task 2: 搞懂“协议” (The Protocol)</h3>
+<p>PyTorch DCP 保存模型时，会问被保存的对象三个问题（三个核心方法）。只要你实现了这三个方法，PyTorch 就能保存你。</p>
+<p>这三个问题是：
+1.  <strong><code>__create_write_items__</code></strong>: “你要存的数据，在全局大图里的坐标（Offset）和尺寸（Shape）是多少？”
+2.  <strong><code>__create_chunk_list__</code></strong>: “你现在手里这一小块数据的物理尺寸是多少？”
+3.  <strong><code>__get_tensor_shard__</code></strong>: “废话少说，把实际的数据（Tensor）交出来。”</p>
+<p><strong>结论：</strong>
+接下来的代码分析，核心就是看这两个类怎么回答这三个问题。</p>
+<hr />
+<h3>✅ Task 3: 解析第一个类 <code>CheckpointableShardedTensor</code></h3>
+<p>这个类是针对<strong>单个切片</strong>的适配器。</p>
+<ul>
+<li>
+<p><strong>身份伪装 (<code>__new__</code>, <code>__init__</code>)</strong>:
+    它继承自 <code>torch.Tensor</code>，但它是一个“假”Tensor。它内部存了一个 <code>self._sh_ten</code> (即 Megatron 的 ShardedTensor)。它只是个外壳。</p>
+</li>
+<li>
+<p><strong>回答问题 1 (<code>__create_write_items__</code>)</strong>:</p>
+<ul>
+<li><strong>代码逻辑</strong>：它从内部的 <code>_sh_ten</code> 里读取 <code>global_offset</code>（全局偏移量）和 <code>global_shape</code>（全局形状）。</li>
+<li><strong>翻译动作</strong>：把这些 Megatron 的属性，填入 PyTorch 的 <code>WriteItem</code> 表格里。</li>
+<li><strong>人话</strong>：告诉 PyTorch，“我是名为 <code>fqn</code> 的变量的一部分，我负责从坐标 (x, y) 开始的那一块。”</li>
+</ul>
+</li>
+<li>
+<p><strong>回答问题 2 (<code>__create_chunk_list__</code>)</strong>:</p>
+<ul>
+<li><strong>代码逻辑</strong>：返回 <code>ChunkStorageMetadata</code>。</li>
+<li><strong>人话</strong>：告诉 PyTorch，“我这一小块数据在磁盘上应该占多大空间。”</li>
+</ul>
+</li>
+<li>
+<p><strong>回答问题 3 (<code>__get_tensor_shard__</code>)</strong>:</p>
+<ul>
+<li><strong>代码逻辑</strong>：<code>return self._sh_ten.data</code></li>
+<li><strong>人话</strong>：直接把 Megatron 存的真实数据交出去。</li>
+</ul>
+</li>
+<li>
+<p><strong>禁止计算 (<code>__torch_dispatch__</code>)</strong>:</p>
+<ul>
+<li>代码里抛出了 <code>NotImplementedError</code>。</li>
+<li><strong>原因</strong>：这个类只是为了保存模型用的“包装盒”，你不应该拿这个包装盒去搞加减乘除运算。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 解析第二个类 <code>LocalShardsContainer</code></h3>
+<p>这个类是为了解决一个<strong>特殊情况</strong>。</p>
+<p><strong>场景：</strong>
+有时候，一张显卡上可能存了<strong>同一个全局变量的两个碎片</strong>。
+比如变量 <code>weight</code>，Rank 0 显卡上既有“左上角”那一块，又有“右下角”那一块（虽然少见，但在某些复杂的 Tensor Parallel 或 Pipeline Parallel 策略下会发生）。</p>
+<p>PyTorch DCP 有个规定：<strong>对于同一个变量名（FQN），每张卡只能提交一个对象。</strong></p>
+<p><strong>结论：</strong>
+如果一张卡有多个碎片，我们不能一个个提交。我们需要一个<strong>容器（Container）</strong>把它们打包在一起，作为一个整体提交给 PyTorch。</p>
+<ul>
+<li>
+<p><strong>初始化 (<code>__init__</code>)</strong>:
+    它接收一个列表 <code>local_shards</code>，里面装的全是上面提到的 <code>CheckpointableShardedTensor</code>。</p>
+</li>
+<li>
+<p><strong>回答问题 1 &amp; 2 (Create Items/Chunks)</strong>:</p>
+<ul>
+<li><strong>策略</strong>：<strong>外包（Delegate）</strong>。</li>
+<li><strong>代码逻辑</strong>：既然我是个容器，那我就遍历我肚子里所有的碎片，调用它们自己的 <code>__create_write_items__</code>，然后把结果拼成一个大列表返回。</li>
+</ul>
+</li>
+<li>
+<p><strong>回答问题 3 (<code>__get_tensor_shard__</code>)</strong>:</p>
+<ul>
+<li><strong>策略</strong>：<strong>查表</strong>。</li>
+<li><strong>代码逻辑</strong>：PyTorch 会给一个 <code>index</code> 或 <code>offset</code>，问：“我要偏移量为 (100, 0) 的那块数据”。</li>
+<li>容器会遍历自己肚子里的碎片，找到 <code>global_offset</code> 匹配的那一块，然后把数据交出去。</li>
+<li><em>注：代码里有个优化，如果给了 index 提示，就直接按索引取，不用慢吞吞地遍历查找。</em></li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 总结回顾 (Summary)</h3>
+<p>现在把文件内容串起来：</p>
+<ol>
+<li><strong>文件目的</strong>：让 Megatron 的切片数据能用 PyTorch 原生的 <code>distributed.checkpoint</code> 库进行保存。</li>
+<li><strong><code>CheckpointableShardedTensor</code></strong>：单兵作战。把 Megatron 的切片信息“翻译”成 PyTorch 能懂的元数据（Metadata）。</li>
+<li><strong><code>LocalShardsContainer</code></strong>：团队作战。如果一张卡上有多个碎片，用这个箱子装起来，统一应对 PyTorch 的检查。</li>
+<li><strong>核心逻辑</strong>：实现了 PyTorch DCP 协议要求的三个方法（元数据描述 + 数据获取）。</li>
+</ol>
+<p><strong>用一句话概括：</strong>
+这是 Megatron-LM 为了兼容 PyTorch 官方 Checkpoint 格式而写的<strong>数据结构适配层</strong>。</p>

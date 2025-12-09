@@ -1,0 +1,92 @@
+<h1>tools/preprocess_mmdata.py</h1>
+<p>这份代码完全可以看作是一个<strong>“数据加工流水线”</strong>的说明书。</p>
+<p>它的核心目标只有一个：<strong>把人类能看懂的“文本+图片”原始数据，转换成计算机（模型）能高效读取的“二进制”格式（.bin 和 .idx 文件）。</strong></p>
+<p>为了让你看懂，我把这个脚本要做的事情拆解成一个 <strong>Task List (任务清单)</strong>，我们模拟计算机的视角，一步步来执行这个任务：</p>
+<hr />
+<h3>任务清单：多模态数据预处理 (Multimodal Data Preprocessing)</h3>
+<h4>✅ Task 1: 准备工作 (读取配置)</h4>
+<p><strong>代码对应：</strong> <code>get_args()</code> 函数
+<strong>计算机独白：</strong> “在开工前，我得先知道老板有什么要求。”</p>
+<ol>
+<li><strong>输入在哪里？</strong><ul>
+<li><code>--input</code>: 文本数据的 JSON 文件路径。</li>
+<li><code>--input-image</code>: 图片文件夹的路径。</li>
+</ul>
+</li>
+<li><strong>输出到哪里？</strong><ul>
+<li><code>--output-prefix</code>: 处理好的文件存成什么名字（比如 <code>my_data</code>，最后会生成 <code>my_data.bin</code>）。</li>
+</ul>
+</li>
+<li><strong>加工标准是什么？</strong><ul>
+<li><code>--tokenizer-type</code>: 用什么分词器（比如 GPT2BPETokenizer）把文字变成数字。</li>
+<li><code>--pad-length</code>: 文本统一长度是多少（不够补齐，太长截断）。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 2: 组建施工队 (多进程准备)</h4>
+<p><strong>代码对应：</strong> <code>main()</code> 函数的前半部分
+<strong>计算机独白：</strong> “数据量太大了，我一个人干太慢，我要叫几个兄弟（进程）一起干。”</p>
+<ol>
+<li><strong>初始化分词器 (<code>tokenizer</code>)</strong>：准备好把文字转数字的字典。</li>
+<li><strong>启动进程池 (<code>multiprocessing.Pool</code>)</strong>：根据 <code>--workers</code> 的数量，启动多个工人进程。</li>
+<li><strong>分配初始化任务 (<code>encoder.initializer</code>)</strong>：让每个工人都拿一份分词器，准备干活。</li>
+</ol>
+<h4>✅ Task 3: 准备原材料 (数据对齐)</h4>
+<p><strong>代码对应：</strong> <code>main()</code> 中 <code>zip(fin, img_paths)</code>
+<strong>计算机独白：</strong> “我要把文本和对应的图片配对，不能乱套。”</p>
+<ol>
+<li>读取 JSON 文本文件的一行（比如描述：“一只猫在睡觉”）。</li>
+<li>找到对应的图片路径（比如 <code>images/cat_01.jpg</code>）。</li>
+<li>把这一对（文本+图片路径）打包，准备扔给工人处理。</li>
+</ol>
+<h4>✅ Task 4: 工人的核心工作 (最关键的一步！)</h4>
+<p><strong>代码对应：</strong> <code>Encoder</code> 类中的 <code>encode</code> 函数
+<strong>计算机独白：</strong> “我是流水线上的工人，拿到一对‘文本+图片’，我要把它变成数字。”</p>
+<p><strong>Step 4.1: 处理文本 (Text Processing)</strong>
+1.  <strong>解析 JSON</strong>：从数据里提取出文字内容。
+2.  <strong>分词 (Tokenize)</strong>：把文字变成 ID 列表（例如 <code>[101, 256, 333...]</code>）。
+3.  <strong>统一长度 (Padding/Truncating)</strong>：
+    *   如果太长，切掉多余的。
+    *   如果太短，用 <code>&lt;eod&gt;</code> (End of Document) 符号填满，直到达到 <code>pad-length</code> 长度。
+    *   <em>目的：模型训练时需要输入长度一致。</em></p>
+<p><strong>Step 4.2: 处理图片 (Image Processing)</strong>
+1.  <strong>读取图片</strong>：以二进制方式打开图片文件 (<code>rb</code>)。
+2.  <strong>字节对齐 (Byte Padding)</strong>：
+    *   因为计算机处理 <code>int32</code>（32位整数）最快，而 <code>int32</code> 是4个字节。如果图片字节数不是4的倍数，就在末尾补 0。
+3.  <strong>转为数字 (Convert to Numpy)</strong>：把图片原本的字节流 (<code>bytearray</code>) 强行转换成 <code>int32</code> 数组。
+4.  <strong>加个头 (Insert Header)</strong>：在数组最前面插一个数字，记录刚才补了几个 0 (pad size)，方便以后还原。</p>
+<p><strong>Step 4.3: 交货</strong>
+*   工人返回：<code>[处理好的文本数字列表, 处理好的图片数字数组, 原始数据大小]</code>。</p>
+<h4>✅ Task 5: 打包入库 (写入文件)</h4>
+<p><strong>代码对应：</strong> <code>main()</code> 后半部分的 <code>IndexedDatasetBuilder</code>
+<strong>计算机独白：</strong> “工人们把处理好的零件传回来了，我要把它们写进最终的仓库文件里。”</p>
+<ol>
+<li><strong>创建构建器 (<code>builders</code>)</strong>：准备写 <code>.bin</code> 和 <code>.idx</code> 文件。</li>
+<li><strong>循环接收 (<code>for ... in encoded_docs</code>)</strong>：不断从工人那里拿处理好的数据。</li>
+<li><strong>写入数据</strong>：<ul>
+<li><code>builders.add_item(sentence)</code>: 写入文本数据。</li>
+<li><code>builders.add_item(img_raw)</code>: 写入图片数据。</li>
+<li><code>builders.end_document()</code>: 标记这一条数据结束了。</li>
+</ul>
+</li>
+<li><strong>监控进度</strong>：每隔一段时间打印一下处理速度（MB/s）。</li>
+</ol>
+<h4>✅ Task 6: 收尾 (Finalize)</h4>
+<p><strong>代码对应：</strong> <code>builders.finalize(output_idx_files)</code>
+<strong>计算机独白：</strong> “所有数据都写完了，封箱。”</p>
+<ol>
+<li>生成索引文件 (<code>.idx</code>)：记录每一条数据在 <code>.bin</code> 文件里的起始位置和长度。</li>
+<li>关闭文件。</li>
+</ol>
+<hr />
+<h3>总结：这脚本到底干了啥？</h3>
+<p>如果不用代码讲，这个脚本做的事情就是：</p>
+<ol>
+<li><strong>左手</strong>拿一个 JSON（里面有字）。</li>
+<li><strong>右手</strong>拿一张图。</li>
+<li>把字变成一串固定的数字（Token IDs）。</li>
+<li>把图变成一串数字（Raw Bytes -&gt; Int32）。</li>
+<li>把这两串数字存进一个巨大的二进制文件里（Megatron-LM 训练时专用的格式）。</li>
+</ol>
+<p><strong>为什么要这么做？</strong>
+因为直接读取成千上万个小图片和文本文件太慢了，会卡死硬盘（IO瓶颈）。把它们预处理成一个巨大的二进制文件，训练时模型就能像喝水一样流畅地读取数据了。</p>

@@ -1,0 +1,106 @@
+<h1>verl/trainer/sft_trainer_ray.py</h1>
+<p>这份代码确实涉及了很多概念（Ray 分布式计算、PyTorch 数据加载、Hydra 配置管理等），看起来会比较晕。</p>
+<p>你可以把这个脚本想象成一个 <strong>“装修工程的总包工头”</strong>（Trainer）。他的任务是指挥一群 <strong>“工人”</strong>（GPU Workers）去完成一项叫 <strong>“SFT（监督微调）”</strong> 的装修任务。</p>
+<p>我为你列了一个 <strong>Task Todo List（任务清单）</strong>，按照代码执行的顺序，一步步拆解他在干什么：</p>
+<h3>📝 SFT 训练任务清单 (Todo List)</h3>
+<ol>
+<li><strong>📋 审图纸 (初始化配置)</strong>：读取配置文件，搞清楚要训练什么模型，用什么数据。</li>
+<li><strong>👷 招募施工队 (构建引擎)</strong>：使用 Ray 框架，在多张显卡（GPU）上启动工作进程。</li>
+<li><strong>🧱 进原料 (准备数据)</strong>：把训练数据加载进来，打包成一个个“包裹”（Batch）。</li>
+<li><strong>💾 建立存档点 (检查点管理)</strong>：准备好“存档”机制，万一停电了能接着干，不用从头开始。</li>
+<li><strong>🚀 开工干活 (训练循环 - <code>fit</code> 函数)</strong>：<ul>
+<li>分发任务给工人。</li>
+<li>收集工人的反馈（Loss, 准确率）。</li>
+<li>定期检查质量（验证集评估）。</li>
+<li>定期存档（保存模型）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步代码详解</h3>
+<p>下面我按照上面的清单，带你一段段看代码：</p>
+<h4>Step 1: 📋 审图纸 (初始化与配置)</h4>
+<p><strong>代码位置：</strong> <code>__init__</code> 和 <code>_build_config</code></p>
+<ul>
+<li><strong>他在干嘛：</strong>
+    当你运行这个脚本时，<code>main</code> 函数会调用 <code>SFTTrainer</code>。
+    <code>__init__</code> 是入口。它首先把 <code>config</code>（比如模型大小、学习率、跑多少轮）保存下来。
+    <code>_build_config</code> 把复杂的配置转换成程序更容易读懂的格式（dataclass）。</li>
+<li><strong>白话解释：</strong>
+    工头说：“把客户的要求（Config）拿来我看看。哦，要是 Llama 模型，学习率要设成 5e-6。”</li>
+</ul>
+<h4>Step 2: 👷 招募施工队 (构建引擎 - 核心难点)</h4>
+<p><strong>代码位置：</strong> <code>_build_engine</code></p>
+<ul>
+<li><strong>他在干嘛：</strong>
+    这是基于 <strong>Ray</strong> 的核心部分。<ul>
+<li><code>TrainingWorkerConfig</code>：给工人每人发一份操作手册。</li>
+<li><code>RayResourcePool</code>：圈定资源（比如“我要用 4 个节点，每个节点 8 张卡”）。</li>
+<li><code>RayWorkerGroup</code>：这行代码最重要。它实际上是在后台启动了多个进程（Workers），每个进程控制一张 GPU。</li>
+<li><code>self.training_client</code>：这就是工头手里的对讲机。以后工头只要对 <code>training_client</code> 发号施令，所有 GPU 都会同步动作。</li>
+</ul>
+</li>
+<li><strong>白话解释：</strong>
+    工头说：“去 Ray 人才市场给我招几个工人，每人配一台电脑（GPU），把操作手册发给他们，连上对讲机，准备听我指挥。”</li>
+</ul>
+<h4>Step 3: 🧱 进原料 (准备数据)</h4>
+<p><strong>代码位置：</strong> <code>_build_dataset</code> 和 <code>_build_dataloader</code></p>
+<ul>
+<li><strong>他在干嘛：</strong><ul>
+<li><code>_build_dataset</code>：读取 parquet 文件（训练数据）。</li>
+<li><code>_build_dataloader</code>：创建 <code>StatefulDataLoader</code>。</li>
+<li><strong>关键点</strong>：这里用了 <code>StatefulDataLoader</code>。普通的 DataLoader 挂了重启得从头读数据，这个 Loader 记性很好，重启后知道上次读到哪一行了。</li>
+</ul>
+</li>
+<li><strong>白话解释：</strong>
+    工头说：“把砖头（数据）运进来。为了防止干活干一半停电，我们要用一种特殊的记账方式（Stateful），停电后再来，知道从哪块砖继续搬。”</li>
+</ul>
+<h4>Step 4: 💾 建立存档点 (检查点管理)</h4>
+<p><strong>代码位置：</strong> <code>_build_ckpt_handler</code></p>
+<ul>
+<li><strong>他在干嘛：</strong>
+    初始化 <code>CheckpointHandler</code>。它负责加载旧的存档（如果有的话，比如 <code>resume_from_path</code>），以及未来保存新的模型权重。</li>
+<li><strong>白话解释：</strong>
+    工头说：“找个秘书专门负责记录进度。如果我是接着上次的活干，先把上次的图纸拿出来。”</li>
+</ul>
+<h4>Step 5: 🚀 开工干活 (训练循环 - <code>fit</code> 函数)</h4>
+<p><strong>代码位置：</strong> <code>fit</code> (这是全篇最长、最重要的函数)</p>
+<p>这是一个大循环，我们拆开看：</p>
+<ol>
+<li>
+<p><strong>准备阶段：</strong></p>
+<ul>
+<li><code>global_step = self.resume_global_step</code>：确认当前是第几步。</li>
+<li><code>self.train_sampler.set_epoch(epoch)</code>：打乱数据顺序，保证每个 Epoch 数据不一样。</li>
+</ul>
+</li>
+<li>
+<p><strong>循环搬砖 (for step, data in enumerate(dataloader))：</strong></p>
+<ul>
+<li><code>data = tu.get_tensordict(...)</code>：整理数据格式。</li>
+<li><strong>核心指令</strong>：<code>output = self.training_client.train_batch(data)</code><ul>
+<li><strong>这句最关键！</strong> 工头通过对讲机喊：“所有人，处理这批数据！”</li>
+<li>注意：这里是<strong>异步</strong>的，或者是远程调用的。<code>SFTTrainer</code> 自己不算梯度，它只是发指令给 Step 2 里的那些 Ray Workers 去算。</li>
+</ul>
+</li>
+<li><code>output.get()</code>：等待工人们干完活，并拿回结果。</li>
+</ul>
+</li>
+<li>
+<p><strong>记账 (Logging)：</strong></p>
+<ul>
+<li><code>metrics = ...</code>：从工人的反馈里提取 Loss（误差）、Throughput（吞吐量）等。</li>
+<li><code>tracking.log(...)</code>：把这些数据记在小本本上（比如发给 WandB 或者 TensorBoard）。</li>
+</ul>
+</li>
+<li>
+<p><strong>中场休息与检查 (Validation &amp; Save)：</strong></p>
+<ul>
+<li><code>if is_valid_step:</code>：每隔一阵子（比如 100 步），暂停训练。拿出一部分考题（验证集），调用 <code>infer_batch</code> 让工人做一下，看看模型是不是变聪明了。</li>
+<li><code>if is_save_step:</code>：每隔一阵子，调用 <code>self.ckpt_handler.save_checkpoint</code> 把当前训练好的模型存到硬盘上。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>我不直接训练模型，我只是一个调度员（Trainer）。我负责准备数据，然后通过 Ray 框架，指挥远程的 GPU 们（Workers）去训练，最后我负责收集战报（Log）和保存成果（Checkpoint）。</strong></p>

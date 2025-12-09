@@ -1,0 +1,85 @@
+<h1>tools/retro/sft/sft_retro.py</h1>
+<p>这份代码确实涉及了很多深度学习框架（Megatron-LM）的底层逻辑，如果对大模型训练流程不熟悉，看起来会非常头大。</p>
+<p>简单来说，这个脚本的目的是：<strong>在一个已经预训练好的 Retro（具有检索增强能力的 GPT）模型基础上，进行有监督微调（SFT），让它学会回答问题（QA任务）。</strong></p>
+<p>为了让你听懂，我把这个脚本做的事情想象成<strong>“给一个带搜索功能的学生（模型）布置家庭作业并批改”</strong>的过程。</p>
+<p>我为你列了一个 <strong>Task Todo List</strong>，我们按照这个流程一步一步看代码在干什么：</p>
+<h3>Task Todo List (代码执行流程)</h3>
+<ol>
+<li><strong>[准备工作] 设定考试规则</strong>：告诉程序我们要训练什么任务、跑几轮、参数怎么设。<ul>
+<li>对应代码：<code>get_tasks_args</code></li>
+</ul>
+</li>
+<li><strong>[分发教材] 准备数据集</strong>：把训练用的问答对（QA）数据找出来，分成训练集、验证集。<ul>
+<li>对应代码：<code>train_valid_test_datasets_provider</code></li>
+</ul>
+</li>
+<li><strong>[整理考卷] 制作数据批次 (Batch)</strong>：把文本变成机器能读懂的数字，并区分哪些是“题目”（Context），哪些是“答案”（Answer），以及准备好“参考资料”（Retrieval neighbors）。<ul>
+<li>对应代码：<code>get_batch</code></li>
+</ul>
+</li>
+<li><strong>[学生答题] 模型前向传播 (Forward)</strong>：让模型根据题目和参考资料去预测答案。<ul>
+<li>对应代码：<code>forward_step</code></li>
+</ul>
+</li>
+<li><strong>[老师批改] 计算损失 (Loss)</strong>：看模型答得对不对，打个分。注意：SFT通常只看答案答得对不对，不管题目复述得好不好。<ul>
+<li>对应代码：<code>loss_func</code></li>
+</ul>
+</li>
+<li><strong>[开始上课] 启动主程序</strong>：把上面所有步骤串起来，开始跑训练。<ul>
+<li>对应代码：<code>if __name__ == "__main__":</code></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>1. 设定考试规则 (<code>get_tasks_args</code>)</h4>
+<p>这就好比在命令行里敲入指令，告诉程序具体怎么跑。
+*   <strong>核心逻辑</strong>：它定义了很多参数（arguments）。
+*   <strong>关键点</strong>：
+    *   <code>--task</code>: 任务名字。
+    *   <code>--epochs</code>: 训练几轮。
+    *   <code>--answer-loss-only</code>: <strong>这是SFT的关键</strong>。意思是算分的时候，只算“答案”部分的错，不要管“问题”部分的错。
+    *   <code>--add_retriever</code>: 是否开启检索功能（Retro模型的核心）。如果开启，模型不仅看题目，还能看检索回来的邻居文档（neighbors）。</p>
+<h4>2. 准备数据集 (<code>train_valid_test_datasets_provider</code>)</h4>
+<p>这一步是加载硬盘上的 JSON 文件（通常是 Question-Answer 对）。
+*   <strong>核心逻辑</strong>：
+    *   它会读取 <code>--data-folder</code> 下的数据。
+    *   如果是 Retro 模式 (<code>args.retro_add_retriever</code>)，它会使用 <code>RetroJsonQADataset</code>，这个数据集类不仅读取文本，还会读取检索到的相关文档（neighbors）。
+    *   它使用 <code>BlendedMegatronDatasetBuilder</code> 把数据混合起来，切分成训练集、验证集和测试集。</p>
+<h4>3. 制作数据批次 (<code>get_batch</code>)</h4>
+<p>这是最“技术”的一步。数据从硬盘读出来是文本，这里要变成张量（Tensor）。
+*   <strong>核心逻辑</strong>：
+    *   <strong>提取数据</strong>：拿到 <code>text</code> (输入文本) 和 <code>answer_mask</code> (答案掩码)。
+    *   <strong>处理检索数据</strong>：如果开启了 Retro，它还会拿到 <code>neighbor_tokens</code>（检索到的相关文档内容）。
+    *   <strong>切分输入输出</strong>：
+        *   <code>tokens</code> (输入给模型的)：是完整序列去掉最后一个词。
+        *   <code>labels</code> (模型要预测的)：是完整序列去掉第一个词（错位预测）。
+    *   <strong>关键操作 <code>answer_mask</code></strong>：
+        *   在 SFT 任务中，我们通常给 Question 部分的 mask 设为 0，Answer 部分设为 1。
+        *   代码里 <code>loss_mask = loss_mask * answer_mask</code> 这一句非常重要。它确保了模型在学习时，只因为“答错了答案”被惩罚，而不会因为“没预测对问题”被惩罚。</p>
+<h4>4. 模型前向传播 (<code>forward_step</code>)</h4>
+<p>这一步是真正调用模型的大脑。
+*   <strong>核心逻辑</strong>：
+    *   调用 <code>get_batch</code> 拿到处理好的数据。
+    *   <strong>分支判断</strong>：
+        *   <strong>如果是 Retro 模型</strong> (<code>args.retro_add_retriever</code>): 调用模型时，除了传入 <code>tokens</code>，还要传入 <code>retriever_input_ids</code> (检索到的参考资料)。模型会结合题目和参考资料来生成答案。
+        *   <strong>如果是普通 GPT</strong>: 就只传 <code>tokens</code>。
+    *   返回模型的输出 <code>output_tensor</code>。</p>
+<h4>5. 计算损失 (<code>loss_func</code>)</h4>
+<p>这一步是给模型的表现打分。
+*   <strong>核心逻辑</strong>：
+    *   使用 Cross Entropy（交叉熵）计算损失。
+    *   利用之前生成的 <code>loss_mask</code>（里面包含了 answer_mask）。
+    *   <strong>结果</strong>：得出一个 <code>loss</code> 值。如果 loss 很大，说明模型答得很烂，通过反向传播（Backpropagation，虽然这个函数里没写，但在 Megatron 框架内部处理）来更新参数。</p>
+<h4>6. 启动主程序 (<code>if __name__ == "__main__":</code>)</h4>
+<p>这是整个脚本的入口。
+*   <strong>核心逻辑</strong>：
+    *   <code>pretrain(...)</code>: 这是 Megatron 提供的通用训练入口函数。
+    *   它把我们上面定义的函数作为参数传进去：
+        *   <code>train_valid_test_datasets_provider</code>: 数据哪来？
+        *   <code>model_provider</code>: 模型长啥样？
+        *   <code>forward_step</code>: 每一步怎么走？
+        *   <code>extra_args_provider</code>: 有什么额外参数？
+    *   <code>ModelType.retro_decoder</code>: 明确告诉框架，我们训练的是 Retro 类型的模型。</p>
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>粘合剂</strong>。它利用 Megatron 强大的底层能力，专门配置了一套流程：<strong>读取 QA 数据 -&gt; 提取检索到的相关文档 -&gt; 屏蔽掉问题的 Loss -&gt; 训练 Retro 模型学会根据检索内容回答问题。</strong></p>

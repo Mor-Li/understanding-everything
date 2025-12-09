@@ -1,0 +1,76 @@
+<h1>tests/unit_tests/inference/contexts/test_dynamic_context.py</h1>
+<p>这份代码确实比较硬核，它测试的是 <strong>Megatron-Core</strong>（NVIDIA 开发的大模型训练/推理框架）中关于 <strong>推理（Inference）上下文管理</strong> 的核心逻辑。</p>
+<p>简单来说，这个文件测试的是<strong>“大模型在生成文字时，如何高效地管理内存和任务状态”</strong>。</p>
+<p>为了让你看懂，我把它想象成一个 <strong>“餐厅座位管理系统”</strong>。大模型是厨房，<code>DynamicInferenceContext</code> 是大堂经理，用户的请求（Prompt）是进来的客人。</p>
+<p>下面是一个 <strong>Task List（学习清单）</strong>，我将按照逻辑顺序，结合代码中的测试函数，一步步带你理解它的工作原理。</p>
+<hr />
+<h3>Task 1: 餐厅开业准备 (初始化上下文)</h3>
+<p><strong>目标</strong>：理解系统启动时需要配置哪些参数，以及“混合架构”是什么。
+*   <strong>对应测试函数</strong>：<code>test_initialize_dynamic_context</code>
+*   <strong>通俗解释</strong>：
+    *   大堂经理（Context）上班了，他需要知道餐厅有多大（<code>buffer_size_gb</code> 显存大小）、有多少张桌子（<code>max_active_requests</code> 最大并发请求数）。
+    *   <strong>KV Cache</strong>：大模型记性不好，需要把生成过的东西记在小本本上，这个小本本就是 KV Cache。
+    *   <strong>Hybrid Model (混合模型)</strong>：代码里反复出现 <code>is_hybrid_model</code>。这是指除了传统的 Transformer（用 Attention 机制），还混合了 <strong>Mamba</strong>（一种新的 SSM 架构）。
+        *   如果是普通模型，只需要管 KV Cache。
+        *   如果是混合模型（Mamba），经理还得额外准备专门存放 Mamba 状态（<code>conv_states</code>, <code>ssm_states</code>）的空间。</p>
+<h3>Task 2: 安排座位 (内存块管理)</h3>
+<p><strong>目标</strong>：理解核心的内存分配机制 —— <strong>Paged Attention（分页内存）</strong>。
+*   <strong>对应测试函数</strong>：
+    *   <code>test_allocate_and_release_memory_blocks</code>
+    *   <code>test_is_memory_available</code>
+*   <strong>通俗解释</strong>：
+    *   显存很贵，不能给每个客人预留一大片连续空地。系统把显存切成很多小块（Block），就像把一本大书撕成一页一页的。
+    *   <strong>Allocate (分配)</strong>：客人来了，先给一页纸（一个 Block）。写满了，再给一页。代码测试了“我要 4 个块，系统是不是真的给了我 4 个块，剩余可用数是不是减少了”。
+    *   <strong>Release (释放)</strong>：客人走了，把这几页纸擦干净放回去，给下一个人用。</p>
+<h3>Task 3: 接待客人 (添加新请求)</h3>
+<p><strong>目标</strong>：当一个新的 Prompt 进来时，系统内部发生了什么。
+*   <strong>对应测试函数</strong>：<code>test_add_request</code>
+*   <strong>通俗解释</strong>：
+    *   来了一个新订单（Request）。
+    *   系统要记录：这是几号桌（<code>request_id</code>），客人说了多少话（<code>prompt_tokens</code>）。
+    *   <strong>关键动作</strong>：系统会计算这句话需要多少个内存块，并把具体的 Token（字）填入分配好的块里。
+    *   代码检查了：Token 对应的 ID 对不对？Token 在块里的位置（Offset）对不对？</p>
+<h3>Task 4: 应对爆满 (处理溢出错误)</h3>
+<p><strong>目标</strong>：测试系统的容错能力。
+*   <strong>对应测试函数</strong>：
+    *   <code>test_request_overflow</code>
+    *   <code>test_token_overflow_error</code>
+*   <strong>通俗解释</strong>：
+    *   <strong>Request Overflow</strong>：比如餐厅只能坐 100 人，结果来了 101 个请求。系统必须报错（抛出异常），不能死机。
+    *   <strong>Token Overflow</strong>：比如显存只够存 10000 个字，结果所有请求加起来要生成 20000 个字。系统也要报错，告诉外面“内存不够了”。</p>
+<h3>Task 5: 上菜与翻台 (更新请求状态)</h3>
+<p><strong>目标</strong>：这是推理过程中最频繁的操作 —— 生成下一个 Token。
+*   <strong>对应测试函数</strong>：<code>test_update_request</code>
+*   <strong>通俗解释</strong>：
+    *   大模型是逐字生成的（Prefill -&gt; Decode -&gt; Decode...）。
+    *   每生成一个新字，系统的状态就要更新一次。
+    *   <strong>测试重点</strong>：
+        1.  如果当前内存块写满了，系统会不会自动分配一个新的块？（代码里模拟了这种情况）。
+        2.  如果某个请求生成结束了（Finished），系统能不能正确识别并把它的状态标记为结束？</p>
+<h3>Task 6: 客人买单 (回收资源)</h3>
+<p><strong>目标</strong>：确保生成结束的请求，其占用的内存被彻底释放。
+*   <strong>对应测试函数</strong>：
+    *   <code>test_release_memory_blocks_for_finished_requests</code>
+    *   <code>test_finished_requests_with_multiple_blocks</code>
+*   <strong>通俗解释</strong>：
+    *   这是防内存泄漏的关键。
+    *   测试逻辑：先造几个请求占住内存 -&gt; 告诉系统这几个请求做完了 -&gt; 检查 <code>block_allocator.total_avail</code>（可用内存块）是不是变回了原来的数量。</p>
+<h3>Task 7: 混合模型的特殊照顾 (Mamba 状态)</h3>
+<p><strong>目标</strong>：测试针对 Mamba 架构的特殊处理。
+*   <strong>对应测试函数</strong>：
+    *   <code>test_mamba_states_cache</code>
+    *   <code>test_add_dummy_requests_parallel_hybrid_allocates_mamba</code>
+*   <strong>通俗解释</strong>：
+    *   Mamba 不像 Transformer 那样极度依赖 KV Cache，但它有自己的“循环状态”（Recurrent State）。
+    *   测试代码检查：当是混合模型时，系统有没有正确地给这些状态分配显存？读取的时候能不能读到正确层的数据？</p>
+<h3>Task 8: 算账 (计算 Log Probabilities)</h3>
+<p><strong>目标</strong>：计算生成内容的概率（置信度）。
+*   <strong>对应测试函数</strong>：<code>test_calculate_and_store_log_probs</code>
+*   <strong>通俗解释</strong>：
+    *   有时候我们不仅要模型生成的字，还要知道模型对这个字有多大把握（Log Probability）。
+    *   这个测试模拟了“预填充（Prefill）”和“解码（Decode）”两个阶段，检查系统计算出的概率值是否与预期数学公式一致。</p>
+<h3>总结</h3>
+<p>这个文件其实就是在测试一个 <strong>“显存管家”</strong>。
+*   它不管模型怎么算数学题（那是 GPU 的事）。
+*   它只管：<strong>谁来了？坐哪？给多少纸写字？写完了没？写完了就把纸收回来。</strong></p>
+<p>建议你先看 <code>test_allocate_and_release_memory_blocks</code>，理解了“块”的概念，再看 <code>test_add_request</code>，就容易多了。</p>

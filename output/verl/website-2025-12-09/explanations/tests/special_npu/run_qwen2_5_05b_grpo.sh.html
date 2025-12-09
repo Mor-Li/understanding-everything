@@ -1,0 +1,84 @@
+<h1>tests/special_npu/run_qwen2_5_05b_grpo.sh</h1>
+<p>这份脚本确实看起来参数非常多，容易让人眼花缭乱。但其实它就像是一份<strong>“给计算机下达的详细任务清单”</strong>。</p>
+<p>为了让你看懂，我把这份脚本拆解成一个<strong>包含 6 个步骤的 To-Do List（待办事项清单）</strong>。你可以想象自己是这个项目的“包工头”，正在给手下的“工人”（计算机/NPU集群）分配任务。</p>
+<hr />
+<h3>📋 任务清单：训练一个会做数学题的小模型</h3>
+<h4>✅ Step 1: 准备施工环境 (Environment Setup)</h4>
+<p><strong>脚本对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nb">set</span><span class="w"> </span>-x
+<span class="nb">export</span><span class="w"> </span><span class="nv">VLLM_ASCEND_ENABLE_NZ</span><span class="o">=</span><span class="m">0</span>
+<span class="nv">MODEL_ID</span><span class="o">=</span><span class="si">${</span><span class="nv">MODEL_ID</span><span class="k">:-</span><span class="nv">Qwen</span><span class="p">/Qwen2.5-0.5B-Instruct</span><span class="si">}</span>
+<span class="nv">MODEL_PATH</span><span class="o">=</span>...
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <strong>任务：</strong> 告诉计算机，“我们要干活了，把调试模式打开（<code>set -x</code>）”。
+*   <strong>硬件暗号：</strong> <code>VLLM_ASCEND...</code> 这一行是在针对 <strong>华为昇腾 (NPU)</strong> 芯片做特殊设置（通常我们用英伟达 GPU，但这里明确指定了是用 NPU）。
+*   <strong>选定底座：</strong> 我们要训练的模型是 <strong>Qwen2.5-0.5B</strong>。这是一个只有 0.5 Billion 参数的小模型（通常用于测试或轻量级任务）。</p>
+<h4>✅ Step 2: 确定训练的核心算法 (Algorithm)</h4>
+<p><strong>脚本对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code>python3<span class="w"> </span>-m<span class="w"> </span>verl.trainer.main_ppo<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>algorithm.adv_estimator<span class="o">=</span>grpo<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>...
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <strong>核心任务：</strong> 启动 <code>verl</code> 这个训练框架。
+*   <strong>关键点：</strong> <code>algorithm.adv_estimator=grpo</code>。
+    *   <strong>这是重点！</strong> 我们不是用普通的 PPO，而是用 <strong>GRPO</strong> (Group Relative Policy Optimization)。
+    *   <strong>人话解释：</strong> 这是一种强化学习算法，最近很火（DeepSeek-R1 背后也是类似的逻辑）。它的核心思想是：让模型针对一个问题生成好几个答案，然后对比这组答案的好坏来学习，而不是单纯靠这就这一个答案是对是错。</p>
+<h4>✅ Step 3: 发放教材 (Data Configuration)</h4>
+<p><strong>脚本对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span>data.train_files<span class="o">=</span><span class="nv">$HOME</span>/data/gsm8k/train.parquet<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>data.val_files<span class="o">=</span><span class="nv">$HOME</span>/data/gsm8k/test.parquet<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>...
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <strong>教材内容：</strong> <strong>GSM8K</strong>。这是一个经典的小学数学应用题数据集。
+*   <strong>任务：</strong> 告诉模型，“我们要学数学，训练题在 <code>train.parquet</code>，考试题在 <code>test.parquet</code>”。
+*   <strong>约束条件：</strong> 题目最长 512 字，回答最长 128 字。太长的题目直接丢掉（<code>filter_overlong_prompts=True</code>）。</p>
+<h4>✅ Step 4: 组建“三人成行”训练小组 (Architecture)</h4>
+<p>这是强化学习（RLHF/RL）中最复杂的部分，脚本里用了大量篇幅配置 <code>actor_rollout_ref</code>。你可以理解为训练过程中有三个角色在配合：</p>
+<ol>
+<li><strong>Actor (演员/学生)</strong>：正在被训练的模型，负责写答案。</li>
+<li><strong>Ref (参考/老师)</strong>：原始模型，用来对比。防止学生学歪了（比如为了得分乱写），要保持和原始模型不要差太远（即 <code>kl_loss</code>）。</li>
+<li><strong>Rollout (刷题机器)</strong>：负责快速生成大量的答案供评估。</li>
+</ol>
+<p><strong>脚本对应代码（精简版）：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span>actor_rollout_ref.model.path<span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">MODEL_PATH</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\ </span><span class="w"> </span><span class="c1"># 学生和老师都用 Qwen2.5</span>
+<span class="w">    </span>actor_rollout_ref.actor.optim.lr<span class="o">=</span>5e-7<span class="w"> </span><span class="se">\ </span><span class="w">         </span><span class="c1"># 学生的学习速度（很慢，细嚼慢咽）</span>
+<span class="w">    </span>actor_rollout_ref.rollout.name<span class="o">=</span>vllm<span class="w"> </span><span class="se">\ </span><span class="w">           </span><span class="c1"># 刷题机器用 vLLM 引擎（速度快）</span>
+<span class="w">    </span>actor_rollout_ref.rollout.n<span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="se">\ </span><span class="w">                 </span><span class="c1"># 每次针对一个问题生成 2 个答案来对比</span>
+<span class="w">    </span>actor_rollout_ref.actor.kl_loss_coef<span class="o">=</span><span class="m">0</span>.001<span class="w"> </span><span class="se">\ </span><span class="w">    </span><span class="c1"># 别离老师教的太远，惩罚系数 0.001</span>
+</code></pre></div>
+
+<h4>✅ Step 5: 设定考核指标与时长 (Trainer Settings)</h4>
+<p><strong>脚本对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span>trainer.total_epochs<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>trainer.total_training_steps<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>trainer.project_name<span class="o">=</span><span class="s1">&#39;verl_grpo_example_gsm8k&#39;</span><span class="w"> </span><span class="se">\</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <strong>工期：</strong> <code>total_epochs=1</code>。把教材（GSM8K）只学一遍。
+*   <strong>步数：</strong> <code>total_training_steps=1</code>。<strong>注意：</strong> 这里设为 1 可能是为了<strong>快速测试代码能不能跑通</strong>，而不是真的要训练完。如果是正经训练，这个数字会很大。
+*   <strong>项目名：</strong> 给这次训练起个名字，方便以后查日志。</p>
+<h4>✅ Step 6: 分配工地资源 (Hardware Resource)</h4>
+<p><strong>脚本对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span>trainer.n_gpus_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>trainer.nnodes<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>trainer.device<span class="o">=</span>npu<span class="w"> </span><span class="nv">$@</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <strong>设备类型：</strong> <code>npu</code>。再次确认，这是在华为昇腾芯片上跑的。
+*   <strong>规模：</strong> 使用 1 台机器（Node），这台机器上有 8 张 NPU 卡。
+*   <strong>并行策略：</strong> 之前的 <code>tensor_model_parallel_size=2</code> 意味着把一个模型切开放在 2 张卡上跑，一共 8 张卡，可以跑 4 组。</p>
+<hr />
+<h3>总结：这脚本到底是干啥的？</h3>
+<p>用一句话概括：</p>
+<blockquote>
+<p><strong>“在华为 NPU 机器上，使用 GRPO 算法，让 Qwen2.5-0.5B 这个小模型通过做 GSM8K 数学题进行强化学习训练（快速测试版）。”</strong></p>
+</blockquote>
+<p>如果你是想运行它，只需要确保你的机器是华为昇腾服务器，并且数据路径 <code>$HOME/data/gsm8k/...</code> 下真的有文件即可。</p>

@@ -1,0 +1,108 @@
+<h1>verl/models/qwen2/megatron/layers/parallel_linear.py</h1>
+<p>这份代码确实涉及到了大模型训练中最硬核的底层技术——<strong>张量并行 (Tensor Parallelism)</strong>。如果你没有这方面的背景，看不懂是非常正常的。</p>
+<p>这段代码是基于 <strong>Megatron-LM</strong>（NVIDIA开发的大模型训练框架）构建的，专门为了让 <strong>Qwen2</strong> 这种大模型能够在多个 GPU 上并行运行。</p>
+<p>为了让你听懂，我们不需要一上来就看代码。我们把它拆解成一个 <strong>5步的学习清单 (To-Do List)</strong>，每一步解决一个概念，最后你就能看懂了。</p>
+<hr />
+<h3>✅ Task 1: 理解背景 —— 为什么要“切分”？</h3>
+<p><strong>概念</strong>：
+假设你有一个巨大的矩阵运算 $Y = X \times W$（这是神经网络最基础的线性层）。
+在 Qwen2-72B 这种大模型里，参数矩阵 $W$ 太大了，一张 GPU 的显存根本装不下。</p>
+<p><strong>解决方案</strong>：
+我们需要把这个大矩阵 $W$ <strong>切开</strong>，分给多张显卡存。
+*   <strong>按列切分 (Column Parallel)</strong>：把矩阵竖着切成几份。
+*   这就是代码里 <code>tensor_parallel.ColumnParallelLinear</code> 的意思。</p>
+<p><strong>结论</strong>：
+这个文件里的两个类，本质上都是在做一件事：<strong>定义如何把一个巨大的线性层切分给多个 GPU。</strong></p>
+<hr />
+<h3>✅ Task 2: 理解第一个类 <code>QKVParallelLinear</code></h3>
+<p><strong>场景</strong>：这是 Transformer 中的 <strong>注意力机制 (Attention)</strong> 层。
+在这一层，输入向量需要分别乘以三个权重矩阵，生成 <strong>Q (Query)</strong>, <strong>K (Key)</strong>, <strong>V (Value)</strong>。</p>
+<p><strong>难点 (GQA/MQA)</strong>：
+在以前的模型（如 BERT）里，Q、K、V 的头数（Heads）是一样的。
+但在 <strong>Qwen2</strong> (以及 LLaMA 2/3) 中，为了加速推理，使用了 <strong>GQA (分组查询注意力)</strong>。
+*   <strong>Q 的头数很多</strong> (比如 64 个)。
+*   <strong>K 和 V 的头数很少</strong> (比如 8 个)。</p>
+<p><strong>代码解读</strong>：
+这个类的核心任务就是<strong>算账</strong>：算出到底需要多大的显存空间来存这些 Q、K、V。</p>
+<ul>
+<li><strong>步骤 1：算 Q 的大小</strong>
+    <code>self.q_output_size = num_heads * head_dim</code>
+    (Q的头数 × 每个头的维度)</li>
+<li><strong>步骤 2：算 K 和 V 的大小</strong>
+    <code>self.kv_output_size = num_key_value_heads * head_dim</code>
+    (KV的头数 × 每个头的维度。注意：这里 <code>num_key_value_heads</code> 通常比 <code>num_heads</code> 小)</li>
+<li><strong>步骤 3：算总大小 (Output Size)</strong>
+    <code>output_size = (num_heads + 2 * num_key_value_heads) * self.head_dim</code>
+    这里为什么要 <code>+ 2 * ...</code>？因为 K 和 V 各有一份。所以总宽度 = Q的宽度 + K的宽度 + V的宽度。</li>
+</ul>
+<p><strong>一句话总结 Task 2</strong>：
+<code>QKVParallelLinear</code> 就是把 Q、K、V 三个矩阵拼成一个大矩阵，然后用“列并行”的方式切分到不同显卡上，专门处理 Qwen2 这种 Q 和 KV 头数不一样的情况。</p>
+<hr />
+<h3>✅ Task 3: 理解第二个类 <code>MergedColumnParallelLinear</code></h3>
+<p><strong>场景</strong>：这是 Transformer 中的 <strong>前馈神经网络 (MLP/FFN)</strong> 层。
+在这一层，通常需要把数据放大。</p>
+<p><strong>难点 (SwiGLU)</strong>：
+Qwen2 使用了一种特殊的激活函数结构叫 <strong>SwiGLU</strong>。
+普通的 MLP 只有一个“升维”矩阵。
+SwiGLU 需要两个矩阵并行操作：
+1.  <strong>Gate 矩阵</strong> (控制门)
+2.  <strong>Up 矩阵</strong> (数值映射)</p>
+<p><strong>代码解读</strong>：
+为了效率，我们不想跑两次矩阵乘法，而是把 Gate 和 Up 两个矩阵<strong>拼在一起</strong>算。</p>
+<ul>
+<li><strong>步骤 1：定义输入</strong>
+    <code>gate_ouput_size</code>: 门矩阵的输出大小。
+    <code>up_output_size</code>: 升维矩阵的输出大小。</li>
+<li><strong>步骤 2：算总大小</strong>
+    <code>self.output_size = gate_ouput_size + up_output_size</code>
+    简单粗暴，直接加起来。</li>
+</ul>
+<p><strong>一句话总结 Task 3</strong>：
+<code>MergedColumnParallelLinear</code> 是为了 MLP 层服务的，它把 SwiGLU 需要的两个矩阵（Gate 和 Up）拼成一个大矩阵进行并行计算。</p>
+<hr />
+<h3>✅ Task 4: 逐行“翻译”代码逻辑</h3>
+<p>现在你有了概念，我们再来看代码，就会发现它其实是在<strong>传参</strong>。</p>
+<p><strong><code>QKVParallelLinear</code> 类：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">QKVParallelLinear</span><span class="p">(</span><span class="n">tensor_parallel</span><span class="o">.</span><span class="n">ColumnParallelLinear</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+        <span class="c1"># 1. 算出 Q 占多少列</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">q_output_size</span> <span class="o">=</span> <span class="n">num_heads</span> <span class="o">*</span> <span class="n">head_dim</span>
+        <span class="c1"># 2. 算出 KV 占多少列</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">kv_output_size</span> <span class="o">=</span> <span class="n">num_key_value_heads</span> <span class="o">*</span> <span class="n">head_dim</span>
+
+        <span class="c1"># 3. 算出总共需要的输出宽度：Q + K + V</span>
+        <span class="c1"># Q有1份，K有1份，V有1份，所以是 num_heads + 2 * num_key_value_heads</span>
+        <span class="n">output_size</span> <span class="o">=</span> <span class="p">(</span><span class="n">num_heads</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">num_key_value_heads</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span>
+
+        <span class="c1"># 4. 调用父类（Megatron的列并行线性层）进行初始化</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
+            <span class="n">input_size</span><span class="o">=</span><span class="n">input_size</span><span class="p">,</span>
+            <span class="n">output_size</span><span class="o">=</span><span class="n">output_size</span><span class="p">,</span> <span class="c1"># 告诉父类，我这个大矩阵总共有多宽</span>
+            <span class="o">...</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<p><strong><code>MergedColumnParallelLinear</code> 类：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">MergedColumnParallelLinear</span><span class="p">(</span><span class="n">tensor_parallel</span><span class="o">.</span><span class="n">ColumnParallelLinear</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_size</span><span class="p">,</span> <span class="n">gate_ouput_size</span><span class="p">,</span> <span class="n">up_output_size</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="c1"># 1. 算出总宽度：Gate矩阵宽度 + Up矩阵宽度</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">output_size</span> <span class="o">=</span> <span class="n">gate_ouput_size</span> <span class="o">+</span> <span class="n">up_output_size</span>
+
+        <span class="c1"># 2. 调用父类初始化</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
+            <span class="n">input_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">input_size</span><span class="p">,</span>
+            <span class="n">output_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">output_size</span><span class="p">,</span> <span class="c1"># 告诉父类，拼起来后有多宽</span>
+            <span class="o">...</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>✅ Task 5: 总结 (Takeaway)</h3>
+<p><strong>这个文件的作用是什么？</strong></p>
+<p>这个文件并没有实现复杂的数学运算（运算都在 <code>super().__init__</code> 即 Megatron 底层里实现了）。</p>
+<p>它的作用是 <strong>“适配器 (Adapter)”</strong>：
+它告诉 Megatron 的底层并行线性层：“嘿，我是 Qwen2 模型，我的 Attention 层比较特殊（有 GQA），我的 MLP 层也比较特殊（是 Merged 的），请按照我计算出的 <code>output_size</code> 来帮我分配显存和切分矩阵。”</p>
+<ul>
+<li><strong>QKVParallelLinear</strong>: 负责 Attention 层，把 Q, K, V 拼一起算。</li>
+<li><strong>MergedColumnParallelLinear</strong>: 负责 MLP 层，把 Gate, Up 拼一起算。</li>
+</ul>

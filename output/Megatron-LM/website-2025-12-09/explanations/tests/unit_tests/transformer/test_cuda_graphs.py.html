@@ -1,0 +1,55 @@
+<h1>tests/unit_tests/transformer/test_cuda_graphs.py</h1>
+<p>这份代码是 <strong>Megatron-Core</strong>（NVIDIA 开发的大模型训练框架）中的一个<strong>单元测试文件</strong>。</p>
+<p>它的核心目的是测试 <strong>CUDA Graph（CUDA 图）</strong> 功能在不同模型架构（GPT、LLaVA、Mamba）和不同并行策略下的正确性。</p>
+<p>简单来说，<strong>CUDA Graph</strong> 是一种加速技术，它把一连串 GPU 操作“录制”下来，以后再执行时就不需要 CPU 逐个发指令，而是直接回放录像，从而减少 CPU 的开销并提升速度。</p>
+<p>为了让你更容易理解，我把这个文件的逻辑拆解成一个 <strong>“开发者的任务清单 (Todo List)”</strong>。想象一下，如果你是开发这个功能的工程师，你需要按顺序完成以下测试任务，来确保功能是正常的。</p>
+<hr />
+<h3>任务清单：验证 CUDA Graph 功能</h3>
+<h4>Task 1: 基础功能验证 - 能跑通吗？</h4>
+<p><strong>目标</strong>：在一个最简单的 Transformer 模块上开启 CUDA Graph，看它能不能正常工作，会不会报错。
+*   <strong>对应代码类</strong>：<code>TestParallelTransformerBlockCudagraphs</code>
+*   <strong>具体步骤</strong>：
+    1.  搭建一个标准的 GPT Transformer 模块（<code>TransformerBlock</code>）。
+    2.  开启 Tensor Parallel（张量并行）和 Pipeline Parallel（流水线并行）环境。
+    3.  把模拟的数据（hidden_states）喂给模型。
+    4.  <strong>检查点</strong>：运行完后，检查每一层是否都成功创建了 <code>cudagraph_manager</code>（图管理器），并且里面是否有 <code>cudagraph_runners</code>（图运行器）。
+    5.  <strong>结论</strong>：如果存在，说明 CUDA Graph 成功“挂载”到了模型层上。</p>
+<h4>Task 2: 烧脑逻辑验证 - “第一层”和“最后一层”判断对不对？</h4>
+<p><strong>目标</strong>：在复杂的分布式训练（流水线并行）中，模型被切分到不同 GPU 上。CUDA Graph 需要精确知道哪一层是当前 GPU 的“入口（第一层）”和“出口（最后一层）”，以便正确管理显存。
+*   <strong>对应代码函数</strong>：<code>test_cuda_graph_determine_first_last_layer_logic</code>
+*   <strong>背景</strong>：
+    *   如果我是第一层，我需要准备接收外部输入。
+    *   如果我是最后一层，我需要准备把数据发给下一个 GPU 或计算 Loss。
+    *   如果判断错了，显存里的梯度数据可能会被覆盖，导致训练崩溃。
+*   <strong>具体步骤</strong>：
+    1.  使用 <code>@pytest.mark.parametrize</code> 模拟各种极其复杂的切分情况：
+        *   一共 4 层，1 个 GPU 跑。
+        *   一共 8 层，2 个 GPU 流水线跑。
+        *   一共 14 层，4 个 GPU，还要考虑 Embedding 层和 Loss 层是否占用切分。
+        *   使用虚拟流水线（Virtual Pipeline / Interleaved），即一个 GPU 负责第 1 层和第 3 层，另一个负责第 2 层和第 4 层。
+    2.  <strong>检查点</strong>：对比代码计算出的 <code>is_first_layer</code> / <code>is_last_layer</code> 标志位，是否与我们在 <code>golden</code>（标准答案）里预设的一致。
+    3.  <strong>结论</strong>：确保无论用户怎么切分模型，CUDA Graph 都能找准边界。</p>
+<h4>Task 3: 跨模态模型验证 - 视觉+语言模型能一起跑吗？</h4>
+<p><strong>目标</strong>：验证 LLaVA 这种多模态模型（图片编码器 + 语言解码器）在使用 CUDA Graph 时的特殊逻辑。
+*   <strong>对应代码类</strong>：<code>TestLLaVACudaGraph</code>
+*   <strong>具体步骤</strong>：
+    1.  搭建一个 LLaVA 模型（包含 Vision Transformer 和 Language Transformer）。
+    2.  输入图片和文本数据，执行一次前向传播（Forward）和反向传播（Backward）。
+    3.  <strong>核心难点</strong>：LLaVA 有两个部分，视觉部分算完传给语言部分。测试重点在于 <code>test_llava_cudagraph_is_last_layer_logic</code>。
+    4.  <strong>检查点</strong>：
+        *   确认视觉模型的层和语言模型的层都生成了 Graph Manager。
+        *   手动触发 <code>create_cudagraphs()</code> 录制图。
+        *   确保在反向传播时，边界处的梯度处理是正确的（特别是 <code>is_last_layer</code> 的逻辑在跨模型时是否重置正确）。</p>
+<h4>Task 4: 新架构验证 - Mamba 模型支持吗？</h4>
+<p><strong>目标</strong>：CUDA Graph 不能只支持 Transformer，还要支持最新的 Mamba (SSM) 架构。
+*   <strong>对应代码类</strong>：<code>TestParallelMambaBlockCudagraphs</code>
+*   <strong>具体步骤</strong>：
+    1.  搭建一个 Mamba 模块（<code>MambaStack</code>）。
+    2.  配置混合模式（<code>hybrid_override_pattern="M-M*-"</code>），模拟 Mamba 层和 Attention 层混合的情况。
+    3.  喂入数据运行。
+    4.  <strong>检查点</strong>：同样检查 <code>cudagraph_manager</code> 是否成功创建并附着在 Mamba 层上。
+    5.  <strong>结论</strong>：证明这一套加速机制对非 Transformer 架构也是通用的。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就在干一件事：
+<strong>确保 Megatron-Core 的 CUDA Graph 加速功能，在简单场景（Task 1）、复杂分布式切分场景（Task 2）、多模态场景（Task 3）以及新架构场景（Task 4）下，都能正确地识别网络结构并安全地运行。</strong></p>

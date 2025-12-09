@@ -1,0 +1,127 @@
+<h1>examples/multimodal/model_converter/radio_converter.py</h1>
+<p>这份代码确实涉及了很多深度学习<strong>底层工程化</strong>的概念，如果不懂背景确实像天书。</p>
+<p>简单来说，这是一个<strong>“搬家+拆解”</strong>的脚本。</p>
+<p><strong>场景是这样的：</strong>
+你从网上下载了一个好用的模型（NVIDIA RADIO），它是用普通的 PyTorch 格式写的。但是，你想在一个超大规模的训练框架（Megatron）里使用它。Megatron 脾气很怪，它要求模型参数的名字必须按它的规矩来，而且为了支持多张显卡并行（Tensor Parallelism），它要求把大矩阵切碎。</p>
+<p>这个脚本就是做这个<strong>转换（Convert）</strong>工作的。</p>
+<p>我为你列了一个 <strong>Task To-Do List</strong>，我们将代码逻辑拆解为 5 个步骤，带你一步步看懂它在干啥：</p>
+<hr />
+<h3>Task 1: 搞清楚“我们在做什么” (宏观目标)</h3>
+<p><strong>目标：</strong> 理解脚本的输入和输出。</p>
+<ul>
+<li><strong>输入</strong>：一个标准的 RADIO 模型（通过 <code>torch.hub.load</code> 下载或加载）。这是一个完整的、单文件的模型。</li>
+<li><strong>输出</strong>：一个被<strong>切分</strong>过的、改了名字的模型文件集合，专门供 Megatron 框架读取。</li>
+<li><strong>关键参数</strong>：<code>tensor_parallel_size</code> (TP)。比如 TP=4，意味着我们要把一个完整的模型切成 4 份，分给 4 张显卡用。</li>
+</ul>
+<blockquote>
+<p><strong>代码对应位置：</strong>
+最下面的 <code>if __name__ == "__main__":</code> 和 <code>convert</code> 函数。它们负责接收命令行参数，决定是转 <code>radio_h</code> 还是 <code>radio_g</code> 版本。</p>
+</blockquote>
+<hr />
+<h3>Task 2: 准备“原材料” (加载模型)</h3>
+<p><strong>目标：</strong> 把源模型拿到手。</p>
+<ul>
+<li><strong>动作</strong>：脚本不直接读文件，而是利用 <code>torch.hub</code> 从英伟达的仓库里加载预训练好的 RADIO 模型。</li>
+<li><strong>细节</strong>：它会把模型的所有参数（权重 Weight 和 偏置 Bias）提取出来，放在 <code>state_dict</code>（状态字典）里。你可以把 <code>state_dict</code> 想象成一个巨大的清单，列出了模型里所有的零件。</li>
+</ul>
+<blockquote>
+<p><strong>代码对应位置：</strong>
+<code>python
+model = torch.hub.load('NVlabs/RADIO', 'radio_model', version=version, progress=True)
+state_dict = model.state_dict()</code></p>
+</blockquote>
+<hr />
+<h3>Task 3: 准备“手术刀” (计算切分索引)</h3>
+<p><strong>目标：</strong> 在切分模型前，先算好怎么切，特别是“注意力机制（Attention）”部分。</p>
+<ul>
+<li><strong>难点</strong>：PyTorch 的 Multi-Head Attention 和 Megatron 的存储顺序不一样。<ul>
+<li>PyTorch 通常是把 Q, K, V 放在一起或者按头（Head）堆叠。</li>
+<li>Megatron 为了并行计算，需要对这些数据进行特定的重排（Reordering）。</li>
+</ul>
+</li>
+<li><strong>动作</strong>：代码里那段复杂的 <code>indices</code> 计算，就是在算“原数据的第几行应该搬到新数据的第几行”。这就像是在整理扑克牌，把牌序理顺。</li>
+</ul>
+<blockquote>
+<p><strong>代码对应位置：</strong>
+```python</p>
+<h1>这里的循环就是在算 QKV 矩阵重排的索引</h1>
+<p>for i in range(num_heads):
+    lb = i * kv_channels
+    ...
+    indices.append(...)
+```</p>
+</blockquote>
+<hr />
+<h3>Task 4: 核心手术 —— 改名与切分 (循环处理)</h3>
+<p><strong>目标：</strong> 遍历每一个参数，做两件事：<strong>1. 改名</strong>，<strong>2. 切分</strong>。这是代码最长、最核心的部分。</p>
+<p>我们将这个循环拆解为三个子任务：</p>
+<h4>4.1 改名 (Mapping)</h4>
+<p>Megatron 就像一个挑剔的房东，它不叫 <code>attn.qkv</code>，它非要叫 <code>self_attention.linear_qkv</code>。
+*   <strong>逻辑</strong>：代码里大量的 <code>if "xxx" in name: ... elif ...</code> 就是在一个个对照字典，把原来的名字映射成新名字。</p>
+<h4>4.2 特殊处理 (Reordering)</h4>
+<p>对于 Attention 层的 QKV 权重，利用 Task 3 算好的 <code>indices</code> 进行重排。</p>
+<blockquote>
+<p><strong>代码：</strong> <code>new_tensor = new_tensor[indices]</code></p>
+</blockquote>
+<h4>4.3 切分 (Chunking for Tensor Parallel)</h4>
+<p>这是最关键的并行化步骤。
+*   <strong>原理</strong>：如果你有 2 张卡（TP=2），一个 <code>[100, 100]</code> 的大矩阵，可能需要横着切成两个 <code>[50, 100]</code>，或者竖着切成两个 <code>[100, 50]</code>。
+*   <strong>逻辑</strong>：
+    *   <code>chunk_dim=0</code>：横着切（按行）。
+    *   <code>chunk_dim=1</code>：竖着切（按列）。
+    *   <code>chunk_dim=None</code>：不切（比如 LayerNorm 的参数，每张卡都复制一份完整的）。
+*   <strong>动作</strong>：<code>torch.chunk(new_tensor, tensor_parallel_size, dim=chunk_dim)</code> 把大张量切成小块。</p>
+<blockquote>
+<p><strong>代码对应位置：</strong>
+```python</p>
+<h1>比如这里，设置名字，并决定要按第0维切分</h1>
+<p>if "attn.qkv.weight" in name:
+    new_name = f"{base}.self_attention.linear_qkv.weight"
+    chunk_dim = 0
+...</p>
+<h1>这里执行切分，分给不同的 rank (显卡)</h1>
+<p>if chunk_dim is None:
+    new_tensors = [new_tensor for _ in range(tensor_parallel_size)] # 复制
+else:
+    new_tensors = torch.chunk(new_tensor, tensor_parallel_size, dim=chunk_dim) # 切分
+```</p>
+</blockquote>
+<hr />
+<h3>Task 5: 兼容性处理 (Transformer Engine)</h3>
+<p><strong>目标：</strong> 适配英伟达的高级加速库 Transformer Engine (TE)。</p>
+<ul>
+<li><strong>背景</strong>：TE 库为了支持 FP8（8位浮点数）加速，需要一些额外的元数据（metadata）。</li>
+<li><strong>动作</strong>：如果用户开启了 <code>--use-te</code>，脚本会给每个线性层（Linear Layer）多加一个叫 <code>_extra_state</code> 的空参数，防止加载模型时报错。</li>
+</ul>
+<blockquote>
+<p><strong>代码对应位置：</strong>
+<code>python
+if use_te and is_extra_state_layer:
+    ...
+    new_state_dicts[i]["model"][extra_state_name] = None</code></p>
+</blockquote>
+<hr />
+<h3>Task 6: 打包发货 (保存文件)</h3>
+<p><strong>目标：</strong> 把切好的碎片保存到硬盘上。</p>
+<ul>
+<li><strong>结构</strong>：Megatron 要求文件夹结构必须是 <code>mp_rank_00</code>, <code>mp_rank_01</code> 这种格式。<ul>
+<li>如果你 TP=2，就会生成 <code>mp_rank_00</code>（存前半截参数）和 <code>mp_rank_01</code>（存后半截参数）。</li>
+</ul>
+</li>
+<li><strong>动作</strong>：创建文件夹，保存 <code>.pt</code> 文件，并写入一个 <code>latest_checkpointed_iteration.txt</code> 告诉框架这是最新的存档。</li>
+</ul>
+<blockquote>
+<p><strong>代码对应位置：</strong>
+<code>python
+for i in range(tensor_parallel_size):
+    output_dir_tp = os.path.join(..., f"mp_rank_0{i}")
+    torch.save(new_state_dicts[i], output_path_tp)</code></p>
+</blockquote>
+<hr />
+<h3>总结</h3>
+<p>你不需要读懂每一行 <code>indices</code> 是怎么算的，你只需要知道：</p>
+<ol>
+<li><strong>它是一个翻译器</strong>：把 RADIO 的“方言”翻译成 Megatron 的“官方语言”。</li>
+<li><strong>它是一个屠夫</strong>：根据你有几张显卡（<code>tensor_parallel_size</code>），把模型的大块肉（矩阵）切成小块，分装到不同的袋子（文件夹）里。</li>
+</ol>
+<p><code>radio_h</code> 和 <code>radio_g</code> 两个函数的区别仅仅是<strong>模型大小不同</strong>（Hidden dim, Head number 不同），导致切分时的参数不一样，但逻辑流程是完全一致的。</p>

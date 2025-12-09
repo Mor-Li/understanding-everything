@@ -1,0 +1,101 @@
+<h1>recipe/gkd/teacher/proxy.py</h1>
+<p>这份代码其实在实现一个<strong>“中间人”（Proxy/Broker）</strong>的功能。</p>
+<p>为了让你彻底搞懂，我们不要一上来就看代码细节，而是把这当成一个<strong>“理解任务”</strong>。我为你列了一个 Todo List，我们按照这 4 个步骤，一步步揭开它的面纱。</p>
+<h3>📋 你的学习 Todo List</h3>
+<ol>
+<li><strong>Task 1：搞懂角色设定（什么是 Proxy？）</strong> —— 明白它在系统里是干嘛的。</li>
+<li><strong>Task 2：搞懂准备工作（Environment &amp; Setup）</strong> —— 明白它启动需要什么条件。</li>
+<li><strong>Task 3：搞懂通信工具（Router &amp; Dealer）</strong> —— 明白它用什么方式和别人说话。</li>
+<li><strong>Task 4：搞懂核心工作（Poller &amp; Loop）</strong> —— 明白它是如何忙碌地搬运数据的。</li>
+</ol>
+<hr />
+<h3>🟢 Task 1：搞懂角色设定（什么是 Proxy？）</h3>
+<p>想象一个餐厅的场景：
+*   <strong>客户端 (Clients)</strong> = 进店点菜的顾客。
+*   <strong>服务端 (Services/Workers)</strong> = 后厨做菜的厨师。
+*   <strong>这个脚本 (Proxy)</strong> = <strong>服务员/前台经理</strong>。</p>
+<p><strong>核心观点：</strong>
+顾客（客户端）不直接跑进后厨找厨师，厨师也不直接跑出来找顾客。他们都只跟<strong>这个脚本（服务员）</strong>打交道。这个脚本的作用就是<strong>“上传下达”</strong>：把顾客的需求传给后厨，把后厨做好的菜端给顾客。</p>
+<hr />
+<h3>🟢 Task 2：搞懂准备工作（Environment &amp; Setup）</h3>
+<p>看代码的前几行：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">frontend_listen_port</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;PROXY_FRONTEND_PORT&quot;</span><span class="p">)</span>
+<span class="n">backend_listen_port</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;PROXY_BACKEND_PORT&quot;</span><span class="p">)</span>
+<span class="c1"># ...assert 检查...</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+服务员（Proxy）上班前需要知道两个位置：
+1.  <strong>前门（Frontend）</strong>：在哪里接待顾客？（对应 <code>PROXY_FRONTEND_PORT</code> 端口）
+2.  <strong>后门（Backend）</strong>：在哪里联系后厨？（对应 <code>PROXY_BACKEND_PORT</code> 端口）</p>
+<p>代码通过读取环境变量来获取这两个端口号。如果没设置，程序就报错罢工（<code>assert</code>）。</p>
+<hr />
+<h3>🟢 Task 3：搞懂通信工具（Router &amp; Dealer）</h3>
+<p>这是 ZeroMQ (zmq) 最经典的设计模式。看这两段：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 前端：面对顾客</span>
+<span class="n">frontend</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">socket</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">ROUTER</span><span class="p">)</span>
+<span class="n">frontend</span><span class="o">.</span><span class="n">bind</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;tcp://*:</span><span class="si">{</span><span class="n">frontend_listen_port</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+<span class="c1"># 后端：面对厨师</span>
+<span class="n">backend</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">socket</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">DEALER</span><span class="p">)</span>
+<span class="n">backend</span><span class="o">.</span><span class="n">bind</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;tcp://*:</span><span class="si">{</span><span class="n">backend_listen_port</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+这个服务员有两张脸（两个 Socket）：</p>
+<ol>
+<li>
+<p><strong>Frontend (前端) 用的是 <code>ROUTER</code> 模式：</strong></p>
+<ul>
+<li><code>ROUTER</code> 是一种很聪明的套接字。当它收到顾客（Client）的消息时，它会悄悄给消息贴上一个<strong>标签（ID）</strong>，记下是“几号桌”发来的。</li>
+<li><strong>作用</strong>：它负责<strong>记住是谁发起的请求</strong>，这样等结果回来了，它知道该还给谁。</li>
+</ul>
+</li>
+<li>
+<p><strong>Backend (后端) 用的是 <code>DEALER</code> 模式：</strong></p>
+<ul>
+<li><code>DEALER</code> 是一种处理异步任务的套接字。它面对的是后端的 Worker（服务端）。</li>
+<li><strong>作用</strong>：它负责把手里积压的任务<strong>分发</strong>给连接上来的 Worker 们。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🟢 Task 4：搞懂核心工作（Poller &amp; Loop）</h3>
+<p>这是代码里最长的那部分，也是它一直在做的事。</p>
+<p><strong>步骤 A：眼观六路（Poller）</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">poller</span> <span class="o">=</span> <span class="n">zmq</span><span class="o">.</span><span class="n">Poller</span><span class="p">()</span>
+<span class="n">poller</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">frontend</span><span class="p">,</span> <span class="n">zmq</span><span class="o">.</span><span class="n">POLLIN</span><span class="p">)</span>
+<span class="n">poller</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">backend</span><span class="p">,</span> <span class="n">zmq</span><span class="o">.</span><span class="n">POLLIN</span><span class="p">)</span>
+</code></pre></div>
+
+<p>服务员不能傻等着。如果他只盯着前门（Frontend），后厨（Backend）菜做好了他听不到；反之亦然。
+<strong>Poller</strong> 就是让服务员同时竖起耳朵听<strong>两边</strong>的动静：
+*   前门有顾客进来吗？(<code>POLLIN</code>)
+*   后门有厨师按铃吗？(<code>POLLIN</code>)</p>
+<p><strong>步骤 B：死循环搬运（While Loop）</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+    <span class="n">socks</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">poller</span><span class="o">.</span><span class="n">poll</span><span class="p">())</span> <span class="c1"># 看看哪边有动静？</span>
+
+    <span class="c1"># 情况 1：前门有动静（顾客点菜了）</span>
+    <span class="k">if</span> <span class="n">frontend</span> <span class="ow">in</span> <span class="n">socks</span><span class="p">:</span>
+        <span class="n">parts</span> <span class="o">=</span> <span class="n">frontend</span><span class="o">.</span><span class="n">recv_multipart</span><span class="p">()</span> <span class="c1"># 收到完整的点菜单（包含顾客ID）</span>
+        <span class="n">backend</span><span class="o">.</span><span class="n">send_multipart</span><span class="p">(</span><span class="n">parts</span><span class="p">)</span>     <span class="c1"># 直接转手递给后厨</span>
+
+    <span class="c1"># 情况 2：后门有动静（厨师做好菜了）</span>
+    <span class="k">if</span> <span class="n">backend</span> <span class="ow">in</span> <span class="n">socks</span><span class="p">:</span>
+        <span class="n">reply_parts</span> <span class="o">=</span> <span class="n">backend</span><span class="o">.</span><span class="n">recv_multipart</span><span class="p">()</span> <span class="c1"># 收到做好的菜（包含之前贴的顾客ID）</span>
+        <span class="n">frontend</span><span class="o">.</span><span class="n">send_multipart</span><span class="p">(</span><span class="n">reply_parts</span><span class="p">)</span>   <span class="c1"># 按照ID，转手端给对应的顾客</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+这是一个无限循环，服务员一直在转圈：
+1.  <strong>如果前端有消息</strong>：它收到消息（<code>recv_multipart</code> 会把那个“几号桌”的 ID 也一起收进来），然后<strong>原封不动</strong>地通过后端扔给厨师。
+2.  <strong>如果后端有消息</strong>：厨师处理完了，把结果发回来（ZeroMQ 会自动保留之前的 ID 信息）。服务员收到后，通过前端，<strong>原封不动</strong>地把结果扔回给对应的顾客。</p>
+<h3>📝 总结（中文大白话）</h3>
+<p>这个 <code>proxy.py</code> 文件就是一个<strong>不需要脑子的传话筒</strong>。</p>
+<ol>
+<li>它开启两个端口，左手接用户，右手接服务器。</li>
+<li>它利用 ZeroMQ 的特性（Router/Dealer），自动处理“谁发的消息该回给谁”这个复杂问题。</li>
+<li>它本身<strong>不处理</strong>任何业务逻辑（不看消息内容），它只负责<strong>搬运</strong>数据包：左边进来的扔给右边，右边进来的扔给左边。</li>
+</ol>
+<p>这就是一个标准的 <strong>ZMQ 代理层</strong>，用于解耦客户端和服务端。</p>

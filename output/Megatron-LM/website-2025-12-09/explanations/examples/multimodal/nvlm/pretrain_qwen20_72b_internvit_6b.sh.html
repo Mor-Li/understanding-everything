@@ -1,0 +1,104 @@
+<h1>examples/multimodal/nvlm/pretrain_qwen20_72b_internvit_6b.sh</h1>
+<p>这就好比你拿到了一张<strong>极为复杂的“火箭发射检查清单”</strong>（Shell 脚本），但你可能只是想知道这个火箭是要去哪、带什么货、怎么飞。</p>
+<p>这个脚本的目的是：<strong>训练一个多模态大模型（NVLM）</strong>。简单说，就是把一个懂文字的大模型（Qwen2-72B）和一个懂图片的大模型（InternViT-6B）缝合在一起，让它们学会互相交流。</p>
+<p>为了让你看懂，我把你（作为项目经理）需要确认的 <strong>Task List (待办清单)</strong> 列出来，我们一步步对照脚本里的代码来勾选。</p>
+<hr />
+<h3>Task 01: 准备工作区和日志 (Setup Workspace)</h3>
+<p><strong>目标</strong>：告诉计算机文件存哪，日志写哪，防止训练白跑。</p>
+<ul>
+<li><strong>脚本对应代码</strong>：
+    <code>bash
+    WORKSPACE="&lt;some dir&gt;"  # 你的工作根目录
+    OUTPUT_BASE="${WORKSPACE}/output" # 输出文件夹
+    MODEL_NAME="mcore-qwen20-72b-internvit-..." # 给这次训练起个名</code></li>
+<li><strong>解读</strong>：
+    这里设置了“工地”的位置。<code>MODEL_NAME</code> 会自动带上日期时间，这样每次训练的记录不会搞混。</li>
+</ul>
+<h3>Task 02: 确认“两位主角”是谁 (Define Models)</h3>
+<p><strong>目标</strong>：明确我们要训练的是哪两个模型的组合。</p>
+<ul>
+<li><strong>脚本对应代码</strong>：
+    <code>bash
+    --language-model-type qwen2.0_72B   # 语言大脑：通义千问 72B
+    --vision-model-type internvit       # 视觉眼睛：书生·浦语 InternViT 6B
+    --tokenizer-model Qwen/Qwen2-72B-Instruct # 用的字典</code></li>
+<li><strong>解读</strong>：
+    这是核心配置。你正在使用 <strong>Qwen2 (720亿参数)</strong> 作为语言模型，配合 <strong>InternViT (60亿参数)</strong> 作为视觉编码器。这是一个非常庞大的模型组合。</li>
+</ul>
+<h3>Task 03: 制定“特训”策略 (Training Strategy)</h3>
+<p><strong>目标</strong>：决定这次是“从头学”还是“复习”，以及到底要训练哪部分大脑。</p>
+<ul>
+<li><strong>脚本对应代码</strong>：
+    <code>bash
+    --freeze-ViT   # 冻结视觉模型（眼睛不许动，不训练它）
+    --freeze-LM    # 冻结语言模型（大脑不许动，不训练它）
+    # 注意：这里没有写 freeze-projection 之类的</code></li>
+<li><strong>解读</strong>：
+    <strong>这是最关键的一点！</strong>
+    既然眼睛（ViT）和大脑（LM）都被“冻结（Freeze）”了，那我们在训练啥？
+    我们在训练连接眼睛和大脑的<strong>神经（Projection Layer / Adapter）</strong>。这通常是多模态训练的第一阶段：让语言模型能“看懂”视觉模型传过来的信号，但不要破坏原本就很聪明的语言模型和视觉模型。</li>
+</ul>
+<h3>Task 04: 分配计算资源 (Hardware &amp; Parallelism)</h3>
+<p><strong>目标</strong>：模型太大（72B），一张显卡装不下，需要切分。</p>
+<ul>
+<li><strong>脚本对应代码</strong>：
+    <code>bash
+    --tensor-model-parallel-size 8  # 张量并行：8
+    --pipeline-model-parallel-size 1</code></li>
+<li><strong>解读</strong>：
+    因为 Qwen-72B 太大了，脚本设置了 <code>TP=8</code>。这意味着<strong>每一个模型层都被拆分到了 8 张显卡上</strong>同时计算。你需要一台至少有 8 张高性能显卡（如 H100/A100）的机器才能跑起来。</li>
+</ul>
+<h3>Task 05: 设定学习课程表 (Hyperparameters)</h3>
+<p><strong>目标</strong>：设置学习率、步数、批次大小。</p>
+<ul>
+<li><strong>脚本对应代码</strong>：
+    <code>bash
+    if [[ $DEBUG -eq 1 ]]; then ... else
+        BZ=2048       # Global Batch Size: 一次学2048个样本
+        LR 1e-4       # 学习率
+        SEQ_LEN=256   # 图片序列长度
+        DECODER_SEQ_LEN=512 # 文本序列长度
+    fi</code></li>
+<li><strong>解读</strong>：
+    这里有个 <code>DEBUG</code> 开关。<ul>
+<li>如果 <code>DEBUG=1</code>：只跑极少量数据，用来测试代码有没有报错。</li>
+<li>如果 <code>DEBUG=0</code>（默认）：开启正式训练，一次吞吐 2048 条数据，学习率设为 <code>1e-4</code>。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 06: 指定教材来源 (Data Loading)</h3>
+<p><strong>目标</strong>：模型上课用的课本（数据）在哪里。</p>
+<ul>
+<li><strong>脚本对应代码</strong>：
+    <code>bash
+    DATA_TRAIN="${SOURCE}/examples/multimodal/nvlm/pretrain_blend.yaml"
+    --data-path ${DATA_TRAIN}
+    --img-h 448 --img-w 448 # 图片分辨率</code></li>
+<li><strong>解读</strong>：
+    数据配置在一个 <code>.yaml</code> 文件里，图片会被处理成 448x448 的分辨率喂给模型。</li>
+</ul>
+<h3>Task 07: 按下发射按钮 (Launch Command)</h3>
+<p><strong>目标</strong>：根据环境选择启动方式。</p>
+<ul>
+<li><strong>脚本对应代码</strong>：
+    <code>bash
+    if [[ $BATCH -eq 0 ]]; then
+        torchrun --nproc_per_node 8 ...  # 交互式运行
+    else
+        srun ...                         # 集群调度运行
+    fi</code></li>
+<li><strong>解读</strong>：<ul>
+<li>如果你是在一台机器上直接跑（比如你自己租的服务器），它会用 <code>torchrun</code> 启动 8 个进程。</li>
+<li>如果你是在公司的大集群上（用 Slurm 管理），它会用 <code>srun</code> 提交任务。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个脚本到底在干嘛？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>多模态预训练脚本</strong>，它利用 <strong>8张显卡</strong>，保持 <strong>Qwen-72B</strong> 和 <strong>InternViT-6B</strong> 主体不变（冻结参数），专门训练它们之间的<strong>连接层</strong>，目的是让这个超级巨大的语言模型能够“看懂”图片。</p>
+<p><strong>你需要做什么？</strong>
+1.  修改 <code>WORKSPACE</code> 路径为你自己的文件夹。
+2.  确保你有下载好 <code>Qwen</code> 和 <code>InternViT</code> 的权重文件，并填入 <code>CHECKPOINT_DIR</code>。
+3.  确保你有 8 张显卡（显存要够大）。
+4.  运行脚本。</p>

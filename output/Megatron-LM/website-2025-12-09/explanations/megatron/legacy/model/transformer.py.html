@@ -1,0 +1,116 @@
+<h1>megatron/legacy/model/transformer.py</h1>
+<p>这份代码确实非常难读，因为它不仅仅是一个标准的 Transformer 模型，而是 <strong>NVIDIA Megatron-LM</strong> 的核心代码。</p>
+<p>它的难点在于：<strong>它不是为了“跑通”模型写的，而是为了在成百上千张 GPU 上“并行”训练超大模型（如 GPT-3, GPT-4 规模）写的。</strong> 所以里面充满了分布式计算、显存优化和硬件加速的逻辑。</p>
+<p>为了让你看懂，我制定了一个 <strong>5步走的 To-Do List</strong>。我们可以把这个文件看作是在搭建一座摩天大楼。</p>
+<hr />
+<h3>📝 阅读任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解基础砖块 —— 多层感知机 (MLP)</strong><ul>
+<li><strong>目标</strong>：看懂 <code>ParallelMLP</code> 类。</li>
+<li><strong>核心概念</strong>：张量并行（Tensor Parallelism）。</li>
+</ul>
+</li>
+<li><strong>Task 2: 理解核心引擎 —— 注意力机制 (Attention)</strong><ul>
+<li><strong>目标</strong>：看懂 <code>CoreAttention</code> 和 <code>ParallelAttention</code> 类。</li>
+<li><strong>核心概念</strong>：QKV 切分、FlashAttention。</li>
+</ul>
+</li>
+<li><strong>Task 3: 理解特殊设计 —— 混合专家 (MoE) (可选)</strong><ul>
+<li><strong>目标</strong>：浏览 <code>SwitchMLP</code> 类。</li>
+<li><strong>核心概念</strong>：路由（Router）和专家（Experts）。</li>
+</ul>
+</li>
+<li><strong>Task 4: 组装楼层 —— Transformer Layer</strong><ul>
+<li><strong>目标</strong>：看懂 <code>ParallelTransformerLayer</code>。</li>
+<li><strong>核心概念</strong>：残差连接、LayerNorm、Dropout。</li>
+</ul>
+</li>
+<li><strong>Task 5: 盖成大楼 —— Transformer Model</strong><ul>
+<li><strong>目标</strong>：看懂 <code>ParallelTransformer</code>。</li>
+<li><strong>核心概念</strong>：层堆叠、流水线并行（Pipeline Parallelism）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解 (Step-by-Step)</h3>
+<h4>Step 1: 基础砖块 (MLP) - <code>ParallelMLP</code></h4>
+<p>在标准的 Transformer 里，MLP 就是两个全连接层（Linear）。但在 Megatron 里，因为模型太大，一张显卡放不下，所以必须把矩阵“切开”放。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>class ParallelMLP</code></li>
+<li><strong>核心逻辑</strong>:<ol>
+<li><strong>切分</strong>: 它没有用普通的 <code>nn.Linear</code>，而是用了 <code>tensor_parallel.ColumnParallelLinear</code> 和 <code>RowParallelLinear</code>。</li>
+<li><strong>流程</strong>:<ul>
+<li>输入 <code>h</code> -&gt; <strong>列并行层</strong> (把矩阵竖着切，输出 4h) -&gt; 激活函数 (GeLU/SwiGLU) -&gt; <strong>行并行层</strong> (把矩阵横着切，输出 h)。</li>
+</ul>
+</li>
+<li><strong>为什么这么做</strong>: 这样设计可以让多张 GPU 同时计算一部分数据，最后再把结果拼起来（All-Reduce），从而支持超大模型。</li>
+</ol>
+</li>
+</ul>
+<h4>Step 2: 核心引擎 (Attention) - <code>ParallelAttention</code></h4>
+<p>这是 Transformer 最复杂的部分。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>class ParallelAttention</code> 和 <code>class CoreAttention</code></li>
+<li><strong>分工</strong>:<ul>
+<li><code>ParallelAttention</code>: 负责<strong>外围的并行处理</strong>。它把 Query, Key, Value (QKV) 的矩阵切分到不同的 GPU 上（每个 GPU 只负责一部分 Attention Head）。</li>
+<li><code>CoreAttention</code>: 负责<strong>核心的数学计算</strong>。即公式 $Attention(Q, K, V) = Softmax(\frac{QK^T}{\sqrt{d}})V$。</li>
+</ul>
+</li>
+<li><strong>关键点</strong>:<ul>
+<li><strong>FlashAttention</strong>: 代码里有一个 <code>FlashSelfAttention</code> 类。这是为了加速计算，不显式地生成巨大的 Attention Matrix，而是利用 GPU 硬件特性直接算出结果，极大地节省显存。</li>
+<li><strong>Rotary Embedding (RoPE)</strong>: 代码里出现了 <code>rotary_pos_emb</code>，这是目前大模型标配的位置编码方式。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 3: 混合专家 (MoE) - <code>SwitchMLP</code></h4>
+<p>这是一个高级特性，不是所有模型都有。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>class SwitchMLP</code></li>
+<li><strong>概念</strong>: 传统的 MLP 对所有输入都做同样的计算。MoE 像是有很多个“专家”（Experts，也就是很多个小 MLP）。</li>
+<li><strong>流程</strong>:<ol>
+<li><strong>Router (路由)</strong>: 决定当前的输入数据应该交给哪个 Expert 处理（代码中的 <code>sinkhorn</code> 算法用于负载均衡，防止某个专家累死，其他专家闲死）。</li>
+<li><strong>分发</strong>: 把数据发送给对应的 Expert。</li>
+<li><strong>计算</strong>: Expert 计算完后，再把结果收集回来。</li>
+</ol>
+</li>
+</ul>
+<h4>Step 4: 组装楼层 (Layer) - <code>ParallelTransformerLayer</code></h4>
+<p>现在我们有了 Attention 和 MLP，需要把它们组合成一层。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>class ParallelTransformerLayer</code></li>
+<li><strong>结构</strong>:
+    标准的 Transformer 结构是三明治形状：<ol>
+<li><code>input_norm</code>: 输入归一化。</li>
+<li><code>self_attention</code>: 自注意力机制。</li>
+<li><code>bias_dropout_add</code>: 这是一个融合算子（Fused Kernel）。为了速度，把 偏置相加(Bias Add)、Dropout、残差连接(Residual Add) 三步合并成一步在 GPU 上执行。</li>
+<li><code>post_attention_norm</code>: 注意力后的归一化。</li>
+<li><code>mlp</code>: 前馈神经网络（或者 MoE）。</li>
+<li>再来一次 <code>bias_dropout_add</code>。</li>
+</ol>
+</li>
+<li><strong>Retro</strong>: 代码里有很多 <code>retro_</code> 开头的逻辑，这是指 <strong>Retrieval-Enhanced Transformer</strong>（检索增强 Transformer），允许模型在生成时去外部数据库搜索信息。</li>
+</ul>
+<h4>Step 5: 盖成大楼 (Model) - <code>ParallelTransformer</code></h4>
+<p>最后，我们要把很多层堆叠起来。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>class ParallelTransformer</code></li>
+<li><strong>核心逻辑</strong>:<ol>
+<li><strong>循环堆叠</strong>: 用一个 <code>for</code> 循环，创建 <code>num_layers</code> 个 <code>ParallelTransformerLayer</code>。</li>
+<li><strong>Transformer Engine (TE)</strong>: 代码里有大量的 <code>if self.transformer_impl == 'transformer_engine':</code>。TE 是 NVIDIA 推出的一个库，专门用来加速 Transformer，它支持 FP8（8位浮点数）训练，比传统的 FP16/BF16 更快。</li>
+<li><strong>流水线并行 (Pipeline Parallelism)</strong>:<ul>
+<li>如果模型有 80 层，你有 4 个 GPU 组。</li>
+<li>GPU 组 1 负责 1-20 层，GPU 组 2 负责 21-40 层...</li>
+<li>代码中的 <code>_get_num_layers</code> 和 <code>offset</code> 就是在计算当前这块 GPU 应该负责搭建哪几层楼。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>💡 总结 (Summary)</h3>
+<p>这篇代码讲的不是“什么是 Transformer”，而是 <strong>“如何在几百张显卡上高效地实现 Transformer”</strong>。</p>
+<p>如果你想看懂它，建议按照这个顺序去代码里找对应的部分：
+1.  先看 <code>ParallelTransformerLayer</code> 的 <code>forward</code> 函数，看懂数据的流动方向（Norm -&gt; Attn -&gt; Norm -&gt; MLP）。
+2.  再看 <code>ParallelMLP</code>，理解为什么 Linear 层要分 Column 和 Row。
+3.  最后看 <code>ParallelAttention</code>，理解 QKV 是怎么被切分的。</p>
+<p>不要纠结于 <code>sinkhorn</code>、<code>retro</code> 或者 <code>jit_fuser</code> 这种细节，先抓主干！</p>

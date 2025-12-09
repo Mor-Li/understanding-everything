@@ -1,0 +1,79 @@
+<h1>examples/multimodal/evaluation/evaluation_datasets.py</h1>
+<p>这份代码文件 <code>evaluation_datasets.py</code> 的核心作用是充当多模态大模型（Multimodal LLM）评估时的<strong>“后勤部长”</strong>。它的任务是把各种不同格式的原始数据（图片、视频、文字问答），统一加工成模型能吃进去的格式。</p>
+<p>为了让你更容易理解，我把它拆解成一个<strong>“流水线任务清单 (Task To-Do List)”</strong>，一步步带你看它是怎么工作的。</p>
+<hr />
+<h3>任务清单：多模态数据处理流水线</h3>
+<h4>✅ Task 1: 任务分发与分工 (Data Partitioning)</h4>
+<p><strong>代码对应：</strong> <code>_get_partition_bounds</code> 函数
+<strong>观点/逻辑：</strong>
+*   <strong>背景</strong>：在大模型评估时，通常会有很多张显卡（GPU）同时工作。
+*   <strong>动作</strong>：如果不分工，每张卡都会把所有数据跑一遍，浪费时间。这个函数的作用是<strong>切蛋糕</strong>。
+*   <strong>流程</strong>：
+    1.  拿到数据总数（比如 1000 张图）。
+    2.  看有多少个“工人”（<code>num_partitions</code>，即 GPU 数量）。
+    3.  计算当前“工人”（<code>partition_id</code>）应该负责处理哪一部分数据（比如第 0-100 条）。</p>
+<h4>✅ Task 2: 招聘专员 (The Factory Pattern)</h4>
+<p><strong>代码对应：</strong> <code>get_evaluation_dataset</code> 函数（在文件末尾）
+<strong>观点/逻辑：</strong>
+*   <strong>背景</strong>：世界上有很多不同的测试集（TextVQA, MMMU, VideoMME 等），它们的文件夹结构和标注格式都不一样。
+*   <strong>动作</strong>：这是一个<strong>总调度中心</strong>。
+*   <strong>流程</strong>：
+    1.  用户输入任务名称（比如 <code>task="TextVQA"</code>）。
+    2.  函数判断：如果是 TextVQA，就实例化 <code>VQADataset</code> 类；如果是视频任务 VideoMME，就实例化 <code>VideoMMEDataset</code> 类。
+    3.  它统一了接口，不管外面是什么任务，吐出来的都是一个 Dataset 对象。</p>
+<h4>✅ Task 3: 图片处理与“切片” (Image Processing &amp; Tiling)</h4>
+<p><strong>代码对应：</strong> 各个类的 <code>__init__</code> 和 <code>__getitem__</code> 中的 <code>self._transform_img</code>
+<strong>观点/逻辑：</strong>
+*   <strong>背景</strong>：现在的多模态模型（如 LLaVA, NVLM 等）为了看清图片细节，通常支持<strong>高分辨率</strong>。直接把大图缩放成小图会丢失细节。
+*   <strong>动作</strong>：这里引入了一个核心概念 <strong>Tiling (切片)</strong>。
+*   <strong>流程</strong>：
+    1.  读取图片。
+    2.  <strong>关键点</strong>：如果开启 <code>use_tiling</code>，代码会把一张大图切成很多个小方块（Tiles），外加一张缩略图（Thumbnail）。
+    3.  这样模型既能看到全局（缩略图），又能看清细节（切片图）。
+    4.  代码中反复出现的 <code>tile_count</code> 就是告诉模型：“这张图我切成了几块，你自己拼一下”。</p>
+<h4>✅ Task 4: 处理静态图片任务 (Image QA Datasets)</h4>
+<p><strong>代码对应：</strong> <code>VQADataset</code>, <code>CaptioningDataset</code>, <code>MMMUDataset</code>, <code>OCRBenchDataset</code> 等
+<strong>观点/逻辑：</strong>
+*   <strong>背景</strong>：这是最基础的任务，一张图 + 一个问题。
+*   <strong>动作</strong>：标准化输入输出。
+*   <strong>流程</strong>（以 <code>VQADataset</code> 为例）：
+    1.  读取 JSON 文件，找到图片路径和对应的问题。
+    2.  如果找不到图片，尝试加后缀 <code>.jpg</code> 或 <code>.png</code>（容错处理）。
+    3.  <strong>打包返回</strong>：图片 Tensor（可能是多张切片叠在一起）、切片数量、问题文本、答案文本。</p>
+<h4>✅ Task 5: 处理视频任务 (Video QA Datasets)</h4>
+<p><strong>代码对应：</strong> <code>VideoMMEDataset</code>, <code>MotionBenchDataset</code>, <code>MVBenchDataset</code> 等
+<strong>观点/逻辑：</strong>
+*   <strong>背景</strong>：视频其实就是一连串的图片（帧）。
+*   <strong>动作</strong>：抽帧（Frame Extraction）。
+*   <strong>流程</strong>：
+    1.  使用 <code>torchvision.io.read_video</code> 读取视频文件。
+    2.  <strong>抽样</strong>：视频太长模型吃不下，所以根据 <code>num_frames</code>（比如只看 8 帧或 16 帧）均匀地把视频切开，取出几张代表性的图片。
+    3.  把这几张图当成一堆图片塞给模型，模型通过时间顺序来理解动作。</p>
+<h4>✅ Task 6: 处理特殊格式 (Special Formatting)</h4>
+<p><strong>代码对应：</strong> <code>MMMUDataset</code> 和 <code>MathVistaDataset</code>
+<strong>观点/逻辑：</strong>
+*   <strong>背景</strong>：有些高难度评测（如 MMMU）不仅有图，还有复杂的 Prompt 格式（比如 <code>&lt;image 1&gt;</code> 这种占位符）。
+*   <strong>动作</strong>：Prompt 工程处理。
+*   <strong>流程</strong>：
+    1.  解析问题文本，处理其中的 <code>&lt;image&gt;</code> 标签。
+    2.  如果是多选题（Multiple Choice），代码会自动把选项（A, B, C...）拼接到问题后面，并加上提示语 "Answer with the option's letter..."。
+    3.  这确保了模型输出的格式符合评测脚本的要求。</p>
+<h4>✅ Task 7: 最终打包 (The Output)</h4>
+<p><strong>代码对应：</strong> 所有类的 <code>__getitem__</code> 返回值
+<strong>观点/逻辑：</strong>
+*   <strong>背景</strong>：PyTorch 的 DataLoader 需要从这里拿数据喂给模型。
+*   <strong>动作</strong>：统一输出格式。
+*   <strong>返回的元组通常包含</strong>：
+    1.  <code>imgs</code>: 处理好的图像张量（Tensor）。
+    2.  <code>tile_count</code>: 图像切片数量信息。
+    3.  <code>sample_id</code>: 样本的唯一 ID（方便后续统计分数）。
+    4.  <code>question</code>: 最终拼接好的问题文本。
+    5.  <code>answer</code>: 标准答案（用于计算 Loss 或对比准确率）。
+    6.  <code>metadata</code>: 其他元数据（比如题目类型、领域等）。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就是一个<strong>超级转换器</strong>：
+*   <strong>输入</strong>：乱七八糟的硬盘文件（视频、图片、JSON）。
+*   <strong>中间处理</strong>：切图（Tiling）、抽帧（Video Sampling）、拼Prompt。
+*   <strong>输出</strong>：整齐划一的 Tensor 和文本，供模型训练或推理使用。</p>
+<p>你只需要关注 <code>get_evaluation_dataset</code> 这个入口，以及各个 Dataset 类里的 <code>__getitem__</code> 方法，就能明白数据是怎么流向模型的了。</p>

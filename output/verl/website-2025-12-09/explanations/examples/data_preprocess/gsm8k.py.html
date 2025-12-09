@@ -1,0 +1,110 @@
+<h1>examples/data_preprocess/gsm8k.py</h1>
+<p>这段代码其实就是一个<strong>“数据装修工”</strong>。</p>
+<p>它的核心任务是：把原始的 GSM8k（小学数学题数据集）拿过来，清洗一下，提取出最终答案，然后按照<strong>特定的格式</strong>重新包装，最后存成 Parquet 文件，供后续的大模型训练（特别是强化学习训练）使用。</p>
+<p>为了让你更容易理解，我把你当作这个“装修工”，给你列一个 <strong>Task To-Do List</strong>，然后我们一步步对照代码来看。</p>
+<hr />
+<h3>📋 装修工的 Task To-Do List</h3>
+<ol>
+<li><strong>准备工作</strong>：确定把装修好的数据存放在哪里（读取命令行参数）。</li>
+<li><strong>进货</strong>：把原始的数学题库（GSM8k）加载到内存里。</li>
+<li><strong>打造工具</strong>：写一个小功能，专门用来从长篇大论的解题过程中，把<strong>唯一的数字答案</strong>抠出来。</li>
+<li><strong>流水线加工（核心）</strong>：<ul>
+<li>给题目加上一句口头禅：“让我们一步步思考...”。</li>
+<li>把题目包装成“用户提问”的对话格式。</li>
+<li>把正确答案提取出来，做成“阅卷标准”（Reward Model 需要用的）。</li>
+</ul>
+</li>
+<li><strong>打包入库</strong>：把处理好的训练集和测试集，存成 <code>.parquet</code> 格式的文件（一种高效的表格文件）。</li>
+</ol>
+<hr />
+<h3>🪜 逐步讲解（对照代码）</h3>
+<h4>Task 1: 准备工作 (Setup)</h4>
+<p>代码最开始的一大段 <code>argparse</code>，就是在问你：“老板，货从哪来？修好后放哪？”</p>
+<ul>
+<li><strong>代码位置</strong>：<code>if __name__ == "__main__":</code> 下面的 <code>parser.add_argument...</code></li>
+<li><strong>解释</strong>：<ul>
+<li>它定义了输入路径 (<code>local_dataset_path</code>) 和输出路径 (<code>local_save_dir</code>)。</li>
+<li>如果没有指定本地路径，它默认会去 HuggingFace 也就是网上下载。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 进货 (Load Data)</h4>
+<p>装修工开始搬运原材料。</p>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    if local_dataset_path is not None:
+        dataset = datasets.load_dataset(local_dataset_path, "main")
+    else:
+        dataset = datasets.load_dataset(data_source, "main")</code></li>
+<li><strong>解释</strong>：利用 <code>datasets</code> 库把 GSM8k 数据集加载进来，分成了 <code>train</code>（训练用）和 <code>test</code>（考试用）两部分。</li>
+</ul>
+<h4>Task 3: 打造工具 (Extract Solution)</h4>
+<p>原始数据里的答案往往包含很长的推导过程，比如“2+2等于4，所以答案是4”。我们需要一个工具只提取出那个“4”。</p>
+<ul>
+<li><strong>代码位置</strong>：文件开头的 <code>def extract_solution(solution_str):</code></li>
+<li><strong>解释</strong>：<ul>
+<li>GSM8k 数据集有个特点，最终答案都在 <code>####</code> 符号后面。</li>
+<li>这个函数利用正则表达式 (<code>re.search</code>) 找到 <code>####</code> 后面的数字。</li>
+<li>比如输入 <code>"The answer is #### 42"</code>, 它就吐出 <code>"42"</code>。这是为了后面给模型做“判分”用的。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 流水线加工 (The Core Logic)</h4>
+<p>这是整段代码最重要的地方。它定义了一个加工函数 <code>process_fn</code>，要把每一行原始数据变成模型训练需要的样子。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>def make_map_fn(split):</code> 及其内部。</li>
+<li>
+<p><strong>观点与逻辑</strong>：</p>
+<ol>
+<li><strong>加Prompt（提示词）</strong>：
+    <code>python
+    instruction_following = 'Let\'s think step by step and output the final answer after "####".'
+    question = question_raw + " " + instruction_following</code><ul>
+<li><strong>观点</strong>：大模型在做数学题时，如果加一句“让我们一步步思考（Chain of Thought）”，准确率会变高。这里强制把这句话加到题目后面。</li>
+</ul>
+</li>
+<li><strong>抠答案</strong>：
+    <code>python
+    solution = extract_solution(answer_raw)</code><ul>
+<li>用刚才 Task 3 造的工具，把标准答案里的数字拿出来。</li>
+</ul>
+</li>
+<li><strong>格式重组（Data Structure）</strong>：
+    <code>python
+    data = {
+        "prompt": [{"role": "user", "content": question}],
+        "reward_model": {"style": "rule", "ground_truth": solution},
+        ...
+    }</code><ul>
+<li><strong>观点</strong>：现在的模型都是聊天机器人（ChatBot），所以输入不能只是一个字符串，要封装成 <code>role: user</code> 的对话列表。</li>
+<li><strong>观点</strong>：为了后续做强化学习（RLHF），系统需要知道什么是“对”，什么是“错”。这里把 <code>ground_truth</code>（标准答案）单独存放在 <code>reward_model</code> 字段里，方便奖励模型自动判卷。</li>
+</ul>
+</li>
+</ol>
+</li>
+<li>
+<p><strong>执行加工</strong>：
+    <code>python
+    train_dataset = train_dataset.map(function=make_map_fn("train"), with_indices=True)</code></p>
+<ul>
+<li>这就好比启动传送带，把所有数据都过一遍这个加工逻辑。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 打包入库 (Save)</h4>
+<p>最后把装修好的数据存盘。</p>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    train_dataset.to_parquet(os.path.join(local_save_dir, "train.parquet"))</code></li>
+<li><strong>解释</strong>：<ul>
+<li>它把处理好的数据存为 <code>.parquet</code> 文件。这是一种比 CSV 更快、更节省空间的表格文件格式，非常适合大数据训练读取。</li>
+<li>最后几行代码还检查了是否需要把文件上传到 HDFS（一种分布式文件系统，大公司常用），如果需要就 <code>copy</code> 过去。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这段代码的观点是：<strong>原始数据不能直接喂给模型，必须经过“标准化”处理</strong>。
+1.  <strong>标准化输入</strong>：变成对话格式，并强制开启“思维链”（CoT）。
+2.  <strong>标准化输出</strong>：提取出干净的数字答案，以便计算机能自动判断模型算得对不对。</p>

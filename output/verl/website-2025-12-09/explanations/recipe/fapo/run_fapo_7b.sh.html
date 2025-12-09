@@ -1,0 +1,107 @@
+<h1>recipe/fapo/run_fapo_7b.sh</h1>
+<p>这份脚本看起来很长，其实它只是一个<strong>“启动配置文件”</strong>。它本身不写算法逻辑，而是把一大堆参数打包，告诉计算机：“嘿，用这些设置去训练模型”。</p>
+<p>为了让你更轻松地理解，我把它拆解成一个 <strong>“训练任务清单 (Todo List)”</strong>。想象一下，如果你要组织一次模型训练，你需要做哪些决策？</p>
+<h3>📋 训练任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>起名与定调</strong>：这次训练叫什么？用什么算法？</li>
+<li><strong>准备“选手”与“裁判”</strong>：我们要训练哪个模型？谁来给它打分？</li>
+<li><strong>制定规则 (超参数)</strong>：一次学多少数据？允许写多长的文章？</li>
+<li><strong>安排场地 (硬件/环境)</strong>：数据在哪？用几张显卡？用什么加速引擎？</li>
+<li><strong>正式发令 (执行命令)</strong>：把上面所有决定打包，发给服务器开始干活。</li>
+</ol>
+<hr />
+<h3>🟢 逐步解读 (Step-by-Step)</h3>
+<p>下面我按照上面的清单，一步步带你看代码里的对应部分。</p>
+<h4>1. 起名与定调 (Basic Config)</h4>
+<p>这是脚本最开始的部分，定义了项目的基本信息。</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">project_name</span><span class="o">=</span><span class="s1">&#39;FAPO-Reproduce&#39;</span><span class="w">  </span><span class="c1"># 项目叫 FAPO复现</span>
+<span class="nv">exp_name</span><span class="o">=</span><span class="s1">&#39;FAPO-7B&#39;</span><span class="w">             </span><span class="c1"># 实验名叫 FAPO-7B</span>
+
+<span class="nv">adv_estimator</span><span class="o">=</span>grpo<span class="w">             </span><span class="c1"># 核心重点！使用的算法是 GRPO (DeepSeek-R1 同款思路)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这里决定了我们要跑的是 <strong>FAPO</strong> (一种对齐算法)，并且底层使用的是 <strong>GRPO</strong> (Group Relative Policy Optimization) 估计器。</li>
+</ul>
+<h4>2. 准备“选手”与“裁判” (Models &amp; Paths)</h4>
+<p>训练不仅需要一个模型，通常还需要数据和一个能给模型打分的机制。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 选手 (Actor): 我们要训练的主模型</span>
+<span class="nv">MODEL_PATH</span><span class="o">=</span><span class="si">${</span><span class="nv">MODEL_PATH</span><span class="k">:-</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">RAY_DATA_HOME</span><span class="si">}</span><span class="s2">/models/Qwen2.5-Math-7B&quot;</span><span class="si">}</span>
+
+<span class="c1"># 裁判 (Reward Model): 用来给选手的回答打分的模型</span>
+<span class="nv">GRM_PATH</span><span class="o">=</span><span class="si">${</span><span class="nv">GRM_PATH</span><span class="k">:-</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">RAY_DATA_HOME</span><span class="si">}</span><span class="s2">/models/FAPO-GenRM-4B&quot;</span><span class="si">}</span>
+
+<span class="c1"># 数据文件</span>
+<span class="nv">TRAIN_FILE</span><span class="o">=</span>...<span class="w"> </span><span class="c1"># 训练数据</span>
+<span class="nv">TEST_FILE</span><span class="o">=</span>...<span class="w">  </span><span class="c1"># 测试数据</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li><strong>选手</strong>是 <code>Qwen2.5-Math-7B</code>，一个擅长数学的 7B 模型。</li>
+<li><strong>裁判</strong>是 <code>FAPO-GenRM-4B</code>，这是一个生成式奖励模型（GenRM），它专门负责看选手答得好不好。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 制定规则 (Hyperparameters)</h4>
+<p>这里定义了训练的详细参数，决定了训练的“风格”。</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">max_prompt_length</span><span class="o">=</span><span class="k">$((</span><span class="m">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">2</span><span class="k">))</span><span class="w">    </span><span class="c1"># 提问最长 2048 token</span>
+<span class="nv">max_response_length</span><span class="o">=</span><span class="k">$((</span><span class="m">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">8</span><span class="k">))</span><span class="w">  </span><span class="c1"># 回答最长 8192 token (允许模型进行长链推理)</span>
+
+<span class="nv">train_prompt_bsz</span><span class="o">=</span><span class="m">512</span><span class="w">     </span><span class="c1"># 总批次大小：一次看512个问题</span>
+<span class="nv">n_resp_per_prompt</span><span class="o">=</span><span class="m">8</span><span class="w">      </span><span class="c1"># 采样数量：每个问题让模型回答 8 次 (GRPO算法的核心，通过对比这8个回答来学习)</span>
+<span class="nv">train_prompt_mini_bsz</span><span class="o">=</span><span class="m">32</span><span class="w"> </span><span class="c1"># 显卡显存有限，虽然总共看512个，但每次切成32个慢慢算</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这里的配置是为了适应 <strong>推理模型 (Reasoning Model)</strong> 的训练。<code>max_response_length</code> 很大，说明允许模型写很长的思考过程。<code>n_resp_per_prompt=8</code> 是 GRPO 的特征，它需要针对同一个问题生成多种解法来进行对比。</li>
+</ul>
+<h4>4. 安排场地 (Ray &amp; Hardware)</h4>
+<p>这部分涉及到 <code>Ray</code>（一个分布式计算框架）和底层推理引擎的设置。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Ray 设置</span>
+<span class="nv">RAY_ADDRESS</span><span class="o">=</span>...<span class="w"> </span>
+<span class="nv">NNODES</span><span class="o">=</span><span class="m">2</span><span class="w">       </span><span class="c1"># 用 2 个计算节点 (比如两台服务器)</span>
+<span class="nv">RM_NODES</span><span class="o">=</span><span class="m">2</span><span class="w">     </span><span class="c1"># 奖励模型也分布在 2 个节点上</span>
+
+<span class="c1"># 推理引擎设置</span>
+<span class="nv">offload</span><span class="o">=</span>True<span class="w">   </span><span class="c1"># 显存不够时，把参数卸载到 CPU 内存 (省显存)</span>
+<span class="nv">fsdp_size</span><span class="o">=</span><span class="m">8</span><span class="w">    </span><span class="c1"># 全分片数据并行，通常对应 8 卡 GPU</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这告诉脚本如何利用多台机器和多张显卡。它开启了 <code>offload</code>，说明 7B 模型加上训练状态可能显存比较紧张，需要用 CPU 内存辅助。</li>
+</ul>
+<h4>5. 正式发令 (The Command)</h4>
+<p>这是脚本里最长的一段 <code>ray job submit ...</code>。别被吓到，它只是把上面定义的所有变量，翻译成 Python 程序 (<code>verl.trainer.main_ppo</code>) 能看懂的格式。</p>
+<p>我把这个大命令拆成几个逻辑块给你看：</p>
+<ul>
+<li><strong><code>python3 -m verl.trainer.main_ppo</code></strong>: 启动 VeRL 框架的 PPO/GRPO 训练主程序。</li>
+<li><strong><code>data.*</code></strong>: 告诉程序去哪读数据，每条数据怎么截断。</li>
+<li><strong><code>actor_rollout_ref.*</code> (最重要)</strong>:<ul>
+<li><code>rollout.name=vllm</code>: 使用 <strong>vLLM</strong> 引擎来加速文本生成（让模型快速写出8个回答）。</li>
+<li><code>actor.optim.lr=1e-6</code>: 学习率非常低，微调通常都这样。</li>
+<li><code>actor.ppo_mini_batch_size</code>: 对应上面的 mini_bsz。</li>
+</ul>
+</li>
+<li><strong><code>reward_model.*</code></strong>:<ul>
+<li><code>enable=True</code>: 开启奖励模型。</li>
+<li><code>model.path=${GRM_PATH}</code>: 指定裁判模型路径。</li>
+<li><code>reward_manager=dapo</code>: 使用 DAPO (可能是一种特定的奖励管理策略)。</li>
+<li><code>custom_reward_function</code>: 除了模型打分，可能还有自定义的规则（比如格式对不对，答案对不对）。</li>
+</ul>
+</li>
+<li><strong><code>trainer.*</code></strong>:<ul>
+<li><code>total_epochs=10</code>: 总共把数据学 10 遍。</li>
+<li><code>project_name</code>: 方便在 WandB (可视化面板) 上找到这次训练的曲线。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这个脚本在干嘛？</h3>
+<p>用一句话说：
+<strong>这个脚本启动了一个基于 Ray 集群的训练任务，使用 GRPO 算法，让 <code>Qwen2.5-7B</code> 模型针对数学问题每次生成 8 个答案，并利用 <code>FAPO-GenRM</code> 奖励模型对这些答案进行评分，以此来优化 Qwen 模型，让它数学解题能力更强。</strong></p>
+<h3>你的下一步 (Action Item)</h3>
+<p>如果你要运行它，你需要关注以下几点（Todo）：
+1.  <strong>检查路径</strong>：确认 <code>MODEL_PATH</code> 和 <code>GRM_PATH</code> 指向的文件夹里真的有模型文件。
+2.  <strong>检查数据</strong>：确认 <code>TRAIN_FILE</code> 里的 parquet 数据文件存在。
+3.  <strong>显存显卡</strong>：确认你的机器有足够的 GPU（脚本里默认配置看起来需要多卡甚至多机，<code>NNODES=2</code>）。如果是单机，需要把 <code>NNODES</code> 改成 1，并调整 <code>n_gpus_per_node</code>。</p>

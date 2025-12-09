@@ -1,0 +1,92 @@
+<h1>tests/special_e2e/run_prime.sh</h1>
+<p>完全没问题。这个脚本确实包含了很多术语，因为它是在配置一个非常复杂的<strong>强化学习（Reinforcement Learning, RL）</strong>训练任务。</p>
+<p>简单来说，这个脚本在做一件事：<strong>教一个叫 Qwen（通义千问）的小模型做数学题（GSM8K数据集），并使用一种叫 PRIME 的方法来改进它。</strong></p>
+<p>为了让你看懂，我把阅读和理解这个脚本的过程拆解成了一个 <strong>Todo List（任务清单）</strong>。我们一步步勾选，把代码对应到概念上。</p>
+<hr />
+<h3>📝 任务清单：理解 PRIME 训练脚本</h3>
+<h4>✅ Task 1: 准备“厨房”和“食材” (基础设置)</h4>
+<p>首先，脚本的前几行是在准备环境。</p>
+<ul>
+<li><strong>代码位置</strong>: 第 4-11 行</li>
+<li><strong>解读</strong>:<ul>
+<li><code>NUM_GPUS</code>: 决定用多少张显卡（默认 8 张）。</li>
+<li><code>MODEL_ID</code>: <strong>Qwen/Qwen2.5-0.5B</strong>。这是我们的“学生”，一个只有 0.5B 参数量的小模型。</li>
+<li><code>TRAIN_FILES</code>: <strong>gsm8k</strong>。这是“教材”，著名的数学应用题数据集。</li>
+<li><strong>通俗理解</strong>: 我们请了 8 个老师（GPU），要训练一个小学生（0.5B模型），教材是小学奥数（GSM8K）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 算术题：决定“一口吃多少” (Batch Size 计算)</h4>
+<p>这是脚本里最绕的部分，全是数学计算。这是为了决定显卡一次处理多少数据。</p>
+<ul>
+<li><strong>代码位置</strong>: 第 13-18 行</li>
+<li><strong>核心逻辑</strong>:<ul>
+<li><code>n_resp_per_prompt=4</code>: <strong>关键点</strong>。对于每一道数学题，模型要生成 <strong>4 个不同的答案</strong>。为什么要 4 个？为了对比哪个好，哪个坏（这是强化学习的核心）。</li>
+<li><code>train_traj_micro_bsz</code>: 基础批次大小。</li>
+<li><strong>通俗理解</strong>: 并不是一道题一道题地学，而是打包学。<ul>
+<li>系统会算：我有 8 张卡，每张卡处理 2 个数据，那一次就是 16 个数据。</li>
+<li>因为每道题要生成 4 个答案，所以数据量会膨胀。这几行代码就是在算最终塞给显卡的张量（Tensor）形状是多大，防止显存爆炸。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 启动主程序 (The Recipe)</h4>
+<ul>
+<li><strong>代码位置</strong>: 第 22 行 <code>python3 -m recipe.prime.main_prime ...</code></li>
+<li><strong>解读</strong>:<ul>
+<li>这就好比点击了“开始运行”。它调用了一个叫 <code>main_prime</code> 的 Python 程序，后面那一长串 <code>key=value</code> 都是传给这个程序的参数。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 配置“考生”与“考官” (Actor, Rollout, Reference)</h4>
+<p>这是强化学习（RL）的“铁三角”。我们需要配置三个角色的参数。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>actor_rollout_ref</code> 开头的参数</li>
+<li><strong>子任务 A: 考生 (Actor)</strong><ul>
+<li><code>actor.optim.lr=5e-7</code>: 学习率。学生学得非常慢（数字很小），防止学歪了。</li>
+<li><code>rollout.name=vllm</code>: 使用 <strong>vLLM</strong> 这个工具来加速生成答案。</li>
+<li><code>rollout.n=4</code>: 再次确认，每道题生成 4 个答案。</li>
+</ul>
+</li>
+<li><strong>子任务 B: 参照物 (Reference Model)</strong><ul>
+<li><code>ref.fsdp_config...</code>: 这是一个“旧版本的学生”。在训练时，我们会要求新学生不要偏离旧学生太远（防止它为了拿高分开始胡言乱语），这叫 KL 散度约束。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 制定“评分标准” (Algorithm &amp; Reward)</h4>
+<p>学生做完题（生成 4 个答案）后，谁来打分？怎么根据分数改进？</p>
+<ul>
+<li><strong>代码位置</strong>: <code>algorithm</code> 和 <code>reward_model</code> 开头的参数</li>
+<li><strong>解读</strong>:<ul>
+<li><code>algorithm.adv_estimator=rloo</code>: 使用 <strong>RLOO</strong> 算法。简单说，就是在刚才生成的 4 个答案里，把好的挑出来作为正例，差的作为负例，让模型去学习。</li>
+<li><code>reward_model.reward_manager=prime</code>: <strong>这是重点</strong>。这里用了一种叫 <strong>PRIME</strong> 的特殊奖励管理机制。它可能不需要一个巨大的外部奖励模型，而是通过某种逻辑直接判断数学题对不对（因为数学题答案是唯一的，对就是对，错就是错）。</li>
+<li><code>data.filter_accuracy=True</code>: 只保留那些正确率在 0.2 到 0.8 之间的题目。太简单的（全对）不用学，太难的（全错）学不会，只学“跳一跳能够得着”的。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 设定训练时长 (Trainer)</h4>
+<p>最后，我们要告诉系统跑多久。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>trainer</code> 开头的参数</li>
+<li><strong>解读</strong>:<ul>
+<li><code>trainer.project_name='verl-test'</code>: 这是一个测试项目。</li>
+<li><code>trainer.total_training_steps=1</code>: <strong>最重要的线索</strong>。</li>
+<li><strong>通俗理解</strong>: 这里的总步数是 <strong>1</strong>。这意味着这个脚本<strong>不是</strong>为了真的把模型训练聪明，而是一个 <strong>“冒烟测试” (Smoke Test)</strong>。它只是为了跑通整个流程，确保代码没有报错，显卡能正常工作。真正的训练这里可能是几百几千步。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个脚本讲了个什么故事？</h3>
+<blockquote>
+<p>“你好，电脑。请帮我启动一个测试任务。</p>
+<ol>
+<li>用 8 张显卡，加载 Qwen-0.5B 模型。</li>
+<li>加载 GSM8K 数学题。</li>
+<li>对于每道题，让模型尝试写 4 个不同的解题过程。</li>
+<li>使用 vLLM 加速这个生成过程。</li>
+<li>使用 PRIME 方法和 RLOO 算法，对比这 4 个答案的好坏。</li>
+<li><strong>只跑 1 步</strong>，如果跑完了没报错，就说明我们的代码（PRIME 算法实现）是没问题的。”</li>
+</ol>
+</blockquote>
+<p>现在再回去看代码，是不是觉得 <code>actor_rollout_ref</code> 这些吓人的词其实就是给不同的角色分配任务而已？</p>

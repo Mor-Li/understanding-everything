@@ -1,0 +1,133 @@
+<h1>recipe/spin/dp_actor.py</h1>
+<p>这份代码确实涉及了很多强化学习（RL）和分布式训练的术语。别担心，我们可以把它想象成一个<strong>“正在通过自我博弈（SPIN）来通过考试的学生（Actor）”</strong>。</p>
+<p>这个文件定义了一个类 <code>SPINDataParallelPPOActor</code>。简单来说，它是<strong>负责在大规模显卡集群上，执行模型推理（算分）和模型更新（学习）的核心角色</strong>。</p>
+<p>为了让你看懂，我把它拆解成一份<strong>“Actor 的任务清单 (To-Do List)”</strong>。这个 Actor 每天主要干两件事：
+1.  <strong>做卷子算分</strong>（<code>compute_log_prob</code>）：看看自己对某些句子的把握有多大。
+2.  <strong>根据错题本学习</strong>（<code>update_policy_dpo_with_ref</code>）：根据“好答案”和“坏答案”来调整自己的脑子（参数）。</p>
+<p>下面我们一步步来看：</p>
+<hr />
+<h3>任务一：做卷子算分 (<code>compute_log_prob</code>)</h3>
+<p>这个任务的目标是：给一堆句子，算出模型生成这些句子的概率（Log Probability）。</p>
+<p><strong>To-Do List:</strong></p>
+<ol>
+<li>
+<p><strong>进入考试状态</strong> (<code>self.actor_module.eval()</code>)：</p>
+<ul>
+<li>把自己切换到“评估模式”，不要更新参数，专心做题。</li>
+</ul>
+</li>
+<li>
+<p><strong>把大卷子剪成小纸条</strong> (Micro-batching)：</p>
+<ul>
+<li>因为显存有限，如果一次性把几千道题（Batch）塞进显卡，显卡会爆。</li>
+<li>代码逻辑：<code>micro_batches = batch.split(...)</code>。把大 Batch 切分成一个个微小的 Micro-batch。</li>
+</ul>
+</li>
+<li>
+<p><strong>逐个做题</strong> (Loop over micro_batches)：</p>
+<ul>
+<li>对于每一小批数据，不计算梯度（<code>with torch.no_grad()</code>），只快速往前跑一遍模型（Forward Pass）。</li>
+<li>计算出每个 Token 的概率对数值（Log probs）。</li>
+</ul>
+</li>
+<li>
+<p><strong>拼凑答案</strong> (<code>torch.concat</code> &amp; <code>rearrange</code>):</p>
+<ul>
+<li>把刚才分批算出来的分数，按原来的顺序拼回去，变成一张完整的成绩单。</li>
+<li><em>注：代码里处理了“动态Batch Size”的复杂情况，就是为了防止乱序，最后要把顺序理顺。</em></li>
+</ul>
+</li>
+<li>
+<p><strong>交卷</strong> (Return <code>log_probs</code>)：</p>
+<ul>
+<li>返回所有句子的概率分值。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>任务二：根据“好坏对比”来进化 (<code>update_policy_dpo_with_ref</code>)</h3>
+<p>这是最核心的部分。SPIN 算法使用 <strong>DPO (Direct Preference Optimization)</strong> 的方式来更新模型。也就是告诉模型：“这句话好，多学学；那句话烂，离远点”。</p>
+<p><strong>特别注意</strong>：这个函数名里带 <code>_with_ref</code>，意思是它<strong>不需要</strong>自己在显卡里同时跑一个“参考模型（Reference Model）”，而是直接从数据里读取<strong>已经算好的</strong>参考分数。这非常省显存！</p>
+<p><strong>To-Do List:</strong></p>
+<ol>
+<li>
+<p><strong>进入学习状态</strong> (<code>self.actor_module.train()</code>)：</p>
+<ul>
+<li>把自己切换到“训练模式”，准备调整参数。</li>
+</ul>
+</li>
+<li>
+<p><strong>准备教材</strong> (Retrieve Data):</p>
+<ul>
+<li>从输入数据 <code>data</code> 里拿到：<ul>
+<li><strong>Chosen（胜者）</strong>：好的回答（通常是上一轮更强的模型生成的）。</li>
+<li><strong>Rejected（败者）</strong>：差的回答（通常是这一轮较弱的模型生成的）。</li>
+<li><strong>Reference Logps（参考分）</strong>：老师（旧模型）给这俩回答打的分。<strong>这一步很关键，直接读数据，不算。</strong></li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>制定学习计划</strong> (Setup Micro-batches):</p>
+<ul>
+<li>同样因为显存不够，把这一大堆学习资料切分成小块（Micro-batches）。</li>
+<li>计算一共要切多少块，用于后面梯度累积（Gradient Accumulation）。</li>
+</ul>
+</li>
+<li>
+<p><strong>清空之前脑子里的杂念</strong> (<code>zero_grad</code>):</p>
+<ul>
+<li>把之前的梯度清零。</li>
+</ul>
+</li>
+<li>
+<p><strong>开始分批刻苦钻研</strong> (Loop over micro-batches):</p>
+<ul>
+<li><strong>步骤 A：看题</strong>。<ul>
+<li>把“胜者”和“败者”的输入数据（Input IDs, Mask）拿出来。</li>
+</ul>
+</li>
+<li><strong>步骤 B：自我反思 (Forward Pass)</strong>。<ul>
+<li>用<strong>当前</strong>的模型跑一遍“胜者”和“败者”，算出<strong>当前</strong>的得分 (<code>policy_chosen_logps</code>, <code>policy_rejected_logps</code>)。</li>
+<li><em>注意：这一步是带梯度的，因为我们要更新当前模型。</em></li>
+</ul>
+</li>
+<li><strong>步骤 C：对比老师的分数</strong>。<ul>
+<li>拿出数据里自带的“老师打分” (<code>micro_ref_chosen_logps</code>)。</li>
+</ul>
+</li>
+<li><strong>步骤 D：计算差距 (DPO Loss)</strong>。<ul>
+<li>核心逻辑：<code>compute_online_dpo_loss</code>。</li>
+<li>意思就是：对于“胜者”，我的分要比老师高；对于“败者”，我的分要比老师低。如果做不到，就产生 Loss（损失/痛苦）。</li>
+</ul>
+</li>
+<li><strong>步骤 E：积累经验 (Backward)</strong>。<ul>
+<li><code>scaled_loss.backward()</code>。把这份“痛苦”反向传播回去，计算出每个神经元该怎么改。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>真正改变自己</strong> (<code>_optimizer_step</code>):</p>
+<ul>
+<li>等所有小批次都看完了，梯度也攒够了，执行一次 <code>optimizer.step()</code>，正式修改模型参数。</li>
+</ul>
+</li>
+<li>
+<p><strong>写日记</strong> (Metrics):</p>
+<ul>
+<li>记录下这次学习的成果：Loss 是多少？胜者和败者的分差拉开了吗？准确率是多少？</li>
+<li>返回这些数据用于监控训练进度。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这代码到底是干啥的？</h3>
+<p>这代码是 <strong>SPIN 算法在分布式训练中的“执行者”</strong>。</p>
+<ol>
+<li><strong>它不仅仅是 DPO</strong>：虽然用的是 DPO 的公式，但在 SPIN 的语境下，数据来源于模型之前的迭代（自我博弈），而不是人类标注。</li>
+<li><strong>它是省钱高手</strong>：普通的 DPO 需要在显卡里同时放两个模型（Policy 和 Reference）。这个代码设计的 <code>update_policy_dpo_with_ref</code> 允许把 Reference 的计算剥离出去（比如在生成数据时就顺便算好了），从而让训练过程极大地节省显存，能跑更大的模型或更大的 Batch Size。</li>
+<li><strong>它是切片高手</strong>：代码里大量的逻辑（<code>rearrange_micro_batches</code>, <code>split</code>, <code>concat</code>）都是为了处理超长序列或大规模数据时的显存管理（Micro-batching）。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这是一个<strong>为了省显存</strong>，支持<strong>预先计算参考分</strong>，并能<strong>处理大规模切片数据</strong>的 DPO 训练器，专门用于 SPIN 这种自我博弈的训练流程中。</p>

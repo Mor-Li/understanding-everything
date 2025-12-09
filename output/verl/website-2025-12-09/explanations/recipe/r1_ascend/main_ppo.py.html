@@ -1,0 +1,70 @@
+<h1>recipe/r1_ascend/main_ppo.py</h1>
+<p>这份代码确实涉及很多底层框架的概念（Ray, Hydra, PPO, Megatron），直接看容易晕。</p>
+<p>别担心，我们把它想象成<strong>“组织一场大型分布式的AI训练工程”</strong>。这份文件就是<strong>总指挥官的命令书</strong>。</p>
+<p>我为你列了一个 <strong>5步走的 Task List</strong>，我们一步步拆解它的逻辑：</p>
+<hr />
+<h3>Task 1: 搞懂这是在干嘛 (Context)</h3>
+<p><strong>核心观点：</strong> 这是一份针对 <strong>华为昇腾 (Ascend) NPU 芯片</strong> 定制的启动脚本。
+*   <strong>目标：</strong> 运行 <strong>PPO (Proximal Policy Optimization)</strong> 算法，这是一种强化学习算法（类似于训练 ChatGPT 或 DeepSeek-R1 用的技术）。
+*   <strong>平台：</strong> 基于 <code>verl</code> 框架（字节跳动开源的强化学习库），但为了能在华为的硬件上跑，做了一些“魔改”。</p>
+<h3>Task 2: 搞懂配置与工具 (Tools)</h3>
+<p><strong>核心观点：</strong> 代码开头引入了两个关键工具来管理这一大摊子事。
+1.  <strong>Hydra (<code>@hydra.main</code>)</strong>:
+    *   <strong>通俗解释：</strong> 它是<strong>“配置管理员”</strong>。
+    *   <strong>代码位置：</strong> <code>def main(config):</code>
+    *   <strong>作用：</strong> AI训练有几百个参数（学习率、模型路径、GPU数量等），Hydra 负责从配置文件里读取这些参数，打包成 <code>config</code> 传给程序。
+2.  <strong>Ray (<code>import ray</code>)</strong>:
+    *   <strong>通俗解释：</strong> 它是<strong>“包工头”</strong>。
+    *   <strong>作用：</strong> 因为一个显卡跑不动，需要几十上百张卡一起跑。Ray 负责把这些分散的计算资源（CPU/GPU/NPU）连接起来，统一调度。</p>
+<h3>Task 3: 启动集群 (Initialization)</h3>
+<p><strong>核心观点：</strong> <code>run_ppo</code> 函数的第一阶段是<strong>“搭建工地”</strong>。</p>
+<ul>
+<li><strong>代码段：</strong> <code>if not ray.is_initialized(): ... ray.init(...)</code></li>
+<li><strong>解读：</strong><ol>
+<li>检查 Ray 有没有启动？没有的话就启动它。</li>
+<li>设置环境变量（比如 <code>NCCL_DEBUG</code> 用于调试通信，<code>VLLM</code> 日志等）。</li>
+<li>这就好比在开工前，先通水通电，把工人们（计算节点）都叫到一个群里。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 4: 委派任务 (Task Runner)</h3>
+<p><strong>核心观点：</strong> 代码并没有直接在主线程里跑训练，而是雇了一个<strong>“代理人”</strong>去跑。</p>
+<ul>
+<li><strong>代码段：</strong> <code>runner = ray.remote(num_cpus=1)(TaskRunner).remote()</code> 然后 <code>ray.get(runner.run.remote(config))</code></li>
+<li><strong>解读：</strong><ol>
+<li>创建了一个 <code>TaskRunner</code> 的实例。</li>
+<li><strong>关键点：</strong> 这个 Runner 是在 Ray 的集群里“远程”运行的，而不是在当前这个脚本的进程里。</li>
+<li>如果有性能分析需求（代码里的 <code>nsys</code>），它还会挂载专门的监控工具。</li>
+<li>最后 <code>runner.run</code> 才是真正按下“开始训练”的按钮。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 5: 华为昇腾的“特供”修改 (The Adaptation)</h3>
+<p><strong>核心观点：</strong> 这是整个文件<strong>最重要</strong>的部分，也是它为什么存在的原因。</p>
+<ul>
+<li><strong>代码段：</strong> <code>class TaskRunner(TaskRunnerBase):</code> 及其内部的 <code>add_actor_rollout_worker</code> 方法。</li>
+<li><strong>背景：</strong> 在强化学习中，有一个角色叫 <strong>Actor (演员)</strong>，负责生成数据（Rollout）。</li>
+<li><strong>逻辑拆解：</strong><ol>
+<li>它继承了原本的 <code>TaskRunnerBase</code>（标准版）。</li>
+<li>但是！它重写了 <code>add_actor_rollout_worker</code> 方法。</li>
+<li><strong>看这里：</strong>
+    <code>python
+    elif config.actor_rollout_ref.actor.strategy == "megatron":
+        # ...
+        # NPU-ADAPTATION: Modify the Megatron worker entry point...
+        from .megatron_workers import ActorRolloutRefWorker
+        # NPU-ADAPTATION END</code></li>
+<li><strong>人话翻译：</strong> 标准版的 <code>verl</code> 库用的是通用的 Worker，但在华为昇腾芯片上跑 Megatron（一种大模型并行框架）时，标准版会报错或跑不通。所以，作者在这里<strong>偷梁换柱</strong>，强制让程序加载当前目录下的 <code>.megatron_workers</code>，这是专门为华为 NPU 修复过的版本。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>如果把这个文件看作一个<strong>“施工指令”</strong>，它的意思是：</p>
+<ol>
+<li><strong>(Task 1 &amp; 2)</strong> 使用 Hydra 读取图纸，呼叫 Ray 组建施工队。</li>
+<li><strong>(Task 3)</strong> 确保所有机器联网、环境配置就绪。</li>
+<li><strong>(Task 4)</strong> 指定一个总工头 (<code>TaskRunner</code>) 去现场指挥。</li>
+<li><strong>(Task 5)</strong> <strong>特别叮嘱总工头：</strong> 如果我们要用 Megatron 方案盖楼，<strong>千万别用原来的那个工人，要用我给你专门指派的这个懂华为设备的工人 (<code>.megatron_workers</code>)</strong>。</li>
+</ol>
+<p>这就是为什么会有这个文件：为了在华为昇腾硬件上，兼容 DeepSeek/Verl 的训练流程而做的<strong>适配层</strong>。</p>

@@ -1,0 +1,63 @@
+<h1>recipe/r1_ascend/README_zh.md</h1>
+<p>这份文件实际上是一个<strong>技术操作指南（Recipe）</strong>。</p>
+<p>简单来说，它的核心目的是：<strong>教你怎么在华为昇腾（Ascend NPU）芯片上，对 DeepSeek-V3 这个超大模型进行强化学习（RLHF）训练。</strong></p>
+<p>因为 DeepSeek 原生主要是基于 NVIDIA GPU 开发的，要把它搬到国产昇腾 NPU 上跑，会有很多“水土不服”的地方。这份文档就是告诉你如何解决这些问题，并提供了一套完整的操作流程。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>项目经理视角的 Task To-Do List（任务清单）</strong>，按顺序列出你需要做的事情：</p>
+<hr />
+<h3>第一阶段：项目准备（搞懂我们要干啥）</h3>
+<ul>
+<li><strong>核心目标</strong>：复现 DeepSeek-R1-Zero 的训练流程。</li>
+<li><strong>使用模型</strong>：DeepSeek-V3-Base（671B参数的巨型模型）。</li>
+<li><strong>使用硬件</strong>：昇腾 NPU（比如 Atlas 800T A3 服务器，文档里用了128张卡）。</li>
+<li><strong>训练方法</strong>：GRPO（一种强化学习算法）+ 规则奖励（做对了数学题给奖励）。</li>
+<li><strong>使用数据</strong>：DeepScaler（一个数学推理数据集）。</li>
+</ul>
+<hr />
+<h3>第二阶段：环境搭建（把厨房建好）</h3>
+<p><strong>Task 1: 准备基础软件环境</strong>
+*   <strong>动作</strong>：你需要安装 docker 或者配置 python 环境。
+*   <strong>细节</strong>：因为是在 NPU 上跑，不能直接用官方的包，得去拉取特定适配过的版本：
+    *   <code>verl</code>（强化学习框架）
+    *   <code>vLLM</code>（推理加速框架，要用昇腾适配版 <code>vLLM-Ascend</code>）
+    *   <code>MindSpeed</code>（昇腾的大模型训练库）
+    *   <code>Megatron-LM</code>（大模型并行训练的基础库）</p>
+<p><strong>Task 2: 准备训练食材（数据处理）</strong>
+*   <strong>动作</strong>：下载 DeepScaler 数据集，并把它切好、腌制好。
+*   <strong>细节</strong>：
+    *   下载 <code>json</code> 格式的数据。
+    *   运行脚本 <code>json_to_parquet.py</code> 把数据转换格式。
+    *   <strong>关键点</strong>：在这个过程中，给数据加了“提示词模板”。也就是强制模型在回答前先 <code>&lt;think&gt;</code>（思考），再 <code>&lt;answer&gt;</code>（回答）。这是 R1 模型的精髓。</p>
+<p><strong>Task 3: 准备模型本体（处理冻肉）</strong>
+*   <strong>动作</strong>：下载 DeepSeek-V3 的权重，并转换格式。
+*   <strong>挑战</strong>：模型太大（671B），且原始格式是 FP8，NPU 训练需要 BF16。
+*   <strong>步骤</strong>：
+    1.  下载模型（需要 650GB 磁盘）。
+    2.  把 FP8 格式转成 BF16 格式（膨胀到 1300GB，需要超大磁盘）。
+    3.  <strong>切分权重</strong>：单张卡放不下，必须把模型切碎（Sharding），分散存储。文档提到因为模型太大，甚至需要用 64 张卡来协助完成切分。</p>
+<hr />
+<h3>第三阶段：解决“水土不服”（代码魔改）</h3>
+<p>这一部分是文档中 <strong>“实现细节 (Implementation Details)”</strong> 的核心，也是最难懂的部分。你就理解为：<strong>为了让代码在 NPU 上不报错、跑得快，作者打了这几个补丁（Patch）：</strong></p>
+<p><strong>Task 4: 修复 NPU 兼容性 BUG</strong>
+*   <strong>Patch 1 (奖励函数)</strong>：写了一个简单的数学判卷代码，用来给模型打分（做对加分）。
+*   <strong>Patch 2 (内存泄露)</strong>：修复了 NPU 上 <code>vLLM</code> 休眠时内存清不干净的问题，防止显存爆了。
+*   <strong>Patch 3 (通信问题)</strong>：为了让多张卡一起推理（专家并行），手动修复了通信连接的代码。
+*   <strong>Patch 4 (编译加速)</strong>：
+    *   NPU 的 <code>MindSpeed</code> 训练时不能用 <code>torch.compile</code>（会报错）。
+    *   但是推理时需要用 <code>torch.compile</code>（为了快）。
+    *   <strong>解决</strong>：写了个补丁，让它“推理时开加速，训练时关加速”，以此兼容。
+*   <strong>Patch 5 (内存踩踏)</strong>：修复了推理引擎调度缓存时的一个 Bug，防止内存数据写乱。</p>
+<hr />
+<h3>第四阶段：开始烹饪（执行训练）</h3>
+<p><strong>Task 5: 配置参数与启动</strong>
+*   <strong>动作</strong>：修改配置文件，运行启动脚本。
+*   <strong>关键修改</strong>：文档提到为了做 On-policy（同策略）训练，需要改一行代码，确保新旧概率完全一致。
+*   <strong>启动命令</strong>：运行 <code>bash ./recipe/r1_ascend/ray_start_grpo_npu.sh</code>。</p>
+<p><strong>Task 6: 监控训练过程</strong>
+*   <strong>资源消耗</strong>：这一顿操作需要 128 张 NPU 卡（非常昂贵）。
+*   <strong>性能指标</strong>：文档列出了吞吐量（TPS）和各阶段耗时。
+    *   <code>gen耗时</code>（生成思考过程）：约 482秒。
+    *   <code>update耗时</code>（模型学习更新）：约 343秒。
+    *   这意味着走一步训练需要花费很长时间（单步总耗时约 1000秒）。</p>
+<hr />
+<h3>总结</h3>
+<p>这篇文档就是告诉你在拥有 <strong>几百张华为昇腾显卡</strong> 的情况下，如何通过 <strong>一系列复杂的代码修改和数据处理</strong>，把 <strong>DeepSeek-V3</strong> 这个大模型跑起来，让它学会 <strong>像 R1 一样通过思考来解决数学题</strong>。</p>

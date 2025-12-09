@@ -1,0 +1,97 @@
+<h1>examples/data_preprocess/geo3k.py</h1>
+<p>这段代码其实就是一个<strong>“数据加工流水线”</strong>的脚本。</p>
+<p>它的核心目的是：<strong>把原始的几何题数据集（Geometry3k），转换成大模型训练框架（这里是 VeRL 框架）所需要的标准格式，并保存下来。</strong></p>
+<p>不用担心代码细节，我们把它想象成你在给电脑布置的一份 <strong>Task Todo List（任务清单）</strong>。我们可以把整个流程分为 4 个主要步骤：</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>准备阶段 (Setup)</strong>：<ul>
+<li>告诉电脑：原始数据在哪？处理好的数据存哪？</li>
+</ul>
+</li>
+<li><strong>进货阶段 (Loading)</strong>：<ul>
+<li>去仓库（Hugging Face 或本地）把 <code>Geometry3k</code> 这个几何题数据集搬过来。</li>
+</ul>
+</li>
+<li><strong>加工阶段 (Processing)</strong> —— <em>这是最核心的一步</em>：<ul>
+<li>给每道题加一段“咒语”（提示词），要求模型先思考再回答。</li>
+<li>把数据整理成“对话”的格式（User 问，AI 答）。</li>
+<li>提取答案，作为后续奖励模型（Reward Model）评分的标准。</li>
+</ul>
+</li>
+<li><strong>打包发货 (Saving)</strong>：<ul>
+<li>把处理好的数据压缩保存成 <code>.parquet</code> 格式（一种高效的数据存储格式）。</li>
+<li>如果有需要，同步上传到云端存储（HDFS）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步详解 (Step-by-Step)</h3>
+<p>现在我们对照代码，一步步看它是怎么完成上面这个清单的：</p>
+<h4>1. 准备阶段：设定路径</h4>
+<p>代码开头的一大段 <code>argparse</code> 就是在做配置。
+*   <strong>观点/逻辑</strong>：脚本不能写死路径，要允许用户在运行命令时指定。
+*   <strong>代码行为</strong>：
+    *   <code>--local_dataset_path</code>: 如果你已经下载好了，告诉我在哪。
+    *   <code>--local_save_dir</code>: 处理完的文件存到哪（默认存到 <code>~/data/geo3k</code>）。</p>
+<h4>2. 进货阶段：加载数据</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">local_dataset_path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">dataset</span> <span class="o">=</span> <span class="n">datasets</span><span class="o">.</span><span class="n">load_dataset</span><span class="p">(</span><span class="n">local_dataset_path</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">dataset</span> <span class="o">=</span> <span class="n">datasets</span><span class="o">.</span><span class="n">load_dataset</span><span class="p">(</span><span class="n">data_source</span><span class="p">)</span> <span class="c1"># data_source = &quot;hiyouga/geometry3k&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/逻辑</strong>：我们需要原材料。</li>
+<li><strong>代码行为</strong>：使用 Hugging Face 的 <code>datasets</code> 库加载数据。它包含了几何题目、图片和答案。</li>
+</ul>
+<h4>3. 加工阶段：格式化与“加咒语” (核心！)</h4>
+<p>这是代码中 <code>instruction_following</code> 和 <code>make_map_fn</code> 部分。</p>
+<p><strong>A. 设定“咒语” (System Prompt/Instruction)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">instruction_following</span> <span class="o">=</span> <span class="p">(</span>
+    <span class="sa">r</span><span class="s2">&quot;You FIRST think about the reasoning process as an internal monologue... &quot;</span>
+    <span class="sa">r</span><span class="s2">&quot;MUST BE enclosed within &lt;think&gt; &lt;/think&gt; tags. &quot;</span>
+    <span class="sa">r</span><span class="s2">&quot;The final answer MUST BE put in \boxed</span><span class="si">{}</span><span class="s2">.&quot;</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/逻辑</strong>：现在的推理模型（类似 DeepSeek-R1 或 OpenAI o1）需要经过“思考链（Chain of Thought）”训练。</li>
+<li><strong>代码行为</strong>：这段文字强制要求 AI：<strong>“你必须先在 <code>&lt;think&gt;</code> 标签里写下思考过程，最后把答案放在 <code>\boxed{}</code> 里”</strong>。这成为了题目的一部分。</li>
+</ul>
+<p><strong>B. 数据变形 (Data Transformation)</strong>
+函数 <code>process_fn</code> 是具体的加工车间：
+*   <strong>原始数据长这样</strong>：
+    *   <code>problem</code>: "求三角形面积..."
+    *   <code>answer</code>: "15"
+*   <strong>加工后的数据长这样</strong>（为了喂给模型训练）：
+    <code>python
+    {
+        "prompt": [
+            {
+                "role": "user", 
+                "content": "求三角形面积... (后面加上了上面的咒语)"
+            }
+        ],
+        "reward_model": {
+            "style": "rule",       # 告诉评分系统：用规则匹配来评分
+            "ground_truth": "15"   # 标准答案是 15
+        },
+        "images": [...],           # 保留图片信息
+        ...
+    }</code>
+*   <strong>代码行为</strong>：<code>dataset.map(...)</code> 这行代码就是把这个加工逻辑应用到每一条数据上。</p>
+<h4>4. 打包发货：保存文件</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">train_dataset</span><span class="o">.</span><span class="n">to_parquet</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">local_save_dir</span><span class="p">,</span> <span class="s2">&quot;train.parquet&quot;</span><span class="p">))</span>
+<span class="n">test_dataset</span><span class="o">.</span><span class="n">to_parquet</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">local_save_dir</span><span class="p">,</span> <span class="s2">&quot;test.parquet&quot;</span><span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/逻辑</strong>：处理完的数据需要存下来，方便后续的训练脚本直接读取。</li>
+<li><strong>代码行为</strong>：保存为 <code>parquet</code> 文件。你可以把它理解为一种比 CSV 更快、更小、更适合大数据的 Excel 表格。</li>
+<li>最后几行代码检查是否需要把文件上传到 HDFS（一种分布式文件系统，大公司常用），如果需要就 copy 过去。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>“翻译官”</strong>。</p>
+<p>它把原始的几何题目（Geometry3k），翻译成了 VeRL 训练框架能听懂的“方言”（包含 Prompt、User/Assistant 格式、Reward Model 格式），并加上了“要展示思考过程”的特殊指令。</p>

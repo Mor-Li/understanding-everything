@@ -1,0 +1,118 @@
+<h1>megatron/core/datasets/retro/query/query.py</h1>
+<p>这份代码是 <strong>NVIDIA Megatron-LM</strong> 项目中用于 <strong>RETRO (Retrieval-Enhanced Transformer)</strong> 模型预处理的核心部分。</p>
+<p>为了让你听懂，我们先打个比方：</p>
+<p><strong>RETRO 模型就像一个参加“开卷考试”的学生。</strong>
+*   <strong>普通 GPT</strong>：闭卷考试，全靠死记硬背（训练数据）。
+*   <strong>RETRO</strong>：开卷考试，遇到不懂的题目，可以去翻阅一本巨大的“参考书”（数据库）。</p>
+<p><strong>这个文件 (<code>query.py</code>) 的作用就是：</strong>
+在上考场之前，先帮这位学生把“参考书”里的重点划好。具体来说，它会遍历所有的训练题目（GPT 数据集），提前去数据库里查好相关的资料，并把资料的页码记下来，存到硬盘上。等真正训练（考试）的时候，直接读这些页码就能看到资料了。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<p>为了完成这个“预先查资料”的工作，代码逻辑是按照下面这个 List 一步步执行的：</p>
+<ol>
+<li><strong>[准备阶段] 准备好“图书馆”和“目录”</strong><ul>
+<li>加载包含所有知识的数据库。</li>
+<li>加载用于快速搜索的索引工具 (Faiss)。</li>
+</ul>
+</li>
+<li><strong>[任务分配] 把作业分成小块</strong><ul>
+<li>因为题目太多（数据量太大），不能一次性做完，要分成很多个小任务块 (Block) 逐步处理。</li>
+</ul>
+</li>
+<li><strong>[理解题目] 把文字变成计算机懂的数字 (Embedding)</strong><ul>
+<li>读取当前的训练文本，用一个 BERT 模型把它转换成向量。</li>
+</ul>
+</li>
+<li><strong>[查阅资料] 去索引里搜索相似内容</strong><ul>
+<li>拿着向量去 Faiss 索引里搜，找出最相似的几个片段。</li>
+</ul>
+</li>
+<li><strong>[去重/防作弊] 过滤掉无效资料</strong><ul>
+<li><strong>关键点</strong>：如果搜到的资料就在题目这篇文章里（比如上一句），那不算“外部知识”，要剔除掉。</li>
+</ul>
+</li>
+<li><strong>[存档] 把查到的结果存盘</strong><ul>
+<li>把搜到的资料 ID 写入 <code>.h5</code> 文件，供后续训练使用。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码解读</h3>
+<p>现在我们按照上面的 Todo List，把代码里的函数对应进去讲解：</p>
+<h4>1. 准备阶段：<code>query_neighbors</code> (主入口)</h4>
+<p>这是整个脚本的起点（Main Entry Point）。
+*   <strong>要做的事</strong>：
+    *   加载 <code>db_dataset</code>：这是我们的“知识库”，里面存了所有的文档切片信息。
+    *   调用 <code>get_index(config)</code>：加载 <strong>Faiss</strong> 索引。Faiss 是 Facebook 开源的一个极其高效的向量搜索库，你可以把它理解为“超级谷歌”，专门用来搜向量。
+    *   <strong>代码对应</strong>：
+        <code>python
+        def query_neighbors(config):
+            # ...
+            # 加载数据库信息
+            db_dataset = get_db_merged_train_dataset(...)
+            # 加载 Faiss 索引
+            index = get_index(config)
+            # ...</code></p>
+<h4>2. 任务分配：<code>query_dataset_neighbors</code></h4>
+<p>因为数据量可能有几百 GB 甚至 TB 级，内存放不下，所以必须分批处理。
+*   <strong>要做的事</strong>：
+    *   把整个 GPT 数据集切分成很多个 <code>block</code>（块）。
+    *   使用 <code>psutil</code> 监控内存，防止机器卡死。
+    *   通过 <code>torch.distributed</code> 让多张显卡（如果有的话）分工合作，别抢同一个任务。
+    *   <strong>代码对应</strong>：
+        <code>python
+        # 遍历每一个 block
+        for block_index, block in enumerate(active_blocks):
+            # 处理这个 block
+            query_block_neighbors(...)</code></p>
+<h4>3. 理解题目：<code>embed_block</code></h4>
+<p>现在我们要处理具体的一小块数据了。
+*   <strong>要做的事</strong>：
+    *   把这一块里的文本拿出来。
+    *   使用一个预训练好的 BERT 模型（<code>config.retro_bert_embedders</code>），把文本变成<strong>向量 (Embeddings)</strong>。
+    *   <em>通俗解释</em>：把“苹果”变成 <code>[0.1, 0.5, ...]</code> 这样的一串数字，方便计算机计算相似度。
+    *   <strong>代码对应</strong>：
+        <code>python
+        def embed_block(..., block):
+            # ...
+            # 调用 BERT 模型生成向量
+            return config.retro_bert_embedders.mem.embed_text_dataset(...)</code></p>
+<h4>4 &amp; 5. 查阅与过滤：<code>query_embeddings</code> (核心逻辑)</h4>
+<p>这是最复杂也是最重要的部分。
+*   <strong>要做的事</strong>：
+    *   <strong>搜索 (Search)</strong>：调用 <code>index.search(embeddings)</code>。给出一句话的向量，Faiss 告诉我们数据库里哪几句话跟它最像。
+    *   <strong>过滤 (Filter)</strong>：这是 RETRO 的特殊逻辑。
+        *   <strong>问题</strong>：假设我们在预测“哈利波特骑着扫帚飞”的下一句。如果检索结果直接给出了这本书的下一页，那模型就不用学了，直接抄就行，这叫“数据泄露” (Data Leakage)。
+        *   <strong>解决</strong>：代码会检查搜到的结果 <code>neighbor_id</code> 所属的文档 ID (<code>doc_id</code>)。如果搜到的结果和当前输入属于<strong>同一篇文档</strong>，就把它<strong>删掉</strong>（设为 -1 或跳过）。
+    *   <strong>代码对应</strong>：
+        ```python
+        def query_embeddings(...):
+            # 1. 搜索
+            _, query_neighbor_ids = index.search(...)</p>
+<div class="codehilite"><pre><span></span><code>        # 2. 过滤
+        for chunk_id in range(...):
+            # 拿到当前样本属于哪篇文章
+            sample_doc_ids = sample[&quot;doc_ids&quot;]
+            # ...
+            # 如果搜到的邻居也在这些文章里，就不要它
+            filtered_row = [i for i in query_row if ... not in sample_doc_tuples]
+    ```
+</code></pre></div>
+
+<h4>6. 存档：<code>query_block_neighbors</code></h4>
+<p>把辛苦算出来的结果保存下来。
+*   <strong>要做的事</strong>：
+    *   协调上面所有的步骤（先 Embedding，再 Query）。
+    *   使用 <code>h5py</code> 库创建一个 <code>.h5</code> 文件。
+    *   把过滤后的 <code>filtered_neighbor_ids</code> 存进去。
+    *   这些文件以后会被用来构建训练数据样本。
+    *   <strong>代码对应</strong>：
+        <code>python
+        def query_block_neighbors(...):
+            # ...
+            # 存盘
+            f = h5py.File(block["path"], "w")
+            f.create_dataset("neighbors", data=filtered_neighbor_ids)
+            f.close()</code></p>
+<h3>总结</h3>
+<p>这个脚本就像一个<strong>超级图书管理员</strong>。它不负责写文章（那是 GPT 的事），它的工作是通读所有要写的文章，然后去图书馆里把相关的参考资料全部找出来，把不合规的资料（同源文档）剔除，最后把资料的索引号整整齐齐地列个单子存好。</p>

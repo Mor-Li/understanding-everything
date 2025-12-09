@@ -1,0 +1,114 @@
+<h1>recipe/fapo/reward_fn_reasoning_remote.py</h1>
+<p>这份代码是一个用于 <strong>AI 数学推理训练的“判卷老师”程序</strong>。</p>
+<p>它的核心目的是：<strong>不仅看答案对不对，还要看过程对不对。</strong></p>
+<p>在训练 AI 做数学题时，有时候 AI 会“蒙对”答案（答案对了，但推理过程是错的），这叫 <strong>Flawed Positive (有瑕疵的正确)</strong>。这个脚本就是为了把这种情况抓出来，扣掉分数，防止模型学会投机取巧。</p>
+<p>为了让你更容易理解，我把这个脚本的工作流程拆解成一个 <strong>5步的 Task Todo List</strong>，并逐一讲解。</p>
+<hr />
+<h3>📝 判卷流程 Task List</h3>
+<ol>
+<li><strong>Task 1: 初步批改（只看结果）</strong><ul>
+<li>检查 AI 写的最终答案（Boxed Answer）和标准答案是否一致。</li>
+</ul>
+</li>
+<li><strong>Task 2: 决定是否需要“人工复核”</strong><ul>
+<li>如果答案错了，直接打分 -1，结束。</li>
+<li>如果答案<strong>对了</strong>，进入下一步（因为可能是蒙对的）。</li>
+</ul>
+</li>
+<li><strong>Task 3: 呼叫“专家模型” (GenRM)</strong><ul>
+<li>把题目、标准答案、AI 的解题过程打包，发送给一个更厉害的远程 AI 模型（FAPO-4B-GenRM）。</li>
+</ul>
+</li>
+<li><strong>Task 4: 专家找茬（寻找逻辑漏洞）</strong><ul>
+<li>专家模型会一行行检查 AI 的推理步骤。</li>
+<li>如果发现哪一步瞎编了，就指出错误步骤的编号。</li>
+<li>如果全对，就返回 -1。</li>
+</ul>
+</li>
+<li><strong>Task 5: 最终定分</strong><ul>
+<li>如果专家没找到错误：保持满分（1.0）。</li>
+<li>如果专家找到了错误（虽然答案对了）：判为“蒙对的”，分数降为 0。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码对应讲解</h3>
+<h4>Task 1: 初步批改（只看结果）</h4>
+<p><strong>代码位置：</strong> <code>compute_score_baseline</code> 函数
+<strong>讲解：</strong>
+这是最基础的判卷逻辑。
+*   它提取 AI 输出中 <code>\boxed{}</code> 里的内容。
+*   对比标准答案 (<code>ground_truth</code>)。
+*   <strong>结果：</strong> 如果对就是 <code>1.0</code>，错就是 <code>-1.0</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">compute_score_baseline</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ...省略部分代码...</span>
+    <span class="c1"># 验证答案是否正确</span>
+    <span class="n">correct</span><span class="p">,</span> <span class="n">pred</span> <span class="o">=</span> <span class="n">verify</span><span class="p">(</span><span class="n">solution_str</span><span class="p">,</span> <span class="n">ground_truth</span><span class="p">)</span>
+    <span class="n">reward</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="k">if</span> <span class="n">correct</span> <span class="k">else</span> <span class="o">-</span><span class="mf">1.0</span>
+    <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;score&quot;</span><span class="p">:</span> <span class="n">reward</span><span class="p">,</span> <span class="s2">&quot;acc&quot;</span><span class="p">:</span> <span class="n">correct</span><span class="p">,</span> <span class="o">...</span><span class="p">}</span>
+</code></pre></div>
+
+<h4>Task 2: 决定是否需要“复核”</h4>
+<p><strong>代码位置：</strong> <code>compute_score_fapo</code> 函数的前几行
+<strong>讲解：</strong>
+这里是逻辑的分叉口。
+*   如果 <code>result["acc"] == 0</code>（答案本来就错了），那就没必要复核了，直接返回错误。
+*   如果是测试集 (<code>split == "test"</code>)，为了节省资源通常也不复核。
+*   只有当 <strong>答案正确</strong> 且在 <strong>训练</strong> 时，才继续往下走。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">compute_score_fapo</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 先做基础批改</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">compute_score_baseline</span><span class="p">(</span><span class="n">solution_str</span><span class="p">,</span> <span class="n">ground_truth</span><span class="p">)</span>
+
+    <span class="c1"># 如果答案错了，或者是在做测试，直接返回结果，不折腾了</span>
+    <span class="k">if</span> <span class="n">split</span> <span class="o">==</span> <span class="s2">&quot;test&quot;</span> <span class="ow">or</span> <span class="n">result</span><span class="p">[</span><span class="s2">&quot;acc&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">result</span>
+
+    <span class="c1"># 否则，进入下面的复核流程...</span>
+</code></pre></div>
+
+<h4>Task 3: 呼叫“专家模型” (GenRM)</h4>
+<p><strong>代码位置：</strong> <code>compute_score_fapo</code> 中间部分 &amp; <code>FAPO_GENRM_TEMPLATE</code>
+<strong>讲解：</strong>
+这里定义了一个 Prompt 模板，告诉远程的专家模型：</p>
+<blockquote>
+<p>"这是一道数学题，这是标准答案，这是 AI 写的步骤。请你一步步检查，如果发现哪一步有错，告诉我错误的步骤编号；如果没得错，返回 -1。"</p>
+</blockquote>
+<p>然后通过 <code>chat_completions_aiohttp</code> 发送网络请求给地址 <code>ADDRESS</code>（这里被码掉了，实际上是一个部署了 <code>FAPO-4B-GenRM</code> 模型的服务器）。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 组装考卷，发给专家</span>
+<span class="n">prompt</span> <span class="o">=</span> <span class="n">FAPO_GENRM_TEMPLATE</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">problem</span><span class="o">=</span><span class="n">question</span><span class="p">,</span> <span class="n">ground_truth</span><span class="o">=</span><span class="n">ground_truth</span><span class="p">,</span> <span class="n">solution</span><span class="o">=</span><span class="n">solution_str</span><span class="p">)</span>
+<span class="c1"># 发送请求</span>
+<span class="n">response</span> <span class="o">=</span> <span class="k">await</span> <span class="n">chat_completions_aiohttp</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>Task 4: 专家找茬（寻找逻辑漏洞）</h4>
+<p><strong>代码位置：</strong> <code>judge_fp_process</code> 函数
+<strong>讲解：</strong>
+这个函数解析专家模型的回复。
+*   专家模型会返回一个数字，比如 <code>\boxed{2}</code>（第2步错了）或者 <code>\boxed{-1}</code>（没发现错误）。
+*   代码逻辑 <code>int(eval(result)) != -1</code>：
+    *   如果返回 <code>-1</code>，表达式为 False（没找到错）。
+    *   如果返回 <code>2</code>，表达式为 True（找到了错，这就是 <strong>Flawed Positive</strong>）。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">judge_fp_process</span><span class="p">(</span><span class="n">response</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 提取专家返回的数字</span>
+    <span class="n">boxed_result</span> <span class="o">=</span> <span class="n">last_boxed_only_string</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">remove_boxed</span><span class="p">(</span><span class="n">boxed_result</span><span class="p">)</span>
+    <span class="c1"># 如果数字不是 -1，说明有错</span>
+    <span class="n">reward_score</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="nb">eval</span><span class="p">(</span><span class="n">result</span><span class="p">))</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span> 
+    <span class="k">return</span> <span class="n">reward_score</span> <span class="c1"># 返回 True 代表有逻辑错误</span>
+</code></pre></div>
+
+<h4>Task 5: 最终定分</h4>
+<p><strong>代码位置：</strong> <code>compute_score_fapo</code> 的最后部分
+<strong>讲解：</strong>
+*   如果 <code>judge_fp_process</code> 返回了 True（即专家说：这题它是蒙对的，过程有错）：
+    *   把分数 <code>result["score"]</code> 强行改成 <code>0.0</code>。
+    *   打上标记 <code>result["flawed_positive"] = True</code>。
+*   这样，AI 在训练时就会受到惩罚，从而学会“不仅要算对，过程还要严谨”。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 如果专家回复了，并且判定过程有瑕疵 (Flawed Positive)</span>
+<span class="k">if</span> <span class="n">response</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">judge_fp_process</span><span class="p">(</span><span class="n">response</span><span class="p">):</span> 
+    <span class="n">result</span><span class="p">[</span><span class="s2">&quot;score&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="mf">0.0</span>  <span class="c1"># 扣分！</span>
+    <span class="n">result</span><span class="p">[</span><span class="s2">&quot;flawed_positive&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span> <span class="c1"># 标记为“蒙对的”</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这个文件的核心观点是：<strong>在强化学习训练中，为了防止模型学会“走捷径”或“瞎蒙”，引入了一个额外的判别模型（Reward Model）来审查推理过程。只有答案正确且过程无误，才能拿到满分。</strong></p>

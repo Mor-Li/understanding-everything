@@ -1,0 +1,79 @@
+<h1>tools/checkpoint/loader_core.py</h1>
+<p>这份代码确实看起来比较抽象，因为它不是一个独立运行的脚本，而是<strong>Megatron-LM 模型权重转换工具</strong>的一部分。</p>
+<p>简单来说，这个文件的作用是：<strong>“伪装”成 Megatron 的训练环境，把庞大的模型权重文件读取进内存，然后通过一个管道（Queue）传输出去，供其他程序（比如转换成 HuggingFace 格式的脚本）使用。</strong></p>
+<p>为了让你彻底搞懂，我把阅读这份代码的任务拆解成了一个 <strong>5步走的 To-Do List</strong>。我们一步一步来打勾。</p>
+<hr />
+<h3>✅ Task 1: 理解大背景 —— "搬家公司"</h3>
+<p><strong>目标</strong>：明白这个文件在整个项目中扮演的角色。</p>
+<ul>
+<li><strong>核心概念</strong>：想象你要搬家（转换模型格式），这个文件就是<strong>负责打包旧家家具的工人</strong>。</li>
+<li><strong>代码对应</strong>：<ul>
+<li>它继承自 <code>MegatronCheckpointLoaderBase</code>，说明它是一个基础的加载器。</li>
+<li>它的核心任务是读取 NVIDIA Megatron 格式的 Checkpoint（存档点）。</li>
+<li>它不负责“存”新文件，只负责“读”和“传”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 检查配置单 —— <code>add_arguments</code></h3>
+<p><strong>目标</strong>：看看搬运工干活前需要哪些指令。</p>
+<ul>
+<li><strong>核心概念</strong>：在搬家前，你得告诉工人：旧家具在哪？有多少个？要不要拆包？</li>
+<li><strong>代码解读</strong>：<ul>
+<li><code>add_arguments(parser)</code> 函数定义了这些指令。</li>
+<li><code>--true-vocab-size</code>: 词表原本有多大？（用来裁剪多余的填充部分）。</li>
+<li><code>--megatron-path</code>: Megatron 的源代码在哪？（因为它需要调用 Megatron 内部的代码来加载模型）。</li>
+<li><code>--position-embedding-type</code>: 位置编码是哪种？（比如是经典的 <code>learned_absolute</code> 还是现在的 <code>rope</code>）。</li>
+<li><code>--loader-transformer-impl</code>: 用哪种 Transformer 实现（本地的还是 Transformer Engine）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 伪装身份 —— <code>MegatronCheckpointLoaderLLM</code> 类</h3>
+<p><strong>目标</strong>：理解为什么代码里要写 <code>sys.argv</code> 和 <code>import</code>。</p>
+<ul>
+<li><strong>核心概念</strong>：Megatron 的代码写得很“独”，它通常假设自己是在命令行启动训练的。为了能复用 Megatron 的代码来加载模型，这个脚本必须<strong>欺骗</strong> Megatron，假装自己正在进行一次训练初始化。</li>
+<li><strong>代码解读</strong>：<ul>
+<li><strong><code>build_sys_argv</code> (伪造身份证)</strong>:<ul>
+<li>它把我们需要参数塞进 <code>sys.argv</code>。这样当 Megatron 内部代码解析命令行参数时，就会看到我们设定的配置，而不是报错。</li>
+</ul>
+</li>
+<li><strong><code>import_model_provider</code> (找对图纸)</strong>:<ul>
+<li>根据是 <code>GPT</code> 还是 <code>BERT</code>，它会动态地导入不同的模型构建函数 (<code>model_provider</code>)。</li>
+<li>这就像是根据家具是“柜子”还是“桌子”，拿出不同的组装说明书。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 流水线作业 —— <code>send_model_over_queue</code></h3>
+<p><strong>目标</strong>：看懂数据是怎么流动的。</p>
+<ul>
+<li><strong>核心概念</strong>：这是最关键的一步。工人把家具拆好后，要把零件放到传送带（Queue）上，传给外面的卡车。</li>
+<li><strong>代码解读</strong>：<ol>
+<li><code>self.send_metadata_over_queue()</code>: 先告诉对面：“我要发货了，这是货物清单（元数据）”。</li>
+<li><code>schema = get_model_schema(...)</code>: 获取模型的“结构图”。这告诉程序模型里有哪些层（Layer），每一层叫什么名字。</li>
+<li><code>self.send_llm_over_queue(schema)</code>: <strong>重头戏</strong>。根据结构图，把真实的权重张量（Tensor）一个个放到 <code>queue</code>（队列）里发出去。</li>
+<li><code>self.queue.put("done")</code>: 发送完毕，告诉对面：“搬完了，可以关门了”。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 启动按钮与安全网 —— <code>load_checkpoint</code></h3>
+<p><strong>目标</strong>：理解程序的入口和异常处理。</p>
+<ul>
+<li><strong>核心概念</strong>：这是整个文件的对外接口。外部程序只调用这个函数。</li>
+<li><strong>代码解读</strong>：<ul>
+<li><code>loader = MegatronCheckpointLoaderLLM(args, queue)</code>: 雇佣搬运工（实例化类）。</li>
+<li><code>loader.load()</code>: 命令工人开始干活。</li>
+<li><code>try...except</code>: <strong>安全网</strong>。如果搬运过程中出错了（比如文件损坏、内存不足），它会往队列里发一个 <code>"exit"</code> 信号，告诉对面程序：“出事了，停止转换”，然后抛出错误。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结回顾</h3>
+<p>如果你要把这段代码翻译成人话，它就是：</p>
+<blockquote>
+<p>“我是个加载器。启动时，我会先伪造一些启动参数来骗过 Megatron 的系统，然后根据你是 GPT 还是 BERT 找到对应的模型代码。接着，我把模型结构和权重读出来，通过一个队列（Queue）把数据扔给主进程。如果一切顺利就发个‘done’，如果出错了就发个‘exit’。”</p>
+</blockquote>

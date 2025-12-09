@@ -1,0 +1,63 @@
+<h1>tools/wait_daemon.sh</h1>
+<p>这份代码确实如果没有背景知识（特别是关于 SLURM 集群调度的知识），看起来会非常莫名其妙。</p>
+<p>简单来说，这是一个<strong>“拖延战术”</strong>脚本，目的是为了<strong>防止干活干到一半被系统强制关机</strong>。</p>
+<p>我为你列了一个<strong>“学习 To-Do List”</strong>，我们将分 5 个步骤，像剥洋葱一样把它的逻辑理清楚。</p>
+<hr />
+<h3>📋 任务清单：理解 <code>wait_daemon.sh</code></h3>
+<h4>✅ Task 1: 了解背景（这个脚本是给谁用的？）</h4>
+<ul>
+<li><strong>场景</strong>：这通常用于大型服务器集群（比如学校或公司用来跑 AI 模型的超级计算机）。</li>
+<li><strong>主角</strong>：<strong>SLURM</strong>。SLURM 是一个任务调度系统，你可以把它想象成<strong>“包工头”</strong>。你提交任务给它，它分配机器给你跑代码。</li>
+</ul>
+<h4>✅ Task 2: 理解“包工头”的坏毛病（为什么要写这个脚本？）</h4>
+<ul>
+<li><strong>痛点</strong>：SLURM 这个包工头有个默认的坏习惯——<strong>“连坐”</strong>。</li>
+<li><strong>现象</strong>：假设你提交了一个任务（Main Job）。当你的主任务（比如训练模型的主进程）一结束，SLURM 就会认为“活儿干完了”，然后立刻<strong>杀死</strong>该用户在这个节点上所有的其他进程。</li>
+<li><strong>后果</strong>：这很糟糕！因为你的代码里可能还有一些<strong>后台进程</strong>（比如负责上传日志、保存模型数据、或者通知服务器“我跑完了”的小助手进程）。如果主进程刚停，包工头就立刻断电，这些小助手还没来得及把最后的数据传回去就“死”了，导致数据丢失。</li>
+</ul>
+<h4>✅ Task 3: 制定策略（脚本的目的是什么？）</h4>
+<ul>
+<li><strong>目标</strong>：我们需要告诉包工头：“嘿，虽然主任务跑完了，但请等一等！我还有几个后台小弟（Python 进程）在收尾，等它们都干完活你自己退出了，你再关机。”</li>
+<li><strong>方法</strong>：写一个脚本，在主任务结束后运行。这个脚本会<strong>死死地盯着</strong>系统里还有没有属于你的 Python 进程。只要还有，这个脚本就不结束。SLURM 看到这个脚本还在跑，就不会强行断电。</li>
+</ul>
+<h4>✅ Task 4: 逐行拆解代码（它是怎么实现的？）</h4>
+<p>现在我们带着上面的理解，来看代码的细节：</p>
+<p><strong>1. 检测函数：<code>is_daemon_running</code></strong></p>
+<div class="codehilite"><pre><span></span><code>is_daemon_running<span class="o">()</span><span class="w"> </span><span class="o">{</span>
+<span class="w">    </span>pgrep<span class="w"> </span>-u<span class="w"> </span><span class="nv">$USER</span><span class="w"> </span><span class="s2">&quot;python&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>/dev/null
+<span class="o">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>翻译</strong>：这是一个侦察兵。</li>
+<li><code>pgrep -u $USER "python"</code>：这句话的意思是“在当前用户（$USER）名下，查找名字里带有 'python' 的进程”。</li>
+<li><code>&gt; /dev/null</code>：意思是“不要把查到的结果打印在屏幕上，我只需要知道<strong>有没有</strong>就行”。</li>
+<li><strong>逻辑</strong>：如果找到了 Python 进程，这个函数返回“真”（True/0）；如果没找到，返回“假”（False/1）。</li>
+</ul>
+<p><strong>2. 等待函数：<code>wait_daemon</code></strong></p>
+<div class="codehilite"><pre><span></span><code>wait_daemon<span class="o">()</span><span class="w"> </span><span class="o">{</span>
+<span class="w">   </span><span class="k">while</span><span class="w"> </span>is_daemon_running<span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">      </span>sleep<span class="w"> </span><span class="m">1</span>
+<span class="w">   </span><span class="k">done</span>
+<span class="o">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>翻译</strong>：这是一个守门员。</li>
+<li><code>while is_daemon_running; do ... done</code>：只要上面的侦察兵说“还有 Python 进程在跑”，我就一直循环做下面的事。</li>
+<li><code>sleep 1</code>：睡 1 秒钟。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>看看有没有 Python 进程？-&gt; 有。</li>
+<li>睡 1 秒。</li>
+<li>看看有没有 Python 进程？-&gt; 还有。</li>
+<li>睡 1 秒。</li>
+<li>看看有没有 Python 进程？-&gt; 没有了（大家都收工了）。</li>
+<li>循环结束，脚本退出。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 5: 总结核心观点</h4>
+<p><strong>一句话总结：</strong>
+这个脚本定义了一个<strong>“守门员功能”</strong>，它会每秒检查一次是否还有 Python 进程在运行。只有当所有 Python 进程都结束后，它才会放行，允许 SLURM 关闭整个任务。</p>
+<p><strong>它的作用是：</strong>
+<strong>保护数据完整性</strong>。确保负责监控和数据上传的后台进程（MonitorProcess）有足够的时间完成收尾工作，而不会被系统无情地“秒杀”。</p>

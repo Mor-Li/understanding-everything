@@ -1,0 +1,107 @@
+<h1>tests/special_npu/run_qwen3_30b_dapo_mindspeed.sh</h1>
+<p>这份脚本确实看起来很复杂，因为它涉及到<strong>大模型训练（LLM Training）</strong>中最硬核的部分：<strong>在国产算力卡（NPU/昇腾）上，结合多种并行策略，去训练一个巨大的 MoE 模型（Qwen3-30B）</strong>。</p>
+<p>简单来说，这是一个<strong>启动脚本</strong>。你可以把它想象成是一个<strong>“工程指挥官”的待办清单（To-Do List）</strong>。</p>
+<p>为了让你看懂，我把这个脚本翻译成一个<strong>计算机执行任务的清单</strong>，一步一步带你过一遍：</p>
+<hr />
+<h3>任务总目标</h3>
+<p><strong>目标</strong>：在 8 张 NPU 卡上，使用 DAPO (一种对齐算法) 和 GRPO 策略，微调（训练）Qwen3-30B 这个模型，让它更会做数学题（使用 GSM8K 数据集）。</p>
+<hr />
+<h3>计算机的执行清单 (To-Do List)</h3>
+<h4>1. ✅ 准备阶段：检查装备 (环境变量设置)</h4>
+<p>脚本的第 4-9 行。
+*   <strong>Task</strong>: "我要先确认一下模型叫什么名字 (<code>MODEL_ID</code>)，放在哪个文件夹 (<code>MODEL_PATH</code>)。"
+*   <strong>Task</strong>: "我要确认是否需要把模型切分成分布式格式 (<code>USE_DIST_CKPT</code>)。"
+*   <strong>Task</strong>: "设置一些基础环境，比如遇到错误立刻停止 (<code>set -xeuo pipefail</code>)，防止这就瞎跑。"</p>
+<h4>2. 🎭 排练阶段：是否使用“替身”？ (Dummy Model)</h4>
+<p>脚本的第 12-32 行。
+*   <strong>Task</strong>: "主人设置了 <code>USE_DUMMY_MODEL=True</code> 吗？"
+    *   <strong>如果 是</strong>：说明现在只是想测试代码能不能跑通，不想真的加载那个几十 GB 的大模型。
+    *   <strong>动作</strong>：我会立刻用 Python 生成一个<strong>随机初始化的“假模型”</strong>（只有壳子，没有智慧）。
+    *   <strong>目的</strong>：省时间，快速调试流程。</p>
+<h4>3. 🔄 格式转换阶段：把模型“切开” (Convert to Megatron)</h4>
+<p>脚本的第 35-48 行。
+*   <strong>Task</strong>: "主人设置了 <code>USE_DIST_CKPT=True</code> 吗？"
+    *   <strong>如果 是</strong>：说明原来的模型是 HuggingFace 格式（单文件或简单切分），但我们接下来要搞大规模并行训练，需要转换成 <strong>Megatron-Core (mcore)</strong> 格式。
+    *   <strong>动作</strong>：运行 <code>converter_hf_to_mcore.py</code>，把模型权重转换并切分好，存到指定位置。</p>
+<h4>4. 🚀 核心任务：启动训练 (Run Main Python Command)</h4>
+<p>这是脚本最长的一段（第 52 行到结尾），也是真正干活的地方。
+*   <strong>Task</strong>: "启动 Python 主程序 <code>recipe.dapo.main_dapo</code>。"
+*   <strong>Task</strong>: "给这个程序传入一大堆参数（配置单），告诉它具体怎么干。"</p>
+<p>为了让你看懂这一大堆参数，我把它们拆解成几个<strong>子任务</strong>：</p>
+<ul>
+<li>
+<p><strong>子任务 A：读什么书？（数据配置）</strong></p>
+<ul>
+<li><code>data.train_files</code>: 训练数据在 <code>${HOME}/data/gsm8k/train.parquet</code>（GSM8K 是小学数学数据集）。</li>
+<li><code>data.max_prompt_length=512</code>: 题目最长 512 字。</li>
+<li><code>data.max_response_length=1024</code>: 答案最长 1024 字。</li>
+</ul>
+</li>
+<li>
+<p><strong>子任务 B：用什么脑子？（模型与并行策略）</strong></p>
+<ul>
+<li><strong>模型</strong>: Qwen3-30B (这是一个 MoE 混合专家模型)。</li>
+<li><strong>生成引擎</strong>: <code>actor_rollout_ref.rollout.name=vllm</code>。用 <strong>vLLM</strong> 来做推理（生成答案），因为 vLLM 速度快。</li>
+<li><strong>训练引擎</strong>: <code>strategy=megatron</code>。用 <strong>Megatron</strong> 框架来做训练（反向传播）。</li>
+<li><strong>切分策略 (Parallelism)</strong>: 这里非常硬核，因为模型太大，单卡放不下，或者为了加速：<ul>
+<li><code>tensor_model_parallel_size=2</code>: 张量并行（把矩阵切成2份）。</li>
+<li><code>pipeline_model_parallel_size=2</code>: 流水线并行（把层切成2段）。</li>
+<li><code>expert_model_parallel_size=2</code>: 专家并行（把 MoE 的专家分配到不同卡）。</li>
+<li><strong>注意</strong>: 这里的配置暗示了这是一个复杂的 3D 并行设置。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>子任务 C：怎么学习？（算法配置）</strong></p>
+<ul>
+<li><code>algorithm.adv_estimator=grpo</code>: 使用 GRPO 算法（一种强化学习算法，类似 PPO 但有优化）。</li>
+<li><code>reward_model.reward_manager=dapo</code>: 奖励管理使用 DAPO 策略。</li>
+<li><code>actor_rollout_ref.actor.optim.lr=1e-6</code>: 学习率非常低（0.000001），小心翼翼地微调，防止模型变傻。</li>
+</ul>
+</li>
+<li>
+<p><strong>子任务 D：在哪干活？（硬件配置）</strong></p>
+<ul>
+<li><code>trainer.device=npu</code>: <strong>重点</strong>，指定使用 NPU（华为昇腾芯片）。</li>
+<li><code>trainer.n_gpus_per_node=8</code>: 用 8 张卡。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 🧹 收尾阶段：打扫战场 (Clean Up)</h4>
+<p>脚本的最后几行。
+*   <strong>Task</strong>: "如果刚才用了‘替身’（假模型），现在测试跑完了，把生成的假文件和临时存档都删掉，别占硬盘空间。"</p>
+<hr />
+<h3>总结一下文中的核心观点（技术逻辑）</h3>
+<p>这个脚本实际上体现了当前<strong>大模型训练</strong>的几个前沿趋势和痛点：</p>
+<ol>
+<li>
+<p><strong>训练与推理分离 (Hybrid Engine)</strong>:</p>
+<ul>
+<li>脚本里让 <strong>vLLM</strong> 负责生成文本（做题），让 <strong>Megatron</strong> 负责更新参数（学习）。</li>
+<li><em>观点</em>：术业有专攻。vLLM 推理极快，Megatron 训练极稳。把两者结合起来做强化学习（RLHF/PPO）是当前最高效的架构。</li>
+</ul>
+</li>
+<li>
+<p><strong>国产算力适配 (NPU)</strong>:</p>
+<ul>
+<li>脚本大量涉及 <code>mindspeed</code> 和 <code>npu</code>。</li>
+<li><em>观点</em>：这是专门为华为昇腾 (Ascend) 芯片优化的代码。因为 NPU 的算子库和 NVIDIA 的 CUDA 不一样，所以需要特殊的配置（比如 <code>VLLM_ASCEND_ENABLE_NZ</code>）。</li>
+</ul>
+</li>
+<li>
+<p><strong>复杂的并行策略 (3D Parallelism)</strong>:</p>
+<ul>
+<li>Qwen3-30B 是个大模型，而且是 MoE 架构。</li>
+<li><em>观点</em>：为了在显存有限的卡上跑起来，必须把模型大卸八块。脚本里同时用了 <strong>TP (张量并行)</strong> + <strong>PP (流水线并行)</strong> + <strong>EP (专家并行)</strong>。这说明单卡绝对跑不动，必须多卡协作。</li>
+</ul>
+</li>
+<li>
+<p><strong>强化学习微调 (RLHF/GRPO)</strong>:</p>
+<ul>
+<li><em>观点</em>：不仅仅是让模型“背书”（SFT），而是通过强化学习（GRPO/DAPO）让模型学会“推理”。通过给模型的回答打分（Reward），让它自己探索出更好的解题步骤。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结：</strong>
+这是一个<strong>在华为 NPU 芯片上</strong>，利用<strong>vLLM加速推理</strong>和<strong>Megatron分布式训练</strong>技术，把 Qwen3-30B 这个大模型切分成多块，通过<strong>强化学习</strong>让它更擅长做<strong>数学题</strong>的启动脚本。</p>

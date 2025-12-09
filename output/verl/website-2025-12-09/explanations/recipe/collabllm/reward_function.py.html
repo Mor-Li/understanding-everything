@@ -1,0 +1,109 @@
+<h1>recipe/collabllm/reward_function.py</h1>
+<p>这份代码是为一个 <strong>强化学习 (RL)</strong> 系统（特别是基于 <code>verl</code> 框架）设计的 <strong>奖励函数（Reward Function）</strong> 管理器。</p>
+<p>简单来说，它的作用是：<strong>当大模型生成了一段对话后，这个代码负责给这段对话“打分”，告诉模型它回答得好不好。</strong></p>
+<p>为了让你听懂，我把这个过程想象成一个 <strong>“阅卷老师”的工作流程</strong>。下面是一个 Task Todo List，展示了代码执行的逻辑顺序：</p>
+<h3>📝 阅卷老师的任务清单 (Task Todo List)</h3>
+<ol>
+<li>
+<p><strong>准备阶段 (<code>__init__</code>)</strong>：</p>
+<ul>
+<li>[ ] 设定评分标准（比如：准确性占 80%，礼貌性占 20%）。</li>
+<li>[ ] 准备好用来打分的“助教”（LLM Judge 的配置）。</li>
+</ul>
+</li>
+<li>
+<p><strong>接收试卷 (<code>__call__</code>)</strong>：</p>
+<ul>
+<li>[ ] 收到一批学生的对话数据（DataProto）。</li>
+<li>[ ] 检查试卷上是不是已经有分数了？如果有，直接登记。</li>
+<li>[ ] 如果没分数，启动一个异步处理流程（因为要同时批改很多份）。</li>
+</ul>
+</li>
+<li>
+<p><strong>批量批改 (<code>_compute_rewards_async</code>)</strong>：</p>
+<ul>
+<li>[ ] <strong>整理试卷</strong>：把所有对话数据提取出来。如果一个问题生成了多个回答（rollouts），把它们全部摊平（Flatten），方便统一处理。</li>
+<li>[ ] <strong>分发任务</strong>：对每一条对话，调用具体的评分函数。</li>
+</ul>
+</li>
+<li>
+<p><strong>具体打分 (<code>conversation_level_reward_func</code>)</strong>：</p>
+<ul>
+<li>[ ] <strong>动态加载规则</strong>：根据配置（metrics），去文件夹里找对应的评分脚本（比如 <code>metrics/accuracy.py</code>）。</li>
+<li>[ ] <strong>执行打分</strong>：运行脚本里的 <code>compute_score</code> 函数（可能需要调用 GPT-4 等外部模型来判断）。</li>
+<li>[ ] <strong>重试机制</strong>：如果调用外部模型超时或报错，自动重试几次。</li>
+</ul>
+</li>
+<li>
+<p><strong>汇总与登记 (<code>_compute_rewards_async</code> 后半部分)</strong>：</p>
+<ul>
+<li>[ ] <strong>收集分数</strong>：把所有助教打的分数收回来。</li>
+<li>[ ] <strong>加权计算</strong>：根据一开始设定的权重（metric_weights），计算综合得分。</li>
+<li>[ ] <strong>分数截断</strong>：把分数限制在 -1 到 1 之间（Clamp）。</li>
+<li>[ ] <strong>填入成绩单</strong>：把计算出的最终分数，填在模型说完话的<strong>最后一个字</strong>的位置上（Sparse Reward）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细讲解</h3>
+<p>现在我们结合代码，一步一步把上面的清单展开讲讲。</p>
+<h4>第一步：准备阶段 (Class <code>CollabLLMRewardManager</code>)</h4>
+<p>这是一个类，继承自 <code>verl</code> 的奖励管理器。
+*   <strong>代码位置</strong>：<code>class CollabLLMRewardManager</code> -&gt; <code>__init__</code>
+*   <strong>解释</strong>：初始化时，它接收了 <code>metric_weights</code>（比如 <code>{'correctness': 1.0, 'style': 0.5}</code>）。这决定了它会去寻找哪些指标来打分。</p>
+<h4>第二步：接收与异步启动</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>__call__</code></li>
+<li><strong>解释</strong>：这是入口。<ul>
+<li>它首先检查数据里是不是已经有 <code>rm_scores</code> 了，以此避免重复计算。</li>
+<li>关键点在于 <code>asyncio.new_event_loop()</code>。因为给大模型打分通常需要调用 API（很慢），所以这里强制开启了一个异步循环，为了能<strong>并发</strong>地处理整个 Batch 的数据，而不是一个接一个地等。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：具体打分逻辑 (函数 <code>conversation_level_reward_func</code>)</h4>
+<p>这是一个独立的异步函数，用来处理<strong>单条</strong>数据。
+*   <strong>动态加载 (Dynamic Loading)</strong>：
+    *   代码：<code>importlib.util.spec_from_file_location(...)</code>
+    *   <strong>解释</strong>：它不会把评分逻辑写死在文件里，而是去同目录下的 <code>metrics/</code> 文件夹里找文件。比如你的 metric 叫 "safety"，它就去找 <code>metrics/safety.py</code>。这让扩展非常方便，想加新指标只需加个文件。
+*   <strong>重试机制 (Retry Mechanism)</strong>：
+    *   代码：<code>for attempt in range(num_retries): ...</code>
+    *   <strong>解释</strong>：因为评分通常调用 OpenAI 或其他 LLM 的 API，可能会遇到网络波动或 <code>RateLimitError</code>（限流）。代码写了指数退避（Exponential backoff），失败了就等一会再试，最多试 6 次。</p>
+<h4>第四步：数据整理与并发 (函数 <code>_compute_rewards_async</code>)</h4>
+<p>这是最复杂的数学处理部分。
+*   <strong>摊平数据 (Flattening)</strong>：
+    *   代码：<code>flattened_data_sources = ...</code>
+    *   <strong>解释</strong>：强化学习中有时会对同一个 Prompt 生成多次（Rollouts）来探索。这里把所有生成的路径混在一起，变成一个长列表，方便一次性扔给 <code>asyncio.gather</code> 并发处理。
+*   <strong>并行计算</strong>：
+    *   代码：<code>score_dicts = await asyncio.gather(*tasks)</code>
+    *   <strong>解释</strong>：同时发出几十上百个打分请求，极大地节省时间。</p>
+<h4>第五步：计算最终分数 (加权与归一化)</h4>
+<ul>
+<li><strong>加权求和</strong>：<ul>
+<li>代码：<code>weighted_scores_by_metrics</code> 和 <code>scores = ... .sum(dim=0)</code></li>
+<li><strong>解释</strong>：假设 "准确性" 给了 0.8 分（权重 1.0），"幽默感" 给了 0.5 分（权重 0.5）。</li>
+<li>最终分 = $0.8 \times 1.0 + 0.5 \times 0.5 = 1.05$。</li>
+</ul>
+</li>
+<li><strong>Clamp (截断)</strong>：<ul>
+<li>代码：<code>torch.clamp(..., min=-1.0, max=1.0)</code></li>
+<li><strong>解释</strong>：为了防止奖励爆炸导致训练不稳定，强制把分数锁死在 -1 到 1 之间。</li>
+</ul>
+</li>
+</ul>
+<h4>第六步：填入 Tensor (Reward Assignment)</h4>
+<ul>
+<li><strong>关键代码</strong>：
+    <code>python
+    reward_tensor[i, valid_response_length[i].item() - 1] = scores[i]</code></li>
+<li><strong>解释</strong>：这是一个典型的 <strong>Sparse Reward（稀疏奖励）</strong> 写法。<ul>
+<li>假设模型生成了一句话：“你好，世界。”（假设长度是 5 个 token）。</li>
+<li>我们不会给“你”、“好”、“世”打分。</li>
+<li>我们只在最后一个 token（句号或者结束符）的位置填上计算出来的 <code>scores[i]</code>。</li>
+<li>其他位置全是 0。</li>
+<li>这意味着：<strong>只有完整说完这句话，才能拿到奖励。</strong></li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的核心逻辑是：
+<strong>“别管具体的评分规则是什么（我去 metrics 文件夹里读），把所有生成的对话都拿过来，并发地调用 API 去打分，算出一个加权总分，然后把这个分数贴在每句话的结尾，传回给强化学习算法去更新模型。”</strong></p>

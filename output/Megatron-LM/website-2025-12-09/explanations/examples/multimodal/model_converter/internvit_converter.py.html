@@ -1,0 +1,116 @@
+<h1>examples/multimodal/model_converter/internvit_converter.py</h1>
+<p>这份代码其实就是一个<strong>“搬运工”兼“翻译官”</strong>。</p>
+<p>它的核心任务是：把一个在 Hugging Face (HF) 格式下的 <strong>InternViT 模型</strong>（一种视觉 Transformer），转换成 <strong>Megatron-Core (Mcore)</strong> 能够识别的格式，并且在这个过程中，把模型<strong>切分</strong>好，以便在多张显卡上进行<strong>张量并行 (Tensor Parallelism, TP)</strong> 训练。</p>
+<p>为了让你听懂，我把这个复杂的代码逻辑拆解成一个 <strong>Task List (任务清单)</strong>，然后一步步给你解释。</p>
+<hr />
+<h3>核心任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>准备阶段</strong>：加载原模型，准备好要存放切分后数据的“空箱子”。</li>
+<li><strong>数学预处理</strong>：计算如何处理“注意力头” (Attention Heads) 的排列和填充（这是该模型最特殊的地方）。</li>
+<li><strong>循环搬运 (核心)</strong>：遍历原模型的每一个参数（权重）。<ul>
+<li><strong>改名</strong>：把 HF 的变量名改成 Mcore 认识的名字。</li>
+<li><strong>整形/填充</strong>：如果原模型形状不符合并行要求（比如头数不能整除显卡数），给它补零。</li>
+<li><strong>切分 (Slicing)</strong>：根据并行度 (TP Size)，把一个大矩阵切成几小块。</li>
+</ul>
+</li>
+<li><strong>收尾存档</strong>：把切分好的数据分别保存到不同的文件夹里，给不同的显卡用。</li>
+</ol>
+<hr />
+<h3>详细步骤解析</h3>
+<h4>1. 准备阶段 (Setup)</h4>
+<p><strong>代码对应：</strong> <code>convert</code> 函数开头到 <code>order = ...</code> 之前。</p>
+<ul>
+<li><strong>加载原版</strong>：使用 <code>AutoModel.from_pretrained</code> 下载或加载 Hugging Face 格式的 InternViT 模型。</li>
+<li><strong>准备空箱子</strong>：<code>new_state_dicts</code> 是一个列表。如果你设置 <code>tensor_parallel_size=8</code>（用8张卡跑），它就创建 8 个空字典，准备分别装属于这 8 张卡的数据。</li>
+<li><strong>硬编码参数</strong>：代码里写死了 <code>hidden_size=3200</code>, <code>num_heads=25</code>。这是 InternViT-6B 这个特定模型的参数。注意这里的 <strong>25个头</strong>，这是后续麻烦的根源。</li>
+</ul>
+<h4>2. 数学预处理：搞定“乱序”和“不对齐”</h4>
+<p><strong>代码对应：</strong> <code>order</code> 的计算循环 和 <code>num_padded_heads</code> 的逻辑。</p>
+<ul>
+<li><strong>QKV 重排 (The Order)</strong>：<ul>
+<li>Transformer 的核心是 Q (Query), K (Key), V (Value)。</li>
+<li>Hugging Face 的存储顺序和 Megatron 需要的顺序可能不一样（比如 HF 可能是 QQQKKKVVV，而 Megatron 需要 QKVQKVQKV）。</li>
+<li>代码里的双重 <code>for</code> 循环生成了一个 <code>order</code> 索引，就是为了把权重里的数据重新排队，让它符合 Megatron 的胃口。</li>
+</ul>
+</li>
+<li><strong>填充逻辑 (Padding)</strong>：<ul>
+<li><strong>问题</strong>：模型有 <strong>25</strong> 个头。如果你想用 <strong>8</strong> 张卡并行 (<code>tensor_parallel_size=8</code>)，25 除以 8 除不尽（等于3.125）。显卡不喜欢处理小数。</li>
+<li><strong>解决</strong>：代码里写了，如果是 TP=8，就把头数强行补到 <strong>32</strong> 个 (<code>num_padded_heads = 32</code>)。多出来的 7 个头全是 0（dummy heads），纯凑数，为了能被 8 整除。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 循环搬运：改名、整形与切分 (The Loop)</h4>
+<p><strong>代码对应：</strong> <code>for name, tensor in hf_state_dict.items():</code> 及其内部。</p>
+<p>这是代码最长、最繁琐的部分。它拿着 HF 的字典，一项一项处理：</p>
+<ul>
+<li>
+<p><strong>Step 3.1: 改名 (Renaming)</strong></p>
+<ul>
+<li>HF 叫 <code>embeddings.patch_embedding.weight</code>，但 Megatron 叫 <code>conv1.weight</code>。</li>
+<li>HF 叫 <code>encoder.layers.0...</code>，Megatron 叫 <code>decoder.layers.0...</code>（虽然它是 Encoder，但 Megatron 习惯统称结构为 decoder layer）。</li>
+<li><strong>目的</strong>：相当于把“英文说明书”翻译成“中文说明书”，让 Megatron 代码能读懂变量名。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2: 处理特殊层 (Attention Layers)</strong></p>
+<ul>
+<li><strong>QKV (Query/Key/Value)</strong>：<ul>
+<li>检测到 <code>attn.qkv.weight</code>。</li>
+<li><strong>应用重排</strong>：用之前生成的 <code>order</code> 把数据顺序理顺。</li>
+<li><strong>应用填充</strong>：如果需要（比如25头变32头），创建一个更大的全 0 矩阵，把原数据填进去，剩下的空着。</li>
+<li><strong>标记切分方向</strong>：<code>chunk_dim=0</code>。意思是这个矩阵要<strong>按行切分</strong>（Column Parallel）。</li>
+</ul>
+</li>
+<li><strong>Proj (Output Projection)</strong>：<ul>
+<li>检测到 <code>attn.proj.weight</code>。</li>
+<li><strong>应用填充</strong>：同样需要补全维度匹配 32 头。</li>
+<li><strong>标记切分方向</strong>：<code>chunk_dim=1</code>。意思是这个矩阵要<strong>按列切分</strong>（Row Parallel）。因为它是把并行计算的结果汇聚起来的层。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.3: 处理 MLP 层 (Feed Forward)</strong></p>
+<ul>
+<li><code>mlp.fc1</code> (第一层全连接)：<code>chunk_dim=0</code> (按行切，把维度变宽)。</li>
+<li><code>mlp.fc2</code> (第二层全连接)：<code>chunk_dim=1</code> (按列切，把维度缩回来)。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.4: 真正的切分 (Chunking)</strong></p>
+<ul>
+<li>代码逻辑：<code>new_tensors = torch.chunk(new_tensor, tensor_parallel_size, dim=chunk_dim)</code></li>
+<li><strong>解释</strong>：就像切蛋糕。<ul>
+<li>如果 <code>chunk_dim</code> 是 None（比如 LayerNorm 层），大家都不切，每张卡拿一模一样的完整副本。</li>
+<li>如果 <code>chunk_dim</code> 有值，就把大矩阵切成 8 份（假设 TP=8），每张卡只拿属于自己的那 1/8。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.5: 兼容 Transformer Engine (TE)</strong></p>
+<ul>
+<li>代码检查 <code>use_te</code>。如果是，它会给某些层加一个叫 <code>_extra_state</code> 的空占位符。这是为了兼容 NVIDIA 的 Transformer Engine 加速库（通常用于 FP8 训练）。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 收尾存档 (Saving)</h4>
+<p><strong>代码对应：</strong> 最后的一个 <code>for</code> 循环。</p>
+<ul>
+<li>现在 <code>new_state_dicts</code> 这个列表里已经有 8 个字典了，每个字典里装着 1/8 的模型参数（加上未切分的公共参数）。</li>
+<li><strong>创建目录</strong>：按照 Megatron 的标准格式建文件夹：<code>output_path/iter_0000001/mp_rank_00</code> 到 <code>mp_rank_07</code>。</li>
+<li><strong>保存</strong>：用 <code>torch.save</code> 把字典存成 <code>.pt</code> 文件。</li>
+</ul>
+<h3>总结文中的核心观点</h3>
+<ol>
+<li><strong>架构对齐</strong>：HF 的模型结构定义和 Megatron 不一样，必须通过改名和重排数据来对齐。</li>
+<li><strong>整除性是并行的前提</strong>：InternViT 的 25 个头是个“奇葩”数字，为了做 8 卡并行，必须<strong>Padding (填充)</strong> 到 32 个头，牺牲一点点显存换取计算兼容性。</li>
+<li><strong>切分策略</strong>：<ul>
+<li><strong>QKV 和 MLP 第一层</strong> 做列并行（把矩阵切开，各自算一部分特征）。</li>
+<li><strong>输出投影 和 MLP 第二层</strong> 做行并行（把各自算好的特征拼回去）。</li>
+<li><strong>LayerNorm 和 Bias</strong> 通常不切分或只是复制。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这个脚本把一个原本只能单卡或者数据并行跑的 HuggingFace 模型，通过“改名、补零、切块”三个手术，改造成了可以在多张显卡上进行模型并行（Model Parallelism）训练的 Megatron 格式。</p>

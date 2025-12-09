@@ -1,0 +1,63 @@
+<h1>megatron/core/safe_globals.py</h1>
+<p>没问题。这段代码虽然看起来只是一堆引用和列表，但它解决的是一个非常核心的<strong>安全问题</strong>。</p>
+<p>为了让你彻底搞懂，我们把这个过程想象成<strong>“建立一个安全的快递检查站”</strong>。</p>
+<p>下面是一个分步骤的 To-Do List，带你一步步拆解这段代码的含义：</p>
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 理解背景——为什么 Python 的保存/加载机制不安全？</h4>
+<ul>
+<li><strong>概念</strong>：在 Python（以及 PyTorch）中，保存模型通常使用 <code>pickle</code> 模块。</li>
+<li><strong>风险</strong>：<code>pickle</code> 非常强大，它不仅能保存数据（比如权重矩阵），还能保存“代码逻辑”。这意味着，黑客可以在一个模型文件里藏入恶意代码（比如删除你硬盘文件的脚本）。当你用 <code>torch.load()</code> 加载这个模型时，恶意代码就会自动执行。</li>
+<li><strong>现状</strong>：为了防止这种情况，PyTorch 最近引入了更严格的安全机制。它默认不再信任文件里的所有内容，只信任最基础的“权重数据”。</li>
+</ul>
+<h4>✅ Task 2: 理解需求——我们需要加载“非权重”数据</h4>
+<ul>
+<li><strong>问题</strong>：虽然只加载权重最安全，但 Megatron（一个大模型训练框架）在保存检查点（Checkpoint）时，不仅仅保存了权重，还保存了一些<strong>配置信息</strong>和<strong>状态信息</strong>。</li>
+<li><strong>冲突</strong>：<ul>
+<li>PyTorch 安全机制说：“我只允许加载张量（Tensor），别的都不行！”</li>
+<li>Megatron 说：“不行啊，我这里面还有 Numpy 数组、配置参数（Namespace）、枚举类型（Enum），不加载程序就跑不起来！”</li>
+</ul>
+</li>
+<li><strong>解决办法</strong>：我们需要一份<strong>“白名单” (Allowlist)</strong>。告诉 PyTorch：“别紧张，这些特定的类是安全的，放它们进来。”</li>
+</ul>
+<h4>✅ Task 3: 拆解代码——审查“白名单” (<code>SAFE_GLOBALS</code>)</h4>
+<p>现在看代码中的 <code>SAFE_GLOBALS</code> 列表，这就是那份“白名单”。我们可以把它们分类：</p>
+<ol>
+<li><strong>基础 Python 工具类</strong>:<ul>
+<li><code>SimpleNamespace</code>, <code>Namespace</code>: 通常用来存配置参数（比如 <code>args.batch_size</code>）。</li>
+<li><code>PosixPath</code>: 用来存文件路径的。</li>
+<li><code>BytesIO</code>: 处理二进制流的。</li>
+</ul>
+</li>
+<li><strong>Numpy 相关 (科学计算)</strong>:<ul>
+<li><code>ndarray</code>, <code>dtype</code>, <code>UInt32DType</code>: 存一些非 Tensor 的数值数据。</li>
+<li><code>_reconstruct</code>: Numpy 内部用来重建数组的函数。</li>
+</ul>
+</li>
+<li><strong>Megatron 自定义的类</strong>:<ul>
+<li><code>ModelType</code>, <code>AttnBackend</code>: 枚举类型，告诉模型是 GPT 还是 BERT，用哪种注意力机制。</li>
+<li><code>OptimizerConfig</code>: 优化器的配置。</li>
+<li><code>RerunDiagnostic</code> 等: 跟断点续训（Rerun）状态有关的类。</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论</strong>：这个列表里的东西都是 Megatron 正常运行必须读取的“良民”。</p>
+<h4>✅ Task 4: 理解动作——注册白名单 (<code>register_safe_globals</code>)</h4>
+<p>看最后的函数 <code>register_safe_globals()</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">register_safe_globals</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Register megatron-core safe classes with torch serialization.&quot;&quot;&quot;</span>
+    <span class="k">for</span> <span class="bp">cls</span> <span class="ow">in</span> <span class="n">SAFE_GLOBALS</span><span class="p">:</span>
+        <span class="c1"># 这一行是核心！</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">serialization</span><span class="o">.</span><span class="n">add_safe_globals</span><span class="p">([</span><span class="bp">cls</span><span class="p">])</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：这个函数遍历上面的白名单。</li>
+<li><strong>核心指令</strong>：<code>torch.serialization.add_safe_globals([cls])</code>。</li>
+<li><strong>翻译</strong>：这行代码相当于跟 PyTorch 的保安说：“嘿，以后看到列表里这些家伙（类），直接放行，它们是安全的，不用拦截报错。”</li>
+</ul>
+<hr />
+<h3>💡 总结 (Takeaway)</h3>
+<p><strong>这个文件的作用一句话概括：</strong>
+它是 Megatron-Core 的<strong>“安检通行证列表”</strong>。</p>
+<p><strong>为什么要写这个文件？</strong>
+为了让 PyTorch 在开启安全加载模式（防止恶意代码注入）时，依然能成功读取 Megatron 保存的复杂模型配置文件，而不会因为“遇到不认识的类”而报错崩溃。</p>

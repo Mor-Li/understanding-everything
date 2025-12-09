@@ -1,0 +1,104 @@
+<h1>megatron/legacy/indexer.py</h1>
+<p>没问题，这段代码初看确实比较晦涩，因为它涉及到了<strong>深度学习模型</strong>、<strong>大规模数据处理</strong>以及<strong>分布式计算</strong>（多张显卡一起工作）。</p>
+<p>简单来说，这个文件的作用是：<strong>“把海量的维基百科（Wikipedia）文本，通过一个AI模型，转换成计算机可以快速搜索的数字指纹（向量），并保存下来。”</strong></p>
+<p>这个过程通常被称为 <strong>建立索引 (Indexing)</strong>。</p>
+<p>为了让你更容易理解，我按照你的要求分两部分来讲：
+1.  <strong>核心概念 List</strong>：这段代码里出现的关键角色。
+2.  <strong>Task Todo List</strong>：这段代码按顺序执行的一步步任务。</p>
+<hr />
+<h3>第一部分：核心概念 List (角色介绍)</h3>
+<p>在读代码前，先把这几个概念当作剧本里的角色来认识：</p>
+<ol>
+<li><strong>IndexBuilder (索引构建者)</strong>:<ul>
+<li>这是主角（这个类）。它的工作是把书（文本）变成目录（索引）。</li>
+</ul>
+</li>
+<li><strong>BiEncoder Model (双塔编码器模型)</strong>:<ul>
+<li>这是“大脑”。它负责阅读文本，并将其转化为一串数字（Embedding/向量）。之所以叫BiEncoder，是因为它通常有两个头，一个处理问题，一个处理文章，这里主要用到处理文章（Context）的那部分。</li>
+</ul>
+</li>
+<li><strong>Dataset (OpenRetrievalWikiDataset)</strong>:<ul>
+<li>这是“原材料”。也就是成千上万条维基百科的段落。</li>
+</ul>
+</li>
+<li><strong>DataStore / Evidence Embedder</strong>:<ul>
+<li>这是“档案柜”。用来临时存放模型算出来的数字指纹。</li>
+</ul>
+</li>
+<li><strong>Distributed / Rank / Shard (分布式/分片)</strong>:<ul>
+<li>因为数据量太大，一台电脑干不完。所以会有很多个“工人”（GPU）一起干。</li>
+<li>每个工人只干一部分，这叫<strong>分片 (Shard)</strong>。</li>
+<li><strong>Rank 0</strong> 是工头，最后负责把大家干完的活儿拼起来。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>第二部分：Task Todo List (一步步执行流程)</h3>
+<p>想象你是一个图书管理员团队的工头，你要把整个图书馆的书数字化。以下是代码 <code>IndexBuilder</code> 实际上在做的事情清单：</p>
+<h4><strong>阶段一：准备工作 (Setup)</strong></h4>
+<ul>
+<li>
+<p>[ ] <strong>任务 1：初始化 (Init)</strong></p>
+<ul>
+<li>对应代码：<code>__init__</code></li>
+<li>确认我是哪个工人（是工头 Rank 0 还是普通工人）。</li>
+<li>确认我们要处理多少数据，每批处理多少（Batch size）。</li>
+</ul>
+</li>
+<li>
+<p>[ ] <strong>任务 2：加载装备 (Load Attributes)</strong></p>
+<ul>
+<li>对应代码：<code>load_attributes</code></li>
+<li><strong>加载模型</strong>：把训练好的神经网络（BiEncoder）加载到显存里，准备开始计算。</li>
+<li><strong>加载数据</strong>：打开维基百科数据集，准备好一个“传送带”（Dataloader），源源不断地输送文本。</li>
+<li><strong>准备存储器</strong>：准备一个空的 <code>OpenRetreivalDataStore</code> 对象，用来存结果。</li>
+</ul>
+</li>
+</ul>
+<h4><strong>阶段二：流水线作业 (The Loop)</strong></h4>
+<ul>
+<li>[ ] <strong>任务 3：开始循环处理 (Build Loop)</strong><ul>
+<li>对应代码：<code>build_and_save_index</code> 中的 <code>while True</code> 循环。</li>
+<li><strong>3.1 拿数据</strong>：从传送带上拿一批文本（比如 128 个段落）。</li>
+<li><strong>3.2 算指纹</strong>：把这批文本扔给模型 (<code>unwrapped_model.embed_text</code>)。模型会吐出这批文本对应的“向量”（Context Logits）。</li>
+<li><strong>3.3 存数据</strong>：把生成的向量和这行数据的 ID 存到临时的存储器里 (<code>add_block_data</code>)。</li>
+<li><strong>3.4 汇报进度</strong>：如果是工头，打印一下“我们要处理完了多少条了”。</li>
+</ul>
+</li>
+</ul>
+<h4><strong>阶段三：收尾与合并 (Finalize)</strong></h4>
+<ul>
+<li>
+<p>[ ] <strong>任务 4：保存分片 (Save Shard)</strong></p>
+<ul>
+<li>对应代码：<code>self.evidence_embedder_obj.save_shard()</code></li>
+<li>循环结束后，每个工人（GPU）把自己手里算好的那部分数据，先存成一个临时文件。</li>
+</ul>
+</li>
+<li>
+<p>[ ] <strong>任务 5：等待队友 (Barrier)</strong></p>
+<ul>
+<li>对应代码：<code>torch.distributed.barrier()</code></li>
+<li>大家互相等待，确保所有人都把自己的活儿干完了，文件都存好了，再进行下一步。</li>
+</ul>
+</li>
+<li>
+<p>[ ] <strong>任务 6：合并总账 (Merge)</strong></p>
+<ul>
+<li>对应代码：<code>if self.is_main_builder: ... merge_shards_and_save()</code></li>
+<li><strong>只有工头（Rank 0）做这件事</strong>。</li>
+<li>把所有人存的临时文件读取进来，拼成一个完整的大文件。</li>
+<li>检查一下：拼起来的总数是不是等于维基百科的总条数？（Assert 检查）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这段代码的核心逻辑其实非常线性：</p>
+<ol>
+<li><strong>加载</strong>模型和数据。</li>
+<li><strong>循环</strong>读取数据，用模型算出向量。</li>
+<li><strong>保存</strong>局部结果。</li>
+<li><strong>合并</strong>所有结果。</li>
+</ol>
+<p>之所以看着乱，是因为它加了很多处理<strong>多GPU并行</strong>（Distributed）的代码，以及为了兼容不同模型配置（ICT vs REALM）的判断逻辑。你只要盯着 <code>build_and_save_index</code> 这个函数，把它看作是一个大的 <code>For</code> 循环在做“<strong>文本 -&gt; 模型 -&gt; 向量 -&gt; 保存</strong>”这件事，就很容易理解了。</p>

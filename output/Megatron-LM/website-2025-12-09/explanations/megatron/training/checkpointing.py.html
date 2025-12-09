@@ -1,0 +1,129 @@
+<h1>megatron/training/checkpointing.py</h1>
+<p>这份代码文件 <code>megatron/training/checkpointing.py</code> 是 Megatron-LM 训练框架中的 <strong>“存档管理员”</strong>。</p>
+<p>它的核心职责非常简单：<strong>在训练过程中把模型保存下来（Save），以及在需要的时候把模型读取回来（Load）。</strong></p>
+<p>但是，因为 Megatron 是用来训练超大模型的（分布在几百几千张显卡上），所以这个“存”和“取”的过程比普通单卡训练要复杂得多。它需要处理分布式存储、不同格式的兼容、随机数种子的同步等等。</p>
+<p>为了让你看懂，我把这个文件要做的事情拆解成一个 <strong>Task Todo List（任务清单）</strong>，按照逻辑顺序一步步给你讲。</p>
+<hr />
+<h3>📋 任务清单：Megatron 的存档管理流程</h3>
+<h4>Phase 1: 准备工作 (搞清楚存哪、叫什么)</h4>
+<p>在真正读写文件之前，代码需要先处理路径和文件名。</p>
+<ol>
+<li>
+<p><strong>Task: 确定文件名和路径</strong></p>
+<ul>
+<li><strong>对应代码:</strong> <code>get_checkpoint_name</code>, <code>get_checkpoint_tracker_filename</code></li>
+<li><strong>解释:</strong><ul>
+<li>大模型不是存成一个文件的，而是存成一个文件夹。</li>
+<li>如果是分布式训练（模型并行），每张卡（Rank）可能只存自己那一部分权重。</li>
+<li>文件名通常包含迭代次数（如 <code>iter_0001000</code>）。</li>
+<li>还需要一个 <code>latest_checkpointed_iteration.txt</code> 文件，里面只写一个数字，告诉程序“最新的存档是第几次迭代”，方便下次自动断点续训。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task: 检查参数一致性</strong></p>
+<ul>
+<li><strong>对应代码:</strong> <code>check_checkpoint_args</code></li>
+<li><strong>解释:</strong><ul>
+<li>当你加载一个旧存档时，必须确保现在的模型配置（层数、隐藏层大小等）和存档里的一样，否则这就没法加载了。这个函数就是做这个“安检”工作的。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<h4>Phase 2: 存盘流程 (Save Checkpoint)</h4>
+<p>这是训练过程中定期触发的任务。</p>
+<ol>
+<li>
+<p><strong>Task: 收集所有需要保存的状态</strong></p>
+<ul>
+<li><strong>对应代码:</strong> <code>save_checkpoint</code> -&gt; <code>generate_state_dict</code></li>
+<li><strong>解释:</strong> 存档不仅仅是存模型权重（Model Weights）。为了能完美恢复训练，还需要存：<ul>
+<li><strong>Optimizer State:</strong> 优化器的状态（比如 Adam 的动量），没有这个就没法接着训练。</li>
+<li><strong>RNG State (<code>get_rng_state</code>):</strong> 随机数生成器的种子。确保恢复训练后，Dropout 等随机行为和之前是一致的。</li>
+<li><strong>Args:</strong> 当时的训练参数。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task: 处理分布式存储格式 (核心难点)</strong></p>
+<ul>
+<li><strong>对应代码:</strong> <code>save_checkpoint</code> 中的逻辑分支</li>
+<li><strong>解释:</strong> Megatron 支持多种存储格式，这里会根据配置决定怎么存：<ul>
+<li><strong>Legacy (Torch):</strong> 老格式，每张卡存自己的 <code>.pt</code> 文件。</li>
+<li><strong>Torch Distributed (TorchDist):</strong> 新格式，更高效的分布式存储。</li>
+<li><strong>Local vs Global:</strong> 是存到共享存储（如 Lustre）还是存到每台机器的本地磁盘。</li>
+<li><strong>FSDP/DTensor:</strong> 如果用了 PyTorch 原生的 FSDP，需要特殊的处理逻辑。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task: 异步保存 (不耽误训练)</strong></p>
+<ul>
+<li><strong>对应代码:</strong> <code>args.async_save</code>, <code>async_save_request</code></li>
+<li><strong>解释:</strong> 存几十 GB 甚至 TB 的数据很慢。为了不让 GPU 等着硬盘写完，代码支持“异步保存”。主进程继续训练，后台线程慢慢写硬盘。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task: 清理旧存档</strong></p>
+<ul>
+<li><strong>对应代码:</strong> <code>cleanup_old_non_persistent_checkpoint</code></li>
+<li><strong>解释:</strong> 硬盘空间有限，通常只保留最近的 N 个存档。存完新的，就得把最老的删掉。</li>
+</ul>
+</li>
+</ol>
+<h4>Phase 3: 读盘流程 (Load Checkpoint)</h4>
+<p>这是启动训练或断点续训时触发的任务。</p>
+<ol>
+<li>
+<p><strong>Task: 找到最新的存档</strong></p>
+<ul>
+<li><strong>对应代码:</strong> <code>load_checkpoint</code> -&gt; <code>read_metadata</code></li>
+<li><strong>解释:</strong> 去读那个 <code>latest_checkpointed_iteration.txt</code> 文件，知道该加载第多少步的存档。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task: 预加载参数 (Args)</strong></p>
+<ul>
+<li><strong>对应代码:</strong> <code>load_args_from_checkpoint</code></li>
+<li><strong>解释:</strong> 在构建模型之前，先只读存档里的参数配置。这允许用户不指定模型大小，直接用存档里的配置来初始化模型结构。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task: 加载权重与状态</strong></p>
+<ul>
+<li><strong>对应代码:</strong> <code>_load_base_checkpoint</code></li>
+<li><strong>解释:</strong><ul>
+<li>这是最重的一步。根据不同的格式（Legacy, TorchDist, FSDP），把硬盘上的数据读进内存。</li>
+<li><strong>关键点:</strong> 如果现在的并行度（TP/PP size）和存档时的不一样，高级的格式（如 TorchDist）支持<strong>自动重切分（Resharding）</strong>。比如以前是用 8 张卡训的，现在用 16 张卡加载，代码会自动把权重切分好。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task: 兼容性修复</strong></p>
+<ul>
+<li><strong>对应代码:</strong> <code>fix_query_key_value_ordering</code></li>
+<li><strong>解释:</strong> 随着 Megatron 版本迭代，有些矩阵的排列顺序变了（比如 Attention 的 QKV）。这个任务负责检测旧版本存档，并自动把权重转置一下，改成新版本能用的格式。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task: 恢复随机数和优化器</strong></p>
+<ul>
+<li><strong>对应代码:</strong> <code>load_checkpoint</code> 后半部分</li>
+<li><strong>解释:</strong> 把读出来的随机数种子设置回去，把优化器状态填回去。</li>
+</ul>
+</li>
+</ol>
+<h3>总结：这个文件讲了啥？</h3>
+<p>简单来说，<code>checkpointing.py</code> 就是一个<strong>复杂的“搬运工”</strong>：</p>
+<ol>
+<li><strong>打包：</strong> 把分散在几百张显卡显存里的数据（模型、优化器、随机状态）收集起来，整理好格式，写到硬盘里。</li>
+<li><strong>解包：</strong> 从硬盘里把数据读出来，根据当前的显卡数量和策略，把数据切分好，精准地填回每一张显卡的显存里。</li>
+<li><strong>管家：</strong> 记住哪个是最新的，删掉太旧的，处理版本不兼容的问题。</li>
+</ol>
+<p><strong>给你的建议：</strong>
+如果你不需要修改底层的存储逻辑，你只需要关注 <code>save_checkpoint</code>（怎么存）和 <code>load_checkpoint</code>（怎么取）这两个主入口函数即可，其他的都是辅助它们完成工作的工具函数。</p>

@@ -1,0 +1,61 @@
+<h1>megatron/core/dist_checkpointing/strategies/torch.py</h1>
+<p>这份代码确实比较晦涩，因为它处于两个复杂系统的交界处：<strong>Megatron-Core（英伟达的大模型训练框架）</strong> 和 <strong>PyTorch Distributed Checkpoint（PyTorch 原生的分布式存储格式，简称 DCP）</strong>。</p>
+<p>简单来说，这个文件的作用是一个<strong>“翻译官”</strong>和<strong>“调度员”</strong>。它负责把 Megatron 内部切分好的张量（ShardedTensor），转换成 PyTorch 能听懂的格式，然后利用 PyTorch 的底层能力把模型保存到硬盘上（或者从硬盘读出来）。</p>
+<p>为了让你看懂，我为你列了一个<strong>“学习任务清单 (Todo List)”</strong>，我们一步步拆解这个文件在干什么。</p>
+<hr />
+<h3>📋 学习任务清单：从小白到看懂源码</h3>
+<h4>✅ Task 1: 理解核心背景（为什么要写这个文件？）</h4>
+<ul>
+<li><strong>背景</strong>：在大模型训练中，模型参数被切分到了几百个 GPU 上（模型并行）。保存模型时，不能让所有 GPU 把数据发给一个人存（内存会爆），也不能每个人存一个独立文件（文件数太多难管理）。</li>
+<li><strong>解决方案</strong>：PyTorch 推出了 <code>torch.distributed.checkpoint</code> (DCP)，专门用来高效保存这种切分后的张量。</li>
+<li><strong>本文件的作用</strong>：Megatron 有自己的一套张量切分定义（<code>MCore ShardedTensor</code>），PyTorch 也有自己的一套（<code>Torch ShardedTensor</code>）。这个文件就是负责<strong>把 Megatron 的格式“翻译”成 PyTorch 的格式</strong>，然后调用 PyTorch 的保存/加载功能。</li>
+</ul>
+<h4>✅ Task 2: 数据翻译（核心函数解析）</h4>
+<p>代码里有一大块逻辑是在做数据结构的转换。
+*   <strong>关注点</strong>：<code>sharded_tensor_to_torch_sharded_tensor</code> 函数。
+*   <strong>解释</strong>：
+    *   Megatron 的 tensor 可能是被“展平”（flattened）的，或者有特殊的切分逻辑。
+    *   PyTorch 的 DCP 需要知道：“这个 tensor 全局形状是多大？你手里这块碎片在全局的哪个坐标？”
+    *   这个函数就在计算坐标（Offsets）和形状（Shapes），把 Megatron 的碎片包装成 PyTorch 能识别的 <code>TorchShardedTensor</code>。</p>
+<h4>✅ Task 3: 制定保存计划（Save Planner）</h4>
+<p>保存分布式模型不是“直接写盘”那么简单，需要所有 GPU 坐下来“开个会”，商量谁存哪一块数据，这就叫 Planner。
+*   <strong>关注点</strong>：<code>MCoreSavePlanner</code> 类。
+*   <strong>解释</strong>：
+    *   它继承自 PyTorch 的默认 Planner。
+    *   <strong>特殊处理</strong>：它处理了 Megatron 特有的元数据（Metadata），比如 <code>mcore_data</code>。
+    *   <strong>去重</strong>：在大模型训练中，有些参数在所有 GPU 上是一样的（复制的），Planner 需要确保不用每个 GPU 都存一份，只存一份即可（Deduplication）。</p>
+<h4>✅ Task 4: 执行保存策略（Save Strategy）</h4>
+<p>这是外部调用的入口，负责指挥整个保存流程。
+*   <strong>关注点</strong>：<code>TorchDistSaveShardedStrategy</code> 类。
+*   <strong>流程</strong>：
+    1.  <strong>准备</strong>：把 Megatron 的 <code>state_dict</code>（状态字典）拿来。
+    2.  <strong>翻译</strong>：调用 Task 2 的逻辑，转成 PyTorch 格式。
+    3.  <strong>异步写</strong>：使用 <code>FileSystemWriterAsync</code>。为了不卡住训练，保存动作是在后台线程进行的（Async）。
+    4.  <strong>缓存</strong>：<code>cached_central_plan</code>。如果模型结构没变，第二次保存时就不需要重新“开会商量”了，直接复用上次的计划，速度更快。</p>
+<h4>✅ Task 5: 制定加载计划（Load Planner）</h4>
+<p>加载比保存更麻烦，因为硬盘上的文件切分方式可能和当前 GPU 的数量不一致（比如 8卡存的，现在用 16卡跑）。
+*   <strong>关注点</strong>：<code>MCoreLoadPlanner</code> 类。
+*   <strong>解释</strong>：
+    *   <strong>形状校验</strong>：检查硬盘里的 tensor 形状和代码里定义的是否一致。
+    *   <strong>FP8 支持</strong>：代码里提到了 <code>Float8Tensor</code>。FP8（8位浮点数）比较特殊，加载时可能不连续，这个 Planner 负责把它们处理成连续内存，防止报错。</p>
+<h4>✅ Task 6: 执行加载策略（Load Strategy）</h4>
+<p>这是从硬盘恢复模型的入口。
+*   <strong>关注点</strong>：<code>TorchDistLoadShardedStrategy</code> 类。
+*   <strong>流程</strong>：
+    1.  <strong>读元数据</strong>：先读一个小的 <code>.metadata</code> 文件，看看模型长啥样。
+    2.  <strong>重构形状（Reformulation）</strong>：<code>get_reformulation_metadata</code>。因为 Megatron 有时会为了性能把 N 维张量拉成 1 维存。加载时得知道怎么还原回去。
+    3.  <strong>调用 PyTorch 加载</strong>：<code>checkpoint.load_state_dict(...)</code>。
+    4.  <strong>反向翻译</strong>：把 PyTorch 加载出来的结果，剥离掉包装壳（<code>_unwrap_pyt_sharded_tensor</code>），变回 Megatron 需要的原始 Tensor。</p>
+<hr />
+<h3>🔍 总结一下文中的核心观点（Takeaways）</h3>
+<p>如果你只想知道这个文件体现了什么设计思想，看这里：</p>
+<ol>
+<li><strong>拥抱标准，但保留个性</strong>：Megatron 决定不再自己造轮子去写底层的分布式文件读写，而是全面拥抱 PyTorch 原生的 <code>distributed.checkpoint</code>。但因为 Megatron 内部优化太激进（比如 Flattened Tensor），所以必须写一个复杂的“中间层”来适配。</li>
+<li><strong>性能至上 (Async &amp; Cache)</strong>：<ul>
+<li><strong>异步保存</strong>：训练大模型一秒钟都很贵，所以保存检查点不能阻塞计算，必须异步。</li>
+<li><strong>元数据缓存</strong>：成千上万个张量的元数据同步很慢，能缓存就缓存，不要每次 checkpoint 都重新计算全局视图。</li>
+</ul>
+</li>
+<li><strong>兼容性处理</strong>：代码里充满了对不同版本 PyTorch（2.2, 2.3, 2.4...）的兼容性判断，以及对 FP8（Transformer Engine）和 DTensor 的支持。这说明这是一个正在快速迭代、需要兼容多种硬件和软件环境的模块。</li>
+</ol>
+<p>希望这个 List 能帮你把这个复杂的文件拆解成容易理解的小模块！你可以先从 <strong>Task 4 (Save Strategy)</strong> 和 <strong>Task 6 (Load Strategy)</strong> 这两个入口类看起。</p>

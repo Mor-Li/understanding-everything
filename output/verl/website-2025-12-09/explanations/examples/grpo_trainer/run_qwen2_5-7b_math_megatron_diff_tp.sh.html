@@ -1,0 +1,92 @@
+<h1>examples/grpo_trainer/run_qwen2_5-7b_math_megatron_diff_tp.sh</h1>
+<p>这份脚本确实包含了很多高阶术语，涉及到<strong>大模型训练（LLM Training）</strong>、<strong>强化学习（RL）</strong>以及<strong>分布式计算（Distributed Computing）</strong>。</p>
+<p>为了让你更容易理解，我把它想象成<strong>“你要组织一场针对数学天才（Qwen2.5模型）的强化集训”</strong>。</p>
+<p>下面是按照这份脚本逻辑整理的 <strong>Task To-Do List（任务清单）</strong>，带你一步步看懂它在干什么：</p>
+<hr />
+<h3>📋 任务清单：启动“数学天才”强化训练</h3>
+<h4>✅ Task 1: 准备训练环境与教材 (Environment &amp; Data)</h4>
+<p><strong>脚本内容：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">CUDA_DEVICE_MAX_CONNECTIONS</span><span class="o">=</span><span class="m">1</span>
+<span class="nv">gsm8k_train_path</span><span class="o">=</span>...
+<span class="nv">math_train_path</span><span class="o">=</span>...
+</code></pre></div>
+
+<p><strong>解读：</strong>
+1.  <strong>设置显卡通信规则</strong>：告诉 NVIDIA 显卡在计算和通信时怎么优化（Megatron 框架的特殊要求）。
+2.  <strong>准备教材</strong>：
+    *   指定了两本“习题集”的路径：<strong>GSM8K</strong>（小学数学应用题）和 <strong>MATH</strong>（高难度竞赛数学题）。
+    *   把它们打包成训练集（<code>train_files</code>）和考试集（<code>test_files</code>）。</p>
+<h4>✅ Task 2: 确定训练目标与方法 (Algorithm)</h4>
+<p><strong>脚本内容：</strong></p>
+<div class="codehilite"><pre><span></span><code>python3<span class="w"> </span>-m<span class="w"> </span>verl.trainer.main_ppo<span class="w"> </span>...
+algorithm.adv_estimator<span class="o">=</span>grpo
+</code></pre></div>
+
+<p><strong>解读：</strong>
+1.  <strong>启动主程序</strong>：运行 <code>verl</code> 库里的 PPO 训练器。
+2.  <strong>选择教学法</strong>：使用 <strong>GRPO</strong> (Group Relative Policy Optimization)。
+    *   <em>通俗解释</em>：这是一种强化学习算法。传统的 PPO 需要一个“判卷老师”（Critic模型）来打分，GRPO 通过让模型生成一组答案，然后对比这一组答案的好坏来优化，通常更省显存，适合数学推理任务。</p>
+<h4>✅ Task 3: 设定“学生”模型 (Model Configuration)</h4>
+<p><strong>脚本内容：</strong></p>
+<div class="codehilite"><pre><span></span><code>actor_rollout_ref.model.path<span class="o">=</span>Qwen/Qwen2.5-7B-Instruct
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <strong>指定学生</strong>：我们要训练的基础模型是 <code>Qwen2.5-7B-Instruct</code>（通义千问2.5，70亿参数版本）。</p>
+<h4>✅ Task 4: <strong>【核心难点】</strong> 分配显卡资源 (Parallelism &amp; Resource)</h4>
+<p>这里是这个脚本最复杂、也是标题中 <code>diff_tp</code> (Different Tensor Parallelism) 的含义所在。在强化学习中，模型有三个分身，脚本让它们用了不同的显卡分配策略：</p>
+<p><strong>1. 正在学习的分身 (Actor - Training):</strong></p>
+<div class="codehilite"><pre><span></span><code>actor_rollout_ref.actor.megatron.pipeline_model_parallel_size<span class="o">=</span><span class="m">2</span>
+actor_rollout_ref.actor.megatron.tensor_model_parallel_size<span class="o">=</span><span class="m">2</span>
+</code></pre></div>
+
+<ul>
+<li><strong>任务</strong>：进行反向传播，更新参数。</li>
+<li><strong>策略</strong>：使用 <strong>Megatron</strong> 框架。把模型切成 2x2 的碎片（流水线并行 PP=2，张量并行 TP=2）。</li>
+</ul>
+<p><strong>2. 负责做题的分身 (Rollout - Inference):</strong></p>
+<div class="codehilite"><pre><span></span><code>actor_rollout_ref.rollout.name<span class="o">=</span>vllm
+actor_rollout_ref.rollout.tensor_model_parallel_size<span class="o">=</span><span class="m">4</span>
+</code></pre></div>
+
+<ul>
+<li><strong>任务</strong>：快速生成答案（做题）。</li>
+<li><strong>策略</strong>：使用 <strong>vLLM</strong> 框架（推理速度极快）。注意这里 <code>TP=4</code>，意味着它用 4 张卡并行计算一层，为了极致的推理速度。</li>
+</ul>
+<p><strong>3. 参考答案的分身 (Reference - Baseline):</strong></p>
+<div class="codehilite"><pre><span></span><code>actor_rollout_ref.ref.megatron.pipeline_model_parallel_size<span class="o">=</span><span class="m">2</span>
+actor_rollout_ref.ref.megatron.tensor_model_parallel_size<span class="o">=</span><span class="m">2</span>
+</code></pre></div>
+
+<ul>
+<li><strong>任务</strong>：保持原始模型不变，用来防止学生练“走火入魔”（计算 KL 散度）。</li>
+<li><strong>策略</strong>：和 Actor 一样，使用 Megatron，PP=2, TP=2。</li>
+</ul>
+<p><strong>总结 Task 4</strong>：这个脚本的高明之处在于<strong>混合架构</strong>。训练用 Megatron，做题用 vLLM，并且它们占用的显卡切分方式不一样（Diff TP），这是为了最大化利用 8 张显卡的显存和算力。</p>
+<h4>✅ Task 5: 制定课程表 (Training Hyperparameters)</h4>
+<p><strong>脚本内容：</strong></p>
+<div class="codehilite"><pre><span></span><code>data.train_batch_size<span class="o">=</span><span class="m">1024</span>
+actor_rollout_ref.actor.optim.lr<span class="o">=</span>1e-6
+actor_rollout_ref.rollout.n<span class="o">=</span><span class="m">5</span>
+trainer.total_epochs<span class="o">=</span><span class="m">15</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+1.  <strong>大班教学</strong>：一共要看 1024 道题才算一步（Batch Size）。
+2.  <strong>学习进度</strong>：学习率（LR）设为 <code>1e-6</code>，非常小心地微调，防止学坏。
+3.  <strong>刷题量</strong>：每道题让模型生成 5 个不同的解法（<code>rollout.n=5</code>），然后从中挑好的学习（GRPO 的特性）。
+4.  <strong>学期长度</strong>：总共训练 15 个轮次（Epochs）。</p>
+<h4>✅ Task 6: 安排后勤与记录 (Logistics)</h4>
+<p><strong>脚本内容：</strong></p>
+<div class="codehilite"><pre><span></span><code>trainer.n_gpus_per_node<span class="o">=</span><span class="m">8</span>
+trainer.project_name<span class="o">=</span><span class="s1">&#39;verl_grpo_example_gsm8k_math&#39;</span>
+trainer.save_freq<span class="o">=</span><span class="m">20</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+1.  <strong>硬件设施</strong>：这台机器上有 8 张 GPU。
+2.  <strong>写日记</strong>：实验名字叫“verl_grpo...”，日志会发到 WandB（一个可视化平台）和控制台。
+3.  <strong>存档</strong>：每 20 步保存一次模型，防止断电白干。</p>
+<hr />
+<h3>💡 一句话总结</h3>
+<p>这个脚本在指挥 <strong>8张显卡</strong>，利用 <strong>Megatron 和 vLLM 混合架构</strong>，使用 <strong>GRPO 算法</strong>，让 <strong>Qwen2.5-7B</strong> 模型通过大量做 <strong>数学题（GSM8K/MATH）</strong> 来提升它的解题能力。</p>

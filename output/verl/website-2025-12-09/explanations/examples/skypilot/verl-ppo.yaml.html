@@ -1,0 +1,96 @@
+<h1>examples/skypilot/verl-ppo.yaml</h1>
+<p>这份文件其实是一个<strong>自动化脚本</strong>，专门写给一个叫 <strong>SkyPilot</strong> 的工具看的。</p>
+<p>你可以把 SkyPilot 想象成一个<strong>“云端管家”</strong>。你把这份清单（YAML文件）交给管家，管家就会帮你去云端（比如 AWS, GCP, 或者 Kubernetes）租电脑、装软件、然后指挥这些电脑一起干活。</p>
+<p>这个文件的核心目的是：<strong>租两台带 H100 显卡的电脑，利用 Ray 框架组网，运行 PPO 算法来训练一个 Qwen（通义千问）大模型，让它更会做数学题（GSM8K 数据集）。</strong></p>
+<p>为了让你彻底看懂，我把这个文件的逻辑拆解成一个 <strong>5步走的 Task List</strong>：</p>
+<hr />
+<h3>Task 1: 搞定“硬件与场地” (Resources &amp; Secrets)</h3>
+<p><strong>目标</strong>：告诉管家我们需要什么样的电脑，以及进门的“钥匙”。</p>
+<ul>
+<li><strong>原文对应</strong>：<code>resources</code>, <code>num_nodes</code>, <code>secrets</code></li>
+<li><strong>白话解释</strong>：<ol>
+<li><strong>我要几台电脑？</strong> <code>num_nodes: 2</code> —— 给我来 2 台。</li>
+<li><strong>什么配置？</strong> <code>accelerators: H100:1</code> —— 每台都要有 1 张英伟达 H100 显卡（很贵的卡）。</li>
+<li><strong>系统环境？</strong> <code>image_id: ...</code> —— 电脑开机后，预装好这个 Docker 镜像（里面已经装好了 CUDA, PyTorch 等基础环境）。</li>
+<li><strong>暗号/钥匙？</strong> <code>WANDB_API_KEY</code> —— 这是一个用于记录实验数据的网站（WandB）的密码，填进去后，训练过程的图表就会自动上传。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 2: 装修与备菜 (Setup)</h3>
+<p><strong>目标</strong>：电脑开机后，自动执行一系列命令，把环境和数据准备好。</p>
+<ul>
+<li><strong>原文对应</strong>：<code>setup</code> 部分</li>
+<li><strong>白话解释</strong>：<ol>
+<li><strong>清理旧物</strong>：<code>rm -rf verl</code> —— 删掉旧文件夹，防止冲突。</li>
+<li><strong>下载代码</strong>：<code>git clone ... verl</code> —— 把 <code>verl</code> 这个项目的最新代码下载下来。</li>
+<li><strong>安装依赖</strong>：<code>pip3 install ...</code> —— 安装 Python 运行需要的各种包（比如 vllm 用于加速推理）。</li>
+<li><strong>准备食材（数据）</strong>：<ul>
+<li><code>mkdir -p ~/data/gsm8k</code> —— 建个文件夹。</li>
+<li><code>python3 .../gsm8k.py</code> —— 运行一个脚本，自动下载并处理 <strong>GSM8K</strong> 数据集（这是一个经典的小学数学应用题数据集）。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>Task 3: 组建团队 (Ray Cluster Setup)</h3>
+<p><strong>目标</strong>：现在有两台电脑，它们得互相认识，组成一个团队（集群）。这里用到了一个叫 <strong>Ray</strong> 的工具来管理分布式计算。</p>
+<ul>
+<li><strong>原文对应</strong>：<code>run</code> 部分的前半段（<code>if</code> 判断语句）</li>
+<li>
+<p><strong>白话解释</strong>：
+    SkyPilot 会把这段代码同时发给两台电脑执行，但电脑会根据自己的编号（RANK）做不同的事：</p>
+<ul>
+<li>
+<p><strong>如果是 0 号电脑 (Head Node / 班长)</strong>：</p>
+<ol>
+<li><code>ray start --head ...</code>：启动 Ray，并宣布自己是“头儿”（Head）。</li>
+<li><code>while ... sleep 10</code>：这是一个循环等待的过程。班长会一直盯着，直到看到另一台电脑（Worker）连接上来。如果两台电脑都连上了，它才会进行下一步。</li>
+</ol>
+</li>
+<li>
+<p><strong>如果是 1 号电脑 (Worker Node / 组员)</strong>：</p>
+<ol>
+<li><code>else</code> 分支里的代码。</li>
+<li><code>ray start --address $HEAD_IP...</code>：它不当头儿，而是直接连接 0 号电脑的 IP 地址，听从指挥。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 开始干活 (Training Command)</h3>
+<p><strong>目标</strong>：团队组建好了，班长（0号电脑）下达最终的训练指令。</p>
+<ul>
+<li><strong>原文对应</strong>：<code>python3 -m verl.trainer.main_ppo ...</code> (那一大串长命令)</li>
+<li><strong>白话解释</strong>：
+    这是真正的 AI 训练启动命令。虽然很长，但全是<strong>参数配置</strong>：<ol>
+<li><strong>用什么数据？</strong> <code>data.train_files=...gsm8k...</code> (刚才下载的数学题)。</li>
+<li><strong>用什么模型？</strong> <code>model.path=Qwen/Qwen2.5-0.5B-Instruct</code> (用通义千问 0.5B 版本作为底座)。</li>
+<li><strong>用什么算法？</strong> <strong>PPO</strong> (Proximal Policy Optimization)。这是一种强化学习算法。简单说就是：模型做题 -&gt; 也就是 Actor，另一个模型（Critic）打分 -&gt; 做对了奖励，做错了惩罚 -&gt; 模型以此调整参数。</li>
+<li><strong>怎么分配显卡？</strong><ul>
+<li><code>actor_rollout_ref...</code>：负责“做题”和“生成答案”的部分。</li>
+<li><code>critic...</code>：负责“打分”的部分。</li>
+</ul>
+</li>
+<li><strong>训练多久？</strong> <code>trainer.total_epochs=2</code> (把题目做两轮)。</li>
+<li><strong>几个人干活？</strong> <code>trainer.nnodes=2</code> (两台电脑一起跑)。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 5: 监控与结束</h3>
+<p><strong>目标</strong>：确保任务在跑，并且能看到进度。</p>
+<ul>
+<li><strong>原文对应</strong>：<code>trainer.logger=[console,wandb]</code></li>
+<li><strong>白话解释</strong>：
+    训练开始后，日志会打印在屏幕上（console），同时也会发送到 WandB 网站上。你可以喝着咖啡在网页上看模型的准确率是不是在上升。</li>
+</ul>
+<hr />
+<h3>总结一下这个 Task</h3>
+<p>如果你运行这个文件，实际上发生的事情是：</p>
+<ol>
+<li><strong>SkyPilot</strong> 去云上开了 <strong>2台 H100</strong>。</li>
+<li>两台电脑自动<strong>下载代码</strong>和<strong>数学题数据</strong>。</li>
+<li><strong>0号电脑</strong>启动 Ray 变成主机，<strong>1号电脑</strong>连上去变成从机。</li>
+<li><strong>0号电脑</strong>确认大家都到齐了。</li>
+<li><strong>0号电脑</strong>运行 Python 命令，开始用 <strong>PPO 算法</strong> 训练 <strong>Qwen-0.5B</strong> 模型，让它学做数学题。</li>
+<li>两台电脑的显卡开始疯狂运转，直到训练结束。</li>
+</ol>

@@ -1,0 +1,103 @@
+<h1>examples/grpo_trainer/run_qwen2_5_vl_7b_npu.sh</h1>
+<p>这份脚本确实包含了很多技术细节，因为它是在配置一个非常复杂的<strong>多模态大模型强化学习（RLHF）训练任务</strong>。</p>
+<p>为了让你看懂，我把它拆解成一个<strong>“六步走”的 Todo List</strong>。你可以把这份脚本想象成你在<strong>给一个学生（模型）布置一学期的学习计划</strong>。</p>
+<p>这是一个使用 <code>verl</code> 框架，在 <strong>华为昇腾 NPU</strong> 芯片上，对 <strong>Qwen2.5-VL-7B（视觉语言模型）</strong> 进行 <strong>GRPO</strong> 算法训练的配置单。</p>
+<hr />
+<h3>✅ Task 0: 搞清楚我们在干什么（核心目标）</h3>
+<ul>
+<li><strong>目标</strong>：我们要训练 Qwen2.5-VL-7B 这个模型，让它更会做几何题（Geo3k数据集）。</li>
+<li><strong>方法</strong>：使用 GRPO 算法（一种比 PPO 更省显存的强化学习算法）。</li>
+<li><strong>硬件</strong>：华为昇腾 NPU（不是英伟达 GPU）。</li>
+</ul>
+<hr />
+<h3>✅ Task 1: 环境与“开关”设置 (Environment Setup)</h3>
+<p>脚本的最开始几行是在调整基础设施。</p>
+<ul>
+<li><strong>脚本代码</strong>：
+    <code>bash
+    set -x
+    ENGINE=${1:-vllm}
+    export USE_OPTIMIZED_MODEL=0</code></li>
+<li><strong>解读</strong>：<ol>
+<li><code>ENGINE=${1:-vllm}</code>：决定用什么引擎来让模型生成答案。默认用 <strong>vLLM</strong>（因为它推理速度快）。</li>
+<li><code>export USE_OPTIMIZED_MODEL=0</code>：<strong>关键点</strong>。注释里说了，虽然 vLLM 针对昇腾 NPU 做了优化，但在 RLHF 训练这种特殊场景下，优化可能会出 Bug，所以这里强制<strong>关掉优化</strong>，求稳。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 准备教材 (Data Configuration)</h3>
+<p>告诉程序去哪里读取数据，以及数据长什么样。</p>
+<ul>
+<li><strong>脚本代码</strong>：
+    <code>bash
+    data.train_files=$HOME/data/geo3k/train.parquet \
+    data.image_key=images \
+    ...</code></li>
+<li><strong>解读</strong>：<ol>
+<li><strong>教材来源</strong>：用的是 <code>$HOME/data/geo3k</code> 下的数据，这是一个几何题数据集。</li>
+<li><strong>多模态设置</strong>：<code>image_key=images</code> 告诉模型，数据里包含图片（因为这是 VL 模型，既看图也看字）。</li>
+<li><strong>篇幅限制</strong>：题目最长 1024 token，回答最长 2048 token。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 配置“学生”与“参考系” (Actor &amp; Ref Model)</h3>
+<p>这是训练的核心部分，定义了模型本身和训练参数。</p>
+<ul>
+<li><strong>脚本代码</strong>：
+    <code>bash
+    actor_rollout_ref.model.path=Qwen/Qwen2.5-VL-7B-Instruct \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.kl_loss_coef=0.01 \</code></li>
+<li><strong>解读</strong>：<ol>
+<li><strong>主角是谁</strong>：<code>Qwen/Qwen2.5-VL-7B-Instruct</code>。我们是在这个已经微调过的模型基础上继续训练。</li>
+<li><strong>学习率 (lr)</strong>：<code>1e-6</code>。这个数字很小，说明我们希望模型<strong>微调</strong>，不要步子迈太大把脑子学坏了。</li>
+<li><strong>紧箍咒 (KL Loss)</strong>：<code>kl_loss_coef=0.01</code>。这是为了防止模型为了拿高分而“胡言乱语”。它强制模型现在的输出不能偏离原始模型太远。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 配置“考试模式” (Rollout Configuration)</h3>
+<p>在 RLHF 中，模型需要先自己生成一堆答案（Rollout），然后根据奖励打分来学习。这一步非常消耗显存。</p>
+<ul>
+<li><strong>脚本代码</strong>：
+    <code>bash
+    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
+    actor_rollout_ref.rollout.n=5 \
+    actor_rollout_ref.rollout.name=$ENGINE \</code></li>
+<li><strong>解读</strong>：<ol>
+<li><strong>并行加速</strong>：<code>tensor_model_parallel_size=4</code>。意思是，在生成答案时，把 1 个模型切开放在 <strong>4 张卡</strong> 上一起跑。这是为了解决显存不够或加速推理的问题。</li>
+<li><strong>题海战术</strong>：<code>rollout.n=5</code>。对于同一个问题，让模型生成 <strong>5 个不同的回答</strong>。GRPO 算法会对比这 5 个回答的好坏，好的给予奖励，差的给予惩罚。</li>
+<li><strong>引擎</strong>：使用前面定义的 <code>vllm</code> 引擎来快速生成这 5 个答案。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 硬件与训练场设置 (Trainer &amp; Hardware)</h3>
+<p>最后是关于机器怎么跑的设置。</p>
+<ul>
+<li><strong>脚本代码</strong>：
+    <code>bash
+    trainer.n_gpus_per_node=16 \
+    trainer.nnodes=1 \
+    trainer.device=npu \</code></li>
+<li><strong>解读</strong>：<ol>
+<li><strong>设备类型</strong>：<code>device=npu</code>。再次确认，这是华为昇腾的代码，不是英伟达 GPU。</li>
+<li><strong>算力规模</strong>：<code>n_gpus_per_node=16</code>。这台机器上有 16 张 NPU 卡（通常是一个满配的昇腾服务器机柜）。</li>
+<li><strong>训练时长</strong>：<code>total_epochs=15</code>。这套教材要学 15 轮。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这个脚本在讲什么故事？</h3>
+<blockquote>
+<p>“嘿，电脑！给我启动一个训练任务。</p>
+<ol>
+<li><strong>用 NPU 跑</strong>，把 vLLM 的激进优化关掉，免得报错。</li>
+<li><strong>教材</strong>用 Geo3k 几何题，记得带上图片。</li>
+<li><strong>学生</strong>是 Qwen2.5-VL-7B，学习要小心翼翼（学习率低）。</li>
+<li><strong>上课方式 (GRPO)</strong> 是这样的：每道题让学生<strong>做 5 遍</strong>（<code>rollout.n=5</code>），为了做得快，做题的时候把脑子劈成 4 瓣（TP=4）并行思考。</li>
+<li>一共用 <strong>16 张卡</strong> 跑这个任务，学 15 轮。”</li>
+</ol>
+</blockquote>
+<p>这就是这个脚本的全部含义。</p>

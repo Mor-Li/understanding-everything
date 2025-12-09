@@ -1,0 +1,140 @@
+<h1>megatron/legacy/model/vision/knn_monitor.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了<strong>自监督学习（Self-Supervised Learning, SSL）</strong>、<strong>分布式训练（多GPU）</strong>以及<strong>k近邻算法（kNN）</strong>。</p>
+<p>简单来说，这个文件的作用是：<strong>在一个没有标签的训练过程中，利用“作弊”的方式（kNN）来通过已知标签的数据集，强行评估当前模型到底学得好不好。</strong></p>
+<p>我们可以把这个过程想象成一个<strong>“开卷考试”</strong>的过程。</p>
+<p>为了让你读懂，我制定了一个 <strong>TODO List（任务清单）</strong>。我们按照这个清单，一步一步把代码拆解开来看。</p>
+<hr />
+<h3>任务清单 (Project To-Do List)</h3>
+<ol>
+<li><strong>【背景任务】理解我们在干什么？（核心概念）</strong></li>
+<li><strong>【任务一】准备“参考书”数据 (<code>build_data_loader</code>)</strong></li>
+<li><strong>【任务二】构建“全知全能题库” (<code>compute_feature_bank</code>)</strong><ul>
+<li>2.1 提取特征</li>
+<li>2.2 汇总所有GPU的知识</li>
+</ul>
+</li>
+<li><strong>【任务三】利用题库进行“开卷考试” (<code>knn_predict</code>)</strong><ul>
+<li>3.1 查重（计算相似度）</li>
+<li>3.2 抄答案（加权投票）</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>1. 【背景任务】理解我们在干什么？</h4>
+<p><strong>场景：</strong> 你正在训练一个视觉模型（比如 Vision Transformer），用的是自监督学习（比如 SimCLR, MoCo, DINO）。这意味着训练时<strong>不用标签</strong>，模型只看图片。
+<strong>问题：</strong> 既然不用标签，训练过程中我怎么知道模型变聪明了没有？准确率是多少？
+<strong>解决方案（即本代码的功能）：</strong>
+虽然训练不用标签，但我手里其实是有标签的。我可以把所有训练集的图片都喂给模型，算出它们的特征向量，存成一个<strong>“特征库（Bank）”</strong>。
+当我要测试一张新图片时，我算出新图片的特征，去“特征库”里找和它最像的 $K$ 张图。如果这 $K$ 张图大部分是“猫”，那我就猜这张新图也是“猫”。</p>
+<p>这就是 <strong>kNN Monitor</strong>。</p>
+<hr />
+<h4>2. 【任务一】准备“参考书”数据</h4>
+<p>对应代码函数：<code>build_data_loader</code></p>
+<ul>
+<li><strong>目标</strong>：把训练集图片加载进来。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>这是一个标准的 PyTorch/Megatron 数据加载器。</li>
+<li>关键点在于 <code>DistributedSampler</code>：因为是多显卡训练，每张卡只读取数据的一部分，互不重复。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>3. 【任务二】构建“全知全能题库” (核心)</h4>
+<p>对应代码函数：<code>compute_feature_bank</code></p>
+<p>这是最复杂的部分。它的目标是：<strong>把整个训练集跑一遍，记下所有图片的“特征”和“标签”，并存到内存里。</strong></p>
+<p><strong>步骤拆解：</strong></p>
+<ul>
+<li>
+<p><strong>2.1 提取特征 (Extract Features)</strong>
+    ```python
+    # 切换到评估模式
+    for m in model: m.eval()</p>
+<h1>遍历数据加载器</h1>
+<p>for i, batch in enumerate(dataloader):
+    # ... 数据搬运到 GPU ...
+    # 输入模型，拿到特征。
+    # 注意这里用了 teacher_feature，通常在自监督学习中，teacher 网络的特征更稳定
+    student_feature, teacher_feature = model<a href="images">0</a></p>
+<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 归一化 (Normalize)：把特征向量长度变为1，方便后面算余弦相似度
+feature = F.normalize(teacher_feature.float(), dim=1)
+
+<span class="gh">#</span> 存入临时的列表
+feature_bank.append(feature)
+feature_label.append(labels)
+</code></pre></div>
+
+<p>```</p>
+</li>
+<li>
+<p><strong>2.2 汇总所有GPU的知识 (Distributed Gather)</strong></p>
+<ul>
+<li><em>问题</em>：每张显卡（GPU）只算了一部分数据。如果只用本地数据做题库，题库太小，不准。</li>
+<li><em>解决</em>：大家把各自算好的特征交换一下，拼成一个完整的、包含所有训练数据的超级大矩阵。
+```python</li>
+</ul>
+<h1>这一步是把所有卡上的特征拼起来</h1>
+<p>feature_banks = [torch.zeros_like(feature_bank) for i in range(mpu.get_data_parallel_world_size())]</p>
+<h1>全局通信：All Gather。所有显卡把自己的 feature_bank 发给其他人</h1>
+<p>torch.distributed.all_gather(feature_banks, feature_bank, group=mpu.get_data_parallel_group())</p>
+<h1>同样的操作也对标签（label）做一遍</h1>
+<p>torch.distributed.all_gather(feature_labels, feature_label, ...)</p>
+<h1>最后转置一下，变成 [特征维度, 图片总数] 的形状，方便矩阵乘法</h1>
+<p>feature_banks = torch.cat(feature_banks, dim=0).t().contiguous()</p>
+<h1>存到全局变量 _FEATURE_BANK 里，以后这就叫“题库”</h1>
+<p>_FEATURE_BANK = (feature_banks, feature_labels, classes)
+```</p>
+</li>
+</ul>
+<hr />
+<h4>4. 【任务三】利用题库进行“开卷考试”</h4>
+<p>对应代码函数：<code>knn_predict</code></p>
+<p>现在我们有了<strong>题库</strong>（<code>feature_bank</code>，里面存了成千上万张图的特征）和<strong>答案</strong>（<code>feature_labels</code>）。
+现在来了一批<strong>新题目</strong>（验证集图片的特征 <code>feature</code>），我们要预测它们是什么类别。</p>
+<p><strong>步骤拆解：</strong></p>
+<ul>
+<li>
+<p><strong>3.1 查重（计算相似度）</strong>
+    <code>python
+    # 矩阵乘法：新特征 x 题库特征。
+    # 因为之前做过归一化，这里的矩阵乘法等价于计算“余弦相似度”。
+    # 结果 sim_matrix 是一个 [B, N] 的矩阵，表示当前 batch 每张图和题库里所有图的相似度。
+    sim_matrix = torch.mm(feature, feature_bank)</code></p>
+</li>
+<li>
+<p><strong>3.2 找最像的 K 个邻居 (Top-K)</strong>
+    ```python
+    # 找出最相似的 knn_k (比如200) 个样本
+    # sim_weight: 相似度数值
+    # sim_indices: 它们在题库里的索引
+    sim_weight, sim_indices = sim_matrix.topk(k=knn_k, dim=-1)</p>
+<h1>查出这 K 个邻居对应的真实标签</h1>
+<p>sim_labels = torch.gather(feature_labels.expand(...), dim=-1, index=sim_indices)
+```</p>
+</li>
+<li>
+<p><strong>3.3 抄答案（加权投票）</strong></p>
+<ul>
+<li>并不是简单的少数服从多数，而是<strong>谁越像，谁的票越重要</strong>。
+```python</li>
+</ul>
+<h1>计算权重：距离越近（相似度越高），权重越大。这里用了一个指数函数来放大差异。</h1>
+<p>sim_weight = (sim_weight / knn_t).exp()</p>
+<h1>这是一个独热编码（One-Hot）的过程，用来统计每个类别的得分</h1>
+<p>one_hot_label = ... </p>
+<h1>核心投票逻辑：把 K 个邻居的权重加到它们对应的类别上</h1>
+<p>pred_scores = torch.sum(...)</p>
+<h1>谁的分数最高，就预测是谁</h1>
+<p>pred_labels = pred_scores.argsort(dim=-1, descending=True)
+```</p>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这段代码其实就讲了一个故事：</p>
+<ol>
+<li><strong>准备阶段</strong>：把所有训练图片过一遍模型，提取出“特征”和“标签”，拼在一起做成一本<strong>字典（Feature Bank）</strong>。</li>
+<li><strong>应用阶段</strong>：每当我想知道模型现在对于一张新图理解得怎么样的时，我就算出新图的特征，去<strong>字典</strong>里查和它最像的 $K$ 张图。</li>
+<li><strong>结论</strong>：如果那 $K$ 张图的标签主要是“狗”，那我就预测新图是“狗”。如果预测对了，说明模型的特征提取能力很强（把同类图片聚在了一起）。</li>
+</ol>
+<p>这种方法的好处是：<strong>不需要训练一个新的全连接层（Classifier）就能快速评估自监督模型的质量。</strong></p>

@@ -1,0 +1,98 @@
+<h1>tools/checkpoint/loader_llava.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到 <strong>NVIDIA Megatron-Core (Mcore)</strong> 的底层模型加载机制，专门用于加载 <strong>LLaVA (Large Language-and-Vision Assistant)</strong> 多模态模型的 Checkpoint（权重文件）。</p>
+<p>简单来说，这个脚本的任务是：<strong>把硬盘上保存的、可能被切分在不同 GPU 上的 LLaVA 模型权重读取出来，整理好，然后发送给转换工具或者推理引擎。</strong></p>
+<p>为了让你听懂，我把这个脚本的工作流程拆解成一个 <strong>“搬家清单 (Todo List)”</strong>。想象我们要把一个复杂的乐高模型（LLaVA）从旧盒子（Checkpoint）里拿出来，重新整理打包。</p>
+<p>以下是代码逻辑的 Todo List 分解：</p>
+<hr />
+<h3>Task 1: 搞清楚我们要搬什么 (配置解析)</h3>
+<p><strong>对应代码：</strong> <code>add_arguments</code>, <code>_maybe_parse_additional_megatron_args</code></p>
+<ul>
+<li><strong>目标</strong>：在动手搬运权重之前，先看说明书，搞清楚这个 LLaVA 模型长什么样。</li>
+<li><strong>动作</strong>：<ol>
+<li><strong>读取基本参数</strong>：比如词表大小 (<code>vocab-size</code>)、Megatron 库的路径。</li>
+<li><strong>读取 LLaVA 专属参数</strong>：这一点最重要。LLaVA 不仅仅是语言模型，还有视觉部分。代码会从 Checkpoint 中提取：<ul>
+<li><code>vision_model_type</code>: 眼睛用的是哪种模型？(比如 InternViT, SigLIP, Radio 等)。</li>
+<li><code>img_h</code>, <code>img_w</code>: 图片输入多大？(比如 448x448)。</li>
+<li><code>patch_dim</code>: 图片切块的大小。</li>
+<li><code>freeze_vision</code>: 训练时有没有冻结视觉部分？</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>白话解释</strong>：就像搬家前先看清单，确认这次搬的是“三室一厅”还是“别墅”，特别是要注意“带不带花园”（视觉部分）。</li>
+</ul>
+<h3>Task 2: 建立模型蓝图 (构建 Metadata)</h3>
+<p><strong>对应代码：</strong> <code>build_checkpoint_metadata</code></p>
+<ul>
+<li><strong>目标</strong>：创建一个包含所有模型尺寸信息的“元数据”对象，告诉后续步骤每一层有多大。</li>
+<li><strong>动作</strong>：<ol>
+<li><strong>加载配置类</strong>：从 Megatron 库中导入 Vision 和 Language 的配置工具。</li>
+<li><strong>计算尺寸</strong>：确认 Vision Transformer (ViT) 有多少层 (<code>vision_num_layers</code>)，注意力头有多少个，隐藏层维度是多少。</li>
+<li><strong>记录特殊结构</strong>：比如是否使用了 <code>Swiglu</code> (一种激活函数结构)，因为这决定了权重矩阵的形状。</li>
+</ol>
+</li>
+<li><strong>白话解释</strong>：画一张图纸。在搬运砖头（权重 Tensor）之前，先知道墙要砌多高、多厚。</li>
+</ul>
+<h3>Task 3: 搬运“眼睛” (视觉编码器 Vision Backbone)</h3>
+<p><strong>对应代码：</strong> <code>send_vision_backbone_over_queue</code> <strong>(这是核心难点)</strong></p>
+<ul>
+<li><strong>目标</strong>：提取处理图片的那部分神经网络权重。</li>
+<li><strong>动作</strong>：<ol>
+<li><strong>处理特殊的视觉模型</strong>：代码里写了 <code>if</code> 判断，专门处理 <code>internvit</code>, <code>siglip</code>, <code>radio</code> 等不同种类的视觉模型。它们的第一层（Conv1）和位置编码（Position Embeddings）名字不一样，要分别提取。</li>
+<li><strong>处理 Tensor Parallel (TP) 切分</strong>：<ul>
+<li>这是最复杂的地方。Megatron 训练时，为了快，把一个大的矩阵切成了几块放在不同 GPU 上（<code>encoder_tp_size</code>）。</li>
+<li><strong>拼接 (Concat)</strong>：加载时，代码用 <code>for tp_rank in range...</code> 循环读取所有切片，然后用 <code>torch.cat</code> 把它们拼回一个完整的矩阵。</li>
+<li><em>例子</em>：<code>qkv_weight</code> (注意力权重) 通常被切分了，这里把它还原。</li>
+</ul>
+</li>
+<li><strong>发送到队列</strong>：处理完一层，就用 <code>queue_put</code> 发送出去。</li>
+</ol>
+</li>
+<li><strong>白话解释</strong>：LLaVA 的“眼睛”可能被拆散了放在不同的箱子里。这一步是把眼睛的零件找齐，如果是切开的（TP切分），要用胶水（<code>torch.cat</code>）把它们粘回完整的形状。</li>
+</ul>
+<h3>Task 4: 搬运“神经桥梁” (视觉投影层 Vision Projection)</h3>
+<p><strong>对应代码：</strong> <code>send_vision_projection_over_queue</code></p>
+<ul>
+<li><strong>目标</strong>：LLaVA 有一个连接层（Projector），负责把图片的特征转换成语言模型能懂的特征。</li>
+<li><strong>动作</strong>：<ol>
+<li>提取 <code>linear_fc1</code> 和 <code>linear_fc2</code> 的权重。</li>
+<li>同样需要处理 <strong>TP 切分</strong>：<ul>
+<li>第一层通常是按行切分或按列切分，代码里通过 <code>dim=0</code> 或 <code>dim=1</code> 的 <code>torch.cat</code> 来还原。</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>白话解释</strong>：这是连接眼睛和大脑的视神经。虽然只有两层简单的全连接层，但同样被切碎了，需要拼好。</li>
+</ul>
+<h3>Task 5: 搬运“大脑” (语言模型 LLM)</h3>
+<p><strong>对应代码：</strong> <code>send_llm_over_queue</code> (在 <code>send_model_over_queue</code> 中被调用)</p>
+<ul>
+<li><strong>目标</strong>：提取负责说话的文本生成部分（通常是 LLaMA 或其它 GPT 架构）。</li>
+<li><strong>动作</strong>：<ul>
+<li>这里代码没有展开写，而是直接调用了父类的方法。因为语言模型的加载逻辑是通用的，不需要为 LLaVA 重写。</li>
+<li>它会复用 <code>schema</code> 来定义语言模型的层结构。</li>
+</ul>
+</li>
+<li><strong>白话解释</strong>：搬运大脑。因为大脑的结构很标准（GPT结构），直接用通用的搬运工（父类方法）搬就行了。</li>
+</ul>
+<h3>Task 6: 总指挥 (Orchestration)</h3>
+<p><strong>对应代码：</strong> <code>send_model_over_queue</code> 和 <code>load_checkpoint</code></p>
+<ul>
+<li><strong>目标</strong>：按顺序执行上述所有步骤。</li>
+<li><strong>动作</strong>：<ol>
+<li>先发 Metadata。</li>
+<li>再发 Vision Backbone (Task 3)。</li>
+<li>再发 Vision Projection (Task 4)。</li>
+<li>最后发 LLM (Task 5)。</li>
+<li>发送 "done" 信号。</li>
+</ol>
+</li>
+<li><strong>白话解释</strong>：这是工头。他拿着对讲机喊：“先把说明书发过去，然后发眼睛，再发视神经，最后发大脑，完事收工！”</li>
+</ul>
+<hr />
+<h3>总结：这段代码的核心观点</h3>
+<ol>
+<li><strong>多模态的复杂性</strong>：LLaVA 不像纯文本模型那么简单，它由三个模块拼接而成（Vision, Projector, Language），加载器必须分别处理这三部分的权重映射。</li>
+<li><strong>兼容性地狱</strong>：代码里充满了 <code>if model_type == 'internvit'</code> 这种判断，说明这个加载器为了兼容不同的视觉基座（Vision Backbones），做了很多“脏活累活”来对齐层名称。</li>
+<li><strong>并行还原</strong>：Megatron 的核心特性是模型并行（Model Parallelism）。这个脚本的一个主要工作就是把训练时<strong>切分</strong>（Sharded）的权重，在加载时<strong>合并</strong>（Concat）成完整的权重张量。</li>
+</ol>

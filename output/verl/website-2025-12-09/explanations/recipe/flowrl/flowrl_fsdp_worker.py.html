@@ -1,0 +1,67 @@
+<h1>recipe/flowrl/flowrl_fsdp_worker.py</h1>
+<p>这份代码是一个 <strong>自定义的训练工人（Worker）</strong>，专门用于一种叫做 <strong>FlowRL</strong>（流式强化学习）的算法。</p>
+<p>你可以把它想象成一个“车间主任”，它的工作是协调模型（Actor）、推理引擎（Rollout）和参考模型（Ref）。但因为它要跑 FlowRL 算法，所以它比普通的 PPO 算法工人多了一些特殊的“改装”步骤。</p>
+<p>为了让你看懂，我把它做的事情拆解成一个 <strong>“FlowRL 启动与运行 To-Do List”</strong>，一步步带你看：</p>
+<hr />
+<h3>📋 FlowRL Worker 的任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 加载基础模型 (买个底盘)</h4>
+<p><strong>对应代码：</strong> <code>_build_model_optimizer</code> 函数的前半部分。
+*   <strong>动作</strong>：从 HuggingFace 加载预训练模型（比如 Llama, Qwen 等）。
+*   <strong>解释</strong>：这是训练的起点，先把基础的大模型加载到内存里。此时它还只是一个普通的语言模型。</p>
+<h4>✅ Task 2: 【核心】安装 FlowRL 独有的零件 "ProjZ" (改装引擎)</h4>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># ==== FlowRL: inject ProjZ BEFORE FSDP wrap ====</span>
+<span class="k">if</span> <span class="n">role</span> <span class="o">==</span> <span class="s2">&quot;actor&quot;</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_actor</span><span class="p">:</span>
+    <span class="n">actor_module</span><span class="o">.</span><span class="n">add_module</span><span class="p">(</span><span class="s2">&quot;proj_z&quot;</span><span class="p">,</span> <span class="n">ProjZModule</span><span class="p">(</span><span class="o">...</span><span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：在模型上强行“焊”上去一个小模块，起名叫 <code>proj_z</code>。</li>
+<li><strong>解释</strong>：这是这篇代码最关键的地方！<ul>
+<li>普通的 RL (如 PPO) 不需要这个。</li>
+<li><strong>FlowRL 算法</strong> 需要估计一个叫 $Z$ (配分函数/Partition Function) 的数值。</li>
+<li>所以必须在模型被切分（FSDP）之前，把这个用于计算 $Z$ 的神经网络层加进去，让它成为模型的一部分，跟着一起训练。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 模型切分与并行化 (FSDP 包装)</h4>
+<p><strong>对应代码：</strong> <code>FSDP(...)</code> 或 <code>apply_fsdp2(...)</code> 部分。
+*   <strong>动作</strong>：使用 PyTorch 的 FSDP (Fully Sharded Data Parallel) 技术把刚才改装好的模型（含 <code>proj_z</code>）包裹起来。
+*   <strong>解释</strong>：大模型太大了，单张显卡放不下。这一步是为了把模型切碎，分散到多张显卡上进行分布式训练。</p>
+<h4>✅ Task 4: 切换大脑，使用 FlowRL 的训练逻辑</h4>
+<p><strong>对应代码：</strong> <code>init_model</code> 函数。</p>
+<div class="codehilite"><pre><span></span><code><span class="bp">self</span><span class="o">.</span><span class="n">actor</span> <span class="o">=</span> <span class="n">FlowRLActor</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：把默认的“演员”（Actor）替换成 <code>FlowRLActor</code>。</li>
+<li><strong>解释</strong>：<ul>
+<li>父类默认可能使用的是 PPO Actor，计算的是 PPO Loss。</li>
+<li>这里强制换成 <strong>FlowRL Actor</strong>，因为我们需要计算 <strong>Trajectory Balance Loss (轨迹平衡损失)</strong>，这是 FlowRL 算法的核心数学公式。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 推理前的“安检” (剔除 ProjZ)</h4>
+<p><strong>对应代码：</strong> <code>rollout_mode</code> 函数。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># ==== FlowRL: Filter out proj_z parameters ====</span>
+<span class="n">params</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">params</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">k</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;proj_z&quot;</span><span class="p">)}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：当需要把模型参数传给推理引擎（vLLM）去生成文本时，<strong>先把 <code>proj_z</code> 参数剔除掉</strong>。</li>
+<li><strong>解释</strong>：<ul>
+<li>我们在 Task 2 加的 <code>proj_z</code> 只是为了训练时算 Loss 用的。</li>
+<li><strong>vLLM (推理引擎)</strong> 只负责生成文本，它根本看不懂也不需要 <code>proj_z</code>。如果把这个参数传给 vLLM，它可能会报错或者感到困惑。</li>
+<li>所以，这一步相当于在“发货”给推理引擎前，把训练专用的辅助轮拆下来。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+1.  拿来一个 LLM。
+2.  <strong>加一个 <code>proj_z</code> 模块</strong>（为了 FlowRL）。
+3.  <strong>切分模型</strong>（为了多卡训练）。
+4.  <strong>换用 FlowRLActor</strong>（为了算 FlowRL Loss）。
+5.  <strong>生成文本时隐藏 <code>proj_z</code></strong>（为了不干扰推理引擎）。</p>
+<p>你看懂这个 List，就看懂了这个文件的所有核心观点的。</p>

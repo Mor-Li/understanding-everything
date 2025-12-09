@@ -1,0 +1,116 @@
+<h1>tests/unit_tests/transformer/test_submodule_callables.py</h1>
+<p>这份代码确实比较硬核，它是 <strong>NVIDIA Megatron-Core</strong>（一个用于训练超大模型的库）中的一个单元测试文件。</p>
+<p>简单来说，这个文件的目的是：<strong>验证“把一个巨大的 Transformer 层拆解成几个小零件单独运行”和“直接运行整个层”，算出来的结果是不是一模一样。</strong></p>
+<p>为了让你看懂，我制定了一个 <strong>6步学习 Task List</strong>，我们一步步来拆解：</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心背景 —— 为什么要“拆解”模型？</strong></li>
+<li><strong>Task 2: 搞懂“对照组” —— 标准运行模式 (<code>run_model_ref_with_capture</code>)</strong></li>
+<li><strong>Task 3: 搞懂“实验组” —— 拆解运行模式 (<code>run_model_submodules_with_capture</code>)</strong></li>
+<li><strong>Task 4: 深入细节 —— 拆成了哪几步？</strong></li>
+<li><strong>Task 5: 验证逻辑 —— 怎么判断测试通过？</strong></li>
+<li><strong>Task 6: 总结 —— 这个测试到底在保卫什么？</strong></li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>Task 1: 理解核心背景 —— 为什么要“拆解”模型？</h4>
+<p>在训练像 GPT-4 这种超大模型时（特别是使用了 MoE 混合专家模型时），为了速度快，我们需要做很多复杂的并行优化。</p>
+<ul>
+<li><strong>普通模式</strong>：直接调用 <code>layer(input)</code>，像黑盒一样一次性跑完。</li>
+<li><strong>高级模式</strong>：我们需要把这个黑盒打开，把里面的步骤拿出来，比如“先做 Attention，停一下，发个数据给别的显卡，再做 MoE...”。</li>
+</ul>
+<p>这个文件测试的功能叫做 <code>build_layer_callables</code>，它的作用就是把黑盒拆成一个个可以独立调用的函数（Callables）。</p>
+<p><strong>比喻</strong>：
+*   <strong>普通模式</strong>：你去餐厅点一份“巨无霸套餐”，服务员直接端给你。
+*   <strong>拆解模式</strong>：你要求服务员先把面包给你，再把肉饼给你，再把生菜给你。
+*   <strong>测试目的</strong>：确认分开拿到的东西，吃进肚子里和直接点套餐是一样的。</p>
+<h4>Task 2: 搞懂“对照组” —— 标准运行模式</h4>
+<p>看函数 <code>run_model_ref_with_capture</code>（Reference，即参考答案）：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">run_model_ref_with_capture</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">input_tensors</span><span class="p">,</span> <span class="n">iterations</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">iterations</span><span class="p">):</span>
+        <span class="c1"># 直接调用 model，不做任何花哨的操作</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">input_tensors</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">())[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="c1"># ...</span>
+        <span class="n">output</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 计算梯度（反向传播）</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 把输出结果和参数的梯度存起来，作为“标准答案”</span>
+    <span class="k">return</span> <span class="n">capture</span>
+</code></pre></div>
+
+<ul>
+<li><strong>核心逻辑</strong>：这是最传统的运行方式，用来生成标准答案。</li>
+</ul>
+<h4>Task 3: 搞懂“实验组” —— 拆解运行模式</h4>
+<p>看函数 <code>run_model_submodules_with_capture</code>（Submodules，即子模块）：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">run_model_submodules_with_capture</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">input_tensors</span><span class="p">,</span> <span class="n">microbatches</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 关键点！这里把 model 拆解成了 6 个小函数（callables）</span>
+    <span class="n">callables</span><span class="p">,</span> <span class="n">dw</span> <span class="o">=</span> <span class="n">build_layer_callables</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+    <span class="n">attn</span><span class="p">,</span> <span class="n">post_attn</span><span class="p">,</span> <span class="n">dispatch</span><span class="p">,</span> <span class="n">moe</span><span class="p">,</span> <span class="n">combine</span><span class="p">,</span> <span class="n">post_process</span> <span class="o">=</span> <span class="n">callables</span>
+
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">microbatches</span><span class="p">):</span>
+        <span class="c1"># 下面不再是 model(input)，而是手动一步步调用这些小函数</span>
+
+        <span class="c1"># 1. 算 Attention</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">attn</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">input_tensors</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+
+        <span class="c1"># 2. Attention 后的处理</span>
+        <span class="n">local_tokens</span><span class="p">,</span> <span class="n">probs</span> <span class="o">=</span> <span class="n">post_attn</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
+
+        <span class="c1"># 3. 分发数据 (MoE 特有)</span>
+        <span class="n">dispatched_tokens</span> <span class="o">=</span> <span class="n">dispatch</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">local_tokens</span><span class="p">,</span> <span class="n">probs</span><span class="p">)</span>
+
+        <span class="c1"># 4. 专家计算 (MoE 特有)</span>
+        <span class="n">expert_outputs</span> <span class="o">=</span> <span class="n">moe</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">dispatched_tokens</span><span class="p">)</span>
+        <span class="c1"># ...</span>
+
+        <span class="c1"># 5. 合并数据</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">combine</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">expert_output</span><span class="p">,</span> <span class="n">shared_expert_output</span><span class="p">)</span>
+
+        <span class="c1"># ...同样做反向传播</span>
+</code></pre></div>
+
+<ul>
+<li><strong>核心逻辑</strong>：这里手动模拟了 Transformer 层的内部流程。虽然代码变长了，但这意味着开发者可以在这几步中间插入“通信操作”或者“流水线并行逻辑”。</li>
+</ul>
+<h4>Task 4: 深入细节 —— 拆成了哪几步？</h4>
+<p>这个测试主要针对的是 <strong>MoE (Mixture of Experts)</strong> 架构的 Transformer 层。拆解的步骤如下：</p>
+<ol>
+<li><strong><code>attn</code></strong>: 计算自注意力机制（Self-Attention）。</li>
+<li><strong><code>post_attn</code></strong>: Attention 之后的 LayerNorm 或 Dropout 等处理。</li>
+<li><strong><code>dispatch</code></strong>: (MoE特有) 路由器。决定每个 token 应该去哪个“专家”（Expert）那里处理，并把数据发送过去。</li>
+<li><strong><code>moe</code></strong>: (MoE特有) 专家计算。实际的 MLP 层计算。</li>
+<li><strong><code>combine</code></strong>: (MoE特有) 把各个专家算好的结果收集回来，拼在一起。</li>
+</ol>
+<p>这个测试就是为了确保：<strong>手动按顺序执行这5步 = 执行整个层</strong>。</p>
+<h4>Task 5: 验证逻辑 —— 怎么判断测试通过？</h4>
+<p>看类 <code>TestTransformerLayerSubmoduleCallables</code> 中的 <code>test_1f1b_overlap</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 1. 初始化模型</span>
+    <span class="n">model</span> <span class="o">=</span> <span class="n">TransformerLayer</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 2. 跑一遍“标准模式”，拿到 capture_ref</span>
+    <span class="n">capture_ref</span> <span class="o">=</span> <span class="n">run_model_ref_with_capture</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 3. 重置模型参数，跑一遍“拆解模式”，拿到 capture_callables</span>
+    <span class="n">capture_callables</span> <span class="o">=</span> <span class="n">run_model_submodules_with_capture</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 4. 比较两者是否完全一致</span>
+    <span class="n">comp_res</span> <span class="o">=</span> <span class="n">compare_captures</span><span class="p">(</span><span class="n">capture_ref</span><span class="p">,</span> <span class="n">capture_callables</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">comp_res</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="c1"># 如果不一致，报错</span>
+</code></pre></div>
+
+<ul>
+<li><strong>测试点</strong>：不仅输出（Output）要一样，参数的梯度（Gradient）也要一样。这证明了拆解后没有丢失任何数学精度。</li>
+</ul>
+<h4>Task 6: 总结 —— 这个测试到底在保卫什么？</h4>
+<p>这个测试是为了支持 <strong>“通信与计算重叠 (Overlap)”</strong> 技术。</p>
+<p>在多卡训练 MoE 模型时，<code>dispatch</code>（发数据）和 <code>combine</code>（收数据）非常耗时。
+如果只能写 <code>model(input)</code>，程序就死板了。
+如果能拆成 <code>attn</code>, <code>dispatch</code>, <code>moe</code>，工程师就可以写出这样的骚操作：</p>
+<blockquote>
+<p>“在 GPU 1 做 <code>attn</code> 计算的时候，顺便让网卡去发上一批数据的 <code>dispatch</code>，别让网卡闲着。”</p>
+</blockquote>
+<p><strong>一句话总结全文：</strong>
+这个文件在测试：<strong>把 Transformer 层大卸八块后手动拼装运行，其结果和原装的一模一样，为后续的高级并行优化（如计算通信重叠）提供安全保障。</strong></p>

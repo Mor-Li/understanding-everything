@@ -1,0 +1,112 @@
+<h1>tests/unit_tests/transformer/test_full_cuda_graph.py</h1>
+<p>这份代码确实涉及了很多高性能深度学习框架（Megatron-LM）的底层概念，如果不了解背景，读起来就像天书。</p>
+<p>简单来说，这是一个<strong>单元测试（Unit Test）</strong>。它的目的是验证 Megatron-LM 中的一个特定功能：<strong><code>FullCudaGraphWrapper</code></strong> 是否能正常工作。</p>
+<p>为了让你读懂，我制定了一个 <strong>“学习任务清单 (To-Do List)”</strong>。我们按照这个清单，一步步拆解这段代码的逻辑。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1：理解核心概念 (什么是 CUDA Graph？)</strong></li>
+<li><strong>Task 2：看懂测试前的准备工作 (Setup)</strong></li>
+<li><strong>Task 3：看懂“假”模型和数据 (Mocking)</strong></li>
+<li><strong>Task 4：看懂核心操作 (Wrapper 的包装)</strong></li>
+<li><strong>Task 5：看懂执行流程 (预热与回放)</strong></li>
+<li><strong>Task 6：看懂结果验证 (Assert)</strong></li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>✅ Task 1：理解核心概念 (什么是 CUDA Graph？)</h4>
+<p>在看代码前，你必须知道 <strong>CUDA Graph</strong> 是什么。
+*   <strong>普通模式</strong>：CPU 像一个发号施令的工头，每一步都告诉 GPU（工人）做一个小动作（比如“做个加法”、“做个乘法”）。由于 CPU 和 GPU 之间沟通有延迟，大量的小动作会导致 CPU 忙着发令，GPU 经常闲着等命令。
+*   <strong>CUDA Graph 模式</strong>：CPU 把一整套动作（比如整个神经网络的前向传播）录制成一张“图纸”（Graph）。以后 CPU 只要说一句“执行图纸 A”，GPU 就自己一口气把活全干完。这能极大地提升速度。</p>
+<p><strong>这个文件的目的</strong>：就是测试 Megatron-LM 能不能把“训练循环”打包成这种高效的“图纸”来运行。</p>
+<h4>✅ Task 2：看懂测试前的准备工作 (Setup)</h4>
+<p>代码开头的一堆 import 和 setup 是为了搭建一个迷你的运行环境。</p>
+<ul>
+<li><code>@pytest.mark.skipif(...)</code>:<ul>
+<li>这是说：如果没安装 <code>TransformerEngine</code> 或者版本太低，就跳过这个测试。因为 CUDA Graph 的某些功能依赖它。</li>
+</ul>
+</li>
+<li><code>Utils.initialize_model_parallel(...)</code>:<ul>
+<li>这是模拟分布式环境。虽然你可能在一张卡上跑，但它假装有 <code>tensor_model_parallel_size=2</code>（张量并行）和 <code>pipeline_model_parallel_size=1</code>（流水线并行）。这是为了骗过 Megatron 的内部检查。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3：看懂“假”模型和数据 (Mocking)</h4>
+<p>为了测试，我们不需要一个真正的 GPT 或 BERT，只需要一个能跑通的“空壳”。</p>
+<ul>
+<li><code>forward_step_func</code>:<ul>
+<li>定义了“每一步训练做什么”。</li>
+<li>它接收数据，扔给模型，然后定义了一个简单的 <code>loss_func</code>（损失函数）。</li>
+<li>注意 <code>loss_func</code> 返回的是 <code>rank</code>（当前进程的 ID），这是一个为了方便验证结果的假数据。</li>
+</ul>
+</li>
+<li><code>model = torch.nn.Linear(4, 1)</code>:<ul>
+<li>定义了一个最简单的线性层作为模型。</li>
+<li><code>model.model_type = 'unit-test'</code>: 给它贴个标签。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4：看懂核心操作 (Wrapper 的包装)</h4>
+<p>这是全篇代码的<strong>灵魂</strong>所在：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">forward_backward_func</span> <span class="o">=</span> <span class="n">get_forward_backward_func</span><span class="p">()</span>
+<span class="c1"># ...</span>
+<span class="c1"># 下面这行是关键！</span>
+<span class="n">forward_backward_func</span> <span class="o">=</span> <span class="n">FullCudaGraphWrapper</span><span class="p">(</span><span class="n">forward_backward_func</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><code>get_forward_backward_func()</code>: 获取了 Megatron 标准的“前向+后向”传播函数。</li>
+<li><strong><code>FullCudaGraphWrapper(...)</code></strong>:<ul>
+<li>这是一个装饰器或包装器。</li>
+<li>它把普通的传播函数包了起来。</li>
+<li><strong>作用</strong>：当以后调用 <code>forward_backward_func</code> 时，它会自动尝试使用 CUDA Graph 的方式（录制或回放）来执行，而不是普通的 CPU 指挥模式。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5：看懂执行流程 (预热与回放)</h4>
+<p>CUDA Graph 有个特点：必须先跑一次来“录制”（Capture），之后才能“回放”（Replay）。</p>
+<p>代码里调用了两次 <code>forward_backward_func</code>：</p>
+<ol>
+<li>
+<p><strong>第一次调用 (Warmup/Capture)</strong>:
+    <code>python
+    losses_reduced = forward_backward_func(..., num_microbatches=4, ...)</code></p>
+<ul>
+<li>这次运行是为了让 GPU 熟悉流程，建立图结构（Graph Capture）。</li>
+</ul>
+</li>
+<li>
+<p><strong>第二次调用 (Replay)</strong>:
+    <code>python
+    losses_reduced = forward_backward_func(..., num_microbatches=4, ...)</code></p>
+<ul>
+<li>这次才是真正的测试。它应该直接调用之前录制好的 Graph，飞快地执行。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 6：看懂结果验证 (Assert)</h4>
+<p>最后，我们要确定图模式下跑出来的结果是对的。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">loss_reduced_expected</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="p">{</span><span class="s1">&#39;loss_reduced&#39;</span><span class="p">:</span> <span class="n">rank</span><span class="p">},</span> <span class="o">...</span> <span class="c1"># 期望的结果就是当前的 rank ID</span>
+<span class="p">]</span>
+
+<span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">losses_reduced</span><span class="p">,</span> <span class="n">loss_reduced_expected</span><span class="p">):</span>
+    <span class="k">assert</span> <span class="n">i</span><span class="p">[</span><span class="s1">&#39;loss_reduced&#39;</span><span class="p">]</span> <span class="o">==</span> <span class="n">j</span><span class="p">[</span><span class="s1">&#39;loss_reduced&#39;</span><span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li>之前我们在 Task 3 里定义了 loss 就是 <code>rank</code>。</li>
+<li>这里检查：跑完图模式后，返回的 loss 是不是还是 <code>rank</code>？</li>
+<li>如果是，说明<strong>CUDA Graph 并没有把数据算错或搞丢</strong>，功能正常。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑是：</p>
+<ol>
+<li><strong>搭台子</strong>：初始化假的并行环境。</li>
+<li><strong>造道具</strong>：弄个最简单的模型和假的 Loss 函数。</li>
+<li><strong>加特效</strong>：用 <code>FullCudaGraphWrapper</code> 把训练函数包起来，赋予它“图执行”的能力。</li>
+<li><strong>彩排</strong>：跑第一次（Warmup）。</li>
+<li><strong>正式演出</strong>：跑第二次（Replay）。</li>
+<li><strong>查作业</strong>：检查算出来的 Loss 对不对。如果对，说明 Wrapper 工作正常。</li>
+</ol>

@@ -1,0 +1,125 @@
+<h1>tools/preprocess_data.py</h1>
+<p>这份代码 <code>preprocess_data.py</code> 是 <strong>Megatron-LM</strong>（一个用于训练超大语言模型的框架）中非常核心的数据预处理脚本。</p>
+<p>简单来说，它的作用是：<strong>把原始的文本数据（JSON格式），转换成模型训练能直接读取的高效二进制格式（.bin 和 .idx）。</strong></p>
+<p>你可以把它想象成一个<strong>食品加工厂的流水线</strong>：原料（文本）运进来，经过切分、清洗、打包，最后变成标准化的罐头（二进制文件）存入仓库。</p>
+<p>下面我按照你的要求，分为 <strong>逻辑流程 List</strong>、<strong>任务清单 Todo</strong> 以及 <strong>详细步骤讲解</strong>。</p>
+<hr />
+<h3>1. 逻辑流程 List (High-Level Logic)</h3>
+<p>这个脚本的宏观逻辑是“<strong>分而治之</strong>”：</p>
+<ol>
+<li><strong>准备阶段</strong>：检查参数，准备分词器（Tokenizer）。</li>
+<li><strong>切分阶段 (Partitioning)</strong>：如果输入文件太大，先把它切分成几个小文件，方便并行处理。</li>
+<li><strong>断句阶段 (Sentence Splitting - 可选)</strong>：把长段落切分成句子（主要用于BERT类模型）。</li>
+<li><strong>编码阶段 (Tokenization)</strong>：这是核心。把人类文字转换成机器能读懂的数字 ID。</li>
+<li><strong>存储阶段 (Binarization)</strong>：把数字 ID 存成二进制文件。</li>
+<li><strong>合并阶段 (Merging)</strong>：如果最开始切分了文件，最后要把生成的索引合并起来。</li>
+</ol>
+<hr />
+<h3>2. 任务清单 Todo (Execution Task List)</h3>
+<p>如果把这个脚本看作一个项目经理，它实际上是在按顺序执行以下 Task：</p>
+<ul>
+<li>
+<p>[ ] <strong>Task 0: 初始化</strong></p>
+<ul>
+<li>读取命令行参数（输入路径、输出路径、使用什么分词器、开启多少个 CPU 核心等）。</li>
+<li>下载或加载 NLTK 数据包（如果需要进行断句）。</li>
+</ul>
+</li>
+<li>
+<p>[ ] <strong>Task 1: 数据分片 (Partitioning)</strong></p>
+<ul>
+<li><em>判断</em>：如果用户设置 <code>partitions &gt; 1</code>？</li>
+<li><em>执行</em>：读取巨大的原始 JSON 文件，按行轮询写入到 N 个小文件中（例如 <code>data_0.json</code>, <code>data_1.json</code>...）。</li>
+</ul>
+</li>
+<li>
+<p>[ ] <strong>Task 2: 句子切分 (Sentence Splitting - Optional)</strong></p>
+<ul>
+<li><em>判断</em>：用户是否开启 <code>--split-sentences</code>？</li>
+<li><em>执行</em>：启动多进程，调用 NLTK 库，把文档里的整段话切成一句一句的，并写回临时文件。</li>
+</ul>
+</li>
+<li>
+<p>[ ] <strong>Task 3: 并行编码 (Tokenization &amp; Encoding)</strong></p>
+<ul>
+<li><em>动作</em>：启动多进程池 (<code>multiprocessing.Pool</code>)。</li>
+<li><em>执行</em>：每个进程领取一部分数据，使用 <code>Tokenizer</code>（如 GPT2BPETokenizer）将文本转为 Token IDs（例如 <code>[101, 2345, 102]</code>）。</li>
+<li><em>输出</em>：同时生成 <code>.bin</code> (存数据) 和 <code>.idx</code> (存索引) 文件。</li>
+</ul>
+</li>
+<li>
+<p>[ ] <strong>Task 4: 合并索引 (Merging)</strong></p>
+<ul>
+<li><em>判断</em>：如果是多文件分片处理的。</li>
+<li><em>执行</em>：将所有分片的 <code>.idx</code> 信息合并，确保训练时可以像读取一个大文件一样读取所有数据。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>3. 一步一步详细讲解文中的观点</h3>
+<p>下面我结合代码中的关键类和函数，给你讲讲它是怎么一步步实现的。</p>
+<h4>第一步：搞定工具人 —— <code>Encoder</code> 类</h4>
+<p>代码里定义了一个 <code>Encoder</code> 类，它是真正的“工人”。
+*   <strong>它的工作</strong>：手里拿着一本字典（Tokenizer），负责把看到的文字查字典变成数字。
+*   <strong><code>initializer</code> 方法</strong>：工人在开工前，先把字典（Tokenizer）和断句工具（NLTK）准备好放在桌子上。
+*   <strong><code>encode</code> 方法</strong>：这是最关键的动作。
+    1.  读取一行 JSON。
+    2.  提取文本内容。
+    3.  调用 <code>tokenizer.tokenize(text)</code> 变成 ID 列表。
+    4.  如果在末尾需要加结束符，就加上 <code>&lt;eod&gt;</code> (End of Document)。
+    5.  返回 ID 列表和长度。</p>
+<h4>第二步：搞定调度员 —— <code>Partition</code> 类</h4>
+<p><code>Partition</code> 类是“车间主任”，负责管理那一堆 <code>Encoder</code> 工人。
+*   它使用 <code>multiprocessing.Pool</code> 来同时雇佣几十个工人（进程）。
+*   <strong><code>process_json_file</code> 方法</strong>：
+    *   打开输入文件。
+    *   把文件流喂给进程池 (<code>pool.imap</code>)。
+    *   <strong>重点</strong>：它使用 <code>indexed_dataset.IndexedDatasetBuilder</code>。当工人们把处理好的数字 ID 扔回来时，它负责把这些 ID 写入到最终的 <code>.bin</code> 文件里，并记录偏移量到 <code>.idx</code> 文件。</p>
+<h4>第三步：主程序的执行流 —— <code>main</code> 函数</h4>
+<ol>
+<li>
+<p><strong>处理输入文件 (Input Handling)</strong>：</p>
+<ul>
+<li>代码逻辑：<code>if args.partitions == 1: ... else: ...</code></li>
+<li><strong>解释</strong>：如果你的语料有 100GB，单进程读太慢。代码会先扫描一遍，把它拆成 10 个 10GB 的小文件（Partitioning），这样后面就可以 10 个进程同时跑，互不干扰。</li>
+</ul>
+</li>
+<li>
+<p><strong>断句 (Sentence Splitting)</strong>：</p>
+<ul>
+<li>代码逻辑：<code>partition.split_sentences</code></li>
+<li><strong>解释</strong>：有些模型（比如 BERT）需要知道“句子”的边界。这里利用 NLTK 库识别句号、问号等，把一段话拆开。如果是 GPT 类模型，通常这一步是跳过的或者是恒等操作（IdentitySplitter）。</li>
+</ul>
+</li>
+<li>
+<p><strong>编码与输出 (Encoding)</strong>：</p>
+<ul>
+<li>代码逻辑：<code>partition.process_json_file</code></li>
+<li><strong>解释</strong>：这是最耗时的部分。<ul>
+<li>输入：<code>{"text": "今天天气不错"}</code></li>
+<li>处理：转成 ID <code>[34, 998, 123]</code></li>
+<li>输出：写入 <code>output_prefix.bin</code>（二进制存这些数字）和 <code>output_prefix.idx</code>（记录这句话在 bin 文件里的起始位置和长度）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>善后 (Merging)</strong>：</p>
+<ul>
+<li>代码逻辑：<code>builders[key].add_index(...)</code> 然后 <code>finalize</code>。</li>
+<li><strong>解释</strong>：如果你之前把数据分成了 10 份处理，你现在会有 10 个 <code>.bin</code> 和 10 个 <code>.idx</code>。<ul>
+<li><code>.bin</code> 文件通常保持分开或直接拼接（代码里主要是处理索引）。</li>
+<li><code>.idx</code> 文件必须合并。因为训练器加载数据时，它希望看到一个总的索引，告诉它第 100 万个样本在哪里，而不管这个样本原本属于第几个切片。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个脚本的核心目的就是<strong>效率</strong>。
+因为预训练数据通常是 TB 级别的，普通的 Python <code>for</code> 循环处理不过来。
+所以它：
+1.  <strong>切</strong>（把大文件切小）。
+2.  <strong>并</strong>（多进程并行处理）。
+3.  <strong>压</strong>（存成紧凑的二进制格式，读取速度比文本快几十倍）。</p>
+<p>你看懂这个逻辑后，再回看代码，关注 <code>Encoder.encode</code>（怎么转数字）和 <code>main</code> 里的流程控制（怎么分发任务），就会清晰很多了。</p>

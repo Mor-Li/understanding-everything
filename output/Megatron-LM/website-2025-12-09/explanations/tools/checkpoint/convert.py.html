@@ -1,0 +1,132 @@
+<h1>tools/checkpoint/convert.py</h1>
+<p>这份代码乍一看确实很抽象，因为它其实是一个<strong>“总指挥”</strong>或者<strong>“调度中心”</strong>。它自己不干具体的脏活累活（不直接读写具体的文件），而是指挥另外两个“工人”（Loader和Saver）去干活。</p>
+<p>我们可以把这个文件看作是一个<strong>“模型搬家公司”</strong>的调度流程。</p>
+<p>为了让你听懂，我把这个代码的逻辑拆解成一个 <strong>Task Todo List（任务清单）</strong>。我们按照这个清单，一步一步来看它是怎么工作的。</p>
+<hr />
+<h3>任务清单 (Task Todo List)</h3>
+<h4>1. 制定“搬家清单” (定义通信协议)</h4>
+<p><strong>对应代码位置：</strong> 开头的几十行大段注释 (<code># - Metadata Namespace...</code> 到 <code># - "done"</code>)。</p>
+<ul>
+<li><strong>原来的困惑：</strong> 这些注释列了一大堆 <code>transformer layer</code>, <code>qkv weight</code> 是啥？</li>
+<li><strong>通俗解释：</strong>
+    这是最重要的一步。因为模型文件很大，不能乱搬。这部分注释其实是<strong>Loader（装车工）</strong>和<strong>Saver（卸车工）</strong>之间的<strong>“约定”</strong>。<ul>
+<li>它规定了：不管你原来的模型长什么样，你必须把数据整理成<strong>统一的格式（Python字典）</strong>。</li>
+<li>它规定了<strong>顺序</strong>：先传整体信息（Metadata），再传词表（Embeddings），然后第一层、第二层……最后结束。</li>
+<li><strong>为什么要这样？</strong> 这样就可以把“读取”和“保存”解耦。Loader 只管读成标准格式，Saver 只管把标准格式存成新文件，互不干扰。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 招募“装车工”和“卸车工” (加载插件)</h4>
+<p><strong>对应代码位置：</strong> <code>load_plugin</code> 函数 和 <code>main()</code> 函数的前半部分。</p>
+<ul>
+<li><strong>代码逻辑：</strong><ul>
+<li><code>args.loader</code>: 你想从哪里读？（比如从 Megatron 旧版格式读）。</li>
+<li><code>args.saver</code>: 你想存成什么样？（比如存成 Megatron Core 新版格式）。</li>
+</ul>
+</li>
+<li><strong>通俗解释：</strong>
+    这就是在招人。<ul>
+<li><code>load_plugin</code> 就是去叫人。比如你下令 <code>--loader megatron --saver mcore</code>。</li>
+<li>程序就会去 Python 库里动态导入 <code>loader_megatron.py</code> (装车工) 和 <code>saver_mcore.py</code> (卸车工)。</li>
+<li>如果找不到人，程序就报错退出。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 准备工具和指令 (解析参数)</h4>
+<p><strong>对应代码位置：</strong> <code>parser.add_argument</code> 以及 <code>loader.add_arguments(parser)</code>。</p>
+<ul>
+<li><strong>代码逻辑：</strong><ul>
+<li>先定义基础参数：模型类型（GPT/BERT）、加载路径、保存路径。</li>
+<li>然后让“装车工”和“卸车工”自己提要求 (<code>add_arguments</code>)。</li>
+</ul>
+</li>
+<li><strong>通俗解释：</strong>
+    这是在开工前的会议。<ul>
+<li>总指挥问：我们要搬去哪？（<code>--save-dir</code>）</li>
+<li>装车工举手说：我需要知道原来的并行度是多少（<code>--target-tensor-parallel-size</code>）。</li>
+<li>卸车工举手说：我需要知道要存成什么精度（<code>--bf16</code>）。</li>
+<li>这个过程把所有需要的配置都收集齐了。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 搭建“传送带” (创建队列)</h4>
+<p><strong>对应代码位置：</strong> <code>queue = mp.Queue(maxsize=args.max_queue_size)</code></p>
+<ul>
+<li><strong>代码逻辑：</strong><ul>
+<li>使用 <code>torch.multiprocessing</code> 创建一个队列（Queue）。</li>
+</ul>
+</li>
+<li><strong>通俗解释：</strong>
+    模型非常大（几十上百GB），如果装车工把东西全搬出来堆在地上，内存就爆了。<ul>
+<li>所以他们建立了一条<strong>传送带</strong>（Queue）。</li>
+<li>装车工每拆下来一块零件，就往传送带上一放。</li>
+<li>卸车工在另一头拿下来打包。</li>
+<li><code>maxsize=50</code> 意味着传送带上最多放50个零件，满了装车工就得歇会儿，等卸车工拿走一些。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 启动“卸车工” (启动 Saver 进程)</h4>
+<p><strong>对应代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Starting saver...&quot;</span><span class="p">)</span>
+<span class="n">saver_proc</span> <span class="o">=</span> <span class="n">mp</span><span class="o">.</span><span class="n">Process</span><span class="p">(</span><span class="n">target</span><span class="o">=</span><span class="n">saver</span><span class="o">.</span><span class="n">save_checkpoint</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">queue</span><span class="p">,</span> <span class="n">args</span><span class="p">))</span>
+<span class="n">saver_proc</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>通俗解释：</strong>
+    先把负责<strong>写文件</strong>的人派到后台去（启动一个独立进程）。<ul>
+<li>告诉他：你就守在传送带（<code>queue</code>）末尾，看到东西来了就按格式存进硬盘。</li>
+<li>此时，卸车工处于“待机”状态，等待数据过来。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 启动“装车工” (运行 Loader)</h4>
+<p><strong>对应代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Starting loader...&quot;</span><span class="p">)</span>
+<span class="n">loader</span><span class="o">.</span><span class="n">load_checkpoint</span><span class="p">(</span><span class="n">queue</span><span class="p">,</span> <span class="n">args</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>通俗解释：</strong>
+    现在，主程序开始让<strong>读文件</strong>的人干活了。<ul>
+<li>Loader 开始读取旧的模型文件。</li>
+<li>它按照 <strong>Step 1</strong> 里的那个清单，把权重转换成统一格式。</li>
+<li>它把转换好的数据不断地塞进传送带（<code>queue</code>）。</li>
+<li>（与此同时，后台的 Saver 正在拼命地从传送带取数据存盘）。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 收工 (等待结束)</h4>
+<p><strong>对应代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Waiting for saver to complete...&quot;</span><span class="p">)</span>
+<span class="n">saver_proc</span><span class="o">.</span><span class="n">join</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>通俗解释：</strong><ul>
+<li>Loader 搬完所有东西后，会往传送带上放一个“done”（结束）的信号，然后Loader自己就下班了。</li>
+<li>Saver 看到“done”信号，知道没货了，把最后一点存完，也下班了。</li>
+<li><code>saver_proc.join()</code> 就是主程序在确认：卸车工真的走了吗？走了的话，那我也结束运行。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这文件到底在干啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>通用模型转换框架</strong>。</p>
+<p><strong>它的核心思想是：</strong>
+不要为每一对“格式A转格式B”写一个单独的脚本。
+而是定义一种<strong>中间通用格式</strong>（即文件开头的注释）。</p>
+<ul>
+<li>如果你想把 HuggingFace 转成 Megatron：<ul>
+<li>写一个 Loader：把 HF 读成通用格式。</li>
+<li>用现有的 Megatron Saver。</li>
+</ul>
+</li>
+<li>如果你想把 Megatron 转成由 DeepSpeed 格式：<ul>
+<li>用现有的 Megatron Loader。</li>
+<li>写一个 Saver：把通用格式存成 DeepSpeed。</li>
+</ul>
+</li>
+</ul>
+<p>这个 <code>convert.py</code> 只是负责把这两头连接起来，并提供传送带（Queue）来高效传输数据。</p>

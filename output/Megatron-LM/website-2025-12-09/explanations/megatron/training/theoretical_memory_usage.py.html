@@ -1,0 +1,111 @@
+<h1>megatron/training/theoretical_memory_usage.py</h1>
+<p>这份代码确实充满了数学公式和并行计算的术语，直接读起来非常枯燥。它的核心目的是<strong>在模型还没跑起来之前，通过公式估算训练这个模型需要多少显存（VRAM）</strong>。</p>
+<p>为了让你看懂，我把它拆解成一个<strong>学习任务清单 (To-Do List)</strong>。你按照这个步骤，一步步对照代码看，就能理解它的逻辑了。</p>
+<hr />
+<h3>任务清单：一步步拆解显存估算</h3>
+<h4>任务 1：理解显存的“两大巨头”</h4>
+<p>在阅读代码细节前，你首先要建立一个概念，训练大模型时显存主要被两样东西吃掉了：
+1.  <strong>静态显存（模型本身）</strong>：不管你输不输入数据，模型加载进来就占用的。包括：<strong>权重参数 (Weights)</strong> + <strong>优化器状态 (Optimizer States)</strong>。
+2.  <strong>动态显存（运行时产生）</strong>：数据流过模型时产生的中间结果，为了反向传播算梯度用的。这叫：<strong>激活值 (Activations)</strong>。</p>
+<blockquote>
+<p><strong>代码对应：</strong>
+看文件最底部的 <code>report_theoretical_memory</code> 函数。
+*   它调用 <code>compute_weight_and_optimizer_memory</code> 计算第一部分。
+*   它调用 <code>compute_activation_memory</code> (或 <code>...without_sp</code>) 计算第二部分。
+*   最后 <code>total_memory = weight... + activation...</code>。</p>
+</blockquote>
+<hr />
+<h4>任务 2：计算“静态显存” (权重 + 优化器)</h4>
+<p><strong>目标：</strong> 理解 <code>compute_weight_and_optimizer_memory</code> 函数。</p>
+<ul>
+<li>
+<p><strong>Step 2.1：数参数 (Counting Parameters)</strong></p>
+<ul>
+<li>Transformer 模型主要由 Attention 层和 MLP (Feed Forward) 层组成。</li>
+<li><strong>Attention 部分：</strong> 代码中 <code>self_attn_term</code> 就是在算 Q, K, V, O 矩阵的参数量。如果是 <code>multi_latent_attention</code> (MLA) 或者是 LoRA，公式会变复杂，但本质都是 <code>Hidden_Size * Hidden_Size</code> 这种矩阵乘法。</li>
+<li><strong>MLP 部分：</strong> 代码中 <code>num_parameters_in_transformer_layer_dense</code> 里的 <code>ffn_hidden_size</code> 部分。如果是 MoE (混合专家模型)，参数量会激增，因为有多个专家 (<code>num_experts</code>)。</li>
+<li><strong>Embedding 部分：</strong> 词表大小 (<code>vocab_size</code>) * 隐藏层维度 (<code>hidden_size</code>)。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.2：切分参数 (Parallelism)</strong></p>
+<ul>
+<li>模型太大了，单卡放不下。</li>
+<li><strong>TP (Tensor Parallel)</strong>：把一层切开。代码里你会看到除以 <code>args.tensor_model_parallel_size</code>。</li>
+<li><strong>PP (Pipeline Parallel)</strong>：把层分给不同卡。比如 80 层模型，PP=4，每张卡只存 20 层。代码里有 <code>/ args.pipeline_model_parallel_size</code>。</li>
+<li><strong>关键点：</strong> 这个函数算的是“负载最重的那张卡”上有多少参数 (<code>num_parameters_on_most_loaded_model_shard</code>)。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.3：参数转字节 (Params to Bytes)</strong></p>
+<ul>
+<li>算出了参数个数（比如 70B），怎么变成显存大小（GB）？</li>
+<li><strong>公式：</strong> <code>num_bytes_per_parameter</code>。</li>
+<li><strong>普通 Adam 优化器：</strong> 1个参数需要 <strong>18-20 bytes</strong>。<ul>
+<li>权重 (FP16): 2 bytes</li>
+<li>梯度 (FP16): 2 bytes</li>
+<li>优化器状态 (FP32 Master Weight + Momentum + Variance): 4+4+4 = 12 bytes。</li>
+<li>Total = 2+2+12 = 16 (代码里写 18 是留了余量)。</li>
+</ul>
+</li>
+<li><strong>分布式优化器 (Distributed Optimizer)</strong>：把优化器状态切分到所有数据并行 (DP) 的卡上。代码里是 <code>6 + (12 / args.data_parallel_size)</code>，这能极大节省显存。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>任务 3：计算“动态显存” (激活值)</h4>
+<p><strong>目标：</strong> 理解 <code>compute_activation_memory</code> (带序列并行) 和 <code>compute_activation_memory_without_sp</code> (不带序列并行)。</p>
+<ul>
+<li>
+<p><strong>Step 3.1：理解什么是激活值</strong></p>
+<ul>
+<li>虽然我们只存权重，但在前向传播时，每一层的输出（Output）都要存下来，因为反向传播算梯度时要用到。</li>
+<li>这就叫 Activation Memory。它跟 <strong>Batch Size (微批次大小)</strong> 和 <strong>Sequence Length (序列长度)</strong> 成正比。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2：基础公式</strong></p>
+<ul>
+<li>看代码里的 <code>sbh</code> 概念：<code>seq_length * micro_batch_size * hidden_size</code>。这是激活值的基本单位。</li>
+<li>Transformer 每一层通常需要存 <code>sbh * 常数</code> 这么多字节。</li>
+<li>代码里的 <code>18 + ...</code> 或 <code>10 + ...</code> 就是根据是否使用 Recomputation（重计算技术）推导出来的系数。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.3：并行的影响</strong></p>
+<ul>
+<li><strong>TP (Tensor Parallel)</strong>：不仅切分参数，也切分激活值。所以代码最后除以了 <code>args.tensor_model_parallel_size</code>。</li>
+<li><strong>PP (Pipeline Parallel)</strong>：这是最坑的地方。流水线并行意味着显卡不能处理完一个 Batch 就立刻释放内存，它必须等流水线转一圈。</li>
+<li>代码中 <code>activation_memory *= args.pipeline_model_parallel_size</code> (或者更复杂的 <code>interleaved</code> 公式) 就是在算这个。PP 越大，显存里积压的“在途 (In-flight)”微批次激活值就越多。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>任务 4：代码逻辑串联 (Walkthrough)</h4>
+<p>现在你再回头看代码，就能把它们串起来了：</p>
+<ol>
+<li><strong>Arguments Check</strong>: 检查是不是 MoE，是不是 MTP，是不是 LoRA（这些都是增加参数的变量）。</li>
+<li><strong>Count Params</strong>:<ul>
+<li>算出 <code>num_total_parameters</code> (总参数量)。</li>
+<li>算出 <code>num_parameters_on_most_loaded_model_shard</code> (单卡实际承载参数量 = 总量 / PP / TP)。</li>
+</ul>
+</li>
+<li><strong>Calc Static Memory</strong>:<ul>
+<li>单卡参数量 * 每个参数占用的字节数 (18 或更少)。</li>
+</ul>
+</li>
+<li><strong>Calc Activation Memory</strong>:<ul>
+<li>算出一层 Transformer 的激活值大小。</li>
+<li>乘以层数 (<code>num_layers</code>)。</li>
+<li>乘以流水线并行带来的倍数 (PP Size)。</li>
+<li>除以张量并行的大小 (TP Size)。</li>
+</ul>
+</li>
+<li><strong>Sum Up</strong>:<ul>
+<li>静态 + 动态 = 理论总显存。</li>
+</ul>
+</li>
+</ol>
+<h3>总结：这段代码在说什么？</h3>
+<p>这段代码就是<strong>Megatron-LM 的显存计算器</strong>。</p>
+<p>它在说：“嘿，根据你设定的层数、隐藏层大小、并行策略（TP/PP/DP），我用数学公式帮你算一下，你每张显卡至少需要多少 GB 的显存才能跑得动这个模型。如果算出来是 85GB，而你只有 80GB 的 A100，那你最好去改改参数（比如减小 Batch Size 或开启分布式优化器），否则一跑就会报 OOM 错误。”</p>

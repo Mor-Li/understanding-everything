@@ -1,0 +1,72 @@
+<h1>verl/workers/config/actor.py</h1>
+<p>这份代码文件 <code>verl/workers/config/actor.py</code> 的核心作用是<strong>定义“Actor（演员/策略模型）”在强化学习（RLHF）训练时的所有配置参数</strong>。</p>
+<p>简单来说，在训练大模型（比如用 PPO 算法）时，我们需要一个“Actor”模型来生成回复。这个文件就是用来规定这个 Actor <strong>怎么训练、怎么更新参数、怎么利用显卡资源</strong>的“设置清单”。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>“配置训练任务的 Todo List”</strong>，每一步对应代码中的一个类或一段逻辑：</p>
+<hr />
+<h3>📋 任务 Todo List：配置你的 Actor 模型</h3>
+<h4>1. Todo: 设定 MoE 模型的“路由”规则 (如有)</h4>
+<p><strong>对应代码类：</strong> <code>RouterReplayConfig</code>
+如果你训练的是 Mixture of Experts (MoE) 模型（比如 Mixtral），你需要决定专家（Experts）怎么选择。
+*   <strong>你需要决定的事：</strong>
+    *   <code>mode</code>: 是正常训练，还是把“路由选择”录制下来（record），或者是重放之前的选择（replay）？这通常用于调试或保证确定性。
+    *   <code>record_file</code> / <code>replay_file</code>: 如果要录像或回放，文件存在哪？</p>
+<h4>2. Todo: 设定“奖惩规则” (损失函数配置)</h4>
+<p><strong>对应代码类：</strong> <code>PolicyLossConfig</code>
+这是 PPO 算法的核心。你需要告诉计算机如何计算“Loss”（误差），也就是怎么衡量模型好坏并进行更新。
+*   <strong>你需要决定的事：</strong>
+    *   <code>loss_mode</code>: 用哪种公式算 Loss？（默认是 <code>vanilla</code>，即标准的 PPO）。
+    *   <code>ppo_kl_coef</code>: <strong>KL 散度系数</strong>。这非常重要，它控制模型不要偏离“原始模型”太远，防止模型为了拿高分而“胡言乱语”。
+    *   <code>clip_cov_ratio</code>: 裁剪比例，防止一次更新步子迈得太大。</p>
+<h4>3. Todo: 设定核心训练参数 (主菜)</h4>
+<p><strong>对应代码类：</strong> <code>ActorConfig</code>
+这是最庞大的配置类，决定了训练的整体节奏。
+*   <strong>关于资源与批次 (Batch Size)：</strong>
+    *   <code>ppo_mini_batch_size</code>: PPO 更新时的总批次大小。
+    *   <code>ppo_micro_batch_size_per_gpu</code>: 每张显卡单次处理的数据量（显存不够就调小这个）。
+    *   <code>use_dynamic_bsz</code>: 是否使用动态批次大小（处理变长序列时用）。
+*   <strong>关于 PPO 算法细节：</strong>
+    *   <code>ppo_epochs</code>: 每一批数据要反复学几遍？（通常是 1-4 遍）。
+    *   <code>entropy_coeff</code>: <strong>熵系数</strong>。鼓励模型保持多样性，不要总是输出一样的东西。
+    *   <code>clip_ratio</code>: PPO 的裁剪范围（通常 0.2），限制模型参数更新幅度。
+*   <strong>关于优化与效率：</strong>
+    *   <code>use_torch_compile</code>: 是否用 PyTorch 2.0 的编译加速。
+    *   <code>use_fused_kernels</code>: 是否使用融合算子加速（如 FlashAttention）。</p>
+<h4>4. Todo: 选择并行策略 (怎么用多张显卡)</h4>
+<p>代码里提供了两个 <code>ActorConfig</code> 的子类，你需要根据你的硬件架构选一个：</p>
+<ul>
+<li>
+<p><strong>选项 A: 使用 Megatron (NVIDIA 方案)</strong></p>
+<ul>
+<li><strong>对应代码类：</strong> <code>McoreActorConfig</code></li>
+<li><strong>特点：</strong> 适合超大规模模型，使用 Tensor Parallel (TP) 和 Pipeline Parallel (PP)。</li>
+<li><strong>设置：</strong> 这里会加载 <code>megatron</code> 的相关配置。</li>
+</ul>
+</li>
+<li>
+<p><strong>选项 B: 使用 FSDP (PyTorch 方案)</strong></p>
+<ul>
+<li><strong>对应代码类：</strong> <code>FSDPActorConfig</code></li>
+<li><strong>特点：</strong> 也就是 Fully Sharded Data Parallel，把模型参数切片放在不同显卡上，省显存，通用性好。</li>
+<li><strong>设置：</strong><ul>
+<li><code>fsdp_config</code>: FSDP 的具体配置（比如怎么切分参数）。</li>
+<li><code>grad_clip</code>: 梯度裁剪，防止梯度爆炸。</li>
+<li><code>use_remove_padding</code>: 是否移除 Padding 以加速计算。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>5. Todo: 安全检查 (Validation)</h4>
+<p><strong>对应代码逻辑：</strong> <code>validate()</code> 和 <code>__post_init__</code> 方法
+当你填完上面的配置后，代码会自动运行这些检查逻辑，防止你犯低级错误。
+*   <strong>它会检查什么？</strong>
+    *   <strong>数学是否成立：</strong> 比如 <code>train_batch_size</code> 必须大于等于 <code>ppo_mini_batch_size</code>。
+    *   <strong>显卡能否整除：</strong> 你的总 Batch Size 能否被显卡数量整除？
+    *   <strong>参数冲突：</strong> 比如你不能既设置了 <code>micro_batch_size</code> 又设置了 <code>micro_batch_size_per_gpu</code>（代码里提示前者已废弃）。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件不涉及具体的“训练代码实现”（比如前向传播怎么写），它是一个<strong>“参数定义书”</strong>。</p>
+<ul>
+<li>如果你是<strong>算法工程师</strong>，你会经常改 <code>PolicyLossConfig</code> 和 <code>ActorConfig</code> 里的 <code>kl_coef</code> 或 <code>lr</code> 来调优模型效果。</li>
+<li>如果你是<strong>系统工程师</strong>，你会关注 <code>FSDPActorConfig</code> 或 <code>McoreActorConfig</code> 来让训练跑得更快、不爆显存。</li>
+</ul>

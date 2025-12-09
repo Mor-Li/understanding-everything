@@ -1,0 +1,75 @@
+<h1>verl/workers/reward_model/megatron/reward_model.py</h1>
+<p>这份代码实现了一个 <strong>MegatronRewardModel</strong>。</p>
+<p>为了让你听懂，我们可以把这个类比作一个 <strong>“阅卷老师”</strong>。在 RLHF（强化学习）流程中，有一个“学生模型”（SFT Model）在写作业（生成文本），而这个“阅卷老师”（Reward Model）负责给作业打分。</p>
+<p>由于这个“老师”个头很大（大模型），需要用到 <strong>Megatron</strong>（一种分布式计算框架）来运行。</p>
+<p>下面我列一个 <strong>Task Todo List</strong>，模拟这个代码在运行时的思维过程，一步步带你看它是怎么工作的：</p>
+<hr />
+<h3>📝 阅卷老师的任务清单 (Task Todo List)</h3>
+<h4>1. [准备工作] 搬运大脑 (Memory Management)</h4>
+<ul>
+<li><strong>背景</strong>：因为显存（GPU内存）很贵，通常“学生模型”和“阅卷老师”不能同时塞进显卡里。</li>
+<li><strong>任务</strong>：<ul>
+<li>平时，老师在休息，把参数存在内存（CPU）里，不占显存（<code>offload_params_to_cpu</code>）。</li>
+<li><strong>当需要打分时</strong>：把参数从 CPU 搬运到 GPU 上（<code>load_params_to_cuda</code>）。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<code>compute_reward</code> 函数开头的第一件事。</li>
+</ul>
+<h4>2. [关键步骤] 语言翻译 (Re-tokenization)</h4>
+<ul>
+<li><strong>痛点</strong>：这是代码中最复杂的一块（<code>re_encode_by_rm_tokenizer</code>）。</li>
+<li><strong>情况</strong>：有时候，“学生模型”用的词表（Tokenizer A）和“阅卷老师”用的词表（Tokenizer B）不一样。比如学生是 Llama，老师是 Qwen。学生写出来的数字代码（input_ids），老师看不懂。</li>
+<li><strong>任务流程</strong>：<ol>
+<li><strong>还原</strong>：把学生生成的数字 ID 翻译回人类能看的 <strong>文本</strong>（Decode）。</li>
+<li><strong>格式调整</strong>：把学生用的对话格式（比如 <code>&lt;|user|&gt;</code>）替换成老师习惯的格式（比如 <code>[INST]</code>）。代码里有一堆 <code>.replace(...)</code> 就是在做这个。</li>
+<li><strong>重写</strong>：用老师的词表（RM Tokenizer）把文本重新变成数字 ID（Encode）。</li>
+<li><strong>对齐</strong>：处理新旧句子的长度差异（Padding），生成新的 <code>attention_mask</code>。</li>
+</ol>
+</li>
+<li><strong>观点</strong>：这一步是为了确保奖励模型能正确理解输入内容，否则就像用英语字典去查法语单词，分肯定打错了。</li>
+</ul>
+<h4>3. [核心工作] 批改作业 (Forward Computation)</h4>
+<ul>
+<li><strong>背景</strong>：现在数据准备好了，开始计算。</li>
+<li><strong>任务</strong>：<ul>
+<li><strong>动态组卷</strong>：如果开启了 <code>use_dynamic_bsz</code>，为了计算效率，会把长短不一的句子重新排列组合，避免浪费计算资源（<code>rearrange_micro_batches</code>）。</li>
+<li><strong>分布式计算</strong>：因为模型太大，被切分到了多张显卡上（Pipeline Parallelism）。代码通过 <code>forward_backward_func</code> 指挥各个显卡接力计算。</li>
+<li><strong>广播结果</strong>：计算完成后，最后一张显卡（Pipeline Last Stage）拿到了结果，需要把分数广播（Broadcast）给其他所有显卡，大家同步一下。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<code>forward_batch</code> 函数。</li>
+</ul>
+<h4>4. [提取分数] 只要期末成绩 (Extract Last Token Reward)</h4>
+<ul>
+<li><strong>背景</strong>：模型输出的是每一个 Token（字/词）的分数，是一个序列 <code>[0.1, 0.2, ..., 0.9]</code>。</li>
+<li><strong>观点</strong>：在 RLHF 中，我们通常只关心 <strong>整句话说完之后</strong> 的那个分数，作为对整段回答的评价。</li>
+<li><strong>任务</strong>：<ul>
+<li>找到句子结束的位置（<code>attention_mask</code> 为 1 的最后一位）。</li>
+<li>从一长串分数中，精准地把那个位置的分数“抠”出来。</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    # 找到最后一个有效token的下标
+    ends = attention_mask.cumsum(dim=-1).argmax(dim=-1).view(-1, 1)
+    # 提取那个位置的分数
+    rewards = torch.gather(token_level_rewards, dim=1, index=ends)</code></li>
+</ul>
+</li>
+</ul>
+<h4>5. [收尾] 腾出教室 (Offload &amp; Cleanup)</h4>
+<ul>
+<li><strong>任务</strong>：<ul>
+<li>把刚才为了“翻译”而临时修改的数据（input_ids）还原回去，保持数据原样。</li>
+<li>打完分了，老师把参数搬回 CPU（<code>offload_params_to_cpu</code>），或者清空 GPU 缓存（<code>empty_cache</code>）。</li>
+<li>把分数打包成 <code>rm_scores</code> 返回。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在讲啥？</h3>
+<p>这段代码定义了一个 <strong>兼容 Megatron 分布式架构</strong> 的奖励模型工作流。它最独特的地方在于：</p>
+<ol>
+<li><strong>省显存</strong>：它支持把参数在 CPU/GPU 之间来回倒腾。</li>
+<li><strong>跨模型兼容</strong>：它花很大篇幅处理 <strong>Tokenizer 不一致</strong> 的问题（<code>re_encode</code>），这意味着你可以用一个 Llama 架构的模型去给一个 Qwen 架构的模型生成的文本打分。</li>
+<li><strong>流水线并行</strong>：它不直接跑 <code>model(input)</code>，而是用 Megatron 的工具切分数据和模型，进行复杂的分布式前向传播。</li>
+</ol>
+<p>你看懂这个逻辑流了吗？最核心的就是：<strong>搬运权重 -&gt; (如果需要)翻译文本 -&gt; 分布式计算 -&gt; 提取最后一个字的分数 -&gt; 清理现场。</strong></p>

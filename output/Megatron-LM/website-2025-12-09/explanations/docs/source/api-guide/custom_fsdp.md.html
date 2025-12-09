@@ -1,0 +1,101 @@
+<h1>docs/source/api-guide/custom_fsdp.md</h1>
+<p>这份文档主要介绍的是 <strong>Megatron-Core (MCore) 自定义的 FSDP (Fully Sharded Data Parallel，全分片数据并行)</strong> 技术。</p>
+<p>为了让你更容易理解，我把这篇文档的内容拆解成了一个<strong>“学习与实施清单” (To-Do List)</strong>。你可以把它想象成你作为一个开发者，想要使用这个功能时需要按顺序执行的步骤。</p>
+<p>⚠️ <strong>重要提示（文档开头的警告）</strong>：
+在 M-Core 0.14 版本中，这个功能已经被重构并改名为 <strong>Megatron FSDP</strong>，底层改用了基于 DTensor 的实现。如果你用的是最新版代码，这篇文档可能部分过时了。但如果你是在维护旧版本或学习原理，以下内容依然有效。</p>
+<hr />
+<h3>📋 MCore Custom FSDP 学习与实施清单</h3>
+<h4>✅ Task 1: 理解核心概念 (它是什么？)</h4>
+<ul>
+<li><strong>目标</strong>：明白为什么要用它。</li>
+<li><strong>核心观点</strong>：<ul>
+<li><strong>省显存</strong>：传统的 DDP (分布式数据并行) 会在每个 GPU 上复制完整的模型参数、梯度和优化器状态。而 FSDP 把这些东西切碎（Sharding），分散存储在不同 GPU 上。</li>
+<li><strong>能跑大模型</strong>：通过切分，你可以训练那些原本单张卡放不下的大模型。</li>
+<li><strong>效率优化</strong>：它支持通信与计算重叠（Overlap），并兼容 BF16、FP8 等混合精度训练，以及 TP (张量并行)、EP (专家并行)、CP (上下文并行)。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 开启功能 (怎么用？)</h4>
+<ul>
+<li><strong>目标</strong>：在启动脚本中加入正确的参数。</li>
+<li><strong>操作</strong>：<ol>
+<li>添加 <code>--use-megatron-fsdp</code>：开启自定义 FSDP。</li>
+<li>添加 <code>--data-parallel-sharding-strategy optim_grads_params</code>：指定切分策略（切分优化器、梯度和参数）。</li>
+<li>添加 <code>--no-gradient-accumulation-fusion</code> 和 <code>--use-distributed-optimizer</code>：这是配套必须的设置。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 3: 优化配置 (最佳实践)</h4>
+<ul>
+<li><strong>目标</strong>：调整环境以获得最高性能。</li>
+<li><strong>操作</strong>：<ol>
+<li><strong>取消环境变量</strong>：执行 <code>unset CUDA_DEVICE_MAX_CONNECTIONS</code>。<ul>
+<li><em>原因</em>：为了让计算和通信更好地并行（Overlap），避免 CUDA 流产生气泡。虽然这可能会轻微拖慢 TP 或 CP，但在 FSDP 下是推荐的。</li>
+</ul>
+</li>
+<li><strong>添加参数</strong>：<code>--calculate-per-token-loss</code>。<ul>
+<li><em>原因</em>：减少梯度缩放（Gradient Scaling）的频率，节省计算资源。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 4: 理解工作原理 (它是怎么跑的？)</h4>
+<ul>
+<li><strong>目标</strong>：搞懂数据流向，方便由于 bug 时调试。</li>
+<li><strong>流程解析</strong>：<ul>
+<li><strong>初始化</strong>：模型参数被切分，每张卡只保留自己那一部分。</li>
+<li><strong>前向传播 (Forward)</strong>：<ol>
+<li><strong>All-Gather</strong>：从其他卡把当前层需要的完整参数拿过来。</li>
+<li><strong>计算</strong>：算完这一层。</li>
+<li><strong>丢弃</strong>：算完立刻扔掉别人的参数，只留自己的分片（省显存）。</li>
+</ol>
+</li>
+<li><strong>后向传播 (Backward)</strong>：<ol>
+<li><strong>All-Gather</strong>：再次把完整参数拿过来。</li>
+<li><strong>计算梯度</strong>：算出梯度。</li>
+<li><strong>Reduce-Scatter</strong>：把梯度同步并切分回各张卡。</li>
+<li><strong>丢弃</strong>：再次扔掉完整参数。</li>
+</ol>
+</li>
+<li><strong>本质</strong>：把 DDP 的 <code>All-Reduce</code> 拆解成了 <code>Reduce-Scatter</code> (后向) + <code>All-Gather</code> (前向)，中间不保留完整副本。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 代码层面的修改 (如何写代码？)</h4>
+<ul>
+<li><strong>目标</strong>：在 Python 代码中应用 FSDP。</li>
+<li><strong>操作</strong>：<ul>
+<li>接口设计模仿了 PyTorch 原生的 DDP。</li>
+<li>使用 <code>FullyShardedDataParallel</code> 包装你的模型。</li>
+<li><strong>必须指定</strong> <code>fsdp_unit_modules</code>：告诉系统哪些层（比如 TransformerLayer）是最小切分单元。</li>
+<li><strong>必须使用</strong> <code>DistributedOptimizer</code>：因为 FSDP 需要分布式的 checkpoint 保存机制。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 进阶技巧 - Meta Device 初始化</h4>
+<ul>
+<li><strong>目标</strong>：解决超大模型连 CPU 内存都放不下的问题。</li>
+<li><strong>操作</strong>：<ul>
+<li>使用 <code>torch.device("meta")</code> 初始化模型。这意味模型只占个“坑位”，不实际分配内存。</li>
+<li>FSDP 会在构建时逐层初始化参数。</li>
+<li><em>注意</em>：如果你的模型有自定义模块，必须实现 <code>reset_parameters</code> 方法，否则参数可能全是空的。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 7: 深入底层 - 显存管理与 Hooks</h4>
+<ul>
+<li><strong>目标</strong>：了解它是如何进一步压榨性能的。</li>
+<li><strong>机制</strong>：<ul>
+<li><strong>Hooks (钩子)</strong>：FSDP 利用 PyTorch 的 Pre-forward (前向运行前) 和 Post-backward (后向运行后) 钩子来自动执行参数的收集和释放。</li>
+<li><strong>激活重计算 (Activation Recompute) 优化</strong>：通常重计算会导致参数被加载两次。自定义 FSDP 做了优化，识别出这是重计算过程，避免重复的“加载-释放-加载-释放”动作。</li>
+<li><strong>避免显存碎片</strong>：频繁申请/释放显存会导致碎片化。FSDP 使用了特殊的内存分配器（如 <code>StorageResizeBasedBucketAllocator</code>），通过重置存储大小而不是直接释放 tensor 来规避显存峰值和碎片问题。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>简单来说，这篇文档教你如何用 MCore 的 FSDP 插件来<strong>省显存</strong>。
+1.  <strong>加 Flag</strong> 开启功能。
+2.  <strong>改配置</strong> 优化并行效率。
+3.  <strong>懂原理</strong>：用时间（通信）换空间（显存），算的时候借参数，算完就还回去。</p>

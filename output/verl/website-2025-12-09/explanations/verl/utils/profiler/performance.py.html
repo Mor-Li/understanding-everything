@@ -1,0 +1,65 @@
+<h1>verl/utils/profiler/performance.py</h1>
+<p>这个文件 <code>verl/utils/profiler/performance.py</code> 的核心作用是做一个<strong>“体检仪”</strong>。它是用来监控 AI 模型训练过程中的<strong>显存（Memory）使用情况</strong>和<strong>运行时间（Timing）</strong>的。</p>
+<p>为了让你更容易理解，我把你当作这个模块的开发者，列一个 <strong>“开发任务清单 (Todo List)”</strong>。我们从最简单的功能开始，一步步构建出这个文件。</p>
+<hr />
+<h3>📋 任务清单：构建一个性能监控工具</h3>
+<h4>✅ Task 1: 我想知道现在显卡用了多少内存</h4>
+<p><strong>目标</strong>：写一个函数，能够告诉我当前 GPU 显存被占用了多少，还剩多少。
+-   <strong>对应代码</strong>：<code>_get_current_mem_info</code>
+-   <strong>讲解</strong>：
+    -   这个函数通过 <code>torch.cuda</code> (或者封装后的 <code>get_torch_device()</code>) 去询问显卡：“喂，你现在分配了多少显存？(allocated)”，“你预留了多少？(reserved)”。
+    -   它还做了一些数学运算，把字节（Bytes）转换成我们需要看的 GB 或 MB。
+    -   <em>细节</em>：代码里专门提到了 <code>vllm</code> 的 sleep mode，说明它为了兼容不同的底层库做了特殊处理。</p>
+<h4>✅ Task 2: 我想把显存信息打印出来</h4>
+<p><strong>目标</strong>：光获取数据不行，我得把它打印到屏幕上或者日志里，方便我调试。
+-   <strong>对应代码</strong>：<code>log_gpu_memory_usage</code>
+-   <strong>讲解</strong>：
+    -   这是一个简单的包装函数。它调用上面的 Task 1 获取数据，然后拼成一句话（比如 "memory allocated: 10GB..."）。
+    -   它还考虑了<strong>多卡训练</strong>（Distributed）：通常我们只希望“班长”（Rank 0，即主卡）说话，不要 8 张卡同时刷屏。</p>
+<h4>✅ Task 3: 我想自动监控某个函数前后的显存变化</h4>
+<p><strong>目标</strong>：每次写代码手动查显存太累了。我想弄个“装饰器”，只要给函数贴个标签，它就能自动告诉我这个函数运行前后的显存变化。
+-   <strong>对应代码</strong>：<code>GPUMemoryLogger</code> (这是一个类)
+-   <strong>讲解</strong>：
+    -   这是一个 Python <strong>装饰器 (Decorator)</strong>。
+    -   用法像这样：<code>@GPUMemoryLogger(role="actor")</code>。
+    -   <strong>原理</strong>：
+        1.  函数运行<strong>前</strong>：自动打印一次显存。
+        2.  运行你的函数。
+        3.  函数运行<strong>后</strong>：再自动打印一次显存。
+    -   这样你就能一眼看出是不是某个函数（比如 <code>update_actor</code>）导致了显存暴涨（Memory Leak）。</p>
+<h4>✅ Task 4: 我想知道代码运行到了哪里</h4>
+<p><strong>目标</strong>：有时候程序跑着跑着不知道卡哪了，我需要一个带时间戳、文件名、行号的打印功能。
+-   <strong>对应代码</strong>：<code>log_print</code>
+-   <strong>讲解</strong>：
+    -   这是一个增强版的 <code>print</code>。
+    -   它利用 <code>inspect</code> 库去“偷看”当前的运行环境，获取文件名 (<code>file_name</code>)、函数名 (<code>function_name</code>) 和行号 (<code>line_number</code>)。
+    -   输出格式像这样：<code>[2024-05-20 10:00:00-train.py:50:main]: Hello</code>。</p>
+<h4>✅ Task 5: 我想计算代码运行了多长时间 (计时器)</h4>
+<p><strong>目标</strong>：我想知道某一段代码跑得快不快，需要一个计时器。
+-   <strong>对应代码</strong>：<code>_timer</code>, <code>simple_timer</code>, <code>marked_timer</code>
+-   <strong>讲解</strong>：
+    -   这里使用了 <code>contextmanager</code> (上下文管理器)，也就是 <code>with</code> 语句的用法。
+    -   用法：
+        <code>python
+        timing_dict = {}
+        with simple_timer("模型前向传播", timing_dict):
+            model(input) # 这里的代码会被计时</code>
+    -   代码运行完后，花费的时间会自动加到 <code>timing_dict</code> 字典里。
+    -   <code>marked_timer</code> 是为未来预留的，可能用于更高级的硬件分析工具（如 NVTX），目前功能和 <code>simple_timer</code> 差不多。</p>
+<h4>✅ Task 6: 多卡训练时，我想汇总所有卡的数据</h4>
+<p><strong>目标</strong>：我有 8 张显卡在训练。我想知道它们<strong>平均</strong>花了多长时间，或者哪张卡最慢。
+-   <strong>对应代码</strong>：
+    -   <code>reduce_timing</code>
+    -   <code>topk_reduce_ratio_min_max</code>
+    -   <code>gather_timing</code>
+-   <strong>讲解</strong>：这是分布式训练（Distributed Training）特有的功能。
+    -   <strong><code>reduce_timing</code></strong>: 把所有显卡上的时间数据收集起来，算一个平均值（AVG）。比如卡1用1秒，卡2用2秒，平均就是1.5秒。
+    -   <strong><code>gather_timing</code></strong>: 把所有显卡的数据收集到一个列表里，不合并。
+    -   <strong><code>topk_reduce_ratio_min_max</code></strong>: 这是一个高级统计。它不仅看最大值（最慢的卡）和最小值（最快的卡），还计算“拖后腿”的比例。这在排查分布式训练卡顿（Straggler problem）时非常有用。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件就是一个<strong>工具箱</strong>，里面装了：
+1.  <strong>显存计</strong>（看显存爆没爆）。
+2.  <strong>秒表</strong>（看代码跑得快不快）。
+3.  <strong>对讲机</strong>（在多张显卡之间汇总这些数据）。</p>
+<p>你看懂这个逻辑了吗？它是为了保证大规模 AI 训练时，工程师能看清系统内部发生了什么。</p>

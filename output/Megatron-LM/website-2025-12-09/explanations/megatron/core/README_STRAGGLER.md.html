@@ -1,0 +1,100 @@
+<h1>megatron/core/README_STRAGGLER.md</h1>
+<p>没问题，这篇文档确实写得比较技术化。简单来说，这个文档是在介绍 Megatron-Core 里一个叫 <strong><code>StragglerDetector</code>（掉队检测器）</strong> 的工具。</p>
+<p>在分布式训练（尤其是 Tensor Parallel）中，所有 GPU 必须同步。如果有一张 GPU 变慢了（掉队了，Straggler），整个训练都会被卡住，等待那张最慢的卡。这个工具就是用来<strong>抓出是谁在拖后腿，以及为什么拖后腿</strong>。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>5步走的 ToDo List</strong>，一步步带你看懂：</p>
+<hr />
+<h3>✅ Task 1: 理解核心概念 (What is it?)</h3>
+<p><strong>目标</strong>：明白这个工具是干嘛的。</p>
+<ul>
+<li><strong>背景</strong>：在大规模训练中，几百张显卡一起跑，就像一群人绑腿跑。如果其中一个人（Rank）跑得慢，所有人都要等他。这个人就是 <strong>Straggler（掉队者）</strong>。</li>
+<li><strong>功能</strong>：<code>StragglerDetector</code> 就像一个监工，它会记录每张卡的运行时间（RTT）和硬件状态。</li>
+<li><strong>作用</strong>：如果有卡变慢了，它能告诉你：<ol>
+<li>是哪张卡（Rank ID）慢了？</li>
+<li>是因为什么慢？（是温度太高降频了？还是数据读取卡住了？）</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 读懂监控指标 (The Metrics)</h3>
+<p><strong>目标</strong>：看懂日志里那些像乱码一样的缩写。</p>
+<p>文档中给出了一个日志示例，里面全是缩写。你需要掌握这个“密码本”：</p>
+<ul>
+<li>
+<p><strong>基本规则</strong>：</p>
+<ul>
+<li><code>Mn</code> = Minimum (最小值)</li>
+<li><code>Mx</code> = Maximum (最大值)</li>
+<li><code>/Rnk</code> = 后面跟着数字，代表是<strong>哪张显卡（Rank ID）</strong>测出的数据。</li>
+<li>例如 <code>MxRtt/Rnk: 3468.20ms/0</code> 意思是：所有卡里，<strong>最慢的</strong>（最大耗时）是 <strong>0号卡</strong>，耗时 3468ms。</li>
+</ul>
+</li>
+<li>
+<p><strong>具体指标含义</strong>：</p>
+<ol>
+<li><strong>Rtt (RoundTrip Time)</strong>: <strong>最重要指标</strong>。跑完一次迭代的总耗时。如果某张卡的 Rtt 显著高于别人，它就是掉队者。</li>
+<li><strong>Pwr (Power)</strong>: 显卡功耗。</li>
+<li><strong>Tmp (Temperature)</strong>: 显卡温度。</li>
+<li><strong>Utl (Utilization)</strong>: 显卡利用率。</li>
+<li><strong>Clk (Clock)</strong>: 显卡频率。<em>(如果某张卡 Rtt 很高，同时 Clk 很低，说明显卡可能过热降频了)</em>。</li>
+<li><strong>DRtt</strong>: 读取数据（<code>get_batch</code>）的耗时。<em>(如果这个高，说明硬盘或 CPU 处理数据慢)</em>。</li>
+<li><strong>Etpt</strong>: 估算的吞吐量（算力）。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 如何开启这个功能 (Command Line)</h3>
+<p><strong>目标</strong>：学会怎么通过命令行参数启用它。</p>
+<p>如果你只是<strong>使用</strong> Megatron 进行训练，只需要关注这几个启动参数：</p>
+<ol>
+<li><code>--log-straggler</code>: <strong>总开关</strong>。加上这个参数，训练时就会打印检测日志。</li>
+<li><code>--straggler-minmax-count N</code>: 如果集群很大，你可以设置 <code>N</code>。它会打印出“最快的前N名”和“最慢的后N名”，帮你快速定位两极分化的情况。</li>
+<li><code>--disable-straggler-on-startup</code>: 启动时不开启，等训练稳定后再手动开启（防止启动时的波动干扰判断）。</li>
+<li><code>--straggler-ctrlr-port</code>: 一个高级功能，可以通过网络端口远程开关这个检测器。</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 如何在代码中使用 (Coding)</h3>
+<p><strong>目标</strong>：如果你是开发者，需要修改代码，这就是怎么插桩（Instrumentation）。</p>
+<p>文档展示了如何在 Python 代码里调用它：</p>
+<ol>
+<li><strong>初始化</strong>:
+    <code>python
+    from megatron.core.utils import StragglerDetector
+    stimer = StragglerDetector() # 单例模式，全局唯一</code></li>
+<li><strong>配置 (Configure)</strong>:
+    在训练开始前，告诉它有多少张卡、当前是哪张卡。
+    <code>python
+    stimer.configure(world, rank, enabled=True, ...)</code></li>
+<li>
+<p><strong>埋点计时 (Capture Time)</strong>:
+    把你想监控的代码包在 <code>with</code> 语句里：
+    ```python
+    # 监控普通计算
+    with stimer:
+        do_operation()</p>
+<h1>监控数据读取 (特殊标记 bdata=True)</h1>
+<p>with stimer(bdata=True):
+    get_batch(...)
+<code>``
+4.  **上报 (Report)**:
+在训练的主循环里，定期调用</code>report` 函数打印日志。</p>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 实战分析 (Analysis Example)</h3>
+<p><strong>目标</strong>：把上面所有知识串起来，看懂这一行日志。</p>
+<p><strong>日志内容：</strong></p>
+<div class="codehilite"><pre><span></span><code>MnRtt/Rnk: 3453.08ms/8 | MxRtt/Rnk: 3468.20ms/0 | MnTmp/Rnk: 52C/0 | MxTmp/Rnk: 65C/21 ...
+</code></pre></div>
+
+<p><strong>解读步骤：</strong>
+1.  看 <strong>MxRtt</strong> (最大耗时)：是 <strong>3468ms</strong>，发生在 <strong>Rank 0</strong>。说明 Rank 0 是这一轮最慢的。
+2.  看 <strong>MnRtt</strong> (最小耗时)：是 <strong>3453ms</strong>，发生在 <strong>Rank 8</strong>。
+3.  <strong>对比</strong>：最慢(0号)比最快(8号) 慢了约 15ms。这个差距很小，说明系统很健康，没有严重的掉队。
+4.  <strong>如果差距很大</strong>（比如 Rank 0 跑了 5000ms，别人都是 3000ms）：
+    *   检查 Rank 0 的 <strong>MxTmp</strong> (温度) 是否过高？
+    *   检查 Rank 0 的 <strong>MnClk</strong> (频率) 是否掉频了？
+    *   检查 Rank 0 的 <strong>MxDRtt</strong> (数据读取) 是否特别慢？</p>
+<hr />
+<h3>总结</h3>
+<p>这篇 README 其实就是在说：
+<strong>“我们做了一个抓‘慢显卡’的工具，你可以通过命令行 <code>--log-straggler</code> 开启它。开启后，请关注日志里的 <code>MxRtt</code>（最慢时间）和 <code>Clk</code>（频率），以此来判断是不是有硬件故障导致训练变慢。”</strong></p>

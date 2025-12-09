@@ -1,0 +1,95 @@
+<h1>tests/unit_tests/dist_checkpointing/test_async_save.py</h1>
+<p>这份代码确实比较硬核，因为它属于 <strong>Megatron-Core</strong>（一个用于训练超大AI模型的库）的<strong>单元测试</strong>部分。</p>
+<p>简单来说，这个文件的目的是<strong>测试“异步保存模型”（Async Save）这个功能是否正常工作</strong>。</p>
+<p>为了让你听懂，我们把这个复杂的代码拆解成一个 <strong>5步的学习任务清单 (To-Do List)</strong>。我们一步一步来攻克它。</p>
+<hr />
+<h3>📋 任务清单：读懂 <code>test_async_is_equivalent_to_sync.py</code></h3>
+<h4>✅ Task 1: 理解背景概念（什么是 Sharded Checkpointing？）</h4>
+<p>在看代码前，先建立两个概念：
+1.  <strong>Checkpointing（检查点）</strong>: 就像玩游戏存档一样。训练大模型很慢，中间需要把参数存下来，万一断电了可以接着练。
+2.  <strong>Sharded（分片）</strong>: 大模型太大了，一个硬盘存不下。所以要把模型切成很多小块（Shards），分散存到不同的机器或文件里。
+3.  <strong>Sync vs Async（同步 vs 异步）</strong>:
+    *   <strong>同步 (Sync)</strong>: 也就是“堵塞”。保存模型时，训练必须暂停，等存完了才能继续算。这很浪费时间。
+    *   <strong>异步 (Async)</strong>: 也就是“后台运行”。训练继续跑，后台悄悄地把数据写到硬盘里。</p>
+<p><strong>这一步的结论：</strong> 这个文件的核心目的，就是为了证明 <strong>“异步保存”既快又准，而且出错了能报警。</strong></p>
+<hr />
+<h4>✅ Task 2: 理解测试工具（那个奇怪的函数是干啥的？）</h4>
+<p>看代码开头定义的函数 <code>write_data_os_err_mock_fn</code>。</p>
+<ul>
+<li><strong>代码片段</strong>:
+    <code>python
+    def write_data_os_err_mock_fn(...):
+        # ...
+        if Utils.rank == 2 and local_proc_idx == 2:
+            raise OSError('worker #2 critical failure')
+        # ...</code></li>
+<li><strong>白话解释</strong>:
+    这是一个“捣乱”的函数（Mock）。
+    正常情况下，保存文件是不会报错的。但为了测试系统的健壮性，我们需要人为制造一个错误。
+    这个函数的意思是：<strong>“如果是第2号机器的第2个进程在干活，就故意抛出一个硬盘错误 (OSError)，假装写入失败。”</strong>
+    <em>为什么要这样？</em> 后面 Task 4 会用到。</li>
+</ul>
+<hr />
+<h4>✅ Task 3: 分析第一个测试用例 (证明“异步”=“同步”)</h4>
+<p>看类 <code>TestAsyncSave</code> 里的第一个测试：<code>test_async_is_equivalent_to_sync</code>。</p>
+<ul>
+<li>
+<p><strong>它的逻辑是这样的</strong>：</p>
+<ol>
+<li><strong>准备数据</strong>: 造一些假的分布在不同机器上的张量 (<code>sharded_state_dict</code>)。</li>
+<li><strong>异步存一份</strong>: 调用 <code>save(..., async_sharded_save=True)</code>。这时候主程序不等待，直接往下走。</li>
+<li><strong>同步存一份</strong>: 调用 <code>save(..., async_sharded_save=False)</code>。这时候主程序会卡住，直到存完。</li>
+<li><strong>强制完成</strong>: 调用 <code>async_calls.maybe_finalize_async_calls(blocking=True)</code>，强迫异步任务必须做完。</li>
+<li><strong>对比 (Diff)</strong>: 把两份存好的文件读回来 (<code>load</code>)，然后用 <code>diff</code> 函数对比。</li>
+</ol>
+</li>
+<li>
+<p><strong>代码核心点</strong>:
+    <code>python
+    # 既然异步和同步存的是同一个东西，那么读出来的结果必须一模一样
+    diffs = diff(loaded_async_state_dict, loaded_sync_state_dict)
+    assert not any(map(bool, diffs)) # 断言：不能有任何差异</code></p>
+</li>
+<li>
+<p><strong>这一步的结论</strong>: 这个测试证明了异步保存虽然是在后台偷偷干活，但存出来的文件和老老实实暂停保存的文件是<strong>完全一样</strong>的，数据没有丢。</p>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 分析第二个测试用例 (证明“报错”能被发现)</h4>
+<p>看第二个测试：<code>test_errors_are_reported</code>。</p>
+<ul>
+<li><strong>背景</strong>: 异步编程最怕什么？最怕后台线程出错了，主程序不知道，还在傻傻地继续训练，最后发现模型没存上。</li>
+<li>
+<p><strong>它的逻辑是这样的</strong>:</p>
+<ol>
+<li><strong>偷梁换柱</strong>:
+    <code>python
+    # 把正常写文件的功能，替换成我们 Task 2 里定义的那个“捣乱”函数
+    FileSystemWriterAsync.write_preloaded_data = worker_fn</code></li>
+<li><strong>尝试保存</strong>: 无论是异步还是同步，开始保存。</li>
+<li><strong>预期崩溃</strong>:
+    <code>python
+    with pytest.raises(CheckpointException) as exc_info:
+        # 执行保存操作</code>
+    这里 <code>pytest.raises</code> 的意思是：<strong>“我预测这段代码会报错，如果不报错，测试反而算失败。”</strong></li>
+<li><strong>检查报错信息</strong>:
+    <code>python
+    assert 'Worker failure' in str(exc_info.value)</code>
+    它检查报错的内容里有没有包含我们预期的错误信息。</li>
+</ol>
+</li>
+<li>
+<p><strong>这一步的结论</strong>: 这个测试证明了，即使是后台偷偷保存（异步），如果硬盘坏了或者写失败了，主程序也能收到通知并抛出异常，而不是把错误吞掉。</p>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 总结与复盘</h4>
+<p>现在你再看整个文件，应该能看懂它的结构了：</p>
+<ol>
+<li><strong>Setup/Teardown</strong>: 也就是 <code>setup_method</code> 和 <code>teardown_method</code>，负责搭建和拆除分布式的测试环境（比如模拟有2个GPU）。</li>
+<li><strong>Mock Function</strong>: 那个 <code>write_data...</code> 是为了模拟故障。</li>
+<li><strong>Test 1 (Equivalence)</strong>: 验证 <strong>正确性</strong>（异步存 = 同步存）。</li>
+<li><strong>Test 2 (Error Reporting)</strong>: 验证 <strong>安全性</strong>（后台出错，前台能知道）。</li>
+</ol>
+<p><strong>一句话总结文中观点：</strong>
+这篇代码确保了 Megatron-Core 的<strong>异步检查点保存功能</strong>是<strong>可靠的</strong>（数据一致）且<strong>安全的</strong>（能捕获后台写入错误）。</p>

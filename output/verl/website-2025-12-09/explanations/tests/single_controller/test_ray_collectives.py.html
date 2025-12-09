@@ -1,0 +1,103 @@
+<h1>tests/single_controller/test_ray_collectives.py</h1>
+<p>这段代码涉及到了<strong>分布式计算</strong>、<strong>Ray框架</strong>以及<strong>GPU通信（NCCL）</strong>，确实比较抽象。</p>
+<p>为了让你听懂，我们把这个测试想象成一个<strong>“快递分发系统”</strong>的模拟。</p>
+<ul>
+<li><strong>场景</strong>：你有 <strong>4个发货员（Actor）</strong> 和 <strong>2个仓库（Rollout）</strong>。</li>
+<li><strong>任务</strong>：发货员要把手里的货物（数据 Tensor）精准地扔给指定的仓库。</li>
+</ul>
+<p>下面我列一个 <strong>Task Todo List</strong>，带你一步步拆解这段代码在干什么：</p>
+<hr />
+<h3>✅ Task 1: 搞清楚“谁跟谁是一伙的” (分组策略)</h3>
+<p>首先，我们要设定好谁负责给谁发货。代码开头的注释其实就是“分组说明书”。</p>
+<ul>
+<li><strong>发货员 (Actor)</strong> 有 4 人：编号 0, 1, 2, 3。</li>
+<li><strong>仓库 (Rollout)</strong> 有 2 个：编号 0, 1。</li>
+<li><strong>分配规则</strong>：<ul>
+<li>发货员 0 和 1 $\rightarrow$ 发给 仓库 0</li>
+<li>发货员 2 和 3 $\rightarrow$ 发给 仓库 1</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码对应：</strong>
+在 <code>Actor.init</code> 方法里有一句 <code>remote_rank = self.rank // 2</code>。
+*   如果你是发货员 0，<code>0 // 2 = 0</code> (对应仓库0)。
+*   如果你是发货员 3，<code>3 // 2 = 1</code> (对应仓库1)。</p>
+<hr />
+<h3>✅ Task 2: 拉专线电话 (建立通信组)</h3>
+<p>在分布式系统里，两个人要聊天（传数据），必须先建立一个“聊天室”或者“专线”，这里叫 <strong>Collective Group</strong>。</p>
+<p><strong>发货员 (Actor) 的工作：</strong>
+*   <strong>动作</strong>：<code>init_collective_group</code>
+*   <strong>逻辑</strong>：每个发货员只负责联系一个仓库，所以它只需要建立 <strong>1条</strong> 专线。
+*   <strong>专线名字</strong>：比如发货员0，它建立的专线名叫 <code>"A0_R0"</code> (Actor0 到 Rollout0)。</p>
+<p><strong>仓库 (Rollout) 的工作：</strong>
+*   <strong>动作</strong>：<code>init_collective_group</code> (调用了两次)
+*   <strong>逻辑</strong>：每个仓库要接收 <strong>2个</strong> 发货员的货。
+*   <strong>代码解读</strong>：
+    <code>python
+    # 仓库0 (Rank 0) 会算出：
+    self.remote_first_rank = 0  # 对应发货员0
+    self.remote_second_rank = 1 # 对应发货员1
+    # 然后它建立了两个群组：
+    # 1. "A0_R0" (为了接发货员0的电话)
+    # 2. "A1_R0" (为了接发货员1的电话)</code></p>
+<p><strong>这一步总结</strong>：此时，4条专线已经铺设完毕，大家都在电话机旁等着了。</p>
+<hr />
+<h3>✅ Task 3: 发货员打包并发送 (Actor Send)</h3>
+<p>现在开始正式干活了。</p>
+<ul>
+<li><strong>动作</strong>：<code>Actor.send_tensors</code></li>
+<li><strong>打包货物</strong>：
+    <code>python
+    # 创建一个长度为4的数组，里面的数字全都是自己的编号
+    tensor = torch.ones(...) * self.rank</code><ul>
+<li>发货员 0 发送：<code>[0, 0, 0, 0]</code></li>
+<li>发货员 3 发送：<code>[3, 3, 3, 3]</code></li>
+</ul>
+</li>
+<li><strong>发送</strong>：调用 <code>collective.send</code>，通过刚才建好的专线把包扔出去。</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 仓库接收货物 (Rollout Recv)</h3>
+<p>仓库这边比较忙，因为每个仓库要接两个人的货。</p>
+<ul>
+<li><strong>动作</strong>：<code>Rollout.receive_tensors</code></li>
+<li><strong>准备空箱子</strong>：创建 <code>tensor1</code> 和 <code>tensor2</code>（这是用来装接收到的数据的容器）。</li>
+<li><strong>接收</strong>：
+    <code>python
+    # 从第一条专线接货，放入 tensor1
+    collective.recv(self.tensor1, ... group_name=self.first_group_name)
+    # 从第二条专线接货，放入 tensor2
+    collective.recv(self.tensor2, ... group_name=self.second_group_name)</code><ul>
+<li>比如仓库 0，它的 <code>tensor1</code> 会收到 <code>[0, 0, 0, 0]</code>，<code>tensor2</code> 会收到 <code>[1, 1, 1, 1]</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 经理检查工作 (Main Function Test)</h3>
+<p>最后是 <code>test_ray_collective_group</code> 主函数，它相当于经理，负责指挥和验收。</p>
+<ol>
+<li><strong>招聘</strong>：<code>RayWorkerGroup</code> 创建了 4个 Actor 和 2个 Rollout。</li>
+<li><strong>开会</strong>：调用 <code>.init()</code> 让大家按 Task 2 拉好电话线。</li>
+<li><strong>开工</strong>：<ul>
+<li>喊发货员：<code>actor_wg.send_tensors()</code></li>
+<li>喊仓库：<code>rollout_wg.receive_tensors()</code></li>
+</ul>
+</li>
+<li><strong>验收 (Assert)</strong>：<ul>
+<li>经理把仓库里的货拿出来看 (<code>get_tensors</code>)。</li>
+<li><strong>计算逻辑</strong>：<ul>
+<li>代码里有一句断言：<code>sum(output).item() == 4 * i</code></li>
+<li>比如检查发货员 3 的货：数据是 <code>[3, 3, 3, 3]</code>。</li>
+<li>求和：$3+3+3+3 = 12$。</li>
+<li>公式：$4 \times 3 = 12$。</li>
+<li>相等 $\rightarrow$ 测试通过！</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这代码到底想证明什么？</h3>
+<p>这个测试是为了验证：
+在 <strong>Verl</strong> 这个系统里，我们能不能利用 <strong>Ray</strong> 和 <strong>NCCL</strong>，让 <strong>多个Worker（Actor）</strong> 同时向 <strong>少量的Worker（Rollout）</strong> 建立 <strong>点对点（P2P）</strong> 的高速GPU通信通道，并且数据传输是准确无误的。</p>
+<p><strong>简单说：</strong> 就是测试“多对一”的显卡直连通讯功能是不是好使。</p>

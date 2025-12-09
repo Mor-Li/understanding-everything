@@ -1,0 +1,60 @@
+<h1>tests/test_utils/python_scripts/wait_for_resources.py</h1>
+<p>没问题，这段代码乍一看确实有点绕，因为它涉及到了 API 调用、正则表达式和时间比较。</p>
+<p>简而言之，这个脚本是一个<strong>“红绿灯”或者“排队叫号机”</strong>。</p>
+<p>它的核心目的是：<strong>限制同时运行的 CI/CD 任务数量</strong>。如果前面还有太多任务在跑，当前任务就得等着（Sleep），直到前面的跑完了腾出位置，它才继续往下走。</p>
+<p>我们可以把它拆解成一个 <strong>Task Todo List</strong>，一步步来看它是怎么工作的：</p>
+<h3>任务清单：我是如何决定要不要让你“通过”的？</h3>
+<h4>Task 1: 准备工作 (读取配置)</h4>
+<p>脚本启动时，首先要搞清楚环境限制。
+*   <strong>动作</strong>：读取环境变量 <code>NUM_CONCURRENT_JOBS</code>（并发任务数）。
+*   <strong>代码细节</strong>：<code>int(os.getenv("NUM_CONCURRENT_JOBS", 2)) // 2</code>
+*   <strong>白话解释</strong>：比如系统允许同时跑 4 个任务，除以 2 变成 2。这意味着针对同一个目标分支（比如 main），最多只能有 2 个任务同时在跑。</p>
+<h4>Task 2: 身份确认 (我是谁？我要去哪？)</h4>
+<p>脚本通过命令行参数接收当前任务的信息。
+*   <strong>动作</strong>：读取 <code>--pipeline-id</code> 和 <code>--target-branch</code>。
+*   <strong>代码细节</strong>：<code>main(pipeline_id, target_branch)</code>
+*   <strong>白话解释</strong>：
+    *   “我是几号任务？”（Pipeline ID）
+    *   “我想合并到哪个分支？”（Target Branch，例如 main 或 dev）</p>
+<h4>Task 3: 进入无限循环 (开始排队)</h4>
+<p>程序进入一个 <code>while True</code> 的死循环，直到满足条件才会跳出。
+*   <strong>动作</strong>：不断询问“轮到我了吗？”
+*   <strong>代码细节</strong>：<code>while True: ... is_busy = ci_is_busy(...)</code>
+*   <strong>白话解释</strong>：只要系统还“忙”（busy），我就一直等，每分钟问一次。</p>
+<h4>Task 4: 侦查敌情 (核心逻辑 <code>ci_is_busy</code>)</h4>
+<p>这是最复杂的一步。脚本会去 GitLab 服务器拉取一张清单。
+*   <strong>动作 4.1：获取列表</strong>
+    *   拉取最近 100 个 <code>merge_request_event</code> 触发的流水线（Pipeline）。
+*   <strong>动作 4.2：筛选排在我前面的人</strong>
+    *   <strong>时间比我早</strong>：<code>p.attributes["created_at"] &lt; pipeline_time</code>（比我先来排队的）。
+    *   <strong>去往同一个地方</strong>：通过正则提取 Merge Request 信息，确认它的 <code>target_branch</code> 和我的一样。
+    *   <strong>还在占用资源</strong>：状态是 <code>pending</code> (挂起) 或 <code>running</code> (运行中)。
+*   <strong>动作 4.3：计算人数</strong>
+    *   算出满足上述条件的人数，记为 <code>in_queue</code>。</p>
+<h4>Task 5: 做出判断 (等还是不等？)</h4>
+<p>根据查到的人数和 Task 1 设定的限制做对比。
+*   <strong>动作</strong>：比较 <code>in_queue</code> 和 <code>NUM_CONCURRENT_JOBS</code>。
+*   <strong>代码细节</strong>：<code>return in_queue &gt; NUM_CONCURRENT_JOBS</code>
+*   <strong>白话解释</strong>：
+    *   假设限制是 2。
+    *   如果前面有 5 个人在跑 -&gt; <code>5 &gt; 2</code> 为真 -&gt; <strong>系统繁忙 (Busy)</strong>。
+    *   如果前面只有 0 个人在跑 -&gt; <code>0 &gt; 2</code> 为假 -&gt; <strong>系统不忙 (Not Busy)</strong>。</p>
+<h4>Task 6: 执行结果</h4>
+<p>回到 <code>main</code> 函数的循环里。
+*   <strong>如果繁忙 (True)</strong>：
+    *   打印日志：“排在第几位，等待资源中...”。
+    *   <strong>休息 60 秒</strong> (<code>time.sleep(60)</code>)，然后回到 Task 3 重新检查。
+*   <strong>如果不忙 (False)</strong>：
+    *   <code>break</code> 跳出循环。
+    *   <strong>脚本结束</strong>。这意味着 CI/CD 系统可以继续执行后续的步骤了（比如跑测试、打包代码等）。</p>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就像是<strong>银行门口的保安</strong>：</p>
+<ol>
+<li>你拿着号码（Pipeline ID）来了。</li>
+<li>保安看了一眼大厅（GitLab API），数了数里面正在办事且比你来得早的人。</li>
+<li>如果里面人太多（超过 <code>NUM_CONCURRENT_JOBS</code>），保安就让你在门口等 1 分钟再来看。</li>
+<li>如果里面人少了，保安就放行，你才能进去办业务（运行后续的 CI 脚本）。</li>
+</ol>
+<p><strong>为什么要这么做？</strong>
+通常是为了防止太多的测试任务同时运行，把服务器挤爆了，或者是为了避免过多的并发导致数据库冲突等资源竞争问题。</p>

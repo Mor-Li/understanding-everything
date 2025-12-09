@@ -1,0 +1,110 @@
+<h1>tests/unit_tests/data/test_builder.py</h1>
+<p>这份代码确实看起来比较枯燥，因为它是一个<strong>单元测试（Unit Test）</strong>文件，而不是核心功能的实现代码。它的目的是<strong>验证</strong> <code>BlendedMegatronDatasetBuilder</code> 这个类能不能正常工作。</p>
+<p>你可以把这个文件想象成一个<strong>质检员</strong>，正在对工厂（Builder）生产出来的产品（Dataset）进行各种极端情况的测试。</p>
+<p>为了让你看懂，我列了一个<strong>学习任务清单 (To-Do List)</strong>，我们一步一步拆解这个文件的逻辑：</p>
+<hr />
+<h3>✅ Task 1：搞清楚“我们在测什么？” (核心概念)</h3>
+<p><strong>目标</strong>：理解 <code>BlendedMegatronDatasetBuilder</code> 是干嘛的。
+*   <strong>观点</strong>：在训练大模型（如 GPT）时，我们通常有几十个不同的数据源（比如 Wikipedia, GitHub 代码, 书籍等）。我们需要把它们<strong>混合（Blend）</strong>在一起，然后切分成 <strong>训练集(Train)、验证集(Valid)、测试集(Test)</strong>。
+*   <strong>代码对应</strong>：
+    *   <code>BlendedMegatronDatasetBuilder</code>: 就是那个“工厂”，负责把这一堆乱七八糟的数据源组装成我们可以用的数据集对象。
+    *   <code>BlendedMegatronDatasetConfig</code>: 是“订单”，告诉工厂我们要多少数据、怎么混合、每个部分的比例是多少。</p>
+<hr />
+<h3>✅ Task 2：准备“假食材” (数据准备)</h3>
+<p><strong>目标</strong>：理解 <code>do_setup</code> 函数。
+*   <strong>观点</strong>：测试代码不能依赖真实的庞大据集（太慢、太占空间）。所以，测试开始前，必须先造一堆“假数据”。
+*   <strong>代码对应</strong>：
+    *   <code>do_setup(odir)</code> 函数：它在临时文件夹里创建了 10 个（<code>_NUM_DATASETS</code>）假的 <code>.npy</code> 文件。
+    *   这些文件里全是 0 (<code>numpy.zeros</code>)，但这不重要，只要文件存在，Builder 就能读取。
+    *   这就好比为了测试搅拌机好不好用，我们不用真的水果，用塑料水果代替，只要能放进去转就行。</p>
+<hr />
+<h3>✅ Task 3：定义“假产品模板” (Mock Class)</h3>
+<p><strong>目标</strong>：理解 <code>class TestDataset(MegatronDataset)</code>。
+*   <strong>观点</strong>：<code>MegatronDataset</code> 是一个基类（模板）。Builder 需要知道具体怎么读取数据。这里定义了一个简单的 <code>TestDataset</code>，仅仅是为了配合测试。
+*   <strong>代码对应</strong>：
+    *   <code>__init__</code>: 初始化。
+    *   <code>__getitem__</code>: 假装读取数据，返回 <code>{"text": ...}</code>。
+    *   <strong>重点</strong>：这个类没有任何复杂的逻辑，它存在的唯一意义就是让 Builder 有东西可以构建。</p>
+<hr />
+<h3>✅ Task 4：进入测试主流程 (核心测试逻辑)</h3>
+<p><strong>目标</strong>：理解 <code>test_builder()</code> 函数里发生了什么。
+*   <strong>观点</strong>：这是测试的主战场。它通过修改 <code>config</code>（配置），模拟了用户各种奇奇怪怪的需求，然后检查 Builder 返回的结果对不对。</p>
+<p>我们将这一步拆解为几个<strong>子任务</strong>：</p>
+<h4>📋 子任务 4.1：测试“混合”配置 (Blend per split)</h4>
+<ul>
+<li><strong>场景</strong>：用户明确指定了训练集用哪些文件，验证集用哪些文件。</li>
+<li><strong>代码段</strong>：
+    <code>python
+    config = BlendedMegatronDatasetConfig(..., blend_per_split=[...], ...)
+    datasets = BlendedMegatronDatasetBuilder(..., [1000, None, None], ...).build()</code></li>
+<li><strong>解释</strong>：<ul>
+<li>配置说：训练集由 <code>paths[Split.train]</code> 里的文件混合而成。</li>
+<li>目标大小：<code>[1000, None, None]</code> 表示我要 1000 个训练样本，不需要验证和测试集。</li>
+<li><strong>检查点 (<code>assert</code>)</strong>：生成的 <code>datasets[0]</code> 长度是不是 1000？是就是通过。</li>
+</ul>
+</li>
+</ul>
+<h4>📋 子任务 4.2：测试“自动计算大小”</h4>
+<ul>
+<li><strong>场景</strong>：用户不告诉我要多少样本（传了 <code>None</code>），但我希望把所有可用数据都用上。</li>
+<li><strong>代码段</strong>：
+    <code>python
+    datasets = BlendedMegatronDatasetBuilder(..., [None, None, None], ...).build()</code></li>
+<li><strong>解释</strong>：<ul>
+<li>Builder 应该自动扫描文件大小，把所有数据都加进去。</li>
+<li><strong>检查点</strong>：<code>len(datasets[0])</code> 应该等于所有假数据大小的总和 (<code>sum(_SIZES[Split.train])</code>)。</li>
+</ul>
+</li>
+</ul>
+<h4>📋 子任务 4.3：测试“权重” (Weights)</h4>
+<ul>
+<li><strong>场景</strong>：混合数据时，有的数据源权重大（比如高质量书），有的权重小。</li>
+<li><strong>代码段</strong>：
+    <code>python
+    assert numpy.all(numpy.array(datasets[0].weights) == ...)</code></li>
+<li><strong>解释</strong>：<ul>
+<li>检查 Builder 算出来的混合权重（Weights）是否符合我们在数据准备阶段设定的比例。</li>
+</ul>
+</li>
+</ul>
+<h4>📋 子任务 4.4：测试“切分字符串” (Split String)</h4>
+<ul>
+<li><strong>场景</strong>：这是 Megatron 的经典用法。我把所有数据混在一起，然后用一个字符串 <code>"100,0,0"</code> 或 <code>"50,50,0"</code> 来切分。</li>
+<li><strong>代码段</strong>：
+    <code>python
+    config = BlendedMegatronDatasetConfig(..., split="50,50,0", ...)
+    datasets = BlendedMegatronDatasetBuilder(..., [1000, 0, None], ...).build()</code></li>
+<li><strong>解释</strong>：<ul>
+<li><code>split="50,50,0"</code> 意思是：前 50% 的数据做训练，中间 50% 做验证，最后 0% 做测试。</li>
+<li><strong>检查点</strong>：<ul>
+<li><code>datasets[0]</code> (训练集) 的底层数据量应该是总量的 50%。</li>
+<li><code>datasets[1]</code> (验证集) 的底层数据量也应该是总量的 50%。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>📋 子任务 4.5：测试“分布式构建” (Distributed)</h4>
+<ul>
+<li><strong>场景</strong>：在大模型训练中，有很多个 GPU (Rank)。有时候我们只想让特定的 GPU 构建数据。</li>
+<li><strong>代码段</strong>：
+    <code>python
+    if torch.distributed.is_initialized():
+        # lambda: torch.distributed.get_rank() % 2 == 0</code></li>
+<li><strong>解释</strong>：<ul>
+<li>传入一个判断函数：只有偶数号的 GPU 才构建数据，奇数号的 GPU 返回 <code>None</code>。</li>
+<li><strong>检查点</strong>：如果你是偶数 Rank，你有数据；如果你是奇数 Rank，你是 None。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这个文件其实就在讲一件事：</p>
+<blockquote>
+<p><strong>无论用户通过 <code>Config</code> 提出了多么复杂的“混合数据”或“切分数据”的要求（指定大小、指定比例、自动计算、特定GPU构建），<code>BlendedMegatronDatasetBuilder</code> 这个类都必须能准确无误地生产出对应的 Dataset 对象。</strong></p>
+</blockquote>
+<p><strong>建议阅读顺序</strong>：
+1.  先看 <code>test_builder</code> 函数里 <code>with tempfile.TemporaryDirectory() as temp_dir:</code> 之后的部分。
+2.  关注每一个 <code>config = ...</code> 和随后的 <code>datasets = ...build()</code>。
+3.  把每一个 <code>config</code> 块看作一个独立的<strong>测试用例</strong>。
+4.  忽略 <code>TestDataset</code> 和 <code>do_setup</code> 的具体实现细节，只要知道它们是造假数据的工具人就行。</p>

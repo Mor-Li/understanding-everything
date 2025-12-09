@@ -1,0 +1,126 @@
+<h1>recipe/r1_ascend/ray_start_grpo_npu.sh</h1>
+<p>这份脚本确实包含了很多底层配置，看着头晕是很正常的。</p>
+<p>简单来说，<strong>这是一个“启动脚本”</strong>。它的作用是把多台装有华为昇腾（Ascend NPU）显卡的服务器连接起来，组成一个<strong>Ray集群</strong>，准备进行大规模的大模型训练（看起来是 DeepSeek V3 的 GRPO 强化学习任务）。</p>
+<p>为了让你看懂，我把这个脚本要做的事情拆解成一个 <strong>“任务清单 (To-Do List)”</strong>。脚本的执行过程其实就是按顺序完成下面这 4 个阶段的任务。</p>
+<hr />
+<h3>📋 脚本执行任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>【清理现场】</strong>：把之前的残留进程杀掉，打扫干净。</li>
+<li><strong>【填写基本信息】</strong>：告诉脚本有多少台机器、网络IP是多少、怎么通讯。</li>
+<li><strong>【性能调优】</strong>：设置一大堆环境变量，让华为 NPU 和 vLLM（推理引擎）跑得更快、更稳。</li>
+<li><strong>【身份识别与启动】</strong>：<ul>
+<li><strong>如果是“带头大哥”（主节点）</strong>：启动 Ray 头节点 -&gt; 等待所有小弟（子节点）上线 -&gt; 人齐了就发号施令（运行训练脚本）。</li>
+<li><strong>如果是“小弟”（子节点）</strong>：启动 Ray 客户端 -&gt; 拼命尝试连接大哥 -&gt; 连上为止。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细解读</h3>
+<p>下面我按照上面的清单，把代码对应进去讲：</p>
+<h4>第一阶段：清理与准备</h4>
+<p><strong>任务：</strong> 确保环境干净，没有脏数据或旧进程干扰。</p>
+<div class="codehilite"><pre><span></span><code>ray<span class="w"> </span>stop<span class="w"> </span>--force<span class="w">                   </span><span class="c1"># 暴力停止所有正在运行的 Ray 进程（不管有没有在跑，先杀再说）</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">RAY_DEDUP_LOGS</span><span class="o">=</span><span class="m">0</span><span class="w">            </span><span class="c1"># 设置日志显示方式（0表示不折叠重复日志，方便看报错）</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">HYDRA_FULL_ERROR</span><span class="o">=</span><span class="m">1</span><span class="w">          </span><span class="c1"># 让报错信息显示得更完整</span>
+<span class="nb">ulimit</span><span class="w"> </span>-n<span class="w"> </span><span class="m">32768</span><span class="w">                    </span><span class="c1"># 增加系统允许打开的文件数量上限（大模型训练文件操作很多，太小会报错）</span>
+mkdir<span class="w"> </span>logs<span class="w">                         </span><span class="c1"># 建个文件夹存日志</span>
+</code></pre></div>
+
+<h4>第二阶段：网络与硬件配置（<strong>你需要修改这里</strong>）</h4>
+<p><strong>任务：</strong> 定义集群规模和网络地址。</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">NNODES</span><span class="o">=</span><span class="m">16</span><span class="w">                          </span><span class="c1"># 计划用 16 台服务器</span>
+<span class="nv">NPUS_PER_NODE</span><span class="o">=</span><span class="m">16</span><span class="w">                   </span><span class="c1"># 每台服务器有 16 张 NPU 卡（注意：通常物理机是8卡，这里可能是虚拟化或特定集群配置）</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">WORLD_SIZE</span><span class="o">=</span><span class="k">$((</span><span class="nv">$NNODES</span><span class="o">*</span><span class="nv">$NPUS_PER_NODE</span><span class="k">))</span><span class="w"> </span><span class="c1"># 算出总卡数</span>
+
+<span class="c1"># 端口设置</span>
+<span class="nv">RAY_START_PORT</span><span class="o">=</span><span class="m">6766</span>
+<span class="nv">RAY_DASHBOARD_PORT</span><span class="o">=</span><span class="m">8260</span>
+
+<span class="c1"># ★★★ 关键修改点 ★★★</span>
+<span class="nv">MASTER_ADDR</span><span class="o">=</span><span class="s2">&quot;IP FOR MASTER NODE&quot;</span><span class="w">   </span><span class="c1"># 你必须把这里改成主节点的真实 IP 地址</span>
+<span class="nv">SOCKET_IFNAME</span><span class="o">=</span><span class="s2">&quot;SOCKET IFNAME FOR CURRENT NODE&quot;</span><span class="w"> </span><span class="c1"># 你必须把这里改成网卡的名字（比如 eth0 或 enp1s0）</span>
+
+<span class="c1"># 自动获取当前机器的 IP</span>
+<span class="nv">CURRENT_IP</span><span class="o">=</span><span class="k">$(</span>ifconfig<span class="w"> </span><span class="nv">$SOCKET_IFNAME</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-Eo<span class="w"> </span>...<span class="w"> </span><span class="k">)</span><span class="w"> </span>
+
+<span class="c1"># 设置华为 HCCL 通信库的端口和网卡绑定（让 NPU 知道走哪个网卡通信）</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">MASTER_PORT</span><span class="o">=</span><span class="m">29444</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">TP_SOCKET_IFNAME</span><span class="o">=</span><span class="nv">$SOCKET_IFNAME</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">HCCL_SOCKET_IFNAME</span><span class="o">=</span><span class="nv">$SOCKET_IFNAME</span>
+<span class="c1"># ... 其他类似的网络绑定</span>
+</code></pre></div>
+
+<h4>第三阶段：黑科技调优（NPU &amp; vLLM）</h4>
+<p><strong>任务：</strong> 通过环境变量开启各种加速功能。这部分通常是华为或算法工程师调好的，不需要动。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 显存和 PyTorch NPU 内存分配优化</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">CUDA_DEVICE_MAX_CONNECTIONS</span><span class="o">=</span><span class="m">1</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">PYTORCH_NPU_ALLOC_CONF</span><span class="o">=</span><span class="s2">&quot;expandable_segments:True&quot;</span>
+
+<span class="c1"># HCCL 通信超时设置（防止网络稍微卡一下就报错挂掉）</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">HCCL_CONNECT_TIMEOUT</span><span class="o">=</span><span class="m">600</span>
+
+<span class="c1"># vLLM 加速设置（GRPO 算法需要用 vLLM 进行快速推理生成）</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">VLLM_USE_V1</span><span class="o">=</span><span class="m">1</span><span class="w">               </span><span class="c1"># 使用 vLLM V1 引擎</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">VLLM_ENABLE_MC2</span><span class="o">=</span><span class="m">1</span><span class="w">           </span><span class="c1"># 开启 MC2 通信优化</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">VLLM_DP_SIZE</span><span class="o">=</span><span class="m">128</span><span class="w">            </span><span class="c1"># 数据并行的大小</span>
+</code></pre></div>
+
+<h4>第四阶段：身份识别与启动逻辑（核心逻辑）</h4>
+<p><strong>任务：</strong> 脚本会自动判断当前运行脚本的机器是“大哥”还是“小弟”，并执行不同操作。</p>
+<p><strong>逻辑判断：</strong> <code>if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then</code>
+(如果 <strong>配置的主节点IP</strong> 等于 <strong>当前机器IP</strong>，那我就是大哥)</p>
+<hr />
+<p><strong>🅰️ 场景一：我是大哥 (Master Node)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 启动 Ray 的头节点 (Head)，告诉它我有多少 NPU 资源</span>
+ray<span class="w"> </span>start<span class="w"> </span>--head<span class="w"> </span>--port<span class="o">=</span><span class="nv">$RAY_START_PORT</span><span class="w"> </span>...<span class="w"> </span>--resources<span class="o">=</span><span class="s1">&#39;{&quot;NPU&quot;: &#39;</span><span class="nv">$NPUS_PER_NODE</span><span class="s1">&#39;}&#39;</span>
+
+<span class="c1"># 2. 进入等待循环 (While true)</span>
+<span class="k">while</span><span class="w"> </span>true<span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="c1"># 查一下现在 Ray 集群里有多少个 NPU 上线了</span>
+<span class="w">    </span><span class="nv">npu_count</span><span class="o">=</span>...
+
+<span class="w">    </span><span class="c1"># 3. 算一下：上线的机器数够不够预设的 NNODES (16台)？</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="o">[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$device_count</span><span class="s2">&quot;</span><span class="w"> </span>-eq<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$NNODES</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="c1"># 4. 如果人齐了：</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;人齐了，准备开车！&quot;</span>
+<span class="w">        </span><span class="c1"># ★★★ 启动真正的训练脚本 ★★★</span>
+<span class="w">        </span>bash<span class="w"> </span>./recipe/r1_ascend/run_deepseekv3_671b_grpo_megatron_npu.sh
+<span class="w">        </span><span class="k">break</span><span class="w"> </span><span class="c1"># 退出循环</span>
+<span class="w">    </span><span class="k">else</span>
+<span class="w">        </span><span class="c1"># 5. 如果人没齐：</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;还差人呢，再等5秒...&quot;</span>
+<span class="w">        </span>sleep<span class="w"> </span><span class="m">5</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="k">done</span>
+</code></pre></div>
+
+<p><strong>🅱️ 场景二：我是小弟 (Child/Worker Node)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">else</span>
+<span class="w">  </span><span class="c1"># 1. 进入重试循环</span>
+<span class="w">  </span><span class="k">while</span><span class="w"> </span>true<span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">      </span><span class="c1"># 2. 尝试连接大哥的 IP 和端口</span>
+<span class="w">      </span>ray<span class="w"> </span>start<span class="w"> </span>--address<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$MASTER_ADDR</span><span class="s2">:</span><span class="nv">$RAY_START_PORT</span><span class="s2">&quot;</span><span class="w"> </span>...
+
+<span class="w">      </span><span class="c1"># 3. 检查连接状态</span>
+<span class="w">      </span><span class="k">if</span><span class="w"> </span><span class="o">[</span><span class="w"> </span><span class="nv">$?</span><span class="w"> </span>-eq<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="o">]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">          </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;连上大哥了！听候差遣。&quot;</span>
+<span class="w">          </span><span class="k">break</span><span class="w"> </span><span class="c1"># 成功就退出</span>
+<span class="w">      </span><span class="k">else</span>
+<span class="w">          </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;连不上... 5秒后再试 (可能是大哥还没启动，或者网络不通)&quot;</span>
+<span class="w">          </span>sleep<span class="w"> </span><span class="m">5</span>
+<span class="w">      </span><span class="k">fi</span>
+<span class="w">  </span><span class="k">done</span>
+<span class="k">fi</span>
+</code></pre></div>
+
+<hr />
+<h3>💡 总结</h3>
+<p><strong>这一大坨代码其实就做了一件事：</strong></p>
+<p>你在所有 16 台机器上都运行这个脚本。
+*   其中 1 台（IP匹配的那台）会自动变成<strong>指挥官</strong>，它会启动 Ray 服务，并在那里干等，直到数够了 16 台机器。
+*   另外 15 台会自动变成<strong>工人</strong>，它们唯一的任务就是连上指挥官。
+*   一旦指挥官发现 16 台机器全部就位，它就会自动运行最后那行 <code>run_deepseekv3...sh</code>，开始真正的大模型训练。</p>
+<p><strong>你需要做的 Todo：</strong>
+1.  找到 <code>MASTER_ADDR</code> 这一行，填入主节点的 IP。
+2.  找到 <code>SOCKET_IFNAME</code> 这一行，填入机器之间通信用的网卡名称。
+3.  确保所有机器上都运行这个脚本。</p>

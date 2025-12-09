@@ -1,0 +1,108 @@
+<h1>tests/unit_tests/export/trtllm/test_trtllm_single_device_converter.py</h1>
+<p>这份代码是一个<strong>单元测试（Unit Test）</strong>文件。</p>
+<p>简单来说，它的作用是测试一个工具类 <code>SingleDeviceTRTLLMModelWeightsConverter</code>。这个工具类的功能是：<strong>把 Megatron（一个训练框架）训练出来的模型权重，转换并切割成 TensorRT-LLM（一个推理加速框架）所需要的格式。</strong></p>
+<p>因为大模型推理通常需要多张显卡（TP, Tensor Parallelism），所以这个工具的核心难点在于：<strong>怎么把完整的权重切分成几份，分给不同的显卡。</strong></p>
+<p>为了让你看懂，我把这个文件的逻辑拆解成一个 <strong>Task Todo List</strong>，带你一步步走一遍：</p>
+<hr />
+<h3>第一阶段：基础流程测试 (Task 1)</h3>
+<p><strong>对应代码中的类方法：</strong> <code>test_get_model_weights_converter</code></p>
+<p>这个测试是为了验证“在最普通的情况下，转换器能不能正常工作，切分出来的形状对不对”。</p>
+<ul>
+<li>
+<p><strong>Todo 1: 设定“要搬的家”有多大 (Config)</strong></p>
+<ul>
+<li>代码首先定义了模型的配置：<code>vocab_size=10</code>（词表大小），<code>hidden_dim=4</code>（隐藏层维度），<code>inference_tp_size=2</code>（推理时用2张卡）。</li>
+<li><strong>观点：</strong> 转换器必须知道模型长什么样，以及你想用几张卡跑推理。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 2: 伪造一些“家具” (Mock Data)</strong></p>
+<ul>
+<li><code>model_state_dict = { ... }</code></li>
+<li>这里用 <code>torch.randn</code> 生成了一堆随机数。这些随机数假装是训练好的模型权重（比如 Attention 层的权重、MLP 层的权重）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 3: 贴标签 (Mapping)</strong></p>
+<ul>
+<li><code>trtllm_conversion_dict = { ... }</code></li>
+<li>这里建立了一个映射表。左边是 Megatron 的层名字，右边是 TRT-LLM 对应的层名字。</li>
+<li><strong>观点：</strong> 两个框架对层的命名习惯不一样，需要一个字典来翻译。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 4: 启动搬家公司 (Convert)</strong></p>
+<ul>
+<li>初始化 <code>SingleDeviceTRTLLMModelWeightsConverter</code>。</li>
+<li>调用 <code>.convert()</code> 方法。</li>
+<li><strong>核心逻辑：</strong> 这一步会把 PyTorch 的 Tensor 拿出来，根据 <code>tp_size=2</code> 进行切分。比如一个 <code>[10, 4]</code> 的矩阵，可能会被横着切成两个 <code>[5, 4]</code> 或者竖着切成两个 <code>[10, 2]</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 5: 检查切分结果 (Assert)</strong></p>
+<ul>
+<li><code>expected_shapes = { ... }</code></li>
+<li>这里列出了预期的切分后形状。</li>
+<li>注意看 key 的名字：<code>...weight.0.bin</code> 和 <code>...weight.1.bin</code>。</li>
+<li><strong>观点：</strong> <code>.0</code> 代表第0张显卡拿到的权重，<code>.1</code> 代表第1张显卡拿到的权重。测试代码会检查转换后的形状是否和预期一致。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第二阶段：复杂情况测试 - GQA 与 TP 的数学关系 (Task 2)</h3>
+<p><strong>对应代码中的后四个测试方法。</strong></p>
+<p>这是这个文件最核心的逻辑观点。现在的大模型（如 LLaMA 2/3）常用 <strong>GQA (Grouped Query Attention)</strong>，也就是 KV Head（键值头）的数量少于 Attention Head 的数量。</p>
+<p><strong>核心观点：</strong> 当 KV Head 的数量很少，而显卡很多（TP Size 很大）时，能不能切分成功，取决于数学上的整除关系。</p>
+<h4>情况 A：KV Heads 少于 显卡数 (KV &lt; TP)</h4>
+<ul>
+<li>
+<p><strong>测试 1: 合法的切分 (<code>test_num_kv_heads_less_than_tp_size_valid</code>)</strong></p>
+<ul>
+<li><strong>设定：</strong> <code>TP=4</code> (4张卡)，<code>KV Heads=2</code>。</li>
+<li><strong>逻辑：</strong> 4张卡分2个头。<code>4 % 2 == 0</code> (整除)。</li>
+<li><strong>结果：</strong> <strong>合法</strong>。这意味着每 2 张卡共享或者复制某部分数据，可以通过广播或复制机制解决。代码断言转换成功，且切分出了4份权重。</li>
+</ul>
+</li>
+<li>
+<p><strong>测试 2:非法的切分 (<code>test_num_kv_heads_less_than_tp_size_invalid</code>)</strong></p>
+<ul>
+<li><strong>设定：</strong> <code>TP=4</code> (4张卡)，<code>KV Heads=3</code>。</li>
+<li><strong>逻辑：</strong> 4张卡分3个头。<code>4 % 3 != 0</code> (除不尽)。</li>
+<li><strong>结果：</strong> <strong>报错</strong>。你没法把3个头公平地分给4个人，也没法简单的倍增。</li>
+<li><strong>代码行为：</strong> 使用 <code>pytest.raises(Exception)</code> 期待程序抛出错误，错误信息提示“请选择能整除的 TP size”。</li>
+</ul>
+</li>
+</ul>
+<h4>情况 B：KV Heads 多于或等于 显卡数 (KV &gt;= TP)</h4>
+<ul>
+<li>
+<p><strong>测试 3: 非法的切分 (<code>test_num_kv_heads_greater_equal_tp_size_invalid</code>)</strong></p>
+<ul>
+<li><strong>设定：</strong> <code>TP=4</code>，<code>KV Heads=5</code>。</li>
+<li><strong>逻辑：</strong> 5个头分给4张卡。<code>5 % 4 != 0</code>。</li>
+<li><strong>结果：</strong> <strong>报错</strong>。有的卡拿1个头，有的卡拿2个头？这在并行计算中是不允许的，必须负载均衡。</li>
+</ul>
+</li>
+<li>
+<p><strong>测试 4: 合法的切分 (<code>test_num_kv_heads_greater_equal_tp_size_valid</code>)</strong></p>
+<ul>
+<li><strong>设定：</strong> <code>TP=4</code>，<code>KV Heads=8</code>。</li>
+<li><strong>逻辑：</strong> 8个头分给4张卡。<code>8 % 4 == 0</code>。</li>
+<li><strong>结果：</strong> <strong>合法</strong>。每张卡拿2个头。代码断言转换成功。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：文中的核心观点 List</h3>
+<p>如果你要理解这个文件在讲什么，记住以下几点：</p>
+<ol>
+<li><strong>映射与转换：</strong> 这是一个负责把 PyTorch 模型翻译成 TensorRT-LLM 格式的“翻译官”。</li>
+<li><strong>切分原理：</strong> 为了多卡推理，权重必须被切分（Slicing）。</li>
+<li><strong>约束条件 (Constraints)：</strong> 切分不是想切就能切的，必须满足数学约束：<ul>
+<li><strong>如果 KV Heads 很充裕</strong>（比卡多），KV Heads 数量必须能被卡数整除。</li>
+<li><strong>如果 KV Heads 很稀缺</strong>（比卡少），卡数必须能被 KV Heads 数量整除（通常意味着需要在卡之间复制数据）。</li>
+<li><strong>如果不满足整除关系</strong>，转换器必须抛出异常，阻止用户导出错误的模型。</li>
+</ul>
+</li>
+</ol>
+<p>这个测试文件就是在反复验证上述的数学约束逻辑是否被正确实现。</p>

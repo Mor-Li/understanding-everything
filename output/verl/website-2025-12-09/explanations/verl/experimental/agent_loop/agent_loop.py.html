@@ -1,0 +1,125 @@
+<h1>verl/experimental/agent_loop/agent_loop.py</h1>
+<p>这份代码确实比较复杂，因为它涉及到了<strong>分布式计算（Ray）</strong>、<strong>异步编程（Asyncio）</strong>以及<strong>强化学习的数据生成（Rollout）</strong>。</p>
+<p>简单来说，这个文件的核心作用是：<strong>“作为调度中心，指挥一群工人（Worker）拿着提示词（Prompt），去和 大模型（LLM）聊天，生成用于训练的数据，并把这些数据整理好。”</strong></p>
+<p>为了让你听懂，我把这个过程想象成一个<strong>“流水线工厂”</strong>，并为你列一个<strong>Task Todo List（任务清单）</strong>。我们将按照数据流动的顺序，一步步拆解代码。</p>
+<hr />
+<h3>核心任务清单 (Task Todo List)</h3>
+<p>想象你是一个项目经理，你的目标是生成一大批对话数据用来训练模型。以下是系统执行的步骤：</p>
+<ol>
+<li><strong>[初始化] 建厂与招工 (<code>AgentLoopManager</code>)</strong><ul>
+<li>启动 GPU 推理服务器（负责生成文字）。</li>
+<li>招募 CPU 工人（负责处理逻辑）。</li>
+</ul>
+</li>
+<li><strong>[派单] 分发任务 (<code>AgentLoopManager.generate_sequences</code>)</strong><ul>
+<li>收到一大批提示词（Prompts），切分成小块，分发给不同的工人。</li>
+</ul>
+</li>
+<li><strong>[接单] 工人处理 (<code>AgentLoopWorker</code>)</strong><ul>
+<li>工人拿到一堆提示词，为每一个提示词启动一个独立的“智能体循环”。</li>
+</ul>
+</li>
+<li><strong>[执行] 智能体思考与交互 (<code>AgentLoopBase</code> &amp; <code>AsyncLLMServerManager</code>)</strong><ul>
+<li>核心逻辑：发给 LLM -&gt; LLM 回复 -&gt; (可能调用工具) -&gt; 再发给 LLM。</li>
+<li>负载均衡：决定把请求发给哪台 GPU 服务器最快。</li>
+</ul>
+</li>
+<li><strong>[收尾] 数据整理与打分 (<code>_postprocess</code> &amp; Reward)</strong><ul>
+<li>把长短不一的对话对其（Padding）。</li>
+<li>计算奖励分数（Reward）。</li>
+</ul>
+</li>
+<li><strong>[交付] 打包返回 (<code>DataProto</code>)</strong><ul>
+<li>把所有工人的结果拼在一起，返回给训练器。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解 (代码对应解读)</h3>
+<h4>Step 1: 建厂与招工 (初始化阶段)</h4>
+<p><strong>对应类：<code>AgentLoopManager</code></strong></p>
+<ul>
+<li><strong>这是什么？</strong> 它是总管。</li>
+<li><strong>代码做了啥？</strong><ul>
+<li><code>_initialize_llm_servers</code>: 它先启动底层的 LLM 推理服务（代码里的 <code>RolloutReplica</code>），这些是真正用 GPU 算力生成 token 的地方。</li>
+<li><code>_init_agent_loop_workers</code>: 它根据配置，启动若干个 <code>AgentLoopWorker</code>。这些 Worker 运行在 CPU 上，负责逻辑控制。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 2: 派单 (分发任务)</h4>
+<p><strong>对应方法：<code>AgentLoopManager.generate_sequences</code></strong></p>
+<ul>
+<li><strong>这是什么？</strong> 当训练开始时，会有一批数据（比如 1024 个 Prompts）传进来。</li>
+<li><strong>代码做了啥？</strong><ul>
+<li><code>prompts.chunk(...)</code>: 把这 1024 个任务切成几块（比如 4 个 Worker，每人分 256 个）。</li>
+<li><code>worker.generate_sequences.remote(chunk)</code>: 利用 Ray 的远程调用，把任务扔给 Worker 去并行处理。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 3: 接单 (工人开始干活)</h4>
+<p><strong>对应类：<code>AgentLoopWorker</code></strong></p>
+<ul>
+<li><strong>这是什么？</strong> 它是具体的执行者。</li>
+<li><strong>代码做了啥？</strong><ul>
+<li>它收到 256 个 Prompts。</li>
+<li><code>asyncio.gather(*tasks)</code>: 它利用异步编程，同时处理这 256 个任务。注意，它不是一个一个串行做的，而是并发的。</li>
+<li><code>_run_agent_loop</code>: 对每一个 Prompt，它会初始化一个具体的 <code>AgentLoop</code>（智能体循环）来负责这段对话。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 4: 核心交互 (最复杂的部分)</h4>
+<p><strong>对应类：<code>AgentLoopBase</code> (及其子类) 和 <code>AsyncLLMServerManager</code></strong></p>
+<p>这是“Agent Loop”名字的由来。这里定义了<strong>怎么聊</strong>。</p>
+<ul>
+<li>
+<p><strong><code>AgentLoopBase</code> (抽象基类)</strong>:</p>
+<ul>
+<li>这就好比是一个剧本。如果只是简单的问答，剧本就是“问-&gt;答”。如果是复杂的 Agent（如 ReAct），剧本就是“问-&gt;思考-&gt;调用工具-&gt;观察结果-&gt;回答”。</li>
+<li>代码中通过 <code>hydra.utils.instantiate</code> 动态加载具体的剧本。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>AsyncLLMServerManager</code> (LLM 服务器管家)</strong>:</p>
+<ul>
+<li>Worker 自己没有 GPU，它需要找服务器生成文本。</li>
+<li><strong>负载均衡 (<code>_choose_server</code>)</strong>: 管家会看哪台 GPU 服务器空闲（通过 <code>heapq</code> 维护的最小请求堆），就把请求发给谁。</li>
+<li><strong>粘性会话 (Sticky Session)</strong>: 如果是多轮对话，管家会尽量把同一个对话发给同一台服务器，这样利用 KV Cache 缓存，速度更快。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 5: 数据整理与打分 (后处理)</h4>
+<p><strong>对应方法：<code>_agent_loop_postprocess</code> 和 <code>_postprocess</code></strong></p>
+<ul>
+<li><strong>数据对齐</strong>:<ul>
+<li>LLM 生成的句子长度不一样。有的生成了 10 个字，有的生成了 100 个字。</li>
+<li>代码里的 <code>tokenizer.pad</code> 就是把短的句子后面补 0，让它们变成整齐的矩阵（Tensor），方便 GPU 训练。</li>
+</ul>
+</li>
+<li><strong>生成 Mask</strong>:<ul>
+<li><code>response_mask</code>: 标记哪些是 LLM 生成的（需要训练），哪些是 Prompt 或者 Padding（不需要训练）。</li>
+</ul>
+</li>
+<li><strong>计算奖励 (Reward)</strong>:<ul>
+<li>如果有 <code>RewardLoopWorker</code>，它会把生成的对话发给奖励模型打分。这个分数决定了这次生成的好坏。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 6: 交付 (打包)</h4>
+<p><strong>对应方法：<code>AgentLoopManager</code> 的最后部分</strong></p>
+<ul>
+<li><strong>代码做了啥？</strong><ul>
+<li><code>DataProto.concat(outputs)</code>: 总管（Manager）收到所有 Worker 返回的数据包，把它们拼回成一个大包。</li>
+<li>计算一些性能指标（比如生成速度、工具调用次数），然后返回给外层的训练循环。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这文件就像一个<strong>外包公司的调度系统</strong>：</p>
+<ol>
+<li><strong>Manager</strong> 是老板，负责接大单并分发。</li>
+<li><strong>Worker</strong> 是组长，领了任务后，组织手下的 <strong>AgentLoop</strong>（具体的员工）去干活。</li>
+<li><strong>ServerManager</strong> 是资源协调员，负责把员工的计算请求分配给昂贵的 <strong>GPU 服务器</strong>。</li>
+<li>最后大家把结果填在标准的表格里（<strong>TensorDict</strong>），交回给老板。</li>
+</ol>
+<p><strong>你看不到具体的“对话逻辑”（比如怎么调用搜索工具），是因为那些逻辑被封装在 <code>AgentLoopBase</code> 的具体子类里了（通过注册机制加载），这个文件只负责搭台子、管调度和收数据。</strong></p>

@@ -1,0 +1,59 @@
+<h1>examples/data_preprocess/full_hh_rlhf.py</h1>
+<p>完全没问题。这段代码对于刚接触大模型训练（特别是 RLHF - 人类反馈强化学习）的人来说确实比较抽象。</p>
+<p>我们可以把这个脚本看作是一个<strong>“食材预处理车间”</strong>。它的任务是把原始的“食材”（原始数据集）切分、清洗、打包成三种不同的“套餐”，分别喂给大模型训练的三个不同阶段。</p>
+<p>我为你列了一个 <strong>Task Todo List</strong>，按照逻辑顺序，一步步拆解这个脚本在干什么：</p>
+<hr />
+<h3>📋 任务清单：RLHF 数据预处理流水线</h3>
+<h4>✅ Task 0: 了解原材料 (The Raw Data)</h4>
+<p>在开始切菜之前，代码首先通过 <code>load_dataset("Dahoas/full-hh-rlhf")</code> 加载了一个经典的开源数据集。
+*   <strong>数据长什么样？</strong> 每一条数据包含三个部分：
+    1.  <strong>Prompt</strong>: 用户的提问。
+    2.  <strong>Chosen</strong>: 人类认为更好的回答（优质回答）。
+    3.  <strong>Rejected</strong>: 人类认为较差的回答（劣质回答）。</p>
+<h4>✅ Task 1: 准备第一阶段 - SFT 数据 (Supervised Fine-Tuning)</h4>
+<p><strong>目标</strong>：让模型学会“怎么说话”，即给定一个问题，能生成一个流畅的回答。
+*   <strong>对应函数</strong>：<code>generate_sft_dataset</code>
+*   <strong>代码逻辑</strong>：
+    1.  代码遍历了所有数据。
+    2.  它做了一个比较“粗暴”的操作：它把“优质回答”和“劣质回答”都当作了训练材料。
+    3.  <strong>格式转换</strong>：它把数据拆成了简单的 <code>(Prompt, Response)</code> 对。
+        *   把 <code>Prompt + Chosen</code> 存进去。
+        *   把 <code>Prompt + Rejected</code> 也存进去。
+    4.  <strong>打包</strong>：保存为 <code>train.parquet</code> 文件。
+*   <strong>通俗解释</strong>：不管好坏，先让模型读大量的问答对，学会基本的对话能力。</p>
+<h4>✅ Task 2: 准备第二阶段 - RM 数据 (Reward Model)</h4>
+<p><strong>目标</strong>：训练一个“裁判模型”（Reward Model），让它学会分辨什么是好回答，什么是坏回答。
+*   <strong>对应函数</strong>：<code>generate_rm_dataset</code>
+*   <strong>代码逻辑</strong>：
+    1.  <strong>切分数据</strong>：代码特意把数据切了一刀。
+        *   <code>train[:75%]</code>：75% 的数据用来训练裁判。
+        *   <code>train[-25%:]</code>：25% 的数据用来考试（验证）裁判判得准不准。
+    2.  <strong>保留对比</strong>：这里<strong>不能</strong>像 Task 1 那样拆散了。必须保留 <code>(Prompt, Chosen, Rejected)</code> 这一组。
+    3.  <strong>打包</strong>：分别保存为 <code>train.parquet</code> 和 <code>test.parquet</code>。
+*   <strong>通俗解释</strong>：给裁判看大量的“对比题”（这句好，那句坏），训练它的鉴赏能力。</p>
+<h4>✅ Task 3: 准备第三阶段 - RL 数据 (PPO/Reinforcement Learning)</h4>
+<p><strong>目标</strong>：这是真正的强化学习阶段。模型自己生成回答，然后裁判打分，模型根据分数自我进化。
+*   <strong>对应函数</strong>：<code>generate_rl_dataset</code>
+*   <strong>代码逻辑</strong>：
+    1.  在这个阶段，我们<strong>不需要</strong>标准答案（Response）。
+    2.  我们只需要 <strong>Prompt</strong>（考题）。因为答案要让模型自己生成。
+    3.  <strong>格式包装</strong>：代码把 Prompt 包装成了一种特定的 JSON 格式（包含 <code>role: user</code>, <code>content: ...</code>），这是为了适配后续的训练框架（Verl）。
+    4.  <strong>打包</strong>：保存为 <code>train.parquet</code>。
+*   <strong>通俗解释</strong>：准备一堆考题，不带答案，留给模型在“考场”上自己发挥。</p>
+<h4>✅ Task 4: 调度中心 (Main Execution)</h4>
+<p><strong>目标</strong>：决定今天运行哪条流水线。
+*   <strong>对应代码</strong>：<code>if __name__ == "__main__":</code> 部分。
+*   <strong>逻辑</strong>：
+    *   这个脚本本身不会一次性做完所有事。
+    *   你需要通过命令行参数 <code>--split</code> 来告诉它：
+        *   <code>--split sft</code> -&gt; 执行 Task 1
+        *   <code>--split rm</code>  -&gt; 执行 Task 2
+        *   <code>--split rl</code>  -&gt; 执行 Task 3
+    *   它还负责处理文件路径（把处理好的文件存到本地或者 HDFS 云存储上）。</p>
+<hr />
+<h3>总结一下文中的核心观点（注释里的内容）</h3>
+<p>文件开头的注释其实概括了整个策略：
+1.  <strong>RM 切分</strong>：训练奖励模型（RM）时，必须留出一部分数据（25%）做验证，不能全用了。
+2.  <strong>SFT 全用</strong>：做基础微调（SFT）和强化学习（RL）时，使用所有可用的训练数据。
+3.  <strong>SFT 特殊点</strong>：在 SFT 阶段，作者选择把“好的回答”和“坏的回答”都拿去训练模型（这是一种特定的策略，并不是所有人都这么做，通常只用好的。但在数据量不够时，有时候也会全用）。</p>
+<p>希望这个 List 能帮你把代码的逻辑理顺！</p>

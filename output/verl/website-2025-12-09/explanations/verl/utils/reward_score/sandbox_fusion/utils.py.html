@@ -1,0 +1,92 @@
+<h1>verl/utils/reward_score/sandbox_fusion/utils.py</h1>
+<p>这份代码其实是一个<strong>“判题系统”的客户端（Client）</strong>。它的主要作用是把一段代码（比如AI生成的代码）发送到一个远程的安全环境（Sandbox/沙箱）里去运行，然后根据运行结果（对不对、有没有报错、有没有超时）来打分。</p>
+<p>为了让你更容易理解，我们可以把这个文件想象成一个<strong>“考试监考官”</strong>。下面是这位“监考官”的 <strong>Task To-Do List（任务清单）</strong>，每一步对应代码里的核心逻辑：</p>
+<hr />
+<h3>📝 监考官的任务清单 (Task To-Do List)</h3>
+<h4>Task 1: 接收考试任务 (Entry Point)</h4>
+<ul>
+<li><strong>对应函数</strong>: <code>check_correctness</code> (代码最底部)</li>
+<li><strong>要做的事</strong>:<ul>
+<li>拿到考生写的代码 (<code>generation</code>)。</li>
+<li>拿到一堆考题（输入 <code>inputs</code> 和 预期输出 <code>outputs</code>）。</li>
+<li><strong>关键点</strong>: 因为考题可能有很多道（比如10个测试用例），为了快点改完卷子，我要<strong>同时（并发）</strong>去测这些题，而不是做完一道再做下一道。</li>
+<li><strong>工具</strong>: 使用 <code>ThreadPoolExecutor</code> (线程池) 来并行处理任务。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 包装考卷 (Preprocessing)</h4>
+<ul>
+<li><strong>对应函数</strong>: <code>_process_single_case</code> (中间部分)</li>
+<li><strong>要做的事</strong>:<ul>
+<li>针对每一个测试用例（Case），我要把考生的代码稍微“加工”一下。</li>
+<li><strong>如果是Python代码</strong>: 代码里有一大段 <code>wrapper_code</code>。这是为了给考生的代码加一个“壳”。<ul>
+<li>这个“壳”会自动导入很多常用库（<code>import math</code>, <code>import json</code> 等）。</li>
+<li>它会负责读取输入数据 (<code>stdin</code>)。</li>
+<li>它会调用考生的函数，然后把结果打印出来 (<code>stdout</code>)。</li>
+</ul>
+</li>
+<li>这样做是为了让远程沙箱能直接运行这段脚本并拿到结果。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 发送给阅卷机器 (Network Request)</h4>
+<ul>
+<li><strong>对应函数</strong>: <code>call_sandbox_api</code> (代码上部)</li>
+<li><strong>要做的事</strong>:<ul>
+<li>把包装好的代码、输入数据、超时时间限制打包成一个 JSON 包。</li>
+<li>通过 HTTP POST 请求发送给远程服务器 (<code>sandbox_fusion_url</code>)。</li>
+<li><strong>重试机制 (Retry Logic)</strong>: 网络可能会抖动。如果服务器没反应（比如报 <code>504 Gateway Timeout</code>），我会等一会儿（<code>time.sleep</code>），然后重试几次（<code>MAX_RETRIES</code>）。如果试了好几次还是不行，就报错退出。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 等待并解析结果 (Interpretation)</h4>
+<ul>
+<li><strong>对应函数</strong>: 回到 <code>_process_single_case</code></li>
+<li><strong>要做的事</strong>:<ul>
+<li>远程沙箱跑完代码后，会返回一个结果包（运行了多久、有没有报错、输出是什么）。</li>
+<li>监考官需要根据这个结果给这道题定性（打标签）：<ul>
+<li><strong>Case A: 编译失败 (Compile Error)</strong> -&gt; 标记为 <strong>-4</strong>。</li>
+<li><strong>Case B: 运行超时 (Timeout)</strong> -&gt; 标记为 <strong>-3</strong>。</li>
+<li><strong>Case C: 运行报错 (Runtime Error)</strong> -&gt; 比如除以零、数组越界。标记为 <strong>-2</strong>。</li>
+<li><strong>Case D: 系统错误 (System Error)</strong> -&gt; 沙箱坏了或API挂了。标记为 <strong>-1</strong>。</li>
+<li><strong>Case E: 运行成功 (Success)</strong> -&gt; 此时要对比“实际输出”和“预期输出”。<ul>
+<li>如果一样 -&gt; <strong>True</strong> (做对了)。</li>
+<li>如果不一样 -&gt; <strong>False</strong> (做错了/Wrong Answer)。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 聪明地“止损” (Optimization)</h4>
+<ul>
+<li><strong>对应函数</strong>: <code>check_correctness</code> 的后半部分</li>
+<li><strong>要做的事</strong>:<ul>
+<li>如果在改卷过程中，发现第一题就<strong>编译报错</strong>（语法都错了，代码根本跑不起来），那后面的题也不用看了，肯定都跑不起来。</li>
+<li>代码逻辑：<code>if first_compile_error_index != -1</code>，就把后面所有题的结果直接标记为编译错误，省得浪费资源。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: 生成最终成绩单 (Aggregation)</h4>
+<ul>
+<li><strong>对应函数</strong>: <code>check_correctness</code> 的返回值</li>
+<li><strong>要做的事</strong>:<ul>
+<li>把所有测试用例的结果汇总成两个列表：<ol>
+<li><code>results</code>: 简单的分数列表（如 <code>[True, True, False, -3]</code>）。</li>
+<li><code>metadata_list</code>: 详细的调试信息（每个case的输入是什么、报错信息是什么、耗时多少），方便后续分析。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下</h3>
+<p>这个脚本的核心流程就是：
+1.  <strong>分发</strong>: 把多个测试用例分发给多个线程。
+2.  <strong>包装</strong>: 给代码套上“外壳”以便执行。
+3.  <strong>调用</strong>: 也就是“各种重试”去调远程 API。
+4.  <strong>判分</strong>: 把复杂的 API 返回值翻译成我们能看懂的状态码 (-4, -3, -2, -1, True, False)。</p>
+<p><strong>如果你要修改或使用这个文件，最需要关注的是：</strong>
+*   <strong>API URL</strong>: 确保 <code>sandbox_fusion_url</code> 是对的。
+*   <strong>Wrapper</strong>: 如果你发现代码在本地能跑，在沙箱跑不通，可能是 <code>_process_single_case</code> 里的 Python 包装代码 (<code>wrapper_code</code>) 没处理好某些特殊的数据类型。</p>

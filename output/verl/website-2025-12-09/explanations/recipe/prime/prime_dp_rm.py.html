@@ -1,0 +1,76 @@
+<h1>recipe/prime/prime_dp_rm.py</h1>
+<p>这份代码确实比较硬核，它属于 <strong>大模型强化学习（RLHF）</strong> 领域，具体来说是 <strong>PRIME 算法</strong>（一种改进的 Process Reward Model 算法）在 <strong>分布式环境</strong> 下的实现。</p>
+<p>为了让你听懂，我们把这个复杂的代码想象成你在开发一个 <strong>“阅卷老师”系统（Reward Model）</strong>。这个老师的任务是给学生（Policy Model/Actor）写的作文打分，并且要不断学习如何打分打得更准。</p>
+<p>我把它拆解成一个 <strong>“开发任务 Todo List”</strong>，一步步带你看这个类 <code>DataParallelPRIMERewardModel</code> 到底在干嘛。</p>
+<hr />
+<h3>任务清单：构建一个分布式的 PRIME 阅卷系统</h3>
+<h4>Task 1: 招聘与入职 (初始化 <code>__init__</code>)</h4>
+<p><strong>目标</strong>：准备好干活所需的资源。
+*   <strong>代码对应</strong>：<code>__init__</code> 方法。
+*   <strong>逻辑</strong>：
+    1.  <strong>招聘两名阅卷员</strong>：
+        *   <code>self.reward_module</code>：<strong>主阅卷员</strong>（我们要训练的模型）。
+        *   <code>self.ref_module</code>：<strong>参考阅卷员</strong>（通常是训练前的原始模型，用来做对比，防止主阅卷员给分太离谱，即 KL Divergence 约束）。
+    2.  <strong>准备工具</strong>：
+        *   <code>reward_optimizer</code>：<strong>培训师</strong>（优化器），用来更新主阅卷员的脑子（参数）。
+    3.  <strong>确定工作流</strong>：
+        *   是否使用 <code>remove_padding</code>（去填充）：为了省显存和计算快，把句子里的占位符（padding）去掉再计算。
+        *   <code>ulysses_sequence_parallel_size</code>：<strong>分工协作</strong>（序列并行），如果句子太长，切成几段给不同的显卡算。</p>
+<h4>Task 2: 核心阅卷逻辑 (核心算法 <code>_forward_micro_batch</code>)</h4>
+<p><strong>目标</strong>：给一张卷子（一段输入数据），计算出每个字的得分。这是<strong>最难也最核心</strong>的部分。
+*   <strong>代码对应</strong>：<code>_forward_micro_batch</code> 方法。
+*   <strong>逻辑</strong>：
+    1.  <strong>数据清洗</strong>：
+        *   拿到 <code>input_ids</code>（作文内容）。如果有 <code>use_remove_padding</code>，就把多余的 0 去掉，把数据压缩，方便并行计算。
+    2.  <strong>主阅卷员打分</strong>：
+        *   <code>self.reward_module(...)</code>：计算每个 token（字）的 <code>log_prob</code>（生成该字的概率对数）。
+    3.  <strong>参考阅卷员打分</strong>：
+        *   <code>self.ref_module(...)</code>：同样计算每个字的 <code>log_prob</code>。
+    4.  <strong>计算“分歧” (Q值)</strong>：
+        *   <code>q = rm_log_labels - ref_log_labels</code>。
+        *   意思是：主阅卷员比参考阅卷员多喜欢这个字多少？如果主阅卷员觉得这个字好，参考员觉得一般，那 Q 就是正的。
+    5.  <strong>PRIME 算法的魔法 (由果导因)</strong>：
+        *   代码段：<code>if lam == 0.0 ... else ...</code>
+        *   <strong>背景</strong>：通常我们只知道整篇作文最后是对是错（<code>acc</code>，比如数学题做没做对）。但我们需要给中间每个步骤打分。
+        *   <strong>操作</strong>：
+            *   拿到最终结果 <code>acc</code>（比如做对了是 1，错了是 -1）。
+            *   从<strong>最后一个字往前推</strong>（reversed loop）。
+            *   使用公式 <code>lastgaelam = delta + lam * lastgaelam</code>。这叫 <strong>GAE (Generalized Advantage Estimation)</strong>。
+            *   <strong>通俗解释</strong>：如果最后结果是对的，那前面的推理步骤大概率也是对的。通过 <code>lambda</code> (衰减系数) 把最后的奖励一步步传导回前面的每一个字。
+    6.  <strong>输出</strong>：返回 <code>token_level_score</code>（每个字的得分）和 <code>q</code>（原始分歧）。</p>
+<h4>Task 3: 模拟考试 (推理模式 <code>compute_rm_score</code>)</h4>
+<p><strong>目标</strong>：现在有一批学生刚写好的作文，阅卷员需要批量打分，告诉学生哪写得好。
+*   <strong>代码对应</strong>：<code>compute_rm_score</code> 方法。
+*   <strong>逻辑</strong>：
+    1.  <strong>准备模式</strong>：喊一声 <code>eval()</code>，大家停止学习，专心打分。
+    2.  <strong>分批处理</strong>：因为卷子太多（显存有限），切成小块（<code>micro_batch</code>）。
+    3.  <strong>循环打分</strong>：调用上面的 <strong>Task 2</strong> (<code>_forward_micro_batch</code>) 算出分数。
+    4.  <strong>归一化 (PRIME Norm)</strong>：
+        *   <code>self.prime_norm(...)</code>。为了防止分数波动太大，做一个 Batch Norm 或者类似的缩放，让分数稳定在一个区间。
+    5.  <strong>交卷</strong>：返回所有分数，供 PPO 算法去更新学生的策略。</p>
+<h4>Task 4: 阅卷员进修 (训练模式 <code>update_rm</code>)</h4>
+<p><strong>目标</strong>：阅卷员自己也需要进步。根据“标准答案”或“偏好数据”来调整自己的打分标准。
+*   <strong>代码对应</strong>：<code>update_rm</code> 方法。
+*   <strong>逻辑</strong>：
+    1.  <strong>准备模式</strong>：喊一声 <code>train()</code>，准备更新参数。
+    2.  <strong>数据准备</strong>：
+        *   拿到 <code>input_ids</code>（作文）、<code>acc</code>（这篇作文到底对不对）、<code>Q_bc</code>（旧的Q值，用于Off-policy校正）。
+    3.  <strong>计算当前分数</strong>：再次调用 <strong>Task 2</strong>，看看现在的自己给这篇作文打多少分（算出 <code>q</code>）。
+    4.  <strong>计算损失 (Loss)</strong>：
+        *   这是关键。我们需要根据 <code>acc</code>（真实结果）来惩罚阅卷员。
+        *   支持多种 Loss：
+            *   <code>ce</code> (Cross Entropy)：简单的分类损失。
+            *   <code>dpo</code> (Direct Preference Optimization)：<strong>重点</strong>。通过对比当前的 <code>q</code> 和之前的 <code>Q_bc</code> 以及真实结果 <code>acc</code>，计算梯度。
+            *   <code>bon_acc</code> / <code>bon_rm</code>：Best-of-N 采样的变体损失。
+    5.  <strong>反向传播</strong>：<code>loss.backward()</code>，计算梯度。
+    6.  <strong>修整参数</strong>：<code>_optimizer_step()</code>。根据梯度更新模型参数（顺便做个梯度裁剪 <code>grad_clip</code> 防止更新太猛模型炸了）。
+    7.  <strong>汇报</strong>：返回 metrics（训练数据，比如 loss 多少，reward 均值多少），方便画图监控。</p>
+<hr />
+<h3>总结：这代码到底在讲啥？</h3>
+<p><strong>一句话解释</strong>：
+这是一个<strong>训练奖励模型（Reward Model）</strong>的程序，但它不是给整段话打一个分，而是利用 <strong>PRIME 算法</strong>，根据最终的对错（Accuracy），倒推回来给每一个字（Token）打分，并支持在多张显卡上并行训练。</p>
+<p><strong>核心观点/流程</strong>：
+1.  <strong>基于差异的奖励</strong>：奖励不仅仅看绝对值，而是看当前模型相对于参考模型（Reference Model）的概率提升（$q = \pi - \pi_{ref}$）。
+2.  <strong>结果导向的过程奖励</strong>：通过 <code>lambda</code> 参数，把最终的正确/错误结果，平滑地分配给推理过程中的每一步（Time-aware credit assignment）。
+3.  <strong>高效并行</strong>：代码里充斥着 <code>ulysses</code>、<code>unpad</code>、<code>fsdp</code> 等词汇，说明它极度关注在大规模集群上的训练效率。</p>
+<p>你看懂这个 List 之后，再回去看代码里的 <code>for</code> 循环和数学公式，应该就知道它是在实现哪一步了。</p>

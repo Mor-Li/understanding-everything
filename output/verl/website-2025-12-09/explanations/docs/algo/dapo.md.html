@@ -1,0 +1,81 @@
+<h1>docs/algo/dapo.md</h1>
+<p>这份文档其实是在介绍一个叫 <strong>DAPO</strong> 的算法（全称 Decoupled Clip and Dynamic Sampling Policy Optimization）。</p>
+<p>简单来说，这是一个<strong>用来训练大模型（特别是让模型变得更聪明，比如做数学题）的强化学习（RL）算法</strong>。它的核心卖点是：<strong>比之前的 DeepSeek-R1-Zero 训练效率更高，只需要一半的步数就能达到同样的准确率。</strong></p>
+<p>为了让你听懂，我把这个文档拆解成一个 <strong>“DAPO 学习与实操 Todo List”</strong>，咱们一步一步来看它是怎么做到的。</p>
+<hr />
+<h3>✅ Task 1: 搞清楚这是干嘛的（背景）</h3>
+<ul>
+<li><strong>目标</strong>：训练一个大模型（比如 Qwen2.5-32B），让它做数学题（AIME 2024）更厉害。</li>
+<li><strong>现状</strong>：以前的方法（DeepSeek-R1-Zero）挺好，但 DAPO 说它能<strong>省一半时间</strong>，效果还好一点点（准确率 50% vs 52%）。</li>
+<li><strong>工具</strong>：它是基于字节跳动开源的 <code>verl</code> 强化学习框架开发的。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 核心技术点一 —— “不对称的限制” (Separated Clip Epsilons)</h3>
+<p>这是文档中 <code>Configuration</code> 第一部分讲的。</p>
+<ul>
+<li><strong>痛点</strong>：在传统的 PPO（强化学习算法）中，为了防止模型一次更新步子跨太大扯着蛋，会有一个 <code>clip</code>（剪裁）操作，限制更新幅度。通常上下限是一样的（比如 $\pm 0.2$）。</li>
+<li><strong>DAPO的做法</strong>：<strong>区别对待</strong>。<ul>
+<li>配置代码：<code>clip_ratio_low: 0.2</code>, <code>clip_ratio_high: 0.28</code>。</li>
+<li><strong>通俗解释</strong>：对于让模型变“好”的更新，我们可以宽容一点（0.28），允许它多学点；对于可能让模型变“坏”或者不确定的更新，我们要严格一点（0.2），防止它学歪了。这叫“解耦剪裁”（Decoupled Clip）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 核心技术点二 —— “动态挑题” (Dynamic Sampling)</h3>
+<p>这是文档中 <code>Configuration</code> 第二部分，也是 DAPO 名字里 "Dynamic Sampling" 的来源。</p>
+<ul>
+<li><strong>痛点</strong>：训练时，模型会针对一个问题生成好几个回答。<ul>
+<li>如果这几个回答<strong>全对</strong>（太简单，没啥好学的）。</li>
+<li>如果这几个回答<strong>全错</strong>（太难，也没啥好学的）。</li>
+<li><strong>只有“有对有错”的数据，对模型改进最有帮助。</strong></li>
+</ul>
+</li>
+<li><strong>DAPO的做法</strong>：<strong>一直生成，直到凑够有价值的数据。</strong><ul>
+<li>配置代码：<code>filter_groups.enable: True</code>。</li>
+<li><strong>通俗解释</strong>：系统会自动检查生成的一批答案。如果发现某个问题的所有答案分数都一样（比如全是 1 或者全是 0），就<strong>扔掉</strong>，重新生成，直到凑够那些“有对有错”的高质量训练数据。这能让训练效率大幅提升。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 核心技术点三 —— “算分方式要细腻” (Token-level Loss)</h3>
+<p>这是文档中 <code>Configuration</code> 第三部分。</p>
+<ul>
+<li><strong>痛点</strong>：计算损失（Loss）时，是按“整句话”平均，还是按“每个字（Token）”平均？这会影响梯度的数值大小。</li>
+<li><strong>DAPO的做法</strong>：<strong>按 Token 平均</strong>。<ul>
+<li>配置代码：<code>loss_agg_mode: "token-mean"</code>。</li>
+<li><strong>通俗解释</strong>：把所有 Token 的损失加起来，除以总 Token 数。文档表示这种方式比按句子平均更稳定。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 核心技术点四 —— “防止废话连篇” (Overlong Reward Shaping)</h3>
+<p>这是文档中 <code>Configuration</code> 第四部分。</p>
+<ul>
+<li><strong>痛点</strong>：有些模型为了“骗”奖励，会写特别特别长的推理过程，甚至超出长度限制。</li>
+<li><strong>DAPO的做法</strong>：<strong>快超纲时扣分</strong>。<ul>
+<li>配置代码：<code>overlong_buffer</code>。</li>
+<li><strong>通俗解释</strong>：设置一个缓冲区（比如最后 4096 个 token）。如果模型生成的答案长度进入了这个危险区，虽然还没爆显存，但算法会开始给它<strong>扣分（负奖励）</strong>。越长扣得越狠，强迫模型学会精简，在规定长度内说完。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 6: 怎么跑起来？ (Quickstart &amp; FAQ)</h3>
+<p>如果你是程序员，要复现这个结果：</p>
+<ol>
+<li><strong>准备环境</strong>：用 <code>bash prepare_dapo_data.sh</code> 下载数据。</li>
+<li><strong>提交任务</strong>：设置好 Ray 集群地址，运行 <code>run_dapo_qwen2.5_32b.sh</code>。</li>
+<li><strong>避坑指南 (FAQ)</strong>：<ul>
+<li>如果改了配置跑不出结果，别急，RL 训练本来就不太稳定。</li>
+<li><strong>注意</strong>：不要开启 CUDA Graph (<code>enforce_eager=False</code>)，作者发现这会导致性能下降，原因还在查。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这篇文档就是一个<strong>算法食谱（Recipe）</strong>。</p>
+<p>它告诉你：要想把 Qwen2.5 训练成做题高手，不要用标准的 PPO，要用 <strong>DAPO</strong>。
+<strong>DAPO 的秘诀就是：</strong>
+1.  <strong>Clip 不对称</strong>（好的多学点，坏的少学点）。
+2.  <strong>采样动态化</strong>（只学那些“半懂不懂”的有价值样本，全懂或全不懂的都不看）。
+3.  <strong>算分按字算</strong>。
+4.  <strong>太长要惩罚</strong>。</p>

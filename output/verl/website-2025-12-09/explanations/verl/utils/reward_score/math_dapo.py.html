@@ -1,0 +1,96 @@
+<h1>verl/utils/reward_score/math_dapo.py</h1>
+<p>这份代码文件的核心作用就像是一位<strong>“数学阅卷老师”</strong>。</p>
+<p>在训练 AI 做数学题时，模型会生成一长串推理过程和答案。系统需要知道模型算对了没有，以便给它奖励（Reward）或惩罚。这个文件就是用来<strong>提取模型答案</strong>、<strong>清洗格式</strong>，并<strong>判断对错</strong>的。</p>
+<p>为了让你更容易理解，我把它拆解成一个<strong>“阅卷流程 Todo List”</strong>，一步步带你看它是怎么工作的。</p>
+<hr />
+<h3>阅卷流程 Todo List</h3>
+<ol>
+<li><strong>[提取] 寻找答案在哪里</strong>：从模型的一大段废话中找到最终答案。</li>
+<li><strong>[清洗] 把答案擦亮</strong>：去掉单位、统一格式（比如把 "5 dollars" 变成 "5"）。</li>
+<li><strong>[对比] 两种判题标准</strong>：<ul>
+<li>标准 A（严格模式）：必须把答案写在框里 <code>\boxed{}</code>。</li>
+<li>标准 B（Minerva 模式）：只要意思对就行，支持模糊匹配。</li>
+</ul>
+</li>
+<li><strong>[打分] 给出最终成绩</strong>：对给 +1 分，错给 -1 分。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>1. [提取] 寻找答案在哪里 (<code>last_boxed_only_string</code>, <code>remove_boxed</code>)</h4>
+<p>在数学竞赛（如 MATH 数据集）中，通常要求模型把最终答案用 LaTeX 的 <code>\boxed{答案}</code> 包起来。</p>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>last_boxed_only_string</code>: 就像老师在卷子上找红圈圈出的答案。它会从后往前找最后一个 <code>\boxed{...}</code>。</li>
+<li><code>remove_boxed</code>: 找到红圈后，把圈拿掉，只留下里面的内容。</li>
+<li><em>例子</em>：模型输出 <code>...所以结果是 \boxed{42}</code> -&gt; 提取出 <code>\boxed{42}</code> -&gt; 拿掉盒子得到 <code>42</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [清洗] 把答案擦亮 (<code>normalize_final_answer</code>)</h4>
+<p>这是代码中最长、最复杂的部分。因为数学表达太灵活了，计算机比较字符串时很死板，必须统一格式。</p>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li><strong>去掉杂质</strong>：代码里定义了 <code>SUBSTITUTIONS</code> 和 <code>REMOVED_EXPRESSIONS</code> 列表。<ul>
+<li><em>例子</em>：把 "5 meters" 变成 "5"，把 "x = 5" 变成 "5"，把 "$5$" 变成 "5"。</li>
+</ul>
+</li>
+<li><strong>统一 LaTeX 格式</strong>：<ul>
+<li><em>例子</em>：有人写 <code>\frac12</code>，有人写 <code>\frac{1}{2}</code>。这个函数利用正则（Regex）把它们统一成标准格式。</li>
+<li><em>例子</em>：<code>\sqrt2</code> 和 <code>\sqrt{2}</code> 也会被统一。</li>
+</ul>
+</li>
+<li><strong>处理数字</strong>：去掉千分位逗号（"1,000" -&gt; "1000"）。</li>
+</ul>
+</li>
+</ul>
+<p><strong>目的</strong>：确保模型写的 "0.5" 和标准答案 "\frac{1}{2}" 或者 "1/2" 在经过清洗后能被识别为同一个东西（虽然这个脚本主要处理 LaTeX 格式归一化，数值等价通常靠这一步的格式统一来实现）。</p>
+<h4>3. [对比] 两种判题标准 (<code>verify</code> 函数)</h4>
+<p>这个文件提供了两种“阅卷风格”，由 <code>verify</code> 函数调度：</p>
+<ul>
+<li>
+<p><strong>风格 A：严格盒子模式 (<code>is_correct_strict_box</code>)</strong></p>
+<ul>
+<li><strong>规则</strong>：非常死板。模型<strong>必须</strong>输出 <code>\boxed{}</code>，且盒子里的内容在去掉空格后必须和标准答案完全一致。</li>
+<li><strong>用途</strong>：通常用于强化学习（RL）训练，强迫模型学会规范输出。</li>
+</ul>
+</li>
+<li>
+<p><strong>风格 B：Minerva 模式 (<code>is_correct_minerva</code>)</strong></p>
+<ul>
+<li><strong>规则</strong>：模仿 Google Minerva 模型的评估方式。</li>
+<li>它会在文本里找 "Answer:" 这样的关键词。</li>
+<li>它会调用上面提到的“清洗函数” (<code>normalize_final_answer</code>) 把预测结果和标准答案都清洗一遍，然后再对比。</li>
+<li><strong>用途</strong>：更宽容，关注数学做没做对，而不是格式完不完美。</li>
+</ul>
+</li>
+</ul>
+<h4>4. [打分] 给出最终成绩 (<code>compute_score</code>)</h4>
+<p>这是这个文件对外的“总接口”，RL 训练框架主要调用这个函数。</p>
+<ul>
+<li><strong>输入</strong>：<ul>
+<li><code>solution_str</code>: 模型生成的全部文本。</li>
+<li><code>ground_truth</code>: 正确答案。</li>
+</ul>
+</li>
+<li><strong>流程</strong>：<ol>
+<li>为了省时间，它可能只截取模型生成的最后 300 个字符（因为答案通常在最后）。</li>
+<li>调用 <code>verify</code> 进行判断（是 True 还是 False）。</li>
+<li><strong>计算奖励</strong>：<ul>
+<li>如果对（True）：返回 <strong>1.0 分</strong>。</li>
+<li>如果错（False）：返回 <strong>-1.0 分</strong>。</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>输出</strong>：一个字典，包含分数、是否准确（acc）、以及提取出的预测值。</li>
+</ul>
+<h3>总结</h3>
+<p><strong>这一大堆代码就是为了解决一个问题：</strong></p>
+<blockquote>
+<p>当标准答案是 "5"，而模型输出了 "The answer is \boxed{5 dollars}." 时，如何让计算机判定这是<strong>正确</strong>的？</p>
+</blockquote>
+<ul>
+<li>它通过<strong>正则提取</strong>去掉废话。</li>
+<li>通过<strong>归一化</strong>去掉 "dollars"。</li>
+<li>最后对比 "5" == "5"，判定为正确，给模型发一个 +1 的奖励糖果。</li>
+</ul>

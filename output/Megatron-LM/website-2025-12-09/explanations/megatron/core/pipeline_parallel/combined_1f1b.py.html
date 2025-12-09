@@ -1,0 +1,114 @@
+<h1>megatron/core/pipeline_parallel/combined_1f1b.py</h1>
+<p>这份代码确实非常晦涩，因为它处于深度学习框架中最底层的“分布式并行策略”核心。简单来说，这是 <strong>NVIDIA Megatron-Core</strong> 用来在训练大模型（如 GPT、MoE）时，通过<strong>流水线并行（Pipeline Parallelism, PP）</strong> 和 <strong>专家并行（Expert Parallelism, EP）</strong> 来加速训练的调度器代码。</p>
+<p>为了让你听懂，我们把这段代码想象成一个 <strong>“流水线工厂的调度员”</strong>。你的目标是让工厂里的机器（GPU）一刻也不停歇，同时处理“新产品的组装（Forward，前向传播）”和“次品的检修（Backward，反向传播）”。</p>
+<p>核心思想是 <strong>1F1B (One Forward, One Backward)</strong>：做一个前向，紧接着做一个反向。
+而这个文件叫 <code>combined_1f1b</code>，意思是它比普通的 1F1B 更进一步：它试图把前向和反向的内部步骤<strong>“揉在一起”</strong>执行，为了掩盖掉昂贵的通信时间（特别是 MoE 模型中的 All-to-All 通信）。</p>
+<p>下面我为你列一个 <strong>Task To-Do List</strong>，带你一步步走完这个调度员的工作流程。</p>
+<hr />
+<h3>📋 调度员的任务清单 (Task List)</h3>
+<h4>✅ Task 1: 理解当前场景 (Setup)</h4>
+<ul>
+<li><strong>目标</strong>: 我们有一堆数据被切成了很多小份，叫“微批次”（Micro-batches）。</li>
+<li><strong>难点</strong>: 机器在计算时很快，但在不同机器间传输数据（通信）很慢。</li>
+<li><strong>策略</strong>: 当机器在为一个微批次做“计算”时，同时利用这段时间为另一个微批次做“传输”。</li>
+</ul>
+<h4>✅ Task 2: 启动流水线 (Warm-up Phase)</h4>
+<ul>
+<li><strong>对应的代码位置</strong>: <code>combined_1f1b_schedule_for_no_pipelining</code> 函数的开头部分。</li>
+<li><strong>动作</strong>:<ol>
+<li>拿出第 1 个微批次（Micro-batch 0）。</li>
+<li><strong>只做前向传播 (Forward)</strong>。</li>
+<li>为什么不做反向？因为这是第一个，还没有产生梯度，没法反向。</li>
+<li><em>代码细节</em>: 调用 <code>combined_forward_backward_step</code>，但参数里 <code>b_model</code> (backward model) 传的是 <code>None</code>。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 3: 进入稳定状态 (Steady State - The Loop)</h4>
+<p>这是代码最核心的部分，也是 <code>for</code> 循环所在的地方。
+*   <strong>对应的代码位置</strong>: <code>combined_1f1b_schedule_for_no_pipelining</code> 中的 <code>for i in range(num_microbatches - 1):</code>。
+*   <strong>动作</strong>: 开启“左右互搏”模式。
+    1.  <strong>准备</strong>: 手里拿着第 $i+1$ 个微批次（要做前向），同时桌上放着第 $i$ 个微批次刚算完的结果（要做反向）。
+    2.  <strong>执行 (Combined Step)</strong>: 调用 <code>combined_forward_backward_step</code>。
+        *   <strong>左手</strong>: 开始跑第 $i+1$ 个的前向计算。
+        *   <strong>右手</strong>: 开始跑第 $i$ 个的反向传播。
+    3.  <strong>魔法 (Overlap)</strong>: 这两个过程不是简单的“先做完左手再做右手”。代码内部会将它们交织在一起：
+        *   当前向需要等待数据传输（EP A2A 通信）时，立刻切换去算反向的数学题（Attention/MLP 计算）。
+        *   当反向卡住传输时，切回来算前向。
+        *   <em>目的</em>: 彻底消灭等待时间。</p>
+<h4>✅ Task 4: 深入“混合执行”内部 (Inside the Combined Step)</h4>
+<ul>
+<li><strong>对应的代码位置</strong>: <code>combined_forward_backward_step</code> 函数。</li>
+<li><strong>动作分解</strong>:<ol>
+<li><strong>制定计划 (Build Plan)</strong>:<ul>
+<li>不像普通代码直接运行 <code>output = model(input)</code>。</li>
+<li>这里调用 <code>model.build_schedule_plan</code>。意思是：“不要急着算，先给我生成一个<strong>执行计划图 (Schedule Plan)</strong>”。</li>
+<li>这样我们就得到了两张图纸：<code>f_schedule_plan</code>（前向图纸）和 <code>b_schedule_plan</code>（反向图纸）。</li>
+</ul>
+</li>
+<li><strong>准备上下文</strong>:<ul>
+<li>开启 <code>autocast</code> (自动混合精度)。</li>
+<li>如果用了 FP8 (8位浮点)，开启 FP8 上下文。</li>
+</ul>
+</li>
+<li><strong>同时执行 (Run Together)</strong>:<ul>
+<li>代码行：<code>type(plan).run(f_schedule_plan, b_schedule_plan, ...)</code></li>
+<li>这是真正的黑魔法发生地。底层的 <code>run</code> 函数会控制 GPU 的 CUDA Streams，让前向和反向的算子在硬件上并发执行。</li>
+</ul>
+</li>
+<li><strong>收尾</strong>:<ul>
+<li>计算 Loss（损失函数）。</li>
+<li>把前向算出的结果存好，把反向算出的梯度存好。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 5: 冷却流水线 (Cool-down Phase)</h4>
+<ul>
+<li><strong>对应的代码位置</strong>: <code>combined_1f1b_schedule_for_no_pipelining</code> 函数的最后部分。</li>
+<li><strong>动作</strong>:<ol>
+<li>所有的前向都做完了。</li>
+<li>手里还剩最后一个微批次没做反向。</li>
+<li><strong>只做反向传播 (Backward)</strong>。</li>
+<li><em>代码细节</em>: 调用 <code>combined_forward_backward_step</code>，但参数里 <code>f_model</code> (forward model) 传的是 <code>None</code>。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 6: 打包收工 (Return)</h4>
+<ul>
+<li><strong>动作</strong>: 返回所有的数据存储 <code>forward_data_store</code> 和处理过的 Token 总数。</li>
+</ul>
+<hr />
+<h3>🔍 关键代码片段对照翻译</h3>
+<p>为了让你更清楚，我把核心逻辑翻译成“人话”伪代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="mi">1</span><span class="n">f1b调度流程</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+
+    <span class="c1"># === 阶段 1: 热身 ===</span>
+    <span class="c1"># 既然是刚开始，只有前向任务，没有反向任务</span>
+    <span class="n">执行_混合步</span><span class="p">(</span><span class="n">做_前向</span><span class="o">=</span><span class="n">MicroBatch_0</span><span class="p">,</span> <span class="n">做_反向</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+
+    <span class="c1"># === 阶段 2: 稳定循环 (最忙的时候) ===</span>
+    <span class="c1"># 这里的 no_sync_func 是为了防止梯度在这个循环里频繁同步，攒到最后一起发</span>
+    <span class="k">with</span> <span class="n">梯度不需同步</span><span class="p">():</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">剩余批次</span><span class="p">):</span>
+            <span class="c1"># 这是一个“混合步”</span>
+            <span class="c1"># 一边算下一个的前向，一边算上一个的反向</span>
+            <span class="c1"># 这里的魔法是：利用反向的计算时间，掩盖前向的通信延迟（反之亦然）</span>
+            <span class="n">执行_混合步</span><span class="p">(</span>
+                <span class="n">做_前向</span><span class="o">=</span><span class="n">MicroBatch_i</span><span class="o">+</span><span class="mi">1</span><span class="p">,</span> 
+                <span class="n">做_反向</span><span class="o">=</span><span class="n">MicroBatch_i</span>
+            <span class="p">)</span>
+
+    <span class="c1"># === 阶段 3: 收尾 ===</span>
+    <span class="c1"># 前向都做完了，只剩最后一个反向没做</span>
+    <span class="n">执行_混合步</span><span class="p">(</span><span class="n">做_前向</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">做_反向</span><span class="o">=</span><span class="n">MicroBatch_Last</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>💡 总结：这段代码到底在干嘛？</h3>
+<ol>
+<li><strong>它不是写模型结构的</strong>（不是写 Transformer 层的）。</li>
+<li><strong>它是写“时间管理”的</strong>。</li>
+<li>如果不这么写，GPU 就会像一个等待外卖的厨师，切完菜就傻站着等菜送来。</li>
+<li>这么写了之后，GPU 就像一个疯狂的厨师，切菜的同时，另一只手在炒上一锅菜，绝不浪费一毫秒。</li>
+</ol>
+<p><strong>核心观点</strong>：通过精细控制前向和反向的执行顺序（Schedule Plan），在微观层面实现计算与通信的重叠（Overlap），从而提升大模型训练速度。</p>

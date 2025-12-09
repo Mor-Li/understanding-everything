@@ -1,0 +1,107 @@
+<h1>examples/gspo_trainer/test_gspo_qwen30b_a3b_ep.sh</h1>
+<p>这份文件其实就是一个 <strong>“AI 训练启动脚本”</strong>。</p>
+<p>你可以把它想象成给大厨（计算机/GPU集群）的一张 <strong>“烹饪清单”</strong>。这张清单告诉计算机：我们要炒什么菜（训练什么模型）、用什么料（数据）、火候多大（超参数）、以及厨房里的几个人怎么分工（多显卡并行策略）。</p>
+<p>为了让你看懂，我把你在这个脚本中需要完成的 <strong>Task Todo List</strong> 列出来，然后一步步给你解释。</p>
+<hr />
+<h3>📋 Task Todo List (任务清单)</h3>
+<ol>
+<li><strong>【起名与定调】</strong>：给这次训练任务起个名字，确定用什么算法。</li>
+<li><strong>【准备食材】</strong>：告诉电脑模型在哪里、数据在哪里。</li>
+<li><strong>【设定火候】</strong>：设置训练的“严厉程度”（超参数，如学习率、惩罚系数）。</li>
+<li><strong>【分配工位】</strong>：安排多张显卡如何协作（这是最复杂的部分，涉及并行策略）。</li>
+<li><strong>【开始烹饪】</strong>：执行最后那条超长的命令，正式开始跑代码。</li>
+</ol>
+<hr />
+<h3>📝 逐步详细讲解</h3>
+<h4>Task 1: 起名与定调 (Basic Config)</h4>
+<p>这部分定义了我们在干什么。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    project_name='DAPO'
+    exp_name='GSPO-Qwen3-30B-A3B-Base-MATH'
+    adv_estimator=grpo
+    loss_mode=gspo</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>项目名</strong>：DAPO。</li>
+<li><strong>实验名</strong>：<code>GSPO-Qwen3-30B...</code>。这告诉你，我们要训练的是 <strong>Qwen3（通义千问3代）</strong>，大小是 <strong>30B（300亿参数）</strong>。</li>
+<li><strong>算法</strong>：这里出现了 <code>grpo</code> 和 <code>gspo</code>。这是强化学习（RL）算法。简单说，就是让模型做数学题，做对了给奖励，做错了给惩罚。</li>
+<li><strong>目标</strong>：文件名里的 <code>MATH</code> 说明这是专门为了提升<strong>数学解题能力</strong>的训练。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 设定火候 (Hyperparameters)</h4>
+<p>这部分决定了训练的细节规则，防止模型“学歪了”。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    use_kl_in_reward=False
+    kl_coef=0.0
+    clip_ratio_low=3e-4
+    max_prompt_length=$((1024 * 2))
+    max_response_length=$((1024 * 8))</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>KL Coef (0.0)</strong>：通常 RL 训练会限制模型不要偏离“初心”太远。这里设为 0，说明这次训练允许模型放飞自我，或者通过其他方式（如 GRPO）来控制偏差。</li>
+<li><strong>Max Length</strong>：<ul>
+<li>题目最长能有 2048 个 token。</li>
+<li>回答最长能写 8192 个 token（说明是长思维链训练，让模型写很长的解题步骤）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 准备食材 (Paths)</h4>
+<p>告诉程序去哪里硬盘的哪个角落找文件。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    MODEL_PATH=$HDFS_ROOT/model/Qwen3-30B-A3B-Base
+    TRAIN_FILE=.../dapo-math-17k.parquet
+    TEST_FILE=.../aime-2024.parquet</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>Model Path</strong>：这是“底模”，即还没训练这一轮之前的原始 Qwen 模型。</li>
+<li><strong>Train File</strong>：训练数据是 <code>dapo-math-17k</code>，大概 1.7 万道数学题。</li>
+<li><strong>Test File</strong>：考试题目是 <code>aime-2024</code>（美国数学邀请赛题目），用来测试模型变聪明了没有。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 分配工位 (Parallelism - 核心难点)</h4>
+<p>因为 30B 的模型很大，一张显卡装不下，或者算得太慢，需要多张卡配合。这部分定义了<strong>“怎么切分模型”</strong>。</p>
+<ul>
+<li>
+<p><strong>代码对应：</strong>
+    ```bash
+    # gen (生成/做题阶段)
+    rollout_name=vllm
+    gen_tp=1, gen_dp=4, gen_ep=4</p>
+<h1>train (学习/更新阶段)</h1>
+<p>train_tp=4, train_pp=1, EP=4
+<code>``
+*   **解读：**
+*   **vLLM**：这是一个超快的推理引擎。脚本里说，让模型“做题”的时候用 vLLM 加速。
+*   **Megatron**：在最后的大命令里提到，这是用来“训练/更新参数”的框架。
+*   **切分术语**：
+    *   **TP (Tensor Parallel)**：把模型的一层切开，几张卡合力算一层。
+    *   **DP (Data Parallel)**：大家复制一份一样的模型，各自算不同的题目。
+    *   **EP (Expert Parallel)**：**关键点！**</code>EP=4` 说明这个 Qwen 模型是 <strong>MoE (混合专家模型)</strong>。就像医院分科室一样，不同的数据由不同的“专家模块”处理，这里把专家分到了4张卡上。</p>
+</li>
+</ul>
+<h4>Task 5: 开始烹饪 (Execution)</h4>
+<p>最后那一大段 <code>python3 -m verl.trainer.main_ppo ...</code> 就是按下了“启动键”。</p>
+<ul>
+<li><strong>解读：</strong><ul>
+<li>它调用了一个叫 <code>verl</code> 的库（这是一个专门做大模型强化学习的框架）。</li>
+<li>后面的所有 <code>--</code> 开头的参数，都是把上面定义的变量（Task 1-4）传给 Python 程序。</li>
+<li><strong>重点参数</strong>：<ul>
+<li><code>actor_rollout_ref.actor.megatron.expert_model_parallel_size=$EP</code>：告诉程序开启专家并行。</li>
+<li><code>reward_model.reward_manager=dapo</code>：定义了怎么给分（Reward），这里用的是 DAPO 的规则。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这脚本到底是干啥的？</h3>
+<p>用一句话说：
+<strong>这个脚本使用 2 个节点（共16张显卡），加载 Qwen-30B MoE 模型，使用 GRPO/GSPO 强化学习算法，让模型做 1.7 万道数学题，通过 vLLM 加速生成答案，并根据答案的对错来更新模型参数，目的是让它解数学题更厉害。</strong></p>
+<p>你如果不跑代码，只需要知道：这是一个<strong>数学大模型</strong>的<strong>强化学习(RLHF)</strong> 训练配置。</p>

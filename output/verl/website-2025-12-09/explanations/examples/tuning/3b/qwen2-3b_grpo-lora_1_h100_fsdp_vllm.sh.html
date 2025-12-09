@@ -1,0 +1,103 @@
+<h1>examples/tuning/3b/qwen2-3b_grpo-lora_1_h100_fsdp_vllm.sh</h1>
+<p>这份脚本确实看着很“劝退”，因为它把<strong>环境配置、模型参数、算法细节、硬件优化</strong>全部塞在一起了。</p>
+<p>别担心，我们把它当成一份<strong>“训练AI大模型的烹饪菜谱”</strong>。我为你列了一个由浅入深的 <strong>Task List (任务清单)</strong>，我们一步步拆解这份“菜谱”。</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 准备厨房 (环境与日志设置)</strong></li>
+<li><strong>Task 2: 准备食材 (数据与题目)</strong></li>
+<li><strong>Task 3: 确定主厨与助手 (模型与LoRA微调)</strong></li>
+<li><strong>Task 4: 核心烹饪法 (GRPO算法与采样)</strong></li>
+<li><strong>Task 5: 厨房管理与加速 (显存优化与vLLM)</strong></li>
+</ol>
+<hr />
+<h3>详细拆解</h3>
+<h4>Task 1: 准备厨房 (环境与日志设置)</h4>
+<p><strong>目标</strong>：搞清楚我们在哪台机器上跑，记录记在哪里。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>bash
+    export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7  # 指定用哪几块显卡
+    export WANDB_PROJECT=...                     # 设置云端日志(WandB)的项目名
+    MODEL_PATH=Qwen/Qwen2.5-3B-Instruct          # 指定基础模型路径</code></li>
+<li><strong>解读</strong>：<ul>
+<li>这行命令告诉电脑：“我要用编号0到7的这8张显卡。”</li>
+<li><code>WANDB</code> 是一个用来画图看训练曲线的工具，这里设置了项目名称，方便你以后查训练记录。</li>
+<li><code>MODEL_PATH</code> 告诉脚本：我们要基于 <strong>Qwen2.5-3B</strong> 这个模型开始训练。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 准备食材 (数据与题目)</h4>
+<p><strong>目标</strong>：搞清楚模型要学什么内容。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>bash
+    data.train_files=data/gsm8k/train.parquet  # 训练数据
+    data.val_files=data/gsm8k/test.parquet     # 考试数据
+    data.max_prompt_length=512                 # 题目最长多少字
+    data.max_response_length=1024              # 答案最长多少字</code></li>
+<li><strong>解读</strong>：<ul>
+<li><strong>GSM8K</strong>：这是一个非常经典的小学数学应用题数据集。</li>
+<li>这个任务是让模型做数学题。</li>
+<li>限制了题目和答案的长度，防止太长的数据把显存撑爆。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 确定主厨与助手 (模型与LoRA微调)</h4>
+<p><strong>目标</strong>：搞清楚我们是“重修整个大脑”还是“贴便利贴”(LoRA)。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>bash
+    actor_rollout_ref.model.lora_rank=32        # 开启LoRA，秩为32
+    actor_rollout_ref.model.target_modules=all-linear # 对所有线性层加LoRA
+    actor_rollout_ref.actor.optim.lr=3e-5       # 学习率</code></li>
+<li><strong>解读</strong>：<ul>
+<li><strong>LoRA (Low-Rank Adaptation)</strong>：这是一种<strong>省钱</strong>的训练方法。它不修改模型原本庞大的参数（几十亿个），而是给模型“外挂”一些小参数进行训练。</li>
+<li>如果不加这几行，你需要巨大的显存来全量微调；加了这几行，显存占用大幅降低。</li>
+<li><strong>3e-5</strong>：这是模型学习的速度，太快容易学坏，太慢学不会。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 核心烹饪法 (GRPO算法与采样)</h4>
+<p><strong>目标</strong>：这是整个脚本最核心、最难懂的部分。它定义了模型怎么通过“尝试”来变强。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>bash
+    algorithm.adv_estimator=grpo             # 使用 GRPO 算法
+    actor_rollout_ref.rollout.n=5            # 每次让模型生成5个答案
+    algorithm.use_kl_in_reward=False         # 奖励计算方式细节</code></li>
+<li><strong>解读</strong>：<ul>
+<li><strong>GRPO (Group Relative Policy Optimization)</strong>：这是 DeepSeek-R1 背后的核心训练算法之一。</li>
+<li><strong>核心逻辑</strong>：<ol>
+<li>给模型一道数学题。</li>
+<li><code>rollout.n=5</code>：让模型一口气生成 <strong>5个不同的解题过程</strong>。</li>
+<li>GRPO 算法会比较这5个答案，谁对谁错，或者谁的步骤更清晰。</li>
+<li>表现好的那一个答案会受到“奖励”，模型下次就会更倾向于那样回答。</li>
+</ol>
+</li>
+<li>这比传统的 PPO 算法更省资源，因为它不需要一个巨大的“裁判模型”(Critic Model) 来打分，而是通过这5个答案内部互相比较（Group Relative）来更新。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 厨房管理与加速 (显存优化与vLLM)</h4>
+<p><strong>目标</strong>：让训练跑得更快，且不爆显存。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>bash
+    actor_rollout_ref.rollout.name=vllm           # 使用 vLLM 进行推理
+    actor_rollout_ref.actor.fsdp_config.param_offload=True # FSDP 显存优化
+    actor_rollout_ref.model.enable_gradient_checkpointing=True # 梯度检查点</code></li>
+<li><strong>解读</strong>：<ul>
+<li><strong>vLLM</strong>：这是一个<strong>极快</strong>的推理引擎。在训练过程中，模型需要不断地“做题”（生成答案），用 vLLM 做题比用原本的 PyTorch 快得多。</li>
+<li><strong>FSDP (Fully Sharded Data Parallel)</strong>：大模型参数太多，一张卡放不下。FSDP 把模型切碎，每张显卡只存一部分，计算时再拼凑。</li>
+<li><strong>Offload</strong>：如果显存还是不够，把一部分暂时不用的数据存到内存（CPU RAM）里去，虽然慢点，但能防止程序崩溃。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个脚本在干嘛？</h3>
+<p>用一句话说：
+<strong>这个脚本使用 8 张显卡，利用 vLLM 加速生成，通过 GRPO 算法（每次生成5个答案互相对比），配合 LoRA 技术（省显存），教 Qwen2.5-3B 模型做 GSM8K 数学题。</strong></p>
+<p>如果你要运行它，你需要关注的只有两点：
+1.  显卡够不够（脚本里写了要8张，且配置了 H100 相关的参数，普通卡可能跑不动这么大的并发）。
+2.  数据路径 (<code>data/gsm8k/...</code>) 对不对。</p>

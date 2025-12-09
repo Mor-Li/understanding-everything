@@ -1,0 +1,150 @@
+<h1>tests/unit_tests/models/test_gpt_model_quantization.py</h1>
+<p>这份文件是一个 <strong>单元测试（Unit Test）</strong> 文件。</p>
+<p>简单来说，它的作用是 <strong>“检查 NVIDIA Megatron-Core 在构建 GPT 模型时，能不能按照我们预设的‘规则’（Recipe），正确地给每一层网络分配不同的量化（Quantization）配置。”</strong></p>
+<p>所谓的“量化”，你可以理解为为了让模型跑得更快、更省显存，把原本高精度（BF16）的计算变成低精度（FP8）的过程。</p>
+<p>为了让你看懂，我把这个代码的逻辑拆解成一个 <strong>“项目经理给工人派活”</strong> 的 Todo List（任务清单）。代码就是在模拟并验证这个流程。</p>
+<hr />
+<h3>核心任务清单 (Todo List)</h3>
+<ol>
+<li><strong>【环境检查】Task 1: 检查工具包是否齐全</strong><ul>
+<li>我们要用 "Kitchen" 或 "Transformer Engine (TE)" 这两个工具来加速模型。如果没有装，就跳过测试。</li>
+</ul>
+</li>
+<li><strong>【制定规则】Task 2: 编写“施工图纸” (Quantization Recipe)</strong><ul>
+<li>我们需要定义一套复杂的规则：哪些层需要“精装修”（保持高精度 BF16），哪些层可以“简装修”（使用 FP8 加速）。</li>
+</ul>
+</li>
+<li><strong>【构建模型】Task 3: 按照图纸搭建 GPT 模型</strong><ul>
+<li>初始化一个小的 GPT 模型，并把上面的“施工图纸”塞进去。</li>
+</ul>
+</li>
+<li><strong>【验收检查】Task 4: 逐层验收 (Test/Assert)</strong><ul>
+<li>拿着放大镜去检查模型里的每一个层（Layer）。</li>
+<li><strong>检查点 A：</strong> 这一层用的零件对不对？（是用普通的 Linear 层，还是特制的量化 Linear 层？）</li>
+<li><strong>检查点 B：</strong> 这一层拿到的参数对不对？（是 FP8 还是 BF16？）</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步代码解读</h3>
+<p>现在我们按照上面的 Todo List，一步步看代码里是怎么写的。</p>
+<h4>Task 1: 环境检查 (Imports &amp; Setup)</h4>
+<p>代码开头的一大堆 <code>try...except</code> 和 <code>@pytest.mark.skipif</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">try</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">megatron.core.extensions.transformer_engine</span><span class="w"> </span><span class="kn">import</span> <span class="n">HAVE_TE</span>
+<span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
+    <span class="n">HAVE_TE</span> <span class="o">=</span> <span class="kc">False</span>
+<span class="c1"># ... (Kitchen 同理)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：这是在问系统：“你有 <code>Transformer Engine</code> 吗？你有 <code>Kitchen</code> 吗？”</li>
+<li><strong>逻辑</strong>：如果没有这些库，测试跑不起来，直接跳过（Skip），避免报错。</li>
+</ul>
+<h4>Task 2: 制定规则 (The Recipe)</h4>
+<p>这是代码中最核心的部分，出现在 <code>transformer_config</code> 的 <code>quant_recipe</code> 里：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">quant_recipe</span><span class="o">=</span><span class="n">RecipeConfig</span><span class="o">.</span><span class="n">from_config_dict</span><span class="p">({</span>
+    <span class="s2">&quot;matchers&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="c1"># 规则 1：名字里带 &quot;fc2&quot; 的层，必须保持高精度 (bf16)</span>
+        <span class="s2">&quot;keep_in_hp&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;glob&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;pattern&quot;</span><span class="p">:</span> <span class="s2">&quot;*fc2&quot;</span><span class="p">,</span>  <span class="c1"># *fc2 意思是只要结尾是 fc2 就算匹配</span>
+            <span class="s2">&quot;config&quot;</span><span class="p">:</span> <span class="s2">&quot;bf16&quot;</span><span class="p">,</span>
+        <span class="p">},</span>
+        <span class="c1"># 规则 2：剩下的所有层 (*)，使用 FP8 加速 (fp8_cs)</span>
+        <span class="s2">&quot;use_fp8_cs&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;glob&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;pattern&quot;</span><span class="p">:</span> <span class="s2">&quot;*&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;config&quot;</span><span class="p">:</span> <span class="s2">&quot;fp8_cs&quot;</span><span class="p">,</span>
+        <span class="p">},</span>
+    <span class="p">},</span>
+    <span class="s2">&quot;configs&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="c1"># 定义什么是 bf16，什么是 fp8_cs</span>
+        <span class="s2">&quot;bf16&quot;</span><span class="p">:</span> <span class="p">{</span> <span class="o">...</span> <span class="p">},</span>
+        <span class="s2">&quot;fp8_cs&quot;</span><span class="p">:</span> <span class="p">{</span> <span class="o">...</span> <span class="p">},</span>
+    <span class="p">},</span>
+<span class="p">})</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：这是给模型下达的指令。<ul>
+<li>GPT 模型里有很多层，比如 <code>linear_qkv</code>, <code>linear_proj</code>, <code>linear_fc1</code>, <code>linear_fc2</code>。</li>
+<li>这个规则说：<strong>“除了 <code>fc2</code> 这一层我要保持 BF16，其他的统统给我转成 FP8。”</strong></li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 构建模型 (Model Initialization)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">model</span> <span class="o">=</span> <span class="n">GPTModel</span><span class="p">(</span>
+    <span class="n">config</span><span class="o">=</span><span class="n">transformer_config</span><span class="p">,</span> <span class="c1"># 把上面的规则传进去</span>
+    <span class="n">transformer_layer_spec</span><span class="o">=</span><span class="n">transformer_layer_spec</span><span class="p">,</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：程序开始根据配置创建模型对象。在创建过程中，Megatron 会自动解析上面的规则，决定每一层该用什么类、什么参数。</li>
+</ul>
+<h4>Task 4: 验收检查 (Assertion)</h4>
+<p>这是测试函数 <code>test_kitchen_config_resolution_dense</code> 的后半部分：</p>
+<p><strong>1. 定义“标准答案” (Expected Results):</strong>
+程序员先手写了一份“正确答案”，列出了每一层应该是什么样子：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">expected_match</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="c1"># 这一层不是 fc2，所以要是 fp8_cs</span>
+    <span class="s2">&quot;decoder.layers.0.self_attention.linear_proj&quot;</span><span class="p">:</span> <span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="s2">&quot;fp8_cs&quot;</span><span class="p">),</span>
+
+    <span class="c1"># 这一层是 fc2，根据规则，必须是 bf16</span>
+    <span class="s2">&quot;decoder.layers.0.mlp.linear_fc2&quot;</span><span class="p">:</span> <span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="s2">&quot;bf16&quot;</span><span class="p">),</span>
+    <span class="o">...</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>2. 循环检查 (The Loop):</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">module</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_modules</span><span class="p">():</span>
+    <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">expected_types</span><span class="p">:</span>
+        <span class="c1"># 检查 A：类型对不对？(是不是特制的 KitchenRowParallelLinear 等)</span>
+        <span class="k">assert</span> <span class="nb">type</span><span class="p">(</span><span class="n">module</span><span class="p">)</span> <span class="o">==</span> <span class="n">expected_types</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
+
+        <span class="c1"># 检查 B：配置对不对？(拿到的 key 是不是预期的 &quot;fp8_cs&quot; 或 &quot;bf16&quot;)</span>
+        <span class="k">assert</span> <span class="n">module</span><span class="o">.</span><span class="n">kitchen_quant_params</span><span class="o">.</span><span class="n">params_config_key</span> <span class="o">==</span> <span class="n">expected_match</span><span class="p">[</span><span class="n">name</span><span class="p">][</span><span class="mi">1</span><span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：测试程序遍历了刚刚建好的模型。<ul>
+<li>它看到 <code>linear_fc1</code>，会问：“你是 FP8 吗？” -&gt; 必须是。</li>
+<li>它看到 <code>linear_fc2</code>，会问：“你是 BF16 吗？” -&gt; 必须是。</li>
+<li>如果任何一个对不上，测试就会<strong>报错 (Fail)</strong>，说明代码有 Bug。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>这个文件里的三个测试类都在干嘛？</h3>
+<p>文件里有三个主要的测试方法，逻辑都是一样的，只是场景不同：</p>
+<ol>
+<li>
+<p><strong><code>test_kitchen_config_resolution_dense</code></strong>:</p>
+<ul>
+<li><strong>场景</strong>：普通的 GPT 模型（Dense 模型）。</li>
+<li><strong>后端</strong>：使用 NVIDIA 内部的 <strong>Kitchen</strong> 库做量化。</li>
+<li><strong>验证</strong>：验证 <code>fc2</code> 层是 BF16，其他层是 FP8。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>test_kitchen_config_resolution_moe</code></strong>:</p>
+<ul>
+<li><strong>场景</strong>：<strong>MoE (混合专家)</strong> 模型。这种模型结构更复杂，有 <code>experts</code> 层。</li>
+<li><strong>后端</strong>：<strong>Kitchen</strong>。</li>
+<li><strong>验证</strong>：验证 MoE 特有的 <code>experts.linear_fc2</code> 是否也正确应用了 BF16 规则。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>test_te_config_resolution_dense</code> (在 <code>TestGPTModelTEQuantizationConfig</code> 类里)</strong>:</p>
+<ul>
+<li><strong>场景</strong>：普通的 GPT 模型。</li>
+<li><strong>后端</strong>：使用 <strong>Transformer Engine (TE)</strong> 库（这是目前开源界更常用的库）。</li>
+<li><strong>验证</strong>：验证 TE 的层（如 <code>TELayerNormColumnParallelLinear</code>）是否正确接收了配置（<code>fp8_quantization_recipe</code> 是否被激活）。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件就是为了证明：
+<strong>“当你告诉 Megatron-Core ‘我要把除了 fc2 以外的所有层都用 FP8 跑’ 时，系统真的能听懂，并且准确地把每一层都设置好，不会弄错。”</strong></p>

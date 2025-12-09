@@ -1,0 +1,72 @@
+<h1>tools/checkpoint/saver_llava.py</h1>
+<p>这份代码 <code>saver_llava.py</code> 的核心作用是：<strong>将一个转换好的 LLaVA 模型权重，保存为 Megatron-LM 框架可以识别和加载的格式（Checkpoint）。</strong></p>
+<p>由于这是一个多进程架构的一部分（Loader 负责读，Saver 负责写），代码看起来比较碎片化。为了让你看懂，我把它拆解成一个 <strong>“任务清单 (Task List)”</strong>，模拟程序执行的逻辑流。</p>
+<p>想象你是一个负责“搬家并重新组装家具”的工头，这个脚本就是你的操作手册。</p>
+<hr />
+<h3>任务清单：LLaVA 模型保存流程</h3>
+<h4>Task 1: 准备工具与参数 (Setup &amp; Arguments)</h4>
+<p><strong>代码位置:</strong> <code>add_arguments</code> 函数
+*   <strong>目标</strong>: 确定我们要保存成什么样的格式。
+*   <strong>动作</strong>:
+    *   设置目标并行度（例如：是用 1 张卡跑，还是拆分到 8 张卡跑？即 <code>target-tensor-parallel-size</code>）。
+    *   指定 Megatron 代码库的路径。
+    *   选择 Transformer 的底层实现（本地实现还是 NVIDIA 的 Transformer Engine）。</p>
+<h4>Task 2: 继承与初始化 (Initialization)</h4>
+<p><strong>代码位置:</strong> <code>MegatronCheckpointSaverLLaVA</code> 类定义
+*   <strong>目标</strong>: 建立保存器实例。
+*   <strong>观点</strong>: 这个类继承自 <code>MegatronCheckpointSaverBase</code>。这意味着通用的保存逻辑（比如保存文件头、保存 LLM 部分）由父类处理，<strong>这个子类只专注于 LLaVA 特有的部分（视觉部分）</strong>。
+*   <strong>核心机制</strong>: 它通过一个 <code>queue</code>（队列）从 Loader 那里接收权重数据。</p>
+<h4>Task 3: 对齐配置 (Config Alignment)</h4>
+<p><strong>代码位置:</strong> <code>_load_checkpoint_args</code>, <code>_maybe_parse_additional_megatron_args</code>
+*   <strong>目标</strong>: 确保保存的模型配置和原始模型一致，同时兼容 Megatron 的参数。
+*   <strong>动作</strong>:
+    *   <strong>保留关键参数</strong>: 比如层数、隐藏层大小、词表大小等，必须和原模型一样。
+    *   <strong>复制 LLaVA 专属参数</strong>: 比如 <code>vision_model_type</code> (视觉编码器是 CLIP 还是 SigLIP?), <code>img_h/w</code> (图片分辨率), <code>patch_dim</code> (切片大小)。
+    *   <strong>逻辑</strong>: 如果参数不匹配，强制覆盖，保证模型结构正确。</p>
+<h4>Task 4: 伪造启动命令 (Mocking Execution)</h4>
+<p><strong>代码位置:</strong> <code>build_sys_argv</code>
+*   <strong>目标</strong>: 骗过 Megatron 的初始化系统。
+*   <strong>观点</strong>: Megatron 是一个训练框架，通常需要通过命令行启动。为了在脚本中构建一个“空模型壳子”来填充权重，我们需要伪造一个 <code>sys.argv</code>（命令行参数列表）。
+*   <strong>动作</strong>: 构建一个包含 <code>--num-layers</code>, <code>--hidden-size</code> 等参数的列表，假装我们在启动训练，实际上只是为了初始化模型结构。</p>
+<h4>Task 5: 接收并处理“眼睛” (Vision Backbone)</h4>
+<p><strong>代码位置:</strong> <code>receive_vision_backbone</code>
+*   <strong>目标</strong>: 接收视觉编码器（ViT）的权重，并根据并行度进行切分。
+*   <strong>难点</strong>: 如果我要把模型拆分到多张显卡（Tensor Parallelism），权重矩阵必须被切开。
+*   <strong>步骤</strong>:
+    1.  <strong>从队列获取数据</strong>: <code>self.queue_get("vit embeddings")</code> 等。
+    2.  <strong>切分权重 (Chunking)</strong>: 使用 <code>chunk_weight</code> 或 <code>chunk_bias</code> 函数。
+        *   例如：如果是“按列切分”，第一张卡拿矩阵左半边，第二张卡拿右半边。
+    3.  <strong>适配不同模型</strong>: 代码里有很多 <code>if self.md.vision_model_type in ...</code>:
+        *   如果是 <code>internvit</code>，处理方式略有不同。
+        *   如果是 <code>radio-g</code>，需要处理 mask token。
+    4.  <strong>填入模型</strong>: 将切好并分配给当前 GPU (Rank) 的权重，复制到本地模型的 <code>vision_model</code> 中。</p>
+<h4>Task 6: 接收并处理“脖子” (Vision Projection)</h4>
+<p><strong>代码位置:</strong> <code>receive_vision_projection</code>
+*   <strong>目标</strong>: 处理连接视觉部分和语言部分的投影层（Projector/Adapter）。
+*   <strong>动作</strong>:
+    *   这通常是一个 MLP（多层感知机）。
+    *   同样需要进行权重切分（<code>chunk_weight</code>），因为这一层也参与模型并行。
+    *   将权重填入 <code>model.vision_projection</code>。</p>
+<h4>Task 7: 接收并处理“大脑” (Language Model)</h4>
+<p><strong>代码位置:</strong> <code>receive_model</code> 中的最后几行
+*   <strong>目标</strong>: 处理 LLaVA 中的语言模型部分（通常是 Llama 或 Vicuna）。
+*   <strong>观点</strong>:
+    *   LLaVA 的语言部分就是一个标准的 GPT 结构。
+    *   所以代码直接调用了 <code>self.receive_lm</code>（这是父类的方法），复用了通用的 LLM 保存逻辑。</p>
+<h4>Task 8: 总控与执行 (Orchestration)</h4>
+<p><strong>代码位置:</strong> <code>receive_model</code> 和 <code>save_checkpoint</code>
+*   <strong>目标</strong>: 按顺序执行上述步骤。
+*   <strong>流程</strong>:
+    1.  <code>save_checkpoint</code> 启动保存器。
+    2.  <code>saver.save()</code> (父类方法) 会调用子类的 <code>receive_model</code>。
+    3.  <code>receive_model</code> 依次调用：
+        *   <code>receive_vision_backbone</code> (处理视觉)
+        *   <code>receive_vision_projection</code> (处理投影)
+        *   <code>receive_lm</code> (处理语言模型)</p>
+<hr />
+<h3>总结：这段代码的核心观点</h3>
+<ol>
+<li><strong>LLaVA = Vision + Projection + LLM</strong>：保存代码严格遵循这个结构。</li>
+<li><strong>模型并行 (Tensor Parallelism) 是核心难点</strong>：代码中大量的逻辑（<code>chunk_weight</code>, <code>chunk_bias</code>）都是为了解决“如何把一个大矩阵切碎塞进不同的显卡里”这个问题。</li>
+<li><strong>兼容性地狱</strong>：代码里充满了 <code>if/else</code>，是为了兼容不同的视觉塔（CLIP, SigLIP, InternViT 等），这说明该工具试图支持多种 LLaVA 变体。</li>
+</ol>

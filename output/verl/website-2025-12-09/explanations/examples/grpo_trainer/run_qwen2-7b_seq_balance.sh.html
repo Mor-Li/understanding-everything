@@ -1,0 +1,83 @@
+<h1>examples/grpo_trainer/run_qwen2-7b_seq_balance.sh</h1>
+<p>这份脚本乍一看确实参数非常多，很容易让人晕头转向。其实，它就是在配置一个<strong>强化学习（RL）</strong>的训练任务。</p>
+<p>为了让你看懂，我们把这个脚本想象成<strong>“训练一个学生（AI模型）做数学题”</strong>的项目。我把解读过程拆解成一个 <strong>Task List（任务清单）</strong>，带你一步步完成这个项目的配置。</p>
+<hr />
+<h3>Task 1: 确定训练目标（我们要干什么？）</h3>
+<p><strong>核心观点：</strong> 这不是普通的微调，而是<strong>GRPO</strong>训练（类似 DeepSeek-R1 背后的技术）。
+*   <strong>脚本对应：</strong>
+    <code>bash
+    python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \</code>
+*   <strong>解读：</strong>
+    *   我们不是在教模型“背书”（SFT），而是在教它“思考”。
+    *   <code>grpo</code> 是核心算法。它的逻辑是：让模型针对同一个问题生成多个答案，然后对比这一组答案的好坏，好的给予奖励，差的给予惩罚。</p>
+<h3>Task 2: 准备教材（数据来自哪里？）</h3>
+<p><strong>核心观点：</strong> 我们用的是 GSM8K（小学数学题库），因为数学题有标准答案，容易判断对错。
+*   <strong>脚本对应：</strong>
+    <code>bash
+    data.train_files=$HOME/data/gsm8k/train.parquet \
+    data.val_files=$HOME/data/gsm8k/test.parquet \</code>
+*   <strong>解读：</strong>
+    *   这就好比给学生发的《奥数习题集》。模型需要通过做这些题来提升能力。</p>
+<h3>Task 3: 挑选“学生”底子（用哪个模型？）</h3>
+<p><strong>核心观点：</strong> 我们选了 Qwen2-7B-Instruct，它已经很聪明了，我们要在它基础上进一步优化。
+*   <strong>脚本对应：</strong>
+    <code>bash
+    actor_rollout_ref.model.path=Qwen/Qwen2-7B-Instruct \</code>
+*   <strong>解读：</strong>
+    *   这就是我们的“底模”。注意，训练不仅需要一个正在学习的“学生”（Actor），还需要一个“参考系”（Ref），防止学生学歪了（后面会提到 KL Loss）。</p>
+<h3>Task 4: 设置“模拟考”机制（Rollout/推理）</h3>
+<p><strong>核心观点：</strong> 这是 GRPO 最特别的地方。训练过程中，模型必须不断地做题（生成文本），而且要生成很多次。
+*   <strong>脚本对应：</strong>
+    <code>bash
+    rollout_mode="async"
+    rollout_name="sglang" # 或 vllm
+    actor_rollout_ref.rollout.n=5 \</code>
+*   <strong>解读：</strong>
+    *   <code>rollout</code> 就是“推理”或“生成”。
+    *   <code>rollout.n=5</code>：<strong>这行最关键！</strong> 意思是针对每一道数学题，让模型生成 <strong>5 个不同的解题过程</strong>。
+    *   <code>sglang</code> / <code>vllm</code>：为了生成这 5 个答案速度够快，我们使用了专门的推理加速引擎（而不是普通的 PyTorch 推理）。</p>
+<h3>Task 5: 制定“奖惩规则”（损失函数配置）</h3>
+<p><strong>核心观点：</strong> 怎么告诉模型它做得好不好？既要鼓励它做对，又要防止它“胡言乱语”。
+*   <strong>脚本对应：</strong>
+    <code>bash
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \</code>
+*   <strong>解读：</strong>
+    *   <strong>KL Loss (KL 散度)</strong>：这是为了防止模型为了拿高分而“走火入魔”（比如输出乱码来欺骗奖励模型）。它要求现在的模型（Actor）和原始模型（Ref）的输出分布不能差太远。
+    *   <code>coef=0.001</code>：这是约束力度的系数。</p>
+<h3>Task 6: 分配“教室资源”（硬件与显存优化）</h3>
+<p><strong>核心观点：</strong> 7B 的模型还要生成 5 次，显存肯定不够，需要把模型切开放在不同的显卡上。
+*   <strong>脚本对应：</strong>
+    <code>bash
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    trainer.n_gpus_per_node=8 \</code>
+*   <strong>解读：</strong>
+    *   <code>tensor_model_parallel_size=2</code>：<strong>模型并行</strong>。意思是把一个模型切成两半，分别放在两张卡上跑。因为生成 5 个长答案很占显存。
+    *   <code>n_gpus_per_node=8</code>：我们用了一台 8 卡的机器来跑这个任务。</p>
+<h3>Task 7: 设定“课程表”（训练超参数）</h3>
+<p><strong>核心观点：</strong> 学习率、批次大小、学多久。
+*   <strong>脚本对应：</strong>
+    <code>bash
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    data.train_batch_size=1024 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=256 \
+    trainer.total_epochs=15 \</code>
+*   <strong>解读：</strong>
+    *   <code>lr=1e-6</code>：学习率非常低。因为这属于微调阶段，动作太大容易把模型学傻。
+    *   <code>batch_size=1024</code>：每次收集 1024 个数据样本才更新一次参数。</p>
+<hr />
+<h3>总结：这个脚本在讲一个什么故事？</h3>
+<p>如果把这段代码翻译成人类语言，它是对计算机说：</p>
+<blockquote>
+<p>“嘿，电脑！我们要用 <strong>8张显卡</strong> 来训练 <strong>Qwen2-7B</strong>。</p>
+<ol>
+<li><strong>准备数据</strong>：用 GSM8K 数学题。</li>
+<li><strong>生成阶段（Rollout）</strong>：用 <strong>SGLang</strong> 加速引擎，把模型切分到 <strong>2张卡</strong> 一组。每道题让模型生成 <strong>5个</strong> 不同的答案。</li>
+<li><strong>训练阶段（Train）</strong>：使用 <strong>GRPO 算法</strong>。对比这 5 个答案，找出好的，更新模型参数。</li>
+<li><strong>约束</strong>：别让模型变得太离谱（KL Loss），学习率要小（1e-6）。</li>
+<li><strong>目标</strong>：跑 15 轮（Epochs），每 20 步存个档。”</li>
+</ol>
+</blockquote>
+<p>现在再回头看那些参数，是不是觉得它们各司其职，没那么乱了？</p>

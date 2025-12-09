@@ -1,0 +1,84 @@
+<h1>docs/workers/sglang_worker.rst</h1>
+<p>这份文档主要是在讲 <strong>如何在 <code>verl</code> 这个强化学习框架中，使用 <code>SGLang</code> 作为推理（Inference）引擎</strong>。</p>
+<p>简单来说，<code>verl</code> 是用来训练大模型的（比如做 RLHF），而 <code>SGLang</code> 是一个推理速度很快的工具。把它们结合起来，可以大大加快训练过程中“生成文本”这一步的速度。</p>
+<p>为了让你更容易理解，我把文档内容拆解成一个 <strong>“待办清单（To-Do List）”</strong>，你只需要按顺序完成这些任务，就能搞定这篇文档的核心内容。</p>
+<hr />
+<h3>✅ Task 1: 了解背景（这是什么？）</h3>
+<ul>
+<li><strong>核心观点</strong>：<code>SGLang</code> 是一个开源的高性能推理引擎（xAI 的 Grok 模型就在用）。</li>
+<li><strong>用途</strong>：在 <code>verl</code> 进行强化学习训练（Rollout 阶段）时，用 <code>SGLang</code> 替换默认的 <code>vLLM</code>，功能一样但可能更高效，支持单机和多机。</li>
+<li><strong>怎么开启</strong>：只需要在启动脚本里加一句 <code>actor_rollout_ref.rollout.name=sglang</code> 就能无缝切换。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 环境安装（怎么装？）</h3>
+<p>你需要按照特定的版本要求安装依赖。</p>
+<ol>
+<li><strong>执行安装命令</strong>：
+    <code>bash
+    pip install --upgrade pip
+    pip install -e ".[sglang]"  # 安装带sglang支持的verl</code></li>
+<li><strong>检查版本（重要）</strong>：文档特别强调了版本匹配，否则容易报错：<ul>
+<li>PyTorch: 2.6.0+</li>
+<li>CUDA: 12.4</li>
+<li>SGLang: 0.4.6.post5</li>
+<li>FlashInfer: 0.2.5+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 单机训练实战（怎么跑？）</h3>
+<p>这里通过一个具体的例子（用 Qwen2-7B 模型跑 gsm8k 数据集）来演示。</p>
+<ol>
+<li><strong>准备数据</strong>：
+    运行 <code>python3 examples/data_preprocess/gsm8k.py</code> 下载并处理数据。</li>
+<li>
+<p><strong>运行训练脚本</strong>：
+    文档给出了一个很长的 <code>python3 -m verl.trainer.main_ppo ...</code> 命令。</p>
+<ul>
+<li><strong>关键点</strong>：注意命令里有一行 <code>export SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK=True</code>。</li>
+</ul>
+<blockquote>
+<p><strong>🤔 重点解释：为什么要加这个环境变量？（文档花了大篇幅解释这里）</strong>
+*   <strong>问题</strong>：SGLang 启动时会检查所有 GPU 的显存是否剩余一致（误差不能超过 10%），如果不一致会报错。
+*   <strong>现状</strong>：<code>verl</code> 训练时，不同的进程（Worker）加载模型的时间点不一样，或者有些 GPU 先干活了，导致显存使用情况暂时不平衡。
+*   <strong>解决</strong>：加上这个变量 <code>SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK=True</code>，就是告诉 SGLang：“<strong>别管显存平不平衡，直接启动，别给我报错</strong>”，防止因为这个检查导致训练死锁或崩溃。</p>
+</blockquote>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 多机训练实战（怎么扩展？）</h3>
+<p>如果你显卡不够，需要多台机器一起跑（比如两台机器，IP 分别是 Node0 和 Node1）。</p>
+<ol>
+<li>
+<p><strong>启动主节点（Node0）</strong>：
+    在第一台机器上运行 Ray 的头节点命令：
+    <code>bash
+    ray start --head --dashboard-host=0.0.0.0</code>
+    你会看到终端输出一个 IP 地址，比如 <code>10.94.16.4:6379</code>。</p>
+</li>
+<li>
+<p><strong>加入子节点（Node1）</strong>：
+    在第二台机器上运行：
+    <code>bash
+    ray start --address='10.94.16.4:6379'</code>
+    然后运行 <code>ray status</code> 确认两台机器都连上了（能看到 GPU 总数变多了）。</p>
+</li>
+<li>
+<p><strong>运行多机训练脚本</strong>：
+    文档最后给出了一个多机训练 Llama-3.1-8B 的脚本。</p>
+<ul>
+<li><strong>关键参数</strong>：<ul>
+<li><code>trainer.nnodes=2</code>：告诉程序有两台机器。</li>
+<li><code>actor_rollout_ref.rollout.tensor_model_parallel_size=16</code>：这里用了 TP=16（假设每台机器8卡，两台就是16卡并行）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这篇文档其实就是一本<strong>操作手册</strong>：
+1.  告诉你 SGLang 很好用。
+2.  教你装环境。
+3.  教你在单机上跑（并解释了一个关键的显存报错坑）。
+4.  教你用 Ray 连两台机器跑大模型。</p>

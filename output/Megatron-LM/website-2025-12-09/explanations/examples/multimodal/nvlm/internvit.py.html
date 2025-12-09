@@ -1,0 +1,109 @@
+<h1>examples/multimodal/nvlm/internvit.py</h1>
+<p>这份代码确实比较晦涩，因为它是在 <strong>Megatron-LM</strong>（一个超大规模模型并行训练框架）的基础上，为了适配 <strong>InternViT</strong>（书生·万象视觉大模型）做的一些“魔改”和“胶水代码”。</p>
+<p>简单来说，核心矛盾在于：<strong>InternViT 模型的设计（25个头）和 Megatron 的并行规则（切分份数必须能整除）打架了。</strong></p>
+<p>为了帮你读懂，我制定了一个 <strong>“从宏观背景到微观实现”</strong> 的 5步 Todo List。我们一步一步来拆解。</p>
+<hr />
+<h3>📝 阅读任务清单 (Todo List)</h3>
+<h4>✅ Task 1: 理解核心矛盾与解决方案（背景）</h4>
+<p><strong>目标</strong>：读懂文件开头的注释，明白为什么要写这个文件。</p>
+<ul>
+<li><strong>冲突点</strong>：<ul>
+<li>我们使用的张量并行（Tensor Parallel, TP）大小是 <strong>8</strong>（即把模型切成8份放在8张卡上算）。</li>
+<li>InternViT 这个模型的 Attention Head（注意力头）数量是 <strong>25</strong> 个。</li>
+<li><strong>数学问题</strong>：25 除以 8 除不尽。Megatron 框架要求每个 GPU 分到的头数必须是整数。</li>
+</ul>
+</li>
+<li><strong>解决方案 (Workaround)</strong>：<ul>
+<li>凑整！把 25 个头强行补到 <strong>32</strong> 个头（因为 32 / 8 = 4，刚好除尽）。</li>
+<li>多出来的 <strong>7</strong> 个头是“假头”（Dummy Heads），全是 0，不应该起作用。</li>
+</ul>
+</li>
+<li><strong>后果</strong>：<ul>
+<li>既然多了 7 个假头，计算归一化（Norm）和注意力输出时，必须小心剔除这些假数据，否则结果就错了。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 2: 攻克最难的数学逻辑 <code>InternViTRMSNorm</code></h4>
+<p><strong>目标</strong>：理解代码中 <code>InternViTRMSNorm</code> 类在干什么。这是全篇最难懂的地方。</p>
+<ul>
+<li><strong>普通 RMSNorm</strong>：计算所有数据的方差（Variance）来做归一化。</li>
+<li><strong>这里的难点</strong>：<ul>
+<li>数据被切分到了 8 张卡上。</li>
+<li>其中某张卡（或某几张卡）上混入了“假头”（全是0的数据）。</li>
+<li>如果直接算所有数据的均值/方差，那些 0 会把整体数值拉低，导致归一化错误。</li>
+</ul>
+</li>
+<li><strong>代码解读 (<code>_gather_var</code> 方法)</strong>：<ul>
+<li>代码需要手动计算方差。</li>
+<li>它通过 <code>rank</code> (当前显卡的编号) 来判断自己手里的数据是“真数据”还是“混了假数据”。</li>
+<li><strong>逻辑拆解</strong>：<ol>
+<li><code>rank &lt; valid_ranks</code>: 这张卡全是真数据，正常算。</li>
+<li><code>rank == valid_ranks</code>: 这张卡是分界线，一部分真，一部分假。代码用 <code>input_[..., :max_dim]</code> 只取真数据部分来算。</li>
+<li><code>else</code>: 这张卡全是假数据，直接乘 0。</li>
+</ol>
+</li>
+<li>最后通过 <code>all_gather</code> 把大家算出来的真数据的统计量加在一起，得到正确的全局方差。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 3: 理解注意力层的改造 <code>InternViTSelfAttention</code></h4>
+<p><strong>目标</strong>：明白 InternViT 的 Attention 结构和普通模型有什么不同。</p>
+<ul>
+<li><strong>普通 Transformer</strong>：Input -&gt; QKV Linear -&gt; Attention -&gt; Output Linear。</li>
+<li><strong>InternViT 的特殊癖好</strong>：<ul>
+<li>它在生成 Q (Query) 和 K (Key) 之后，做了一次 <strong>LayerNorm</strong>（即代码中的 <code>q_layernorm</code> 和 <code>k_layernorm</code>）。</li>
+<li>这在普通 GPT/LLaMA 结构中是不常见的。</li>
+</ul>
+</li>
+<li><strong>代码解读</strong>：<ul>
+<li>继承了 Megatron 的 <code>SelfAttention</code>。</li>
+<li>重写了 <code>__init__</code>，强行插入了 <code>q_layernorm</code> 和 <code>k_layernorm</code>。</li>
+<li>注意：这两个 Norm 用的就是上面那个特制的 <code>InternViTRMSNorm</code>，因为 Q 和 K 也是被切分且包含“假头”的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 清理垃圾数据 <code>InternViTTEDotProductAttention</code></h4>
+<p><strong>目标</strong>：理解 <code>forward</code> 函数里为什么要乘 0。</p>
+<ul>
+<li><strong>问题</strong>：虽然我们凑了 32 个头，但那 7 个假头经过计算后，可能会产生非零的垃圾数值（比如 Bias 带来的，或者浮点误差）。</li>
+<li><strong>操作</strong>：<ul>
+<li>在 Attention 计算完输出后，必须强制把那 7 个假头对应的输出位置 <strong>抹零</strong>。</li>
+</ul>
+</li>
+<li><strong>代码解读</strong>：<ul>
+<li><code>mask = torch.ones_like(...)</code>：先做一个全 1 的掩码。</li>
+<li>判断当前 GPU (<code>rank</code>) 是否包含假头。</li>
+<li>如果是包含假头的卡，把对应位置的掩码设为 0 (<code>mask[..., max_dim:] *= 0.0</code>)。</li>
+<li>最后 <code>out *= mask</code>：物理抹除垃圾数据。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 组装成型 <code>get_internvit_layer_spec</code></h4>
+<p><strong>目标</strong>：看懂最后是如何把这些零件拼成一个 Layer 的。</p>
+<ul>
+<li><strong>作用</strong>：这是一个“菜单”或者“蓝图”，告诉 Megatron 怎么组装一层 Transformer。</li>
+<li><strong>清单内容</strong>：<ul>
+<li><strong>Input Norm</strong>: 用我们特制的 <code>InternViTRMSNorm</code>。</li>
+<li><strong>Attention</strong>:<ul>
+<li>用特制的 <code>InternViTSelfAttention</code> (带 QK Norm)。</li>
+<li>核心计算用 <code>InternViTTEDotProductAttention</code> (带抹零功能)。</li>
+<li>Q/K Norm 模块指定为 <code>InternViTRMSNorm</code>。</li>
+</ul>
+</li>
+<li><strong>MLP</strong>: 普通的多层感知机。</li>
+<li><strong>Layer Scaling</strong>: InternViT 特有的缩放技术 (<code>self_attn_bda</code>, <code>mlp_bda</code>)。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结文中的核心观点</h3>
+<p>这段代码与其说在表达“观点”，不如说是在<strong>“填坑”</strong>。</p>
+<ol>
+<li><strong>为了兼容性牺牲了优雅</strong>：为了让 25 个头的模型能在 TP=8 的通用框架上跑，不得不引入“Dummy Heads”（凑数）的策略。</li>
+<li><strong>数据正确性至上</strong>：因为引入了凑数的数据，标准算子（Norm, Attention）全部失效，必须重写算子来手动剔除凑数数据的影响（手动计算方差、手动 Mask 输出）。</li>
+<li><strong>特定架构特定支持</strong>：InternViT 有独特的 QK-LayerNorm 和 LayerScaling 设计，必须通过继承和重写 Megatron 的基类来支持。</li>
+</ol>

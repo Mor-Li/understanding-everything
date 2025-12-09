@@ -1,0 +1,118 @@
+<h1>docs/source/api-guide/dist_optimizer.md</h1>
+<p>这份文档确实涉及很多深度学习分布式训练的底层细节，充满了术语（如 sharding, reduce-scatter, all-gather 等）。看不懂是很正常的。</p>
+<p>为了让你彻底搞懂，我把阅读这份文档的任务拆解成一个 <strong>“学习 To-Do List”</strong>。我们不直接翻译，而是通过这 4 个任务，一步步揭开它的面纱。</p>
+<hr />
+<h3>✅ Task 1: 理解核心痛点（为什么要搞这个？）</h3>
+<p><strong>文档第一段：Motivation</strong></p>
+<ul>
+<li><strong>背景：</strong> 在训练大模型时，显存（Memory）通常是不够用的。</li>
+<li><strong>传统做法（Naive method）：</strong> 假设你有 4 张显卡（Rank 0~3）做数据并行训练。最笨的办法是，每张卡上都存一份<strong>一模一样</strong>的优化器状态（Optimizer State）。<ul>
+<li><em>比喻：</em> 就像 4 个人一起做一张卷子，每个人手里都非要拿全套《辞海》字典，太占地方了。</li>
+</ul>
+</li>
+<li><strong>本文做法（Distributed Optimizer）：</strong> 为了省显存，我们把优化器状态<strong>切分（Distribute/Shard）</strong> 到各个显卡上。<ul>
+<li><em>比喻：</em> 把《辞海》撕成 4 份，每人只拿 1/4。需要查字的时候，大家互相交换信息。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论：</strong> 搞这个东西的唯一目的就是<strong>省显存</strong>，让你可以训练更大的模型。</p>
+<hr />
+<h3>✅ Task 2: 理解“切分”的逻辑（Sharding Scheme）</h3>
+<p><strong>文档中间部分：Sharding scheme</strong></p>
+<p>文档中提到了一张图（虽然你看不到图，但文字描述了解释了逻辑）。</p>
+<ul>
+<li><strong>设定：</strong> 假设模型总共有 16 个参数（为了简化说明）。你有 4 张显卡（DP Size = 4）。</li>
+<li><strong>切分方式：</strong><ul>
+<li><strong>显卡 0</strong> 负责维护：第 0-3 个参数的优化器状态。</li>
+<li><strong>显卡 1</strong> 负责维护：第 4-7 个参数的优化器状态。</li>
+<li><strong>显卡 2</strong> 负责维护：第 8-11 个参数的优化器状态。</li>
+<li><strong>显卡 3</strong> 负责维护：第 12-15 个参数的优化器状态。</li>
+</ul>
+</li>
+<li><strong>关键点：</strong> 虽然每张卡在跑“前向传播”时需要完整的模型参数，但在“更新参数”这一步，每张卡只负责更新它自己管的那一小部分。</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 这里的“重头戏” —— 逐步解析数据流（Key Steps）</h3>
+<p><strong>文档最后部分：Key Steps</strong></p>
+<p>这是最难懂的部分，描述了一次训练迭代中发生了什么。我们用通俗语言翻译一下这个流程。</p>
+<p><strong>假设前提：</strong>
+*   模型用的是 <code>bf16</code>（半精度，占内存小）。
+*   优化器用的是 <code>fp32</code>（全精度，占内存大，为了精准）。
+*   有 4 张显卡。</p>
+<p><strong>流程步骤：</strong></p>
+<ol>
+<li>
+<p><strong>Backward pass finishes (反向传播结束)</strong></p>
+<ul>
+<li>每张显卡都算出了全部 16 个参数的梯度（Gradients）。此时，每张卡都有完整的梯度。</li>
+</ul>
+</li>
+<li>
+<p><strong>Call reduce-scatter (调用 Reduce-Scatter)</strong></p>
+<ul>
+<li><em>这是关键通信步骤！</em></li>
+<li>大家不把所有梯度都加起来给每个人（那是 All-Reduce）。</li>
+<li>而是：显卡 0 说“把你们算出来的第 0-3 个参数的梯度都给我，我来求和”；显卡 1 说“把第 4-7 个都给我”……以此类推。</li>
+<li><strong>结果：</strong> 每张卡现在只手里只有 <strong>4 个</strong> 经过汇总的、高精度的梯度值。（剩下的 12 个是垃圾数据，不重要了）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Optimizer.step() (优化器干活)</strong></p>
+<ul>
+<li>每张卡只更新它自己负责的那 <strong>4 个</strong> 参数。</li>
+<li>因为它只需要存这 4 个参数的 <code>fp32</code> 状态，所以显存占用瞬间变成了原来的 1/4。</li>
+</ul>
+</li>
+<li>
+<p><strong>Update Parameters (更新参数)</strong></p>
+<ul>
+<li>显卡把这 4 个更新好的 <code>fp32</code> 参数，转换回 <code>bf16</code>（半精度）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Call all-gather (调用 All-Gather)</strong></p>
+<ul>
+<li><em>这是同步步骤！</em></li>
+<li>现在显卡 0 手里有最新的 0-3 号参数，显卡 1 有最新的 4-7 号参数……</li>
+<li>大家互相广播：“这是我更新好的部分，发给你们！”</li>
+<li><strong>结果：</strong> 所有显卡重新拿到了完整的、更新后的 16 个参数。</li>
+</ul>
+</li>
+<li>
+<p><strong>Ready for next step</strong></p>
+<ul>
+<li>准备好进行下一轮的前向传播。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 看看省了多少内存（The Math Table）</h3>
+<p><strong>文档中间的表格</strong></p>
+<p>既然你已经懂了原理，再看那个表格就简单了：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">情况</th>
+<th style="text-align: left;">传统优化器 (Non-distributed)</th>
+<th style="text-align: left;">分布式优化器 (Distributed)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">fp32 参数</td>
+<td style="text-align: left;">16 (Bytes)</td>
+<td style="text-align: left;">8 + <strong>8/d</strong></td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>解释：</strong> <code>d</code> 是显卡数量。</li>
+<li><strong>传统：</strong> 不管你有几张卡，每张卡都要存完整的状态（16 Bytes）。</li>
+<li><strong>分布式：</strong> 随着显卡数量 <code>d</code> 增加（比如 d=8, d=16），<strong>8/d</strong> 这一项会变得非常小。</li>
+<li><strong>结论：</strong> 显卡越多，单张卡上为了优化器付出的显存代价就越小，越划算。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇文档其实就是在讲 <strong>DeepSpeed ZeRO / Megatron-LM</strong> 这类技术中的 <strong>Optimizer State Sharding</strong>。</p>
+<p><strong>一句话总结全文：</strong>
+为了省显存，我们不要让每张卡都存完整的优化器数据。我们让每张卡只负责更新模型的一小部分，更新完之后，再把更新好的参数广播给所有人。</p>

@@ -1,0 +1,96 @@
+<h1>tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py</h1>
+<p>这段代码的核心目的是<strong>测试“断点续训”（Resume Training）功能是否正常</strong>。</p>
+<p>简单来说，它的逻辑是：
+1.  <strong>第一次跑（Run 1）：</strong> 一口气跑完 100 步。
+2.  <strong>第二次跑（Run 2）：</strong> 假设在第 50 步存了个档（Checkpoint），然后从第 51 步开始读档继续跑到 100 步。
+3.  <strong>对比：</strong> 如果“断点续训”没问题，那么 Run 1 的后半程（51-100步）应该和 Run 2 的表现（51-100步）<strong>完全一致</strong>。</p>
+<p>为了让你更清楚，我把你当作这个程序的执行者，给你列一个 <strong>Task Todo List（任务清单）</strong>，你只需要按顺序执行这些步骤，就能读懂代码了。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<h4>Task 1: 确定“我们要检查什么指标？”</h4>
+<p><strong>代码位置:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">model_config_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+    <span class="n">model_config</span> <span class="o">=</span> <span class="n">yaml</span><span class="o">.</span><span class="n">safe_load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+
+<span class="n">checks_types</span> <span class="o">=</span> <span class="p">(</span>
+    <span class="n">model_config</span><span class="p">[</span><span class="s2">&quot;METRICS&quot;</span><span class="p">]</span> <span class="k">if</span> <span class="s2">&quot;METRICS&quot;</span> <span class="ow">in</span> <span class="n">model_config</span> <span class="k">else</span> <span class="p">[</span><span class="s2">&quot;lm loss&quot;</span><span class="p">,</span> <span class="s2">&quot;num-zeros&quot;</span><span class="p">]</span>
+<span class="p">)</span>
+<span class="n">checks</span> <span class="o">=</span> <span class="p">{</span> <span class="o">...</span> <span class="p">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>你的动作</strong>：打开配置文件（config），看看里面规定了要检查哪些数据。通常是检查 <code>lm loss</code>（语言模型损失值，越低越好）。</li>
+<li><strong>目的</strong>：确定考试科目。</li>
+</ul>
+<h4>Task 2: 检查“第一次跑的数据全不全？”</h4>
+<p><strong>代码位置:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">missing_metrics</span> <span class="o">:=</span> <span class="p">[</span><span class="o">...</span><span class="p">])</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">):</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="kc">False</span>
+</code></pre></div>
+
+<ul>
+<li><strong>你的动作</strong>：拿着 Task 1 确定的“考试科目”，去翻看 <code>actual_values_first_run</code>（第一次完整跑步的数据）。如果发现缺了某一项数据（比如没记录 loss），直接报错并停止。</li>
+<li><strong>目的</strong>：确保作为“标准答案”的第一次跑的数据是完整的。</li>
+</ul>
+<h4>Task 3: 清洗数据，只保留关心的指标</h4>
+<p><strong>代码位置:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">actual_values_first_run</span> <span class="o">=</span> <span class="p">{</span> <span class="o">...</span> <span class="k">if</span> <span class="n">metric_name</span> <span class="ow">in</span> <span class="n">checks</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span> <span class="p">}</span>
+<span class="n">actual_values_second_run</span> <span class="o">=</span> <span class="p">{</span> <span class="o">...</span> <span class="k">if</span> <span class="n">metric_name</span> <span class="ow">in</span> <span class="n">checks</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span> <span class="p">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>你的动作</strong>：把两次跑步记录中那些我们不关心的杂乱数据剔除，只留下 Task 1 里确定的“考试科目”数据。</li>
+<li><strong>目的</strong>：减少干扰，聚焦重点。</li>
+</ul>
+<h4>Task 4: 【核心步骤】时间轴对齐（只截取后半段）</h4>
+<p>这是这段代码最关键的地方。
+<strong>代码位置:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">metric_name</span> <span class="ow">in</span> <span class="n">checks</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+    <span class="c1"># 处理第一次跑的数据</span>
+    <span class="n">actual_values_first_run</span><span class="p">[</span><span class="n">metric_name</span><span class="p">]</span><span class="o">.</span><span class="n">start_step</span> <span class="o">=</span> <span class="n">train_iters</span> <span class="o">//</span> <span class="mi">2</span> <span class="o">+</span> <span class="mi">1</span>
+    <span class="n">actual_values_first_run</span><span class="p">[</span><span class="n">metric_name</span><span class="p">]</span><span class="o">.</span><span class="n">values</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="o">...</span> <span class="n">values</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="o">&gt;</span> <span class="n">train_iters</span> <span class="o">//</span> <span class="mi">2</span>
+    <span class="p">}</span>
+
+    <span class="c1"># 处理第二次跑的数据</span>
+    <span class="n">actual_values_second_run</span><span class="p">[</span><span class="n">metric_name</span><span class="p">]</span><span class="o">.</span><span class="n">start_step</span> <span class="o">=</span> <span class="n">train_iters</span> <span class="o">//</span> <span class="mi">2</span> <span class="o">+</span> <span class="mi">1</span>
+    <span class="n">actual_values_second_run</span><span class="p">[</span><span class="n">metric_name</span><span class="p">]</span><span class="o">.</span><span class="n">values</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="o">...</span> <span class="n">values</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="o">&gt;</span> <span class="n">train_iters</span> <span class="o">//</span> <span class="mi">2</span>
+    <span class="p">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>背景</strong>：假设总共训练 <code>train_iters = 100</code> 步。测试逻辑假定存档点在中间（50步）。</li>
+<li><strong>你的动作</strong>：<ol>
+<li>拿出 <strong>Run 1</strong> 的数据，<strong>扔掉前 50 步</strong>，只保留第 51-100 步的数据。</li>
+<li>拿出 <strong>Run 2</strong> 的数据，<strong>扔掉前 50 步</strong>（因为它是读档重来的，前 50 步可能是空的或者无效的），只保留第 51-100 步的数据。</li>
+</ol>
+</li>
+<li><strong>目的</strong>：我们要比的是“续训后的表现”。所以必须把两条时间线都拉到同一起跑线（第 51 步）开始对比。</li>
+</ul>
+<h4>Task 5: 最终比对（Final Exam）</h4>
+<p><strong>代码位置:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">test_pretraining_regular_pipeline</span><span class="o">.</span><span class="n">test_regular_pipeline</span><span class="p">(</span>
+    <span class="o">...</span><span class="p">,</span>
+    <span class="n">golden_values</span><span class="o">=</span><span class="n">actual_values_first_run</span><span class="p">,</span> <span class="c1"># 标准答案（Run 1 的后半段）</span>
+    <span class="n">actual_values</span><span class="o">=</span><span class="n">actual_values_second_run</span><span class="p">,</span> <span class="c1"># 实际考卷（Run 2 的后半段）</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>你的动作</strong>：调用一个通用的对比函数。把处理过的 Run 1 当作 <code>golden_values</code>（金标准/正确答案），把 Run 2 当作 <code>actual_values</code>（实际值）。</li>
+<li><strong>判断标准</strong>：<ul>
+<li>如果 <code>compare_approximate_results</code> 是 True，允许有一点点误差。</li>
+<li>如果是 False，必须完全一样。</li>
+</ul>
+</li>
+<li><strong>目的</strong>：验证 Run 2 读档后的走势，是否完美复刻了 Run 1 当时的情况。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这段代码讲了一个<strong>“游戏读档测试”</strong>的故事：
+你玩游戏（训练模型），先一口气通关（Run 1）。
+然后你重开，读了半路的一个存档（Run 2）。
+这个脚本就是把<strong>通关录像的后半段</strong>和<strong>读档后的游玩录像</strong>剪辑下来，放在一起逐帧对比，看看读档功能有没有BUG。</p>

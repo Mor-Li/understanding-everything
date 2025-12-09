@@ -1,0 +1,151 @@
+<h1>verl/models/llama/megatron/layers/parallel_linear.py</h1>
+<p>这份代码确实非常硬核，它属于<strong>大模型分布式训练/推理的基础设施代码</strong>。如果你没有接触过“模型并行（Model Parallelism）”或者 Megatron-LM 这种框架，看不懂是非常正常的。</p>
+<p>这份代码的核心目的是：<strong>怎么把一个巨大的 LLaMA 模型切成好几块，放在不同的 GPU 上同时跑，而且还要跑得快。</strong></p>
+<p>为了让你理解，我制定了一个 <strong>5步走的 To-Do List</strong>。我们先不看代码，先搞懂概念，最后再回来看代码，你就会发现它只是把概念变成了 Python 而已。</p>
+<hr />
+<h3>✅ 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1：回顾基础</strong> —— 什么是 Linear 层（全连接层）？</li>
+<li><strong>Task 2：了解 LLaMA 结构</strong> —— 什么是 Q、K、V？什么是 Gate、Up？</li>
+<li><strong>Task 3：核心概念</strong> —— 什么是“列并行（Column Parallel）”？</li>
+<li><strong>Task 4：性能优化</strong> —— 为什么要“合并（Merge）”矩阵？</li>
+<li><strong>Task 5：代码实战</strong> —— 对照代码，把上面 4 点对应起来。</li>
+</ol>
+<hr />
+<h3>🟢 Step-by-Step 讲解</h3>
+<h4>Task 1：回顾基础 —— 什么是 Linear 层？</h4>
+<p>在 PyTorch 里，<code>nn.Linear</code> 做的事情就是一个简单的矩阵乘法：
+$$Y = X \times W + b$$
+其中 $X$ 是输入，$W$ 是权重矩阵（模型参数）。</p>
+<ul>
+<li><strong>重点</strong>：大模型里，$W$ 极其巨大。比如 LLaMA-70B，这个 $W$ 大到一张显卡根本装不下。</li>
+</ul>
+<h4>Task 2：了解 LLaMA 结构 —— 那些奇怪的名字</h4>
+<p>代码里出现了 <code>QKV</code>、<code>Gate</code>、<code>Up</code>，它们是 Transformer 架构中的特定零件：</p>
+<ol>
+<li><strong>QKV (Attention 部分)</strong>：<ul>
+<li>在计算注意力机制时，输入向量需要分别乘以三个不同的权重矩阵，生成 <strong>Q</strong>uery（查询）、<strong>K</strong>ey（键）、<strong>V</strong>alue（值）。</li>
+<li>通常我们需要做 3 次矩阵乘法。</li>
+</ul>
+</li>
+<li><strong>Gate &amp; Up (FFN/MLP 部分)</strong>：<ul>
+<li>LLaMA 的前馈神经网络（FFN）用了一种叫 SwiGLU 的结构。</li>
+<li>它需要两个矩阵操作：一个叫 <strong>Gate</strong>（门控，决定保留多少信息），一个叫 <strong>Up</strong>（升维，把特征维度变大）。</li>
+<li>通常我们需要做 2 次矩阵乘法。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 3：核心概念 —— 什么是“列并行（Column Parallel）”？</h4>
+<p>这是这份代码的<strong>灵魂</strong>。</p>
+<p>既然 $W$ 太大，一张卡装不下，我们就把它<strong>竖着切开</strong>（按列切分）。
+假设 $W$ 的形状是 <code>[100, 200]</code>（100行，200列），我们有 2 张显卡：
+*   <strong>显卡 1</strong> 拿走左半边 <code>[100, 100]</code>。
+*   <strong>显卡 2</strong> 拿走右半边 <code>[100, 100]</code>。</p>
+<p>当输入 $X$ 进来时，两张卡同时计算，<strong>显卡 1 算出结果的左半部分，显卡 2 算出结果的右半部分</strong>。
+这就叫 <code>tensor_parallel.ColumnParallelLinear</code>。</p>
+<h4>Task 4：性能优化 —— 为什么要“合并（Merge）”？</h4>
+<ul>
+<li><strong>笨办法</strong>：算 Q 用一个 Linear，算 K 用一个，算 V 用一个。这要启动 3 次计算内核，效率低。</li>
+<li><strong>聪明办法</strong>：把 Q、K、V 的权重矩阵<strong>拼起来</strong>，变成一个超级大的矩阵。输入 $X$ 只要乘一次这个大矩阵，就能同时得到 Q、K、V 的结果。</li>
+</ul>
+<p><strong>这就是代码中 <code>Merged</code> 和 <code>QKV</code> 前缀的含义：为了加速，把多个逻辑上的 Linear 层拼成了一个物理上的 Linear 层。</strong></p>
+<hr />
+<h3>🟢 Task 5：代码实战（逐行解读）</h3>
+<p>现在我们带着上面的知识，回来看你提供的三个类。</p>
+<h4>1. <code>class QKVParallelLinear</code></h4>
+<p><strong>功能</strong>：负责 Attention 层的计算，把 Q、K、V 的计算合并在一起，并且使用了列并行（多卡计算）。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">QKVParallelLinear</span><span class="p">(</span><span class="n">tensor_parallel</span><span class="o">.</span><span class="n">ColumnParallelLinear</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">input_size</span><span class="p">,</span>
+        <span class="n">num_heads</span><span class="p">,</span>          <span class="c1"># Q 的头数</span>
+        <span class="n">num_key_value_heads</span><span class="p">,</span><span class="c1"># K 和 V 的头数 (LLaMA 中 K/V 头数通常比 Q 少，这叫 GQA 技术)</span>
+        <span class="n">head_dim</span><span class="p">,</span>           <span class="c1"># 每个头的维度</span>
+        <span class="c1"># ... 其他参数</span>
+    <span class="p">):</span>
+        <span class="c1"># ... 省略部分</span>
+
+        <span class="c1"># 计算 Q 的总输出维度</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">q_output_size</span> <span class="o">=</span> <span class="n">num_heads</span> <span class="o">*</span> <span class="n">head_dim</span>
+        <span class="c1"># 计算 K 和 V 的总输出维度</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">kv_output_size</span> <span class="o">=</span> <span class="n">num_key_value_heads</span> <span class="o">*</span> <span class="n">head_dim</span>
+
+        <span class="c1"># 核心逻辑在这里：</span>
+        <span class="c1"># Q 需要 1 份，K 需要 1 份，V 需要 1 份。</span>
+        <span class="c1"># 但因为 K 和 V 共享头数，这里写的是 num_heads (Q) + 2 * num_key_value_heads (K + V)</span>
+        <span class="c1"># 这就是把三个矩阵拼成一个大矩阵的宽度。</span>
+        <span class="n">output_size</span> <span class="o">=</span> <span class="p">(</span><span class="n">num_heads</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">num_key_value_heads</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span>
+
+        <span class="c1"># 调用 Megatron 的父类，告诉它：我要创建一个列并行的层，总输出宽度是 output_size</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
+            <span class="n">input_size</span><span class="o">=</span><span class="n">input_size</span><span class="p">,</span>
+            <span class="n">output_size</span><span class="o">=</span><span class="n">output_size</span><span class="p">,</span>
+            <span class="c1"># ...</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<p><strong>人话翻译</strong>：
+“我要造一个并行层，它的任务是一次性算出 Q、K、V。请根据 Q 的头数和 K/V 的头数，帮我算一下总共需要多宽的矩阵，然后去初始化那个切分好的大矩阵。”</p>
+<hr />
+<h4>2. <code>class MergedColumnParallelLinear</code></h4>
+<p><strong>功能</strong>：负责 FFN（前馈网络）层的计算，把 Gate 和 Up 两个操作合并。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">MergedColumnParallelLinear</span><span class="p">(</span><span class="n">tensor_parallel</span><span class="o">.</span><span class="n">ColumnParallelLinear</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">input_size</span><span class="p">,</span>
+        <span class="n">gate_ouput_size</span><span class="p">,</span> <span class="c1"># Gate 层的输出宽度</span>
+        <span class="n">up_output_size</span><span class="p">,</span>  <span class="c1"># Up 层的输出宽度</span>
+        <span class="c1"># ...</span>
+    <span class="p">):</span>
+        <span class="c1"># 简单粗暴：输出宽度 = Gate宽度 + Up宽度</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">output_size</span> <span class="o">=</span> <span class="n">gate_ouput_size</span> <span class="o">+</span> <span class="n">up_output_size</span>
+
+        <span class="c1"># 调用父类初始化</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
+            <span class="n">input_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">input_size</span><span class="p">,</span>
+            <span class="n">output_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">output_size</span><span class="p">,</span>
+            <span class="c1"># ...</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<p><strong>人话翻译</strong>：
+“LLaMA 的 MLP 层需要同时算 Gate 和 Up。别搞两个层了，直接把这两个矩阵拼在一起，算一次就行。这里就是定义这个拼起来后的并行层。”</p>
+<hr />
+<h4>3. <code>class LinearForLastLayer</code></h4>
+<p><strong>功能</strong>：这是整个模型的最后一层（输出层），把隐藏层特征转化为词表（Vocabulary）的概率（Logits）。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">LinearForLastLayer</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">):</span> <span class="c1"># 注意：这里它继承的是普通的 torch.nn.Linear，但也混入了并行逻辑</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span> <span class="n">config</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="c1"># ...</span>
+        <span class="c1"># 序列并行 (Sequence Parallelism) 是另一种切分方式</span>
+        <span class="c1"># 如果开启了序列并行，意味着输入的数据在“句子长度”这个维度上被切分了</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">sequence_parallel</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">sequence_parallel</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sequence_parallel</span><span class="p">:</span>
+            <span class="c1"># 标记权重也需要配合序列并行</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">sequence_parallel</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="c1"># 先做普通的矩阵乘法</span>
+        <span class="n">logits</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="n">input_</span><span class="p">)</span>
+        <span class="n">logits</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+
+        <span class="c1"># 如果开启了序列并行，现在的 logits 只是句子的一部分。</span>
+        <span class="c1"># 我们需要把分散在不同卡上的句子片段“收集 (Gather)” 起来，拼成完整的句子结果。</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sequence_parallel</span><span class="p">:</span>
+            <span class="n">logits</span> <span class="o">=</span> <span class="n">tensor_parallel</span><span class="o">.</span><span class="n">gather_from_sequence_parallel_region</span><span class="p">(</span>
+                <span class="n">logits</span><span class="p">,</span> 
+                <span class="n">tensor_parallel_output_grad</span><span class="o">=</span><span class="kc">False</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="n">logits</span><span class="p">,</span> <span class="kc">None</span>
+</code></pre></div>
+
+<p><strong>人话翻译</strong>：
+“这是最后一脚。如果我们在训练过程中把长句子切断了分给不同显卡（序列并行），那么算完之后，得把这些片段重新拼回来，才能得到完整的预测结果。”</p>
+<hr />
+<h3>总结</h3>
+<p>这三个类其实就在做三件事：</p>
+<ol>
+<li><strong><code>QKVParallelLinear</code></strong>: 为了省事和加速，把 Attention 里的 Q、K、V 矩阵拼起来，并使用<strong>列并行</strong>（多卡切分权重）。</li>
+<li><strong><code>MergedColumnParallelLinear</code></strong>: 为了省事和加速，把 FFN 里的 Gate、Up 矩阵拼起来，也使用<strong>列并行</strong>。</li>
+<li><strong><code>LinearForLastLayer</code></strong>: 处理最后一层，如果数据在长度方向被切分了（<strong>序列并行</strong>），负责把它拼回来。</li>
+</ol>
+<p>这个文件的存在，就是为了让 <code>Verl</code> 这个框架能够利用 <code>Megatron</code> 的底层能力，去高效地训练像 LLaMA 这样的大模型。</p>

@@ -1,0 +1,84 @@
+<h1>examples/multimodal/nvlm/sft_qwen20_72b_internvit_6b.sh</h1>
+<p>这份脚本确实看起来很吓人，充满了各种技术术语和参数。别担心，把它想象成<strong>一份“火箭发射前的检查清单”</strong>。</p>
+<p>这个脚本的<strong>核心目的</strong>是：<strong>微调（Fine-tune）一个巨大的多模态大模型</strong>。
+具体来说，是把一个很强的语言模型（Qwen2.0-72B）和一个视觉模型（InternViT-6B）缝合在一起进行训练，让它既能看懂图，也能听懂话。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>6步走的 Task List（任务清单）</strong>。</p>
+<hr />
+<h3>📋 任务清单：启动 NVLM 模型微调</h3>
+<h4>Task 1: 准备发射环境 (环境配置)</h4>
+<p><strong>目标</strong>：告诉计算机如何调用 GPU，如何让显卡之间通信。
+*   <strong>代码对应</strong>：
+    <code>bash
+    export NCCL_IB_SL=1
+    export CUDA_DEVICE_MAX_CONNECTIONS=1
+    ...</code>
+*   <strong>白话解释</strong>：这些是给 NVIDIA 显卡设定的“交通规则”。比如 <code>NCCL</code> 是显卡间通信的库，这里设置是为了让多张显卡一起训练时数据传输更顺畅。</p>
+<h4>Task 2: 规划文件夹路径 (输入输出管理)</h4>
+<p><strong>目标</strong>：确定模型存在哪，训练好的新模型存到哪，日志写在哪。
+*   <strong>代码对应</strong>：
+    <code>bash
+    WORKSPACE="&lt;some dir&gt;"
+    OUTPUT_BASE="${WORKSPACE}/output"
+    ...
+    DATA_TRAIN="${SOURCE}/examples/multimodal/nvlm/sft_blend.yaml"</code>
+*   <strong>白话解释</strong>：
+    *   <code>WORKSPACE</code>：你的工作台目录（你需要自己填）。
+    *   <code>OUTPUT</code>：训练结果存放的地方。
+    *   <code>DATA_TRAIN</code>：你的教材（训练数据）在哪里。</p>
+<h4>Task 3: 搬运“半成品”模型 (加载预训练权重)</h4>
+<p><strong>目标</strong>：我们不是从零开始造模型，而是基于一个已经训练过一部分的模型（Pretrained Checkpoint）继续加工。
+*   <strong>代码对应</strong>：
+    <code>bash
+    LOAD_NAME="mcore-qwen20-72b-internvit-pp4"
+    CHECKPOINT_DIR="${WORKSPACE}/output/${LOAD_NAME}/checkpoints"
+    ...
+    --pretrained-checkpoint ${CHECKPOINT_DIR}</code>
+*   <strong>白话解释</strong>：
+    *   这里指定了要加载的基础模型。
+    *   <strong>关键点</strong>：注释里提到模型必须被切分为 <code>pp4</code>（4个流水线并行阶段）。意思是这个模型太大了，单张卡甚至单台机器装不下，必须切成4块分布在不同设备上。</p>
+<h4>Task 4: 设定“大脑”构造 (模型架构参数)</h4>
+<p><strong>目标</strong>：告诉程序这个模型长什么样，有多少层，多宽。如果填错了，模型就加载不进去。
+*   <strong>代码对应</strong>：
+    <code>bash
+    --num-layers 80             # 模型有80层楼那么高
+    --hidden-size 8192          # 每一层有8192个神经元宽度
+    --num-attention-heads 64    # 注意力头数
+    --tensor-model-parallel-size 8  # 张量并行：把一层切成8份
+    --pipeline-model-parallel-size 4 # 流水线并行：把80层切成4段
+    --language-model-type qwen2.0_72B # 语言大脑是 Qwen 72B</code>
+*   <strong>白话解释</strong>：这是Qwen-72B的标准身材数据。特别注意的是并行设置（TP=8, PP=4），这意味着你至少需要 <strong>32张显卡</strong> (8x4) 才能完整把这个模型跑起来。</p>
+<h4>Task 5: 设定“眼睛”构造 (视觉与多模态参数)</h4>
+<p><strong>目标</strong>：告诉模型怎么“看”图片。
+*   <strong>代码对应</strong>：
+    <code>bash
+    --vision-model-type internvit   # 眼睛是 InternViT 模型
+    --freeze-ViT                    # 冻结视觉模型（不训练眼睛，只训练大脑如何理解眼睛看到的）
+    --patch-dim 14                  # 把图片切成14x14的小块
+    --img-h 448                     # 图片分辨率高度
+    --use-tiling                    # 使用切片技术（大图切小图看细节）</code>
+*   <strong>白话解释</strong>：
+    *   这里定义了图像如何被处理。
+    *   <code>freeze-ViT</code> 很重要，意味着我们认为“眼睛”已经够好了，这次训练只调整“大脑”来适应眼睛传来的信号，这样可以节省显存和时间。</p>
+<h4>Task 6: 制定训练课程表 (超参数与运行)</h4>
+<p><strong>目标</strong>：设定学习率、一次学多少数据、学多久。
+*   <strong>代码对应</strong>：
+    <code>bash
+    --lr 2e-6               # 学习率：学得非常慢（微调通常都很慢）
+    --global-batch-size 256 # 一次考试看256道题
+    --train-samples 122880000 # 总共要学1.2亿个样本
+    --bf16                  # 使用 bf16 格式（为了省显存且保持精度）</code>
+*   <strong>以及最后的启动命令</strong>：
+    <code>bash
+    torchrun --nproc_per_node 8 ... # 在当前机器上启动8个进程
+    # 或者
+    srun ... # 如果是在集群上提交作业</code></p>
+<hr />
+<h3>💡 总结：这篇文章到底讲了啥？</h3>
+<p>这个文件就是一个<strong>启动脚本</strong>。它的核心观点（配置逻辑）是：</p>
+<ol>
+<li><strong>大模型必须拆着跑</strong>：因为用了 72B 的 Qwen，必须用 <code>TP=8, PP=4</code> 的并行策略，把模型拆碎了放在几十张显卡上跑。</li>
+<li><strong>SFT（有监督微调）</strong>：这是一个微调阶段，学习率很低（2e-6），目的是让模型学会听指令。</li>
+<li><strong>冻结视觉编码器</strong>：为了效率，不训练图片识别部分（ViT），只训练语言模型理解图片的部分。</li>
+<li><strong>高分辨率处理</strong>：使用了 <code>use-tiling</code>（切片），说明这个训练配置是为了让模型能看清图片里的细节（比如读文档、看图表）。</li>
+</ol>
+<p>你只需要修改 <code>WORKSPACE</code>（你的路径）和 <code>DATA_TRAIN</code>（你的数据），确保存够了显卡，运行这个脚本，训练就开始了。</p>

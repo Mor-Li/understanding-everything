@@ -1,0 +1,81 @@
+<h1>examples/post_training/modelopt/conf/moonshotai/kimi_k2_instruct_export.sh</h1>
+<p>这段代码看起来确实充满了技术术语，别担心，它本质上只是一个<strong>“配置文件”</strong>。</p>
+<p>它的核心任务是：<strong>告诉电脑如何把一个巨大的 Kimi 模型（Kimi-K2）加载进来，并为了能在多张显卡上运行，把它“切分”好。</strong></p>
+<p>为了让你看懂，我为你列了一个<strong>“理解任务清单 (To-Do List)”</strong>，我们将通过完成这 4 个任务，一步步解构这段代码。</p>
+<hr />
+<h3>✅ 任务 1：确定我们要处理谁？（定位模型）</h3>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nv">HF_MODEL_CKPT</span><span class="o">=</span>/workspace/scratch/moonshotai/Kimi-K2-Instruct
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <strong>这是什么？</strong> 这是一个文件路径变量。
+*   <strong>通俗解释：</strong> 就像你做饭前要先从冰箱拿菜一样，这行代码告诉程序：“嘿，Kimi K2 这个大模型的原始文件（权重文件）放在硬盘的这个位置，待会儿去这里读取。”</p>
+<hr />
+<h3>✅ 任务 2：决定要把模型切成几块？（流水线并行）</h3>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nv">PP</span><span class="o">=</span><span class="m">16</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <strong>这是什么？</strong> <code>PP</code> 代表 <strong>P</strong>ipeline <strong>P</strong>arallelism（流水线并行）。
+*   <strong>通俗解释：</strong> Kimi 模型太大了，一张显卡（GPU）根本装不下。
+    *   我们决定把它切成 <strong>16 份</strong>，放在 16 张显卡上串联运行。
+    *   就像工厂流水线一样，第1张卡处理完传给第2张，直到第16张。</p>
+<hr />
+<h3>✅ 任务 3：具体每一块切多厚？（层数分配策略）</h3>
+<p><strong>这是最难懂的部分，也是这段代码的核心观点。</strong></p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nv">MLM_EXTRA_ARGS</span><span class="o">=</span><span class="s2">&quot; \</span>
+<span class="s2">    --decoder-first-pipeline-num-layers 3 \</span>
+<span class="s2">    --decoder-last-pipeline-num-layers 2 \</span>
+<span class="s2">    ...</span>
+<span class="s2">&quot;</span>
+<span class="c1"># Layer distribution over PP: 3, [4] * 14, 2.</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+虽然我们把模型切成了 16 份，但<strong>并不是</strong>每一份都一样大。这就好比切蛋糕，头尾和中间的厚度不一样。</p>
+<ol>
+<li><strong>第一张卡（第1阶段）：</strong><ul>
+<li><code>--decoder-first-pipeline-num-layers 3</code></li>
+<li><strong>意思：</strong> 流水线的<strong>第一张显卡</strong>，只放 <strong>3 层</strong>神经网络。</li>
+</ul>
+</li>
+<li><strong>最后一张卡（第16阶段）：</strong><ul>
+<li><code>--decoder-last-pipeline-num-layers 2</code></li>
+<li><strong>意思：</strong> 流水线的<strong>最后一张显卡</strong>，只放 <strong>2 层</strong>神经网络。</li>
+</ul>
+</li>
+<li><strong>中间的卡（第2~15阶段）：</strong><ul>
+<li>注释写着：<code>[4] * 14</code></li>
+<li><strong>意思：</strong> 中间剩下的 14 张显卡，每张卡放 <strong>4 层</strong>。</li>
+</ul>
+</li>
+</ol>
+<p><strong>🤔 为什么要这么分？（核心观点）</strong>
+你可能会问：<em>为什么不平均分？比如每张卡都放 4 层？</em>
+*   <strong>原因：</strong> 第一张卡要负责把文字转换成数字（Embedding层），最后一张卡要负责把数字转回文字（Unembedding/Loss层）。
+*   <strong>结论：</strong> <strong>头尾这两张卡除了放神经网络层，还要承担额外的繁重任务，占用了大量显存。</strong> 为了防止头尾显卡“撑死”（显存溢出），我们故意让它们少背几层神经网络（只背3层和2层），而让中间那些只负责计算的显卡多背一点（背4层）。这叫<strong>负载均衡</strong>。</p>
+<hr />
+<h3>✅ 任务 4：如何安全地把大象装进冰箱？（加载优化）</h3>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span>--init-model-with-meta-device<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--use-cpu-initialization<span class="w"> </span><span class="se">\</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <strong>这是什么？</strong> 这是加载模型时的内存保护机制。
+*   <strong>通俗解释：</strong>
+    *   <code>--init-model-with-meta-device</code>: 意思是先加载一个“空壳子”（不占实际内存，只占坑位），确认结构没问题了再填数据。防止一开始就申请巨大内存导致死机。
+    *   <code>--use-cpu-initialization</code>: 意思是先在系统内存（CPU RAM）里把权重准备好，再搬运到显卡里。因为系统内存通常比显卡内存大且便宜，这样更安全。</p>
+<hr />
+<h3>📝 总结（这代码到底讲了啥？）</h3>
+<p>如果把这个脚本翻译成人话，它是在对运行程序说：</p>
+<blockquote>
+<p>“我们要处理 <strong>Kimi-K2</strong> 这个模型。
+因为它太大了，我要动用 <strong>16 张显卡</strong> 来跑。
+为了防止显卡内存爆炸，请按这个方案切分：<strong>第1张卡放3层，最后1张卡放2层，中间的卡通通放4层</strong>。
+另外，加载的时候小心点，先在CPU里准备好，别一下子把显卡撑爆了。”</p>
+</blockquote>
+<p>这个脚本通常用于<strong>模型导出（Export）</strong>阶段，比如把 HuggingFace 格式的模型转换成 TensorRT-LLM 或 Megatron 格式，以便后续能高效推理。</p>

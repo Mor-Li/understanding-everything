@@ -1,0 +1,116 @@
+<h1>tests/special_distributed/test_tensor_dict.py</h1>
+<p>完全理解，这段代码确实涉及很多<strong>分布式训练（Distributed Training）</strong>的硬核概念。如果没接触过GPU并行计算，看这个就像看天书。</p>
+<p>简单来说，这是一个<strong>测试文件</strong>（Unit Test）。它的目的是验证 <code>verl</code> 这个库里的两个核心功能在多卡（多GPU）环境下是否工作正常。</p>
+<p>为了让你读懂，我制定了一个 <strong>“学习任务清单 (To-Do List)”</strong>。我们按顺序，一步步解锁代码里的知识点。</p>
+<hr />
+<h3>📋 学习任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>Task 1：搞懂背景</strong> —— 明白这段代码是在什么环境下运行的。</li>
+<li><strong>Task 2：拆解第一个测试 <code>test_all_gather_data_proto</code></strong> —— 搞懂“数据聚合”是怎么回事。</li>
+<li><strong>Task 3：拆解第二个测试 <code>test_vocab_parallel_entropy</code></strong> —— 搞懂“模型并行下的数学计算”是怎么回事。</li>
+<li><strong>Task 4：总结核心观点</strong> —— 这段代码到底想证明什么？</li>
+</ol>
+<hr />
+<h3>🟢 Task 1：搞懂背景</h3>
+<p><strong>代码核心概念：</strong>
+这段代码是为 <strong>4张显卡</strong>（或者更多）设计的。它模拟了一个 2x2 的设备网格（Device Mesh）。
+*   <strong>Rank（编号）：</strong> 每一张显卡都有一个身份证号，叫 <code>global_rank</code>（比如 0, 1, 2, 3）。
+*   <strong>DP (Data Parallel)：</strong> 数据并行。两张卡做一样的事，但处理不同的数据。
+*   <strong>TP (Tensor Parallel)：</strong> 张量并行。两张卡合力处理同一个巨大的矩阵（一人算一半）。</p>
+<p><strong>代码里的 <code>DataProto</code> 是什么？</strong>
+这是 <code>verl</code> 库自定义的一个“大箱子”，里面既可以装 Tensor（比如图像数据 <code>obs</code>），也可以装非 Tensor（比如字符串标签 <code>labels</code>）。</p>
+<hr />
+<h3>🟢 Task 2：拆解第一个测试 (<code>test_all_gather_data_proto</code>)</h3>
+<p><strong>目标：</strong> 测试“数据收集”功能。
+<strong>场景：</strong> 假设我们有4个工人（GPU），分成两组。我想测试：<strong>同组的工人能不能把手里的数据凑到一起？</strong></p>
+<p><strong>步骤解析：</strong></p>
+<ol>
+<li>
+<p><strong>分组 (Device Mesh):</strong>
+    <code>python
+    # 把4张卡排成 2x2 的方阵。
+    # "dp" 是数据并行组，"tp" 是张量并行组。
+    device_mesh = ... mesh_shape=[2, 2] ...</code></p>
+</li>
+<li>
+<p><strong>造数据 (Create Data):</strong></p>
+<ul>
+<li>代码根据显卡的编号 (<code>global_rank</code>) 生成了不同的 <code>obs</code> (数字) 和 <code>labels</code> (字母 "a" 或 "b")。</li>
+<li><em>目的：</em> 让每张卡手里的数据都不一样，这样聚合后方便检查对不对。</li>
+</ul>
+</li>
+<li>
+<p><strong>打包 (Pack):</strong>
+    <code>python
+    data = DataProto.from_dict(...)</code>
+    把数据装进那个“大箱子”。</p>
+</li>
+<li>
+<p><strong>核心动作 (The Action):</strong>
+    <code>python
+    # 关键的一行！
+    # 命令：在 "dp" 这个组里，大家把数据交换并拼起来。
+    all_gather_data_proto(data=data, process_group=device_mesh.get_group("dp"))</code></p>
+</li>
+<li>
+<p><strong>验证 (Verification):</strong></p>
+<ul>
+<li>代码后面的一大堆 <code>if global_rank == 0: ... elif ...</code> 是在写“标准答案”。</li>
+<li>它在检查：聚合后的 <code>data.batch["obs"]</code> 是不是包含了<strong>我和我队友</strong>的数据？</li>
+<li><code>assert</code> 语句：如果不相等，测试就报错。</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论：</strong> 这个测试是为了证明：<strong>在分布式环境下，我们可以顺利地把分散在不同显卡上的 <code>DataProto</code> 数据包完整地拼凑起来。</strong></p>
+<hr />
+<h3>🟢 Task 3：拆解第二个测试 (<code>test_vocab_parallel_entropy</code>)</h3>
+<p><strong>目标：</strong> 测试“并行计算熵（Entropy）”。
+<strong>场景：</strong> 我们在训练一个大语言模型（LLM）。词表（Vocabulary）太大了（比如15万个词），一张卡算不过来。我们用了 <strong>TP（张量并行）</strong>，把词表切开，两张卡各算一半。
+<strong>难题：</strong> 计算“熵”（一种衡量混乱度的指标）通常需要所有的概率值。但现在概率值分散在两张卡上，怎么算才准，而且不爆显存？</p>
+<p><strong>步骤解析：</strong></p>
+<ol>
+<li>
+<p><strong>准备环境:</strong>
+    使用了 <code>megatron</code>（英伟达的一个超大模型库）来初始化并行环境。</p>
+</li>
+<li>
+<p><strong>造数据 (Logits):</strong>
+    <code>logits</code> 是模型预测下一个词的分数。代码造了一个巨大的随机矩阵。</p>
+</li>
+<li>
+<p><strong>切分数据 (Split/Slice):</strong>
+    <code>python
+    # 模拟 TP：每张卡只拿属于自己的那一小条数据
+    vocab_parallel_logits = logits...[:, tp_rank * size : (tp_rank + 1) * size]</code>
+    这就好比一本字典撕成两半，Rank 0 拿 A-M 开头的词，Rank 1 拿 N-Z 开头的词。</p>
+</li>
+<li>
+<p><strong>核心动作 (The Action):</strong>
+    <code>python
+    # 这是要测的主角函数
+    output_entropy = vocab_parallel_entropy(vocab_parallel_logits)</code>
+    这个函数很聪明，它能在<strong>不把所有数据传输到同一张卡</strong>的情况下，算出正确的全局熵。这能省很多显存。</p>
+</li>
+<li>
+<p><strong>对比验证 (Comparison):</strong></p>
+<ul>
+<li><strong>笨办法算一遍：</strong> <code>target_entropy = entropy_from_logits(logits)</code>。这是用完整的、没切分的数据算出来的“标准答案”。</li>
+<li><strong>比对结果：</strong> <code>assert_close(output_entropy, target_entropy)</code>。<ul>
+<li>意思就是：<em>“聪明的并行算法”算出来的结果，必须和“笨办法”算出来的完全一样。</em></li>
+</ul>
+</li>
+<li><strong>比对梯度 (Gradient):</strong> 不仅结果要对，反向传播（训练时的更新方向）也必须完全一致。</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论：</strong> 这个测试是为了证明：<strong>我们写的高效并行熵计算函数，在数学上是绝对精确的，跟单卡计算结果一模一样，但它能支持多卡并行，更省资源。</strong></p>
+<hr />
+<h3>🟢 Task 4：总结核心观点</h3>
+<p>如果把这个文件看作一篇议论文，它的论点如下：</p>
+<ol>
+<li><strong>工具的可靠性：</strong> 我们的 <code>DataProto</code> 数据结构支持分布式操作（<code>all_gather</code>），能正确处理 Tensor 和 Non-Tensor 混合数据。</li>
+<li><strong>数学的正确性：</strong> 我们实现的 <code>vocab_parallel_entropy</code>（词表并行熵计算）是数学上等价于标准计算的。你可以在 Megatron 等并行框架中放心使用它，不用担心算错梯度。</li>
+<li><strong>兼容性：</strong> 这些功能能很好地配合 PyTorch Distributed 和 Megatron Core 工作。</li>
+</ol>
+<p><strong>简单一句话总结：</strong>
+这代码在说：“放心用吧，我们的分布式数据同步功能和并行数学计算功能，我都测过了，结果是对的！”</p>

@@ -1,0 +1,81 @@
+<h1>megatron/core/dist_checkpointing/<strong>init</strong>.py</h1>
+<p>这段代码看起来确实很抽象，因为它是一个 Python 包的 <strong><code>__init__.py</code></strong> 文件。</p>
+<p><strong>简单来说，这个文件的作用就像是一个“餐厅的菜单”或者“公司的前台”。</strong></p>
+<p>它本身不干具体的活（比如炒菜或记账），它的作用是把后台（各个子模块）里最重要的功能提取出来，放在明面上，方便外部调用。</p>
+<p>这个包的主题是 <strong><code>dist_checkpointing</code> (分布式检查点/存档)</strong>。在 Megatron（训练超大模型）的场景下，模型太大，单个 GPU 放不下，被切分到了几十上百个 GPU 上。怎么把这些切碎的模型保存下来，方便下次加载（甚至在不同数量的 GPU 上加载），就是这个包要解决的问题。</p>
+<p>为了让你听懂，我把理解这段代码背后的逻辑拆解成一个 <strong>“搬家任务清单” (Task List)</strong>。</p>
+<hr />
+<h3>任务清单：如何搞定“超大模型搬家” (Distributed Checkpointing)</h3>
+<p>想象你有一栋巨大的乐高城堡（超大模型），大到无法直接搬运。你需要把它拆散装进 100 辆卡车（100 个 GPU）里运走，下次再拼回来。</p>
+<p>以下是根据代码内容拆解的步骤：</p>
+<h4>Task 1: 定义“货物”的类型 (分类打包)</h4>
+<p>在搬家前，你得给物品分类。有些东西是完整的，有些是被切碎的。</p>
+<blockquote>
+<p><strong>对应代码：</strong>
+<code>python
+from .mapping import LocalNonpersistentObject, ShardedObject, ShardedTensor</code></p>
+</blockquote>
+<ul>
+<li><strong><code>ShardedTensor</code> (切分张量)</strong>: 这是核心。比如乐高城堡的地基太大，被切成了 10 块，每辆车运一块。这就是“被切分的数据”。保存时记录它是“地基的第几块”，加载时才能拼回去。</li>
+<li><strong><code>ShardedObject</code> (切分对象)</strong>: 类似于上面的，但可能不是纯数字的张量，而是其他 Python 对象。</li>
+<li><strong><code>LocalNonpersistentObject</code> (本地非持久化对象)</strong>: 比如卡车司机的午饭。这是临时的，不需要搬到新家，保存存档时直接忽略它。</li>
+</ul>
+<h4>Task 2: 执行“装车” (保存存档)</h4>
+<p>现在要把这些切碎的、分类好的数据保存到硬盘上。</p>
+<blockquote>
+<p><strong>对应代码：</strong>
+<code>python
+from .serialization import save</code></p>
+</blockquote>
+<ul>
+<li><strong><code>save</code></strong>: 这个函数就是总指挥。它会告诉所有 GPU：“大家把自己手里的那块乐高积木打包好，写上编号（元数据），存到硬盘的指定文件夹里。”</li>
+<li><strong>注意</strong>: 它是“分布式”保存的，意味着每个 GPU 可能都在写文件，或者汇总写入，目的是速度快且不乱。</li>
+</ul>
+<h4>Task 3: 检查“货物清单” (验证存档)</h4>
+<p>当你拿到一个存好的文件夹，你得先看看这到底是不是我们打包的那种格式，别拿个普通文本文件来糊弄我。</p>
+<blockquote>
+<p><strong>对应代码：</strong>
+<code>python
+from .core import check_is_distributed_checkpoint</code></p>
+</blockquote>
+<ul>
+<li><strong><code>check_is_distributed_checkpoint</code></strong>: 这是一个安检员。它检查目标文件夹里有没有特定的标记文件（比如 metadata 文件），确认这是一个合法的 Megatron 分布式存档。</li>
+</ul>
+<h4>Task 4: 执行“卸货与拼装” (加载存档) —— 最难的一步</h4>
+<p>这是最复杂的地方。因为下次搬家时，可能不是 100 辆卡车了，可能变成了 50 辆或者 200 辆（改变了 GPU 数量/并行度）。你需要根据说明书，把原来的碎片重新分配。</p>
+<blockquote>
+<p><strong>对应代码：</strong>
+<code>python
+from .serialization import (
+    load,
+    load_common_state_dict,
+    load_content_metadata,
+    load_plain_tensors,
+    load_tensors_metadata,
+)</code></p>
+</blockquote>
+<p>这里有很多 <code>load</code> 相关的函数，分工很细：
+1.  <strong><code>load_content_metadata</code> / <code>load_tensors_metadata</code></strong>: 先不搬东西，先读“装箱单”。看看原来那个城堡长什么样，切成了几块。
+2.  <strong><code>load</code></strong>: 总指挥。根据现在的卡车数量（当前 GPU 拓扑），计算每个人该拿哪几块旧积木，然后把权重读入显存。
+3.  <strong><code>load_common_state_dict</code></strong>: 加载那些大家都一样的通用信息（比如：现在是第几轮训练，学习率是多少）。
+4.  <strong><code>load_plain_tensors</code></strong>: 加载那些没被切碎的普通数据。</p>
+<h4>Task 5: 清理现场 (善后)</h4>
+<p>加载完之后，为了省内存，可能需要把一些中间产生的临时标记去掉。</p>
+<blockquote>
+<p><strong>对应代码：</strong>
+<code>python
+from .serialization import remove_sharded_tensors</code></p>
+</blockquote>
+<ul>
+<li><strong><code>remove_sharded_tensors</code></strong>: 在模型权重加载进真正的模型层之后，把内存里用来描述“切分状态”的临时包装壳丢掉，释放空间。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>你看到的这个文件，本身没有逻辑，它只是把上面这 5 个步骤需要的工具（函数和类）从不同的子文件夹（<code>.core</code>, <code>.mapping</code>, <code>.serialization</code>）里拿出来，摆在桌面上。</p>
+<p><strong>以后你在写代码时，只需要：</strong>
+<code>import megatron.core.dist_checkpointing as dist_ckpt</code></p>
+<p>然后就可以直接用：
+*   <code>dist_ckpt.save(...)</code> （存）
+*   <code>dist_ckpt.load(...)</code> （取）
+*   <code>dist_ckpt.ShardedTensor(...)</code> （定义切分数据）</p>
+<p>而不需要去管底层到底是哪个文件在干活。</p>

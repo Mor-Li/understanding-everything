@@ -1,0 +1,60 @@
+<h1>recipe/fully_async_policy/shell/dapo_7b_async_retool.sh</h1>
+<p>这份脚本确实包含了很多术语。简单来说，这是一个<strong>训练 AI 模型的启动脚本</strong>。</p>
+<p>它的核心目的是：<strong>利用强化学习（具体是 GRPO 算法），让一个 Qwen-2.5-7B 模型学会使用工具（写代码/调用工具）来解决数学问题，并且采用了一种“异步（Async）”的高效训练方式。</strong></p>
+<p>为了让你听懂，我把这个脚本拆解成一个 <strong>“AI 训练任务清单 (Task To-Do List)”</strong>，我们一步步来看它在安排什么工作：</p>
+<hr />
+<h3>✅ Task 1: 准备“食材”和“底料” (数据与模型)</h3>
+<p><strong>脚本位置：</strong> <code># ================= data/model/tool =================</code></p>
+<p>首先，脚本告诉程序去哪里找东西：
+1.  <strong>确定数据集 (Data)</strong>：
+    *   训练用：<code>DAPO-Math-17k</code>（这是一个数学题库）。
+    *   测试用：<code>AIME_2024</code>, <code>AIME_2025</code>（用来考试，看模型变聪明了没）。
+2.  <strong>确定基座模型 (Model)</strong>：
+    *   使用的是 <code>Qwen-2.5-7B-instruct</code> 的一个特定版本（checkpoint）。这是我们要训练的“学生”。</p>
+<h3>✅ Task 2: 装备“作弊工具” (Tool Use)</h3>
+<p><strong>脚本位置：</strong> <code># tool</code> 部分</p>
+<p>这不仅仅是聊天，还要让模型学会动手：
+*   <strong>挂载工具</strong>：脚本指定了 <code>retool/sandbox_fusion_tool_config.yaml</code>。
+*   <strong>意思就是</strong>：模型在回答数学题时，可以使用 Python 代码解释器（Sandbox）或者其他工具来计算，而不是光靠脑子想。这叫 "Tool-Integrated Reasoning"。</p>
+<h3>✅ Task 3: 制定“奖惩规则” (算法设置)</h3>
+<p><strong>脚本位置：</strong> <code># ================= algorithm =================</code></p>
+<p>我们要告诉 AI 什么样的回答是好的：
+1.  <strong>核心算法</strong>：<code>adv_estimator=grpo</code>。
+    *   <strong>解释</strong>：这里用的是 <strong>GRPO</strong> (Group Relative Policy Optimization)。这是一种最近很火的强化学习方法（DeepSeek-R1 也是用的这类思路），通过生成多组答案并对比优劣来学习，而不是单纯依赖一个评分模型。
+2.  <strong>对话轮数</strong>：<code>max_turns=16</code>。允许模型和工具进行多轮交互（比如：写代码 -&gt; 报错 -&gt; 修改代码 -&gt; 得出结果），最多 16 个回合。</p>
+<h3>✅ Task 4: 分配“车间流水线” (异步架构配置 - 重点!)</h3>
+<p><strong>脚本位置：</strong> <code># ================= perfomance =================</code> 和 <code># ================= async policy =================</code></p>
+<p>这是这个脚本最复杂也最厉害的地方。它把 GPU（显卡）分成了两组，<strong>一组负责“刷题”，一组负责“总结经验”</strong>，两边同时干活（Async）。</p>
+<p>假设你有 8 张显卡（<code>NGPUS_PER_NODE=8</code>）：
+1.  <strong>刷题组 (Rollout)</strong>：
+    *   <code>n_gpus_rollout=4</code>：分出 4 张卡，利用 <strong>vLLM</strong>（一种超快的推理引擎）快速做题，生成大量数据。
+    *   <code>infer_tp=4</code>：推理时的张量并行度。
+2.  <strong>学习组 (Training)</strong>：
+    *   <code>n_gpus_training=4</code>：剩下 4 张卡，专门用来根据刷题组产生的数据更新模型参数。
+    *   <code>train_sp=4</code>：训练时的序列并行度。</p>
+<p><strong>为什么要这样？</strong>
+因为“生成答案”通常很慢，而“更新参数”很快。把它们拆开，生成组拼命生成，训练组拼命学，不用互相死等。
+*   <code>staleness_threshold=0.5</code>：这是个“保鲜期”设置。如果生成的数据太旧了（模型已经更新了很多步），这批数据就扔掉不用，防止学偏了。</p>
+<h3>✅ Task 5: 启动“中央指挥部” (Main Execution)</h3>
+<p><strong>脚本位置：</strong> 最后那一大段 <code>python3 -m ...</code></p>
+<p>这是最后一步，把上面所有的变量填入命令中，启动 Python 程序。它做了具体的指令映射：
+*   告诉程序：用 <code>retool.py</code> 里的逻辑来给模型打分（Reward Function）。
+*   告诉程序：如果题目太长或者显存不够怎么办（截断、Offload）。
+*   告诉程序：每隔多久存一次盘，每隔多久测试一次（<code>test_freq=10</code>）。
+*   告诉程序：使用 Tensorboard 记录训练过程，项目名叫 <code>retool</code>。</p>
+<hr />
+<h3>总结：这脚本到底在干啥？</h3>
+<p>想象你在训练一个学生解奥数题：</p>
+<ol>
+<li><strong>Task 1</strong>：你拿出了奥数习题集（DAPO数据）和现在的学生水平（Qwen模型）。</li>
+<li><strong>Task 2</strong>：你允许学生使用计算器和草稿纸（Tool/Sandbox）。</li>
+<li><strong>Task 3</strong>：你规定，做对了奖励，做错了惩罚，且要对比多种解法（GRPO算法）。</li>
+<li><strong>Task 4</strong>：你找了 <strong>两个分身</strong>。<ul>
+<li>分身 A（4张显卡）：专门负责疯狂做题、写步骤。</li>
+<li>分身 B（4张显卡）：专门看分身 A 的作业，总结规律，修改脑子里的知识。</li>
+<li>这两个分身同时工作，效率极高。</li>
+</ul>
+</li>
+<li><strong>Task 5</strong>：按下开始按钮。</li>
+</ol>
+<p>这就是这个脚本的全部含义。</p>

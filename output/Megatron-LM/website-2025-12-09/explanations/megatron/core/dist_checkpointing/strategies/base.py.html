@@ -1,0 +1,56 @@
+<h1>megatron/core/dist_checkpointing/strategies/base.py</h1>
+<p>这份代码文件 <code>base.py</code> 是 Megatron-LM 分布式检查点（Checkpointing）系统的<strong>基石</strong>。它本身不干具体的“脏活累活”（比如真的去写磁盘），而是制定了<strong>规则</strong>和<strong>接口</strong>。</p>
+<p>为了让你听懂，我们把“保存/加载模型”想象成<strong>“搬家”</strong>。这个文件就是<strong>搬家公司的总指挥手册</strong>。</p>
+<p>下面是一个<strong>Task Todo List</strong>，带你一步步拆解这份代码的核心观点：</p>
+<hr />
+<h3>Task 1: 搞清楚我们要搬运什么东西 (定义动作类型)</h3>
+<p><strong>代码对应：</strong> <code>class StrategyAction(Enum)</code></p>
+<p>首先，搬家手册定义了四种基本操作。在分布式训练中，数据分两类：
+1.  <strong>Common（通用数据）：</strong> 比如“当前训练到第几步了”、“学习率是多少”。这些数据很小，大家共用一份，不用切分。
+2.  <strong>Sharded（分片数据）：</strong> 比如几千亿参数的模型权重。这些数据太大，必须切成很多块（Shard），分散存储。</p>
+<p><strong>你的理解清单：</strong>
+*   [ ] <strong>LOAD_COMMON</strong>: 加载通用数据（读小本本上的记录）。
+*   [ ] <strong>LOAD_SHARDED</strong>: 加载分片数据（把分散在各地的模型碎片拼凑或者读取进来）。
+*   [ ] <strong>SAVE_COMMON</strong>: 保存通用数据。
+*   [ ] <strong>SAVE_SHARDED</strong>: 保存分片数据（这是最难的，因为涉及多卡并行写入）。</p>
+<hr />
+<h3>Task 2: 选好搬家的工具 (注册与获取策略)</h3>
+<p><strong>代码对应：</strong> <code>default_strategies</code>, <code>get_default_strategy</code>, <code>register_default_strategy</code></p>
+<p>搬家可以用卡车（<code>zarr</code> 后端），也可以用货车（<code>torch_dist</code> 后端），甚至有不同的车型版本（<code>version</code>）。
+这一部分代码是一个<strong>“工具仓库”</strong>。</p>
+<p><strong>你的理解清单：</strong>
+*   [ ] <strong>注册 (Register)</strong>: 当有一个新的保存方法（比如用 PyTorch 原生方式保存）写好后，要来这里“登记”一下。告诉系统：“如果你想要 <code>torch_dist</code> 后端，版本 <code>1</code>，就用我这个类”。
+*   [ ] <strong>获取 (Get)</strong>: 当用户说“我要用 <code>zarr</code> 格式保存”时，系统会查表，把对应的策略类（Strategy Class）拿出来给你用。如果没安装对应的包（比如没装 <code>zarr</code>），这里还会报错提示你安装。</p>
+<hr />
+<h3>Task 3: 制定“通用数据”的搬运规则 (Common Strategies)</h3>
+<p><strong>代码对应：</strong> <code>class LoadCommonStrategy</code>, <code>class SaveCommonStrategy</code></p>
+<p>这是处理简单数据的规则。</p>
+<p><strong>你的理解清单：</strong>
+*   [ ] <strong>SaveCommonStrategy</strong>: 必须实现 <code>save_common</code> 方法。就是把那点很少的全局信息写进文件夹。
+*   [ ] <strong>LoadCommonStrategy</strong>: 必须实现 <code>load_common</code> 方法。从文件夹里把全局信息读出来。
+*   [ ] <strong>特殊情况</strong>: 有时候“通用策略”也得顺手处理一下“分片对象”（<code>load_sharded_objects</code>），这通常是为了处理一些边缘情况，但主要任务还是处理通用数据。</p>
+<hr />
+<h3>Task 4: 制定“分片数据”的搬运规则 (Sharded Strategies)</h3>
+<p><strong>代码对应：</strong> <code>class LoadShardedStrategy</code>, <code>class SaveShardedStrategy</code></p>
+<p>这是处理核心模型权重的规则，最复杂。</p>
+<p><strong>你的理解清单：</strong>
+*   [ ] <strong>SaveShardedStrategy</strong>: 必须实现 <code>save</code> 方法。输入是 <code>sharded_state_dict</code>（一个描述了模型参数如何切分的字典），然后把它存到 <code>checkpoint_dir</code>。
+*   [ ] <strong>LoadShardedStrategy</strong>: 必须实现 <code>load</code> 方法。从磁盘把切碎的权重读回来，填进模型里。
+*   [ ] <strong>只读目录 (Metadata)</strong>: 有个 <code>load_tensors_metadata</code> 方法。意思是“先别把几百GB的数据全读进内存，先告诉我有哪些张量，形状是多大”。这对于预先分配内存很重要。</p>
+<hr />
+<h3>Task 5: 想要搬得更快？ (异步保存)</h3>
+<p><strong>代码对应：</strong> <code>class AsyncSaveShardedStrategy</code></p>
+<p>保存大模型非常慢，会卡住训练。这个策略是为了让保存操作在“后台”运行，不耽误前台继续训练。</p>
+<p><strong>你的理解清单：</strong>
+*   [ ] <strong>AsyncSave</strong>: 定义了 <code>async_save</code> 接口。它不直接保存完，而是返回一个 <code>AsyncRequest</code>（异步请求）。
+*   [ ] <strong>流程</strong>: 主程序调用它，它立刻返回“我知道了，我会在后台存”，然后主程序继续算下一个 batch。
+*   [ ] <strong>兼容性</strong>: 代码里写了，如果我不支持异步怎么办？<code>save</code> 方法里直接调用 <code>async_save</code> 然后立刻等待它做完（<code>execute_sync</code>），强行把它变成同步的。</p>
+<hr />
+<h3>总结 (Summary)</h3>
+<p><strong>这个文件到底讲了啥？</strong></p>
+<p>它定义了一套<strong>“接口标准”</strong>（Abstract Base Classes）。它告诉所有想给 Megatron 写 Checkpoint 插件的开发者：
+1.  不管你用什么技术存文件（Zarr, PyTorch, TensorStore...）；
+2.  你必须把<strong>存/取</strong>操作分成<strong>通用数据/分片数据</strong>两类；
+3.  你必须实现 <code>save()</code> 和 <code>load()</code> 这些标准函数；
+4.  如果你想支持后台保存，你得实现 <code>async_save()</code>。</p>
+<p>它就像是<strong>插座的形状定义</strong>，而具体的保存代码（在其他文件里）则是<strong>插头</strong>。这个文件确保了不同的插头都能插进 Megatron 系统里工作。</p>

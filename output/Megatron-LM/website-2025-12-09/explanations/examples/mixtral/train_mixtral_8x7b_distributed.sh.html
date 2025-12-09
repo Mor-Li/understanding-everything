@@ -1,0 +1,86 @@
+<h1>examples/mixtral/train_mixtral_8x7b_distributed.sh</h1>
+<p>没问题。这份脚本确实看起来很吓人，因为它涉及到了<strong>大模型（LLM）训练中最复杂的部分：分布式训练配置</strong>。</p>
+<p>你可以把这份脚本想象成<strong>“发射火箭前的检查清单”</strong>。我们要训练一个叫 <strong>Mixtral 8x7B</strong> 的巨型模型，因为它太大，一张显卡装不下，甚至一台服务器都装不下，所以需要指挥多台机器、几十张显卡协同工作。</p>
+<p>为了让你听懂，我把这份脚本拆解成一个 <strong>6步走的 Task List（任务清单）</strong>。</p>
+<hr />
+<h3>📋 任务清单：启动 Mixtral 8x7B 训练</h3>
+<h4>✅ Task 1: 召集人马（配置硬件环境）</h4>
+<p>在开始干活前，先要搞清楚我们有多少计算资源，以及它们怎么通讯。</p>
+<ul>
+<li><strong>代码位置</strong>：开头部分 (<code>GPUS_PER_NODE</code>, <code>MASTER_ADDR</code> 等)</li>
+<li><strong>解读</strong>：<ul>
+<li><code>GPUS_PER_NODE=8</code>：告诉脚本，每台服务器有 8 张显卡。</li>
+<li><code>NNODES</code> &amp; <code>MASTER_ADDR</code>：如果是多台服务器联机训练，这里指定有多少台机器，以及“主指挥官”（Master）的 IP 地址在哪里。</li>
+<li><code>DISTRIBUTED_ARGS</code>：这些参数打包起来，是专门传给 <code>torchrun</code>（PyTorch 的启动器）的，告诉它：“嘿，去这几个地址把显卡都调动起来”。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 画图纸（定义模型骨架）</h4>
+<p>我们要造的这个“大脑”长什么样？多高？多胖？</p>
+<ul>
+<li><strong>代码位置</strong>：<code>MODEL_ARGS</code></li>
+<li><strong>解读</strong>：<ul>
+<li><code>--num-layers 32</code>：这个模型有 32 层楼高。</li>
+<li><code>--hidden-size 4096</code>：每一层的宽度（神经元数量）是 4096。</li>
+<li><code>--seq-length 4096</code>：它一次能读懂 4096 个 token 的长文。</li>
+<li><code>--swiglu</code>, <code>RMSNorm</code>, <code>rope</code>：这些是具体的建筑材料（激活函数、归一化方式、位置编码），属于 Llama/Mixtral 系列的标准配置。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 设计“专家系统”（MoE 核心配置）</h4>
+<p><strong>这是这份脚本最特别的地方。</strong> Mixtral 是一个 <strong>MoE (Mixture of Experts)</strong> 模型。简单说，它脑子里住了 8 个专家，遇到问题时不会所有人一起上，而是挑最懂行的 2 个人来回答。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>MOE_ARGS</code></li>
+<li><strong>解读</strong>：<ul>
+<li><code>--num-experts 8</code>：一共设定 8 个专家。</li>
+<li><code>--moe-router-topk 2</code>：每次处理一个词，只激活其中 2 个专家（这就叫 Top-2）。这样做的好处是模型很大，但推理/训练速度很快。</li>
+<li><code>--moe-router-load-balancing-type aux_loss</code>：防止某个专家累死，其他专家闲死。通过这个“辅助损失”强迫数据均匀分配给各位专家。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 切蛋糕（并行策略设置）</h4>
+<p>模型太大了，显存塞不下。我们需要把模型切碎，分给不同的显卡存。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>MODEL_PARALLEL_ARGS</code></li>
+<li><strong>解读</strong>：<ul>
+<li><code>--pipeline-model-parallel-size 4</code>：<strong>流水线并行</strong>。把模型的 32 层切成 4 段，每段 8 层，放在不同的显卡组上。就像流水线工人，A组做完传给B组。</li>
+<li><code>--expert-model-parallel-size 8</code>：<strong>专家并行</strong>。把那 8 个专家分到不同的显卡上。</li>
+<li><code>--tensor-model-parallel-size 1</code>：张量并行设为 1（表示这部分不切）。</li>
+<li><strong>总结</strong>：这是最高深的“显存管理术”，让几十张显卡拼成一个超级显卡。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 制定教学大纲（训练参数）</h4>
+<p>怎么教这个模型？用什么教材？教多快？</p>
+<ul>
+<li><strong>代码位置</strong>：<code>DATA_ARGS</code> 和 <code>TRAINING_ARGS</code></li>
+<li><strong>解读</strong>：<ul>
+<li><code>--tokenizer-type Llama2Tokenizer</code>：用 Llama2 的字典来识字。</li>
+<li><code>--micro-batch-size 1</code> &amp; <code>--global-batch-size 256</code>：每次每张卡只看 1 条数据，但所有卡加起来，一次更新参数时看了 256 条数据。</li>
+<li><code>--lr 1e-4</code>：学习率。学得太快容易走火入魔，太慢则学不会。</li>
+<li><code>--bf16</code>：使用 <code>BFloat16</code> 格式。这是一种数字精度，比普通的 FP32 精度低一点，但速度快且省显存，是现在的行业标准。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 记录与发射（日志与运行）</h4>
+<p>最后，我们要确保训练过程被记录下来，并按下启动按钮。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>LOGGING_ARGS</code> 和最后的 <code>torchrun</code> 命令</li>
+<li><strong>解读</strong>：<ul>
+<li><code>--save</code> / <code>--load</code>：告诉它把训练好的模型存到哪里，或者从哪里接着练。</li>
+<li><code>--wandb...</code>：把训练曲线（Loss下降图）画到 Weights &amp; Biases 网站上，方便人远程监控。</li>
+<li><strong>最后一行 <code>torchrun ... pretrain_gpt.py ...</code></strong>：<ul>
+<li>这就是<strong>点火按钮</strong>。</li>
+<li>它把上面定义的所有参数数组（<code>DISTRIBUTED_ARGS</code>, <code>MODEL_ARGS</code> 等）全部拼接起来，传给 <code>pretrain_gpt.py</code> 这个 Python 程序，正式开始跑代码。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下</h3>
+<p>这份脚本其实就在做一件事：</p>
+<blockquote>
+<p><strong>“我要用 8 个专家（MoE）的架构，把模型切成 4 段（Pipeline Parallel）放在多张显卡上，用 BF16 的精度，按照 Llama2 的识字方式，去跑一份数据，并把结果存下来。”</strong></p>
+</blockquote>
+<p>现在再回去看代码，是不是稍微清晰一点了？</p>

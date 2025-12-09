@@ -1,0 +1,96 @@
+<h1>docs/workers/model_engine.rst</h1>
+<p>这份文档实际上是一个<strong>技术架构设计文档</strong>，主要描述了一个名为 <code>verl</code>（VolcEngine RL，字节跳动的强化学习训练框架）中 <strong>“模型引擎（Model Engine）”</strong> 模块的设计思路、现状和未来计划。</p>
+<p>它主要是写给<strong>开发人员</strong>或<strong>深度用户</strong>看的，所以术语很多。</p>
+<p>为了让你读懂，我把阅读任务分解成 <strong>6个 Task</strong>，由浅入深，带你一步步拆解这份文档：</p>
+<hr />
+<h3>✅ Task 1: 搞清楚“我们在做什么？”（基本概念）</h3>
+<p><strong>目标</strong>：理解这文档里说的“Model Engine”是干嘛的。</p>
+<ul>
+<li><strong>解读</strong>：<ul>
+<li>在大模型训练（特别是RLHF，即强化学习微调）中，我们需要一个“引擎”来负责最底层的计算。</li>
+<li><strong>文档中的 <code>Existing Model Types</code> 章节</strong>告诉我们，这个引擎主要支持两种模型：<ol>
+<li><strong>Language Model（语言模型）</strong>：负责说话的（输入文本/图，输出下一个字）。</li>
+<li><strong>Value Model（价值模型）</strong>：负责打分的（输入文本/图，输出一个分数值）。</li>
+</ol>
+</li>
+<li><strong>未来计划</strong>：还想支持 Qwen-Omni 这种能直接输出语音的模型。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 选车环节（后端支持矩阵）</h3>
+<p><strong>目标</strong>：理解文档开头的表格 <code>Current Support Matrix</code>。这里在对比两种核心技术的优劣。</p>
+<ul>
+<li><strong>背景</strong>：训练大模型需要把模型切分到多个GPU上，这里主要对比了两种切分方案（Backends）。</li>
+<li><strong>解读</strong>：<ol>
+<li><strong>FSDP + ulysses（方案A）</strong>：<ul>
+<li><strong>优点</strong>：支持 HuggingFace 原生模型，上手快（Day 1 support）。</li>
+<li><strong>缺点</strong>：扩展性一般（特别是MoE模型），需要用“Monkey Patch”（一种代码补丁技术，容易因为版本更新而失效，不稳定）。</li>
+</ul>
+</li>
+<li><strong>MCore（Megatron-Core，方案B）</strong>：<ul>
+<li><strong>优点</strong>：扩展性最强（Best），适合超大模型。</li>
+<li><strong>缺点</strong>：很难用。它定义了一个通用的 <code>GPTModel</code>，如果你有新模型，适配起来很困难。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 这里的代码是怎么分层的？（类层级）</h3>
+<p><strong>目标</strong>：理解 <code>Class Hierarchy</code> 章节，知道代码结构。</p>
+<ul>
+<li><strong>解读</strong>：作者把代码分成了三层，像盖楼一样：<ol>
+<li><strong>地基（Base Engine）</strong>：负责脏活累活。比如模型初始化、优化器初始化、模型切片（Sharding）、保存进度（Checkpoint）。</li>
+<li><strong>楼体（Full Engine）</strong>：继承自地基，主要实现 <code>forward_step</code>，也就是模型“向前计算一次”的具体逻辑。</li>
+<li><strong>装修（Worker/Trainer）</strong>：这是最高层，负责具体的训练逻辑（比如SFT、DPO算法）。<strong>关键点</strong>：这一层不关心底层用的是FSDP还是MCore，它只调用统一的接口。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 解决效率问题（数据格式）</h3>
+<p><strong>目标</strong>：理解 <code>Data Format</code> 章节提到的痛点和计划。</p>
+<ul>
+<li><strong>痛点</strong>：<ul>
+<li>目前的系统使用“左右填充（padding）”。比如一批数据里有一句很长，其他短句子就得补很多“0”来对齐。这非常浪费显存和计算资源。</li>
+</ul>
+</li>
+<li><strong>计划</strong>：<ul>
+<li>改为 <strong>No-padding（无填充）</strong> 模式。</li>
+<li>文档列出了一个 <strong>Migration Plan（迁移计划）</strong>：先在引擎层实现 -&gt; 再在Worker层加转换 -&gt; 最后整个系统都改掉。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 怎么存盘和读档？（Checkpoint系统）</h3>
+<p><strong>目标</strong>：理解 <code>Checkpoint System</code> 章节。</p>
+<ul>
+<li><strong>背景</strong>：大模型训练中途需要存盘，但因为模型被切碎在不同GPU上，存取很麻烦。</li>
+<li><strong>流程解读</strong>：<ol>
+<li><strong>加载</strong>：用 HuggingFace 的配置构建模型，加载权重。</li>
+<li><strong>训练中保存</strong>：引擎必须能保存“切片状态”的中间文件（不仅存模型参数，还要存优化器状态）。</li>
+<li><strong>合并</strong>：训练完后，必须提供一个脚本，把这些碎片的切片文件，<strong>合并（Merge）</strong> 回标准的 HuggingFace 格式，方便别人使用。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 6: 我想在这个系统上开发，怎么做？（扩展性）</h3>
+<p><strong>目标</strong>：理解 <code>Extension</code> 章节。</p>
+<ul>
+<li><strong>如果你想加一个新的后端（Backend）</strong>：<ul>
+<li>在 <code>verl/workers/engine</code> 下新建代码。</li>
+<li>跑作者提供的测试脚本（GSM8k SFT），对比Loss和梯度，确保新后端算出来的结果是正确的。</li>
+</ul>
+</li>
+<li><strong>如果你想加新模型类型（Model Type）</strong>：<ul>
+<li>如果是那种输出不是文本的怪模型（比如直接输出音频），请先联系作者讨论，不要自己瞎改。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇文档就是一个<strong>开发指南</strong>，告诉团队成员：
+1.  我们现在支持 FSDP 和 Megatron 两种底层。
+2.  代码分层结构是 Base -&gt; Engine -&gt; Worker。
+3.  我们正准备把数据格式改成更高效的无填充模式。
+4.  存取模型必须遵循“切片保存 -&gt; 合并导出”的流程。</p>

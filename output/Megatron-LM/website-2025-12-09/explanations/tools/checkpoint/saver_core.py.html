@@ -1,0 +1,109 @@
+<h1>tools/checkpoint/saver_core.py</h1>
+<p>这份代码确实比较抽象，因为它属于<strong>Megatron-Core (M-Core)</strong> 项目的“基础设施”部分。简单来说，它的作用是<strong>把转换好的模型权重“保存”成 Megatron 能识别的 Checkpoint 格式</strong>。</p>
+<p>为了让你更容易理解，我们可以把这个过程想象成<strong>“搬家打包”</strong>。你有一堆零散的模型数据（家具），你需要把它们按照新家的布局（并行策略）打包进箱子（Checkpoint文件）里。</p>
+<p>下面是一个 <strong>“Task To-Do List”</strong>，我们将通过完成这 6 个任务，一步步拆解这段代码的逻辑：</p>
+<hr />
+<h3>📋 任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 设定目标 (配置搬家参数)</strong><ul>
+<li><em>对应代码：<code>add_arguments</code> 函数</em></li>
+</ul>
+</li>
+<li><strong>Task 2: 招聘搬家队长 (定义保存类)</strong><ul>
+<li><em>对应代码：<code>class MegatronCheckpointSaverLLM</code></em></li>
+</ul>
+</li>
+<li><strong>Task 3: 确认家具类型 (导入模型提供者)</strong><ul>
+<li><em>对应代码：<code>import_model_provider</code> 方法</em></li>
+</ul>
+</li>
+<li><strong>Task 4: 获取新家图纸 (获取模型架构 Schema)</strong><ul>
+<li><em>对应代码：<code>receive_model</code> 方法</em></li>
+</ul>
+</li>
+<li><strong>Task 5: 开始搬运 (接收并保存)</strong><ul>
+<li><em>对应代码：<code>receive_lm</code> 调用</em></li>
+</ul>
+</li>
+<li><strong>Task 6: 按下启动键 (入口函数)</strong><ul>
+<li><em>对应代码：<code>save_checkpoint</code> 函数</em></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>✅ Task 1: 设定目标 (配置搬家参数)</h4>
+<p><strong>代码段：</strong> <code>def add_arguments(parser): ...</code></p>
+<p><strong>讲解：</strong>
+在开始保存模型之前，我们必须告诉程序我们要存成什么样。
+这就好比搬家前问你：“新家有几个房间？”</p>
+<ul>
+<li><code>--target-tensor-parallel-size</code>: <strong>张量并行 (TP) 大小</strong>。意思是单个矩阵运算被拆分到了几张显卡上。</li>
+<li><code>--target-pipeline-parallel-size</code>: <strong>流水线并行 (PP) 大小</strong>。意思是模型的层（Layer）被切分到了几组显卡上。</li>
+<li><code>--target-expert-parallel-size</code>: <strong>专家并行 (EP) 大小</strong>。这是针对混合专家模型 (MoE) 的。</li>
+<li><code>--saver-transformer-impl</code>: <strong>Transformer 的实现方式</strong>。是用本地的 <code>local</code> 实现，还是用 NVIDIA 加速的 <code>transformer_engine</code>。</li>
+</ul>
+<p><strong>总结：</strong> 这个函数只是在定义命令行可以接受哪些参数，用来控制保存后的模型结构。</p>
+<h4>✅ Task 2: 招聘搬家队长 (定义保存类)</h4>
+<p><strong>代码段：</strong> <code>class MegatronCheckpointSaverLLM(MegatronCheckpointSaverBase):</code></p>
+<p><strong>讲解：</strong>
+这里定义了一个类 <code>MegatronCheckpointSaverLLM</code>。
+注意它继承自 <code>MegatronCheckpointSaverBase</code>（这个父类在别的文件里，负责通用的脏活累活）。
+这个类就是专门负责保存 <strong>LLM (大语言模型)</strong> 的“队长”。它知道专门针对 LLM 需要做什么特殊的准备。</p>
+<h4>✅ Task 3: 确认家具类型 (导入模型提供者)</h4>
+<p><strong>代码段：</strong> <code>def import_model_provider(self): ...</code></p>
+<p><strong>讲解：</strong>
+在搬家前，队长得知道搬的是什么家具。是 GPT？还是 BERT？因为它们的拆装方式不一样。</p>
+<ul>
+<li><strong>如果是 GPT (<code>self.md.model_type == 'GPT'</code>)</strong>:<ul>
+<li>它会导入 <code>gpt_builder</code>。这就像拿到了 GPT 的组装说明书。</li>
+</ul>
+</li>
+<li><strong>如果是 BERT</strong>:<ul>
+<li>它会导入 BERT 的相关代码。</li>
+</ul>
+</li>
+<li><strong>如果都不是</strong>:<ul>
+<li>报错 (<code>raise Exception</code>)。</li>
+</ul>
+</li>
+</ul>
+<p><strong>总结：</strong> 这个方法根据模型类型，动态地加载正确的代码模块，确保后续能正确处理模型结构。</p>
+<h4>✅ Task 4: 获取新家图纸 (获取模型架构 Schema)</h4>
+<p><strong>代码段：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">receive_model</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># Model schema.</span>
+        <span class="n">schema</span> <span class="o">=</span> <span class="n">get_model_schema</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">md</span><span class="o">.</span><span class="n">model_type</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">margs</span><span class="o">.</span><span class="n">transformer_impl</span><span class="p">,</span>
+            <span class="o">...</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+这是最关键的一步。<code>get_model_schema</code> 是去获取一个 <strong>“图纸” (Schema)</strong>。
+这个图纸详细描述了模型的每一层叫什么名字、权重的形状是怎样的、应该如何根据 Task 1 中设定的并行度（TP/PP/EP）进行切分。</p>
+<p>如果不获取这个 Schema，程序就只是一堆死板的数据，不知道该把哪个权重矩阵切成几块存到哪里。</p>
+<h4>✅ Task 5: 开始搬运 (接收并保存)</h4>
+<p><strong>代码段：</strong> <code>self.receive_lm(schema)</code></p>
+<p><strong>讲解：</strong>
+拿到了图纸 (<code>schema</code>) 后，它调用了 <code>self.receive_lm(schema)</code>。
+这个方法并没有在这个文件里定义，而是继承自父类 <code>MegatronCheckpointSaverBase</code>。
+它的作用是：<strong>“好了，图纸我有，数据我也准备接收了，开始干活吧！”</strong> 它会真正地去处理队列中的数据，并写入磁盘。</p>
+<h4>✅ Task 6: 按下启动键 (入口函数)</h4>
+<p><strong>代码段：</strong> <code>def save_checkpoint(queue, args): ...</code></p>
+<p><strong>讲解：</strong>
+这是整个文件的<strong>对外接口</strong>。外部程序（比如转换脚本）只认识这个函数。</p>
+<ol>
+<li>它创建了一个搬家队长实例：<code>saver = MegatronCheckpointSaverLLM(args, queue)</code>。把参数 (<code>args</code>) 和数据来源 (<code>queue</code>) 交给它。</li>
+<li>调用 <code>saver.save()</code>：队长开始指挥工作。</li>
+<li><code>save()</code> 方法（在父类中）会按顺序调用上面提到的 <code>import_model_provider</code> -&gt; <code>receive_model</code> 等流程。</li>
+</ol>
+<hr />
+<h3>💡 核心观点总结</h3>
+<p>这个文件的核心观点是：<strong>将“模型权重的定义”与“保存的动作”解耦。</strong></p>
+<ol>
+<li><strong>通用性</strong>：它不关心数据是从哪里来的（通过 <code>queue</code> 传入），也不关心具体的底层保存逻辑（交给父类 <code>saver_base</code>）。</li>
+<li><strong>特异性</strong>：它只关心 <strong>LLM 相关的配置</strong>——比如是 GPT 还是 BERT，以及如何根据并行度（TP/PP）获取对应的<strong>架构图纸 (Schema)</strong>。</li>
+</ol>
+<p><strong>一句话概括：</strong> 这是一个专门针对 Megatron-Core 大语言模型的“存档管理器”，它负责根据你设定的并行策略，把模型数据正确地“对号入座”并保存下来。</p>

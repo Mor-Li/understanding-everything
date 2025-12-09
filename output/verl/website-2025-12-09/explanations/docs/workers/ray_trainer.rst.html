@@ -1,0 +1,100 @@
+<h1>docs/workers/ray_trainer.rst</h1>
+<p>这份文档主要介绍了一个叫 <code>PPO Ray Trainer</code> 的核心组件。你可以把它想象成整个 <strong>RLHF（人类反馈强化学习）训练任务的总指挥官</strong>。</p>
+<p>它利用 <strong>Ray</strong>（一个分布式计算框架）来管理多张 GPU，协调不同的模型（Actor, Critic, Reward Model 等）进行协同工作。</p>
+<p>为了让你更容易理解，我把文档内容拆解成一个 <strong>“项目经理的 To-Do List”</strong>。这个 Trainer 就是项目经理，它需要按照顺序完成以下三个阶段的任务：</p>
+<hr />
+<h3>第一阶段：准备粮草（数据准备 Data Preparation）</h3>
+<p>在这个阶段，Trainer 是一个单进程的指挥官，它需要先把训练用的“题目”准备好。</p>
+<ul>
+<li><strong>[ ] Task 1: 加载数据集</strong><ul>
+<li>使用 <code>RLHFDataset</code> 类读取数据文件（通常是 parquet 格式）。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 2: 数据预处理</strong><ul>
+<li>给数据套上聊天模板（Chat Templates）。</li>
+<li>把文本转换成机器能懂的 Token（Tokenize）。</li>
+<li>处理长短不一的句子（Padding 补齐，Truncating 截断）。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 3: 分发数据</strong><ul>
+<li>把准备好的一批批“题目”（Prompts），分发给后面负责干活的 GPU 节点。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第二阶段：组建团队（初始化 WorkerGroup）</h3>
+<p>PPO 算法很复杂，需要好几个角色的模型配合（生成模型的 Actor，打分的 Critic，参考用的 Reference Model 等）。这一步是在分配 GPU 资源。</p>
+<ul>
+<li><strong>[ ] Task 4: 分配 GPU 资源池</strong><ul>
+<li>创建一个 <code>RayResourcePool</code>，决定用多少个节点，每个节点用几张卡。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 5: 初始化 WorkerGroup (核心概念)</strong><ul>
+<li><strong>什么是 WorkerGroup？</strong> 就是一组分布在 GPU 上的进程，负责跑具体的模型。</li>
+<li><strong>普通模式：</strong> 比如 Actor 占几张卡，Critic 占另外几张卡，大家分开住。</li>
+<li><strong>省钱/省显存模式 (Colocation)：</strong> 文档特别提到了“Colocated optimization”。意思是把 Actor、Critic、Ref Model 等塞进<strong>同一个进程</strong>里，共享同一个 GPU 上下文。这样可以避免重复占用显存（不用存多份 CUDA context）。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 6: 启动各路模型</strong><ul>
+<li>启动 <code>actor_rollout_wg</code>（负责生成）。</li>
+<li>启动 <code>critic_wg</code>（负责预估价值）。</li>
+<li>启动 <code>ref_policy_wg</code>（负责提供原始概率做参考）。</li>
+<li>启动 <code>rm_wg</code>（奖励模型，负责打分）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第三阶段：执行训练循环（PPO Training Loop）</h3>
+<p>这是文档中最长、代码最多的部分（<code>fit</code> 函数）。这是 Trainer 每天（每个 Epoch）要盯着团队做的事情。</p>
+<p>想象一下 Trainer 手里拿着一个秒表，指挥大家按顺序跑圈：</p>
+<ul>
+<li><strong>[ ] Task 7: 生成回合 (Generate)</strong><ul>
+<li>Trainer 把题目（Prompts）发给 <code>actor_rollout_wg</code>。</li>
+<li><strong>动作：</strong> Actor 模型根据题目写出答案（生成文本）。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 8: 计算参考概率 (Compute Ref Log Prob)</strong><ul>
+<li>Trainer 把刚才生成的问答发给 <code>ref_policy_wg</code>。</li>
+<li><strong>动作：</strong> Reference Model 算一下：“如果是原始模型，写出这段话的概率是多少？”（用于防止模型练歪了，保持不忘初心）。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 9: 预估价值 (Compute Values)</strong><ul>
+<li>Trainer 把数据发给 <code>critic_wg</code>。</li>
+<li><strong>动作：</strong> Critic 模型评价一下：“当前生成的这个状态有多好？”</li>
+</ul>
+</li>
+<li><strong>[ ] Task 10: 计算奖励与优势 (Compute Rewards &amp; Advantage)</strong><ul>
+<li><strong>算分：</strong><ol>
+<li>让 <code>rm_wg</code> (奖励模型) 打分。</li>
+<li>如果有规则（rule-based），再加上规则分。</li>
+<li>加上 KL 散度惩罚（如果生成的内容偏离 Reference Model 太远，就扣分）。</li>
+</ol>
+</li>
+<li><strong>算优势 (Advantage)：</strong> 在 Driver 端计算 GAE（广义优势估计），简单说就是算出“这一步走得比预期好多少”。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 11: 更新 Critic 模型 (Update Critic)</strong><ul>
+<li><strong>动作：</strong> 根据刚才算的真实回报，让 Critic 修正自己的打分能力（使其下次预估更准）。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 12: 更新 Actor 模型 (Update Actor)</strong><ul>
+<li><strong>动作：</strong> 这是最关键的一步。根据 Critic 的反馈和算出来的优势，调整 Actor 的参数，让它下次更有可能生成高分的答案。</li>
+<li><em>注：文档里提到了 <code>critic_warmup</code>，意思是可能先让 Critic 练几步热热身，再开始练 Actor。</em></li>
+</ul>
+</li>
+<li><strong>[ ] Task 13: 验证与记录 (Validate &amp; Log)</strong><ul>
+<li>定期跑一下验证集，看看模型变强了吗。</li>
+<li>把各种指标（生成耗时、分数高低、Loss大小）记到日志里。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 14: 存档 (Checkpoint)</strong><ul>
+<li>定期把练好的 Actor 和 Critic 模型保存到硬盘或 HDFS 上，防止断电白练。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇文档其实就是在讲：
+1.  <strong>怎么把数据喂进去</strong>（Data Preparation）。
+2.  <strong>怎么把多张显卡组织起来</strong>，特别是如何把多个模型挤在一起省显存（WorkerGroup &amp; Colocation）。
+3.  <strong>怎么按 PPO 的标准流程一步步指挥这些显卡干活</strong>（Training Loop: 生成 -&gt; 算分 -&gt; 算优势 -&gt; 更新参数）。</p>

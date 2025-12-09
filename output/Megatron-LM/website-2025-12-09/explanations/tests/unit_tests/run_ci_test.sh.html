@@ -1,0 +1,105 @@
+<h1>tests/unit_tests/run_ci_test.sh</h1>
+<p>这份脚本确实包含了很多环境变量、参数解析和复杂的命令拼接，初看容易晕。</p>
+<p>简单来说，这是一个 <strong>CI（持续集成）自动化测试脚本</strong>。它的核心目的是：<strong>在一个配置好的多显卡环境中，针对特定的代码版本，运行一系列的 Python 单元测试，并生成测试覆盖率报告。</strong></p>
+<p>为了让你好理解，我把它想象成一个“测试经理”的一天，把脚本内容拆解成一个 <strong>Task ToDo List（任务清单）</strong>，一步步带你看它是怎么工作的。</p>
+<hr />
+<h3>📋 脚本执行任务清单 (Task List)</h3>
+<h4>Task 1: 准备工作与参数检查 (初始化)</h4>
+<p><strong>目标</strong>：确保“测试经理”拿到正确的指令，如果指令不对直接报错下班。</p>
+<ol>
+<li><strong>开启严格模式</strong> (<code>set -euxo pipefail</code>)：<ul>
+<li>告诉脚本：只要有一行命令报错，立刻停止运行；引用没定义的变量也要报错。</li>
+</ul>
+</li>
+<li><strong>定位工作目录</strong>：<ul>
+<li>找到脚本自己所在的位置，然后跳到项目根目录，确保后续命令路径正确。</li>
+</ul>
+</li>
+<li><strong>接收并解析参数</strong> (<code>while</code> 循环部分)：<ul>
+<li>脚本读取你输入的命令（如 <code>--tag latest --environment dev</code> 等）。</li>
+<li>它就像在填表：<ul>
+<li><code>TAG</code>: 代码版本（是最新版 <code>latest</code> 还是旧版 <code>legacy</code>？）。</li>
+<li><code>ENVIRONMENT</code>: 运行环境（是长期支持版 <code>lts</code> 还是开发版 <code>dev</code>？）。</li>
+<li><code>BUCKET</code>: 具体要测哪一部分代码（比如只测 <code>tensor_parallel</code> 相关的）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>参数校验</strong>：<ul>
+<li>检查必填项是否都有。</li>
+<li>检查参数值是否合法（比如 <code>TAG</code> 只能是 latest 或 legacy）。</li>
+<li>创建日志文件夹 <code>LOG_DIR</code>。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 2: 选定“战场”与制定“交战规则” (环境配置)</h4>
+<p><strong>目标</strong>：决定去哪个目录测，以及哪些测试用例<strong>不</strong>应该跑。</p>
+<ol>
+<li><strong>切换代码目录</strong>：<ul>
+<li>如果 <code>TAG</code> 是 <code>latest</code>，进入 <code>/opt/megatron-lm</code>。</li>
+<li>否则进入 <code>/opt/megatron-lm-legacy/</code>。</li>
+</ul>
+</li>
+<li><strong>制定过滤规则 (Markers)</strong>：<ul>
+<li>这是 Pytest 的功能。脚本根据环境决定要<strong>跳过</strong>哪些测试：<ul>
+<li>如果是旧版 (<code>legacy</code>)：加上 <code>not internal</code>（不测内部专用代码）。</li>
+<li>如果是稳定版环境 (<code>lts</code>)：加上 <code>not flaky</code>（不测那些不稳定的测试）。</li>
+<li>如果是开发环境 (<code>dev</code>)：加上 <code>not flaky_in_dev</code>。</li>
+</ul>
+</li>
+<li>最后把这些规则拼成一句话，比如：<code>not internal and not flaky</code>。</li>
+</ul>
+</li>
+<li><strong>确定具体测试文件</strong>：<ul>
+<li>调用一个 Python 脚本 <code>find_test_cases.py</code>，根据你传入的 <code>BUCKET</code>，找出具体要跑哪些文件，或者要忽略哪些文件。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 3: 组装机器与网络 (分布式设置)</h4>
+<p><strong>目标</strong>：Megatron-LM 是用来训练大模型的，所以测试也需要模拟多显卡环境。</p>
+<ol>
+<li><strong>配置 PyTorch 分布式参数</strong>：<ul>
+<li>设置 <code>MASTER_ADDR</code> (主节点地址)、<code>GPUS_PER_NODE</code> (每台机器几张卡，默认8张)、<code>NUM_NODES</code> (几台机器) 等。</li>
+<li>把这些参数打包成 <code>DISTRIBUTED_ARGS</code> 变量，准备喂给启动命令。</li>
+</ul>
+</li>
+<li><strong>优化显存</strong>：<ul>
+<li>设置 <code>NCCL_MAX_NCHANNELS=1</code> 等，这是为了限制通信库 NCCL 占用的内存，防止测试时显存爆炸。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 4: 正式执行测试 (核心循环)</h4>
+<p><strong>目标</strong>：真刀真枪地运行代码，并记录结果。</p>
+<ol>
+<li><strong>进入循环</strong> (<code>for i in $(seq $UNIT_TEST_REPEAT)</code>)：<ul>
+<li>根据设定的重复次数（默认1次），运行测试。</li>
+</ul>
+</li>
+<li><strong>运行常规测试 (Prod Test Suite)</strong>：<ul>
+<li>这是脚本里最长的那条 <code>CMD</code> 命令。翻译过来就是：<ul>
+<li>使用 <code>uv run</code> (一个 Python 包管理工具) 运行...</li>
+<li><code>torch.distributed.run</code> (启动多卡并行环境)...</li>
+<li><code>coverage run</code> (监控代码覆盖率)...</li>
+<li><code>pytest</code> (运行测试框架)...</li>
+<li><strong>关键点</strong>：带上了之前生成的过滤规则 (<code>-m 'not experimental ...'</code>) 和文件列表。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>运行实验性测试 (Experimental，可选)</strong>：<ul>
+<li>只有当 <code>TAG</code> 是 <code>latest</code> 时，才会额外跑一遍标记为 <code>experimental</code> 的测试用例。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 5: 汇报工作 (收尾)</h4>
+<p><strong>目标</strong>：把分散的测试数据合并起来。</p>
+<ol>
+<li><strong>合并覆盖率报告</strong>：<ul>
+<li>运行 <code>coverage combine -q</code>。因为是多进程/多卡运行，会产生多个覆盖率数据文件，这步把它们合并成一个总报告。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 总结：这个脚本在干嘛？</h3>
+<p>一句话总结：<strong>“根据你给的参数（版本、环境、测试范围），配置好 8 卡 GPU 环境，剔除掉不稳定的测试用例，运行 Pytest，并生成代码覆盖率报告。”</strong></p>
+<p>如果你需要修改或调试它，最需要关注的是 <strong>Task 2 (Markers 规则)</strong> 和 <strong>Task 4 (那个超长的启动命令)</strong>。</p>

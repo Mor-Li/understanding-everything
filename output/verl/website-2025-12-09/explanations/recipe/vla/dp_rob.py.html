@@ -1,0 +1,51 @@
+<h1>recipe/vla/dp_rob.py</h1>
+<p>这份代码是一个用于<strong>机器人（Robotics）</strong>控制的<strong>强化学习（PPO算法）</strong>中的<strong>Actor（执行者/策略网络）</strong>部分。</p>
+<p>简单来说，这个文件的作用是：<strong>定义一个能够同时看图（Pixel）和读文本（Input IDs）的AI模型，让它根据观察做出动作，并利用PPO算法根据经验不断更新自己的大脑。</strong></p>
+<p>为了让你更好理解，我把它拆解成一个<strong>“训练机器人大脑”的 To-Do List</strong>，一步一步带你看它在干什么。</p>
+<hr />
+<h3>📋 任务清单：如何训练一个 VLA (Vision-Language-Action) 机器人</h3>
+<h4>✅ Task 1: 初始化大脑 (Initialization)</h4>
+<p><strong>对应代码：</strong> <code>__init__</code>
+*   <strong>目标</strong>：把神经网络模型（<code>actor_module</code>）加载进来，准备好优化器（<code>actor_optimizer</code>）。
+*   <strong>关键点</strong>：
+    *   这里继承了 <code>BasePPOActor</code>，说明它是基于 PPO（一种主流强化学习算法）的架构。
+    *   设置了分布式训练的参数（<code>ulysses_sequence_parallel_size</code>），说明这个模型很大，可能需要多张显卡一起跑。</p>
+<h4>✅ Task 2: 整理输入数据 (Data Pre-processing)</h4>
+<p><strong>对应代码：</strong> <code>process_tensor</code>, <code>generate_traj_mask</code>
+*   <strong>目标</strong>：机器人接收到的数据长短不一（有的指令长，有的短），需要把它们对齐。
+*   <strong>关键点</strong>：
+    *   处理 Padding（填充）：把为了对齐而填充的无意义数据（Pad token）标记出来，计算时忽略它们，防止模型学到废话。</p>
+<h4>✅ Task 3: “看”与“想” (Forward Pass - Inference)</h4>
+<p><strong>对应代码：</strong> <code>_forward_micro_batch</code>
+*   <strong>目标</strong>：模型接收 <strong>图像</strong> (<code>pixel_values</code>) 和 <strong>文本指令</strong> (<code>input_ids</code>)，输出 <strong>动作</strong> 的概率。
+*   <strong>关键点（最难懂的部分）</strong>：
+    *   <strong>多模态输入</strong>：注意看 <code>self.actor_module</code> 接收了 <code>pixel_values</code>，这说明它是 VLA 模型（视觉-语言-动作模型）。
+    *   <strong>动作离散化 (Action Binning)</strong>：
+        *   代码里有这样一行：<code>logits = logits[..., -256 - 64 : -64]</code>。
+        *   <strong>解读</strong>：通常语言模型的词表很大（32000个词）。但机器人的动作（比如机械臂移动的距离）被转化成了特定的 Token（比如最后那几百个特殊的词）。
+        *   这段代码的意思是：<strong>我只关心那些代表“动作”的词的概率，其他的普通单词我不管。</strong> 它把连续的动作空间变成了离散的分类问题。</p>
+<h4>✅ Task 4: 自我反思 (Compute Log Prob)</h4>
+<p><strong>对应代码：</strong> <code>compute_log_prob</code>
+*   <strong>目标</strong>：在收集数据阶段，计算模型在当时状态下，做出某个动作的“自信程度”（Log Probability）。
+*   <strong>为什么做这个？</strong>：PPO 算法需要对比“旧策略”和“新策略”的差异。这个函数就是用来计算策略概率的。它会处理动态 Batch 大小，防止显存爆炸。</p>
+<h4>✅ Task 5: 学习与进化 (Update Policy)</h4>
+<p><strong>对应代码：</strong> <code>update_policy</code>
+*   <strong>目标</strong>：这是核心的训练循环。根据收集到的经验（好坏反馈），修改模型参数。
+*   <strong>流程</strong>：
+    1.  <strong>开启训练模式</strong>：<code>self.actor_module.train()</code>。
+    2.  <strong>切分数据</strong>：把一大批数据切成小块（Mini-batch），一点点喂给 GPU。
+    3.  <strong>计算损失 (Loss)</strong>：
+        *   调用 <code>_forward_micro_batch_update</code> 重新算一遍当前的概率。
+        *   使用 <code>core_algos.compute_policy_loss</code> 计算 PPO Loss。这包括：
+            *   <strong>Policy Loss</strong>：如果这个动作带来了高回报（Advantage高），就提高它的概率；反之降低。
+            *   <strong>Clip</strong>：限制更新幅度，不要让模型一次变动太大（PPO 的精髓）。
+    4.  <strong>反向传播</strong>：<code>loss.backward()</code>，计算梯度。
+    5.  <strong>更新参数</strong>：<code>_optimizer_step()</code>，让大脑变聪明一点点。</p>
+<hr />
+<h3>总结：这篇文章讲的观点是什么？</h3>
+<p>这个文件并没有提出新的理论观点，它是一个<strong>工程实现文件</strong>。它实现了一个特定场景下的 PPO Actor：</p>
+<ol>
+<li><strong>场景</strong>：Robotics (VLA)，结合了视觉和语言。</li>
+<li><strong>特殊处理</strong>：它并没有预测普通的文本，而是专门截取了词表中代表 <strong>"Action Bins"（动作分桶）</strong> 的那一部分 Logits 进行优化。这是一种将 Transformer 用于机器人控制的常见做法（类似 Google 的 RT-2）。</li>
+<li><strong>工程优化</strong>：它包含了很多处理显存效率的代码（如 Dynamic Batch Size, Gradient Accumulation, FSDP 支持），是为了在大规模集群上训练大模型设计的。</li>
+</ol>

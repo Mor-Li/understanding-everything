@@ -1,0 +1,64 @@
+<h1>verl/utils/rollout_skip.py</h1>
+<p>这份代码的核心功能其实非常简单，可以用一个词来概括：<strong>“缓存” (Cache)</strong>。</p>
+<p>它的作用是：<strong>在训练或推理过程中，如果发现之前已经生成过相同配置的数据，就直接从硬盘读取，跳过耗时的生成过程（Skip Rollout），从而节省时间。</strong></p>
+<p>为了让你彻底理解，我把它拆解成一个 <strong>“任务清单” (Task List)</strong>，就像你雇佣了一个管家（也就是这个 <code>RolloutSkip</code> 类）来帮你管理数据一样。我们一步步来看他都要做什么：</p>
+<hr />
+<h3>任务清单：管家 <code>RolloutSkip</code> 的工作流程</h3>
+<h4>✅ Task 1: 准备工作 (初始化配置)</h4>
+<p><strong>代码对应：</strong> <code>__init__</code> 方法
+<strong>管家要做的事：</strong>
+*   <strong>读配置单</strong>：管家先看一眼你的 <code>config</code>，记下这次实验的名字 (<code>exp_name</code>)、每次生成多少条数据 (<code>n</code>)、批次大小 (<code>gbs</code>)。
+*   <strong>找仓库</strong>：确定要把数据存在哪里 (<code>dumped_dir</code>)。默认是在 <code>/tmp/verl/rollout_dump</code>。
+*   <strong>安全检查</strong>：如果仓库位置在临时文件夹（比如 Ray 的临时目录），管家会警告你：“嘿，这里的数据可能会被系统自动删掉哦！”</p>
+<h4>✅ Task 2: 给箱子贴标签 (确定文件名)</h4>
+<p><strong>代码对应：</strong> <code>curr_path_dump</code> 属性
+<strong>管家要做的事：</strong>
+*   为了防止搞混，管家需要给存储数据的“箱子”起一个独一无二的名字。
+*   <strong>命名规则</strong>：<code>实验名_项目名_GBS{批次大小}__N{数量}</code>。
+*   <strong>为什么这么做？</strong> 如果你下次改了参数（比如把生成数量 <code>n</code> 从 10 改成了 100），管家一看标签对不上，就知道不能用旧数据，必须重新生成。</p>
+<h4>✅ Task 3: “偷梁换柱” (替换原有流程)</h4>
+<p><strong>代码对应：</strong> <code>wrap_generate_sequences</code> 方法
+<strong>管家要做的事：</strong>
+*   这是最关键的一步。原本你的程序里有一个 <code>generate_sequences</code> 函数负责生成数据。
+*   管家走过去，把这个函数<strong>替换</strong>（Patch）成了他自己写的一个新函数（<code>warp_fn</code>）。
+*   <strong>潜台词</strong>：以后只要程序想生成数据，请求都会先经过管家这一关，而不是直接去跑原本的生成代码。</p>
+<h4>✅ Task 4: 检查库存 (尝试加载)</h4>
+<p><strong>代码对应：</strong> <code>try_load</code> 方法
+<strong>管家要做的事：</strong>
+*   当程序请求数据时，管家先去仓库（硬盘）看一眼：Task 2 里贴好标签的那个箱子存在吗？
+*   <strong>如果存在</strong>：太好了！直接把数据读出来给你。<strong>（省时！这就叫 Skip）</strong>
+*   <strong>如果不存在</strong>：告诉程序“没货”，准备执行下一步。</p>
+<h4>✅ Task 5: 进货并存档 (生成并保存)</h4>
+<p><strong>代码对应：</strong> <code>wrap_generate_sequences</code> 下面的 <code>warp_fn</code> 逻辑
+<strong>管家要做的事：</strong>
+*   如果在 Task 4 里发现没库存，管家就会让原本的生成器去工作（<code>generate_sequences</code>），这一步比较慢。
+*   <strong>关键动作</strong>：生成完数据后，管家不会只把数据给你，他会顺手调用 <code>dump</code> 方法，把这份新数据<strong>存进硬盘</strong>（对应 Task 2 的路径）。
+*   <strong>目的</strong>：下次你再运行同样的任务时，就可以直接回到 Task 4 拿现成的了。</p>
+<hr />
+<h3>总结一下剧情</h3>
+<p>想象你在玩游戏（训练模型）：</p>
+<ol>
+<li>
+<p><strong>第一次运行 (First Run):</strong></p>
+<ul>
+<li>你喊：“我要数据！”</li>
+<li><code>RolloutSkip</code> 管家：“我看了一下硬盘，没有存货。我去生成一份新的（生成中...耗时很久...）。好了，给你！顺便我把这份数据<strong>存盘</strong>了。”</li>
+</ul>
+</li>
+<li>
+<p><strong>第二次运行 (Second Run - 参数没变):</strong></p>
+<ul>
+<li>你喊：“我要数据！”</li>
+<li><code>RolloutSkip</code> 管家：“我看了一下硬盘，<strong>有存货</strong>！不用重新算了，直接读档给你。” <strong>(瞬间完成)</strong></li>
+</ul>
+</li>
+<li>
+<p><strong>第三次运行 (Third Run - 你改了参数 N):</strong></p>
+<ul>
+<li>你喊：“我要数据（这次要更多）！”</li>
+<li><code>RolloutSkip</code> 管家：“我看了一下硬盘，虽然有旧文件，但文件名上的标签和你要的参数<strong>不匹配</strong>。所以我得重新生成一份新的，并存一个新的档案。”</li>
+</ul>
+</li>
+</ol>
+<h3>为什么要写这个文件？</h3>
+<p>在强化学习（RLHF）或者大模型训练中，<code>Rollout</code>（让模型生成回答）是非常消耗显卡资源和时间的。如果你只是想调试后续的训练代码（比如 PPO 的更新逻辑），而不需要每次都重新生成文本，这个工具能帮你节省大量时间。</p>

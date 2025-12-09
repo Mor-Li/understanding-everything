@@ -1,0 +1,76 @@
+<h1>examples/multimodal/llama_3p1_nemotron_nano_vl_8b_v1/text_generation.sh</h1>
+<p>这份代码其实就是一个<strong>启动脚本</strong>。你可以把它想象成是一个“总指挥”，它的工作是把各种复杂的参数配置好，然后命令电脑开始运行一个叫 <strong>Llama 3.1 Nemotron Nano VL 8B</strong> 的多模态大模型（既能看图又能说话的模型）。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“任务清单 (To-Do List)”</strong>，我们一步步来完成这个脚本想要做的事情：</p>
+<hr />
+<h3>📋 任务清单：启动多模态大模型</h3>
+<h4>✅ 第一步：配置运行环境 (Environment Setup)</h4>
+<p><strong>代码位置：</strong> 开头的 <code>export ...</code> 部分。
+<strong>通俗解释：</strong> 在干活之前，先把场地打扫好，规则定好。
+*   <code>NCCL_IB_SL=1</code>：这是关于显卡之间通信的底层设置（不用深究，知道是优化通信用的就行）。
+*   <code>CUDA_DEVICE_MAX_CONNECTIONS=1</code>：限制显卡连接数，防止拥堵。
+*   <code>NVTE_APPLY_QK_LAYER_SCALING=0</code>：这是 Transformer 引擎的一个数学计算开关，这里选择关掉。</p>
+<h4>✅ 第二步：设定默认“菜单” (Default Variables)</h4>
+<p><strong>代码位置：</strong> <code>INPUT_IMAGE_PATH="placeholder"</code> 到 <code>MAX_NUM_TILES=12</code>。
+<strong>通俗解释：</strong> 如果用户不说话，我们就按这些默认标准来。
+*   <code>TP=4</code>：<strong>重点</strong>。Tensor Parallelism = 4。意思是这个模型太大了，或者为了跑得快，我们要用 <strong>4张显卡</strong> 一起跑。
+*   <code>INPUT_IMAGE_PATH</code>：默认的图片路径。
+*   <code>USE_TILING=1</code>：是否启用“切片”技术（把大图片切成小块给模型看）。</p>
+<h4>✅ 第三步：听取用户指挥 (Argument Parsing)</h4>
+<p><strong>代码位置：</strong> <code>while [[ $# -gt 0 ]]; do ... done</code> 这一大段。
+<strong>通俗解释：</strong> 这里是个循环，专门用来听你在运行脚本时输入的命令。
+*   比如你运行脚本时加了 <code>--input-image-path /my/image.jpg</code>，这段代码就会捕捉到，并把默认的路径改成你指定的路径。
+*   它支持修改：显卡数量(TP)、图片路径、输出长度、模型路径等等。</p>
+<h4>✅ 第四步：准备“切图”逻辑 (Tiling Logic)</h4>
+<p><strong>代码位置：</strong> <code>if [[ $USE_TILING -eq 1 ]]; then ... fi</code>
+<strong>通俗解释：</strong> 现在的图片分辨率都很高，模型一次看不完。
+*   如果开启了 Tiling（切片），脚本会把参数 <code>EXTRA_ARGS</code> 加上 <code>--pixel-shuffle</code> 等选项。
+*   意思就是告诉模型：“待会儿图片太大的话，我会切成小块（Tiles）喂给你，你要准备好拼起来看。”</p>
+<h4>✅ 第五步：开始干活！(Run the Model)</h4>
+<p><strong>代码位置：</strong> <code>for PARTITION_ID</code> 循环内部的 <code>torchrun ...</code> 这一长串。
+这是整个脚本的核心，它启动了 Python 程序。我们可以把这一长串参数分成几个<strong>小任务</strong>来看：</p>
+<ul>
+<li>
+<p><strong>任务 5.1：叫醒显卡</strong></p>
+<ul>
+<li><code>torchrun --nproc_per_node ${TP}</code>：唤醒 <code>${TP}</code> 张（也就是默认的4张）显卡，准备并行计算。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 5.2：定义大脑结构 (Model Architecture)</strong></p>
+<ul>
+<li>这一大堆参数（<code>--num-layers 32</code>, <code>--hidden-size 4096</code>, <code>--num-attention-heads 32</code> 等）是在告诉程序：“这个 Llama 3.1 模型的脑子长什么样”。</li>
+<li>比如它有32层神经网络，隐藏层大小是4096。这些必须和训练好的模型文件完全一致，否则模型加载会报错。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 5.3：定义眼睛 (Vision/Multimodal Settings)</strong></p>
+<ul>
+<li><code>--vision-model-type radio</code>：用的视觉编码器类型。</li>
+<li><code>--img-h 512</code>, <code>--img-w 512</code>：图片的基础分辨率。</li>
+<li><code>--special-tokens "&lt;image&gt;" ...</code>：定义一些特殊暗号，模型看到 <code>&lt;image&gt;</code> 就知道这里是张图。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 5.4：指定文件位置</strong></p>
+<ul>
+<li><code>--load ${MODEL_PATH}</code>：去哪里加载模型权重文件。</li>
+<li><code>--tokenizer-model ...</code>：去哪里加载“字典”（把文字变成数字的工具）。</li>
+<li><code>--input-image-path</code> &amp; <code>--output-path</code>：读哪张图，结果写到哪去。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 5.5：推理设置 (Inference Config)</strong></p>
+<ul>
+<li><code>--temperature 1.0</code>：创造力参数。</li>
+<li><code>--top_k 1</code>：每次只选概率最高的一个词（最稳健的回答）。</li>
+<li><code>--bf16</code>：使用 <code>bf16</code> 这种数据格式，省显存且跑得快。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下</h3>
+<p><strong>这个脚本就在做一件事：</strong></p>
+<blockquote>
+<p>“嘿，电脑！请用 <strong>4张显卡</strong> (<code>TP=4</code>)，按照 <strong>Llama 3.1 8B</strong> 的身体结构 (<code>--num-layers</code> 等)，加载我指定的 <strong>模型文件</strong>，开启 <strong>图片切片模式</strong> (<code>Tiling</code>)，去读我给你的 <strong>那张图片</strong>，然后把生成的文字描述 <strong>写到输出文件里</strong>。”</p>
+</blockquote>
+<p>你如果想运行它，只需要关注你要改哪几个参数（通常是模型路径 <code>MODEL_PATH</code> 和图片路径 <code>INPUT_IMAGE_PATH</code>），其他的参数大部分是固定的模型结构配置，不用动。</p>

@@ -1,0 +1,78 @@
+<h1>recipe/gkd/ray_trainer.py</h1>
+<p>这份代码确实比较复杂，因为它不仅仅是一个简单的训练脚本，而是一个<strong>基于 Ray 的分布式、异步流水线（Pipeline）训练系统</strong>。</p>
+<p>它的核心目标是实现 <strong>GKD (Generalized Knowledge Distillation，广义知识蒸馏)</strong> 或者叫 <strong>On-Policy Distillation</strong>。简单来说，就是让一个“学生模型”（Actor）不断生成内容，然后实时请教“老师模型”（Teacher），根据老师的反馈来更新自己。</p>
+<p>为了让你看懂，我把这份代码做的事情拆解成一个 <strong>Task Todo List</strong>，按逻辑执行顺序一步步给你讲：</p>
+<hr />
+<h3>Task 1: 组建团队 (Initialization)</h3>
+<p>在开始训练前，代码首先要分配计算资源（GPU），组建三个角色的团队。
+*   <strong>代码位置</strong>: <code>__init__</code>, <code>init_workers</code>
+*   <strong>Todo</strong>:
+    1.  <strong>招聘“学生” (Actor)</strong>: 负责学习和更新参数的模型。
+    2.  <strong>招聘“抄写员” (Rollout)</strong>: 负责用当前的学生模型去生成文本（做题）。
+        *   <em>注：在 Ray 中，Actor 和 Rollout 可能是同一组 GPU，也可能是分开的。代码里通过 <code>RayWorkerGroup</code> 来管理这些分布在不同机器上的进程。</em>
+    3.  <strong>联系“老师” (Teacher Client)</strong>: 代码中 <code>self.teacher_client</code> 连接到一个远程的推理服务（Teacher Server）。
+        *   <em>逻辑</em>：学生写完作业，要发给远程的老师批改，获取“知识”（logits 或分布）。</p>
+<h3>Task 2: 准备教材 (Data Loading)</h3>
+<ul>
+<li><strong>代码位置</strong>: <code>_create_dataloader</code></li>
+<li><strong>Todo</strong>:<ol>
+<li>加载训练数据集（Prompt/问题）。</li>
+<li>把数据打包成 Batch。</li>
+<li>创建一个 <code>StatefulDataLoader</code>，保证训练挂了重启时能接着读数据，不重复、不漏掉。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 3: 设计流水线 (Scheduling / Pipelining)</h3>
+<p>这是这份代码最难懂、也是最核心的部分。为了不让 GPU 闲着，它设计了复杂的“时间管理大师”策略。
+*   <strong>代码位置</strong>: <code>one_step_off_scheduler</code>, <code>two_step_off_scheduler</code>
+*   <strong>核心痛点</strong>:
+    *   学生生成文本（慢）
+    *   发给老师批改（网络传输+老师推理，慢）
+    *   学生更新参数（快）
+    *   <strong>如果串行做</strong>：生成 -&gt; 等老师 -&gt; 更新 -&gt; 生成... GPU 会有大量时间在空转。
+*   <strong>解决方案 (Todo)</strong>:
+    1.  <strong>异步生成 (Async Generation)</strong>: 发出“生成”指令后，不傻等结果，拿一个“号码牌”（<code>Future</code> 对象）就走。
+    2.  <strong>流水线重叠 (Overlapping)</strong>:
+        *   当 GPU 在<strong>更新</strong>第 N 步的参数时，另一组资源正在<strong>生成</strong>第 N+1 步的数据。
+        *   当第 N+1 步的数据生成好，正在<strong>等待老师批改</strong>时，GPU 可能正在<strong>同步</strong>第 N 步更新后的权重。
+    *   代码里的 <code>scheduler</code> 就是在编排这些 <code>yield</code> 和 <code>future.get()</code> 的顺序，确保<strong>计算</strong>（训练）和<strong>通信</strong>（同步权重、请求老师）的时间重叠。</p>
+<h3>Task 4: 正式训练循环 (The Fit Loop)</h3>
+<p>这是 <code>fit()</code> 函数里的主循环，也是实际干活的地方。
+*   <strong>代码位置</strong>: <code>fit</code>
+*   <strong>Todo (每一步循环做的事)</strong>:
+    1.  <strong>同步权重</strong>: 把刚刚更新好的“学生模型”参数，同步给“抄写员”进程（<code>sync_rollout_weights</code>）。
+    2.  <strong>学生做题 (Rollout)</strong>:
+        *   调用 <code>rollout_wg.async_generate_sequences</code>。
+        *   学生根据当前的 Prompt 生成回答。
+    3.  <strong>老师批改 (Teacher Distillation)</strong>:
+        *   调用 <code>get_teacher_knowledge</code>。
+        *   把学生生成的回答发给 Teacher 模型。
+        *   Teacher 返回它认为“正确”的概率分布（这就是要蒸馏的知识）。
+    4.  <strong>整理考卷</strong>:
+        *   把 Prompt + 学生回答 + 老师反馈 打包在一起。
+        *   计算一些统计指标（比如回答长度 <code>response_seq_len</code>）。
+    5.  <strong>学生订正 (Update Actor)</strong>:
+        *   调用 <code>actor_wg.update_actor(batch)</code>。
+        *   这是核心的 PPO/蒸馏更新步骤。学生模型根据老师的反馈计算 Loss，反向传播更新自己的权重。
+    6.  <strong>记录与保存</strong>:
+        *   计算吞吐量（Throughput）。
+        *   记录日志（Logging）。
+        *   定期保存模型检查点（Checkpoint）。</p>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p>如果把这个过程比作<strong>写作业</strong>：</p>
+<ol>
+<li><strong>普通训练</strong>：写完一道题 -&gt; 找老师批改 -&gt; 订正 -&gt; 再写下一道。</li>
+<li><strong>这份代码 (Ray Trainer)</strong>：<ul>
+<li>你（Actor）在<strong>订正</strong>第 1 页作业的时候；</li>
+<li>你的分身（Rollout Worker）已经在<strong>写</strong>第 2 页作业了；</li>
+<li>与此同时，第 1 页作业的某个部分正在<strong>传输</strong>给远程的老师。</li>
+<li>大家互不等待，利用 <code>Future</code> 对象（期票）来管理进度，最大化利用 GPU 算力。</li>
+</ul>
+</li>
+</ol>
+<p><strong>你需要重点关注的几个类/方法：</strong>
+*   <code>GenerationBatchFuture</code>: 这是一个“快递盒”，里面装着正在生成的作业。一开始是空的，后来装入学生写的作业，最后装入老师的批语。
+*   <code>_async_gen_next_batch</code>: 异步让学生开始写作业。
+*   <code>_async_get_teacher_knowledge</code>: 异步让老师开始批改。
+*   <code>scheduler</code>: 负责指挥谁先动、谁后动、谁等谁。</p>

@@ -1,0 +1,48 @@
+<h1>verl/utils/megatron_peft_utils.py</h1>
+<p>这份代码主要是在处理 <strong>Megatron-LM（一种大模型分布式训练框架）</strong> 和 <strong>PEFT（参数高效微调，比如 LoRA）</strong> 结合时的<strong>存取档（Checkpointing）</strong>问题。</p>
+<p>简单来说，当你在训练一个几百亿参数的大模型时，如果你用了 LoRA，你不需要保存整个巨大的模型，只需要保存那 1% 不到的“补丁（Adapter）”参数。</p>
+<p>为了让你更容易理解，我把这个文件的功能拆解成一个 <strong>“任务清单（Todo List）”</strong>，每一个 Task 对应代码中的一个主要逻辑步骤：</p>
+<hr />
+<h3>📝 任务清单：如何管理大模型的“补丁”参数</h3>
+<h4>Task 1: 搞清楚“我是谁，我在哪” (定位路径)</h4>
+<p><strong>对应函数：</strong> <code>_get_rank_checkpoint_path</code>
+*   <strong>背景：</strong> 在 Megatron 分布式训练中，模型被切成了很多块，分散在不同的 GPU 上（模型并行、流水线并行等）。
+*   <strong>要做的事：</strong>
+    1.  获取当前进程的“身份ID”（Tensor并行排名、Pipeline并行排名等）。
+    2.  根据这些 ID 生成一个专属的文件夹路径（例如 <code>mp_rank_00_001</code>）。
+    3.  <strong>目的：</strong> 确保每张显卡只保存/读取属于它那一小块模型的参数，互不干扰。</p>
+<h4>Task 2: 把“补丁”从大模型里挑出来 (提取参数)</h4>
+<p><strong>对应函数：</strong> <code>get_adapter_state_dict</code>
+*   <strong>背景：</strong> 模型里既有原本的冻结参数（几十 GB），也有新加的 Adapter 参数（几 MB）。我们只想要后者。
+*   <strong>要做的事：</strong>
+    1.  像剥洋葱一样，把模型外面的包装（DDP、Float16Module）剥掉，露出核心。
+    2.  遍历所有参数的名字。
+    3.  <strong>筛选：</strong> 只要名字里带有 <code>".adapter."</code> 的参数。
+    4.  <strong>输出：</strong> 一个只包含 Adapter 参数的小字典。</p>
+<h4>Task 3: 把挑出来的“补丁”存进硬盘 (保存存档)</h4>
+<p><strong>对应函数：</strong> <code>save_adapter_checkpoint</code>
+*   <strong>背景：</strong> 训练过程中需要保存进度，或者训练完了要保存结果。
+*   <strong>要做的事：</strong>
+    1.  调用 Task 2 的功能，拿到 Adapter 参数。
+    2.  调用 Task 1 的功能，找到当前显卡应该存的文件夹。
+    3.  把参数保存成一个 <code>.pt</code> 文件（通常很小）。
+    4.  <strong>优点：</strong> 相比保存全量模型，这样存速度极快，且节省硬盘空间。</p>
+<h4>Task 4: 把硬盘里的“补丁”贴回模型 (读取存档)</h4>
+<p><strong>对应函数：</strong> <code>load_adapter_checkpoint</code>
+*   <strong>背景：</strong> 想要继续训练，或者想要加载训练好的模型进行推理。
+*   <strong>要做的事：</strong>
+    1.  调用 Task 1 的功能，找到对应的文件路径。
+    2.  读取 <code>.pt</code> 文件。
+    3.  <strong>关键动作：</strong> 使用 <code>load_state_dict(..., strict=False)</code> 把参数加载进模型。
+    4.  <strong>注意：</strong> 必须用 <code>strict=False</code>，因为我们只加载了 Adapter 部分，模型会发现缺少了原始的大部分参数，如果不关掉严格模式会报错。</p>
+<h4>Task 5: 算一算“补丁”有多大 (统计信息)</h4>
+<p><strong>对应函数：</strong> <code>count_adapter_parameters</code> 和 <code>print_adapter_info</code>
+*   <strong>背景：</strong> 我们想知道这次微调到底用了多少参数，是不是真的“高效”。
+*   <strong>要做的事：</strong>
+    1.  遍历模型所有参数。
+    2.  统计名字里带 <code>"lora"</code> 或 <code>"adapter"</code> 且 <strong>需要梯度更新（requires_grad）</strong> 的参数数量。
+    3.  计算它占总参数量的百分比（通常小于 1%）。
+    4.  打印出来给你看，让你心里有数。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心作用就是：<strong>在复杂的分布式环境下，精准地只对那 1% 的 Adapter 参数进行“定位、提取、保存、加载、统计”，从而实现高效、省空间的微调流程。</strong></p>

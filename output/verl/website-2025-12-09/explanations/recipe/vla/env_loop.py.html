@@ -1,0 +1,89 @@
+<h1>recipe/vla/env_loop.py</h1>
+<p>这份代码实现了一个 <strong>“环境交互循环”（Environment Loop）</strong>，主要用于机器人学习（VLA: Vision-Language-Action）场景。</p>
+<p>简单来说，它的作用是<strong>让 AI 模型（大脑）和 模拟器（身体/环境）进行多轮互动，并把互动产生的数据（视频、动作、奖励）收集起来，打包好用于训练。</strong></p>
+<p>为了让你听懂，我把这个脚本的工作流程拆解成一个 <strong>“任务清单 (Todo List)”</strong>，就像是一个项目经理在指挥这一套流程。</p>
+<hr />
+<h3>📋 核心任务清单 (Todo List)</h3>
+<p>要把这个代码跑通，程序内部其实按顺序执行了以下 5 个任务：</p>
+<ol>
+<li><strong>【招聘与分工】(Init)</strong>：<ul>
+<li>分配两组“工人”：一组负责动脑子（<code>rollout_wg</code>，模型推理），一组负责动手做实验（<code>env_wg</code>，物理模拟器）。</li>
+<li>计算好要分多少批次（Stage）来做，防止忙不过来。</li>
+</ul>
+</li>
+<li><strong>【准备开工】(Generate Sequences)</strong>：<ul>
+<li>收到任务指令（Prompts）。</li>
+<li>把模型切换到“干活模式”（Rollout mode）。</li>
+</ul>
+</li>
+<li><strong>【重置环境】(Reset)</strong>：<ul>
+<li>在实验开始前，先把所有机器人的状态归位（比如把机械臂复位，把桌子清空）。</li>
+<li>拿到第一眼的画面（Observation）。</li>
+</ul>
+</li>
+<li><strong>【流水线作业】(Run - 核心部分)</strong>：<ul>
+<li>这是一个循环：<strong>看一眼 -&gt; 想动作 -&gt; 做动作 -&gt; 拿奖励 -&gt; 再看一眼</strong>。</li>
+<li>为了快，它使用了<strong>异步流水线（Async Pipeline）</strong>：也就是“这批机器人在动的时候，那批机器人在思考”，不让 GPU 闲着。</li>
+</ul>
+</li>
+<li><strong>【打包交货】(Collate)</strong>：<ul>
+<li>把所有步骤产生的数据（画面、动作、是否完成任务）按时间顺序整理好。</li>
+<li>拼成一个大包裹（Batch），交给后面去训练。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步深度解析 (Step-by-Step)</h3>
+<p>下面我结合代码的具体函数，给你一步步讲讲它是怎么实现上面的清单的。</p>
+<h4>第一步：初始化与配置 (<code>__init__</code>)</h4>
+<p><strong>观点</strong>：在大规模训练中，资源是昂贵的。代码在这里计算了 <code>stage_num</code>（流水线级数）。
+*   <strong>代码逻辑</strong>：它没有一股脑把几千个环境同时跑，而是切分成了几个 Stage。比如总共 100 个环境，分 2 个 Stage，每组 50 个。
+*   <strong>目的</strong>：为了实现<strong>并行掩盖延迟</strong>。当 Stage 1 的环境在物理模拟（CPU密集）时，Stage 2 的数据正在送给模型做推理（GPU密集）。</p>
+<h4>第二步：启动与重置 (<code>generate_sequences</code>)</h4>
+<p><strong>观点</strong>：这是对外的总接口。
+*   <strong>代码逻辑</strong>：
+    1.  <code>reset_future.get()</code>: 等待环境重置完成，拿到初始的画面。
+    2.  <code>self.rollout_wg.switch_to_rollout()</code>: 告诉模型工人，“别训练了，现在是考试时间，只管输出动作”。
+    3.  调用 <code>run()</code> 进入最复杂的循环。</p>
+<h4>第三步：核心异步循环 (<code>run</code>) —— <strong>最难懂的地方</strong></h4>
+<p><strong>观点</strong>：这是整个文件的灵魂。它利用 <code>asyncio</code> 实现了高效的<strong>“观察-决策-行动”</strong>闭环。</p>
+<p>它定义了一个内部函数 <code>_stage_loop(stage_id)</code>，逻辑如下：
+1.  <strong>模型思考 (Rollout)</strong>:
+    *   <code>action_result = await ... rollout_futures[stage_id].get()</code>
+    *   把当前的画面给 AI 模型，AI 返回一个动作（比如“手往左移 1 厘米”）。
+2.  <strong>环境执行 (Env Interact)</strong>:
+    *   <code>env_ref = self.env_wg.env_interact_step(action_data)</code>
+    *   把动作发给模拟器，模拟器计算物理碰撞。
+    *   <code>env_result = await ... env_ref.get()</code>
+    *   模拟器返回结果：新的画面、奖励（Reward）、是否结束（Done）。
+3.  <strong>记录数据</strong>:
+    *   把这一步的 <code>obs</code>, <code>action</code>, <code>rew</code>, <code>done</code> 存进 <code>trajectories</code> 列表里。
+4.  <strong>准备下一步</strong>:
+    *   如果没结束，把新的画面再次发给模型（<code>self.rollout_wg.generate_sequences</code>），触发下一次思考。</p>
+<p><strong>为什么要用 <code>await asyncio.gather</code>？</strong>
+代码最后有一行 <code>await asyncio.gather(*[..._stage_loop(sid)...])</code>。
+这意味着如果有 2 个 Stage，它们是<strong>同时</strong>启动的。Stage 0 在等模拟器结果时，CPU 就会切过去处理 Stage 1 的逻辑。这样能把硬件榨干，速度最快。</p>
+<h4>第四步：数据整理 (<code>_restructure_obs_data</code> 和 <code>_collate_trajectories</code>)</h4>
+<p><strong>观点</strong>：原始数据是散乱的，必须格式化才能喂给神经网络训练。</p>
+<ul>
+<li><strong><code>_restructure_obs_data</code></strong>:<ul>
+<li>因为环境分布在不同的机器（Worker）上，数据回来时是扁平的。这个函数把数据重新切块，按 Stage 分好类。</li>
+</ul>
+</li>
+<li><strong><code>_collate_trajectories</code></strong>:<ul>
+<li>这是收尾工作。循环结束后，<code>trajectories</code> 里存的是散装的字典。</li>
+<li>这个函数把它们堆叠（Stack）起来。</li>
+<li><strong>最终产出</strong>：一个巨大的 Tensor 字典，包含 <code>pixel_values</code>（所有步骤的视频帧）、<code>actions</code>（所有步骤的动作）、<code>rewards</code> 等。</li>
+<li>形状通常是 <code>[Batch_Size, Time_Steps, ...]</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件 <code>env_loop.py</code> 不是在训练模型，而是在<strong>“造数据”</strong>。</p>
+<p>它就像一个<strong>高效率的工厂车间主任</strong>：
+1.  手里拿着一批初始状态（Prompts）。
+2.  指挥 AI 模型（工人A）看图说话，输出动作。
+3.  指挥模拟器（工人B）执行动作，反馈新图。
+4.  利用流水线技术，确保工人A和工人B都不闲着。
+5.  最后把整个过程录下来，打包成数据胶囊，供后续算法学习。</p>

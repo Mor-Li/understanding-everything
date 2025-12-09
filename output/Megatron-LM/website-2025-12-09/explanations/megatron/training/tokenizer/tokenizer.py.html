@@ -1,0 +1,90 @@
+<h1>megatron/training/tokenizer/tokenizer.py</h1>
+<p>这份代码确实比较长，而且属于深度学习框架（Megatron-LM）的底层基础设施代码，初看容易晕。</p>
+<p>简单来说，这个文件的作用是 <strong>“翻译官的总管”</strong>。它的核心任务是把人类的<strong>文本（Text）</strong>转换成模型能读懂的<strong>数字列表（Token IDs）</strong>，反之亦然。因为不同的模型（BERT, GPT, Llama）用不同的“字典”，所以这里写了很多个类来兼容它们。</p>
+<p>为了让你读懂它，我给你列了一个 <strong>学习 Task List（任务清单）</strong>，请按照这个顺序一步步看：</p>
+<hr />
+<h3>✅ Task 1: 搞懂核心概念——什么是 "Wrapper"（包装器）</h3>
+<p><strong>目标</strong>：明白这个文件大部分代码其实不干“实事”，而是负责“联络”。</p>
+<ul>
+<li><strong>观点</strong>：这个文件里的很多类（比如 <code>_HuggingFaceTokenizer</code>, <code>_SentencePieceTokenizer</code>）并没有从零实现分词算法。</li>
+<li><strong>代码证据</strong>：<ul>
+<li>看 <code>_HuggingFaceTokenizer</code> 类，它里面 <code>import transformers</code>，然后调用了 <code>transformers.AutoTokenizer</code>。</li>
+<li>看 <code>_SentencePieceTokenizer</code> 类，它 <code>import sentencepiece</code>。</li>
+</ul>
+</li>
+<li><strong>结论</strong>：这个文件的主要作用是<strong>统一接口</strong>。不管底层用的是 HuggingFace 还是 Google 的 SentencePiece，Megatron 训练框架只管调用 <code>.tokenize()</code> 和 <code>.detokenize()</code>，不需要关心底层的区别。这是一种设计模式，叫“包装器模式”。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 阅读入口函数 <code>build_tokenizer</code></h3>
+<p><strong>目标</strong>：看懂代码是如何根据配置选择“翻译官”的。</p>
+<ul>
+<li><strong>位置</strong>：文件开头的 <code>def build_tokenizer(args, **kwargs):</code> 函数。</li>
+<li><strong>步骤</strong>：<ol>
+<li>浏览那个巨大的 <code>if-elif-else</code> 结构。</li>
+<li>你会看到 <code>args.tokenizer_type</code>。这是用户传进来的参数（比如 "Llama2Tokenizer" 或 "GPT2BPETokenizer"）。</li>
+<li><strong>观点</strong>：这个函数是<strong>工厂模式</strong>。根据你给的名字，生产出对应的分词器对象。</li>
+<li><strong>注意点</strong>：看最后几行 <code>_vocab_size_with_padding</code>。这不仅仅是创建分词器，还为了并行计算效率，强行把词表大小（Vocab Size）凑成了一个整数（比如能被 GPU 数量整除）。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 理解标准接口（所有类都有的东西）</h3>
+<p><strong>目标</strong>：找出所有分词器共有的功能。</p>
+<p>随便挑一个类（比如 <code>_BertWordPieceTokenizer</code> 或 <code>_GPT2BPETokenizer</code>），你会发现它们都有以下属性或方法，这就是 Megatron 对分词器的要求：</p>
+<ol>
+<li><strong><code>vocab_size</code></strong>: 词表里一共有多少个词？</li>
+<li><strong><code>tokenize(text)</code></strong>: 把字符串变成数字列表 <code>[101, 234, 998...]</code>。</li>
+<li><strong><code>detokenize(ids)</code></strong>: 把数字列表变回字符串。</li>
+<li><strong>特殊 Token 属性</strong>:<ul>
+<li><code>eod</code> / <code>eos</code>: 句子结束符 (End of Sentence/Document)。</li>
+<li><code>bos</code>: 句子开始符 (Beginning of Sentence)。</li>
+<li><code>pad</code>: 填充符（用来把短句子补长）。</li>
+<li><code>cls</code> / <code>sep</code>: BERT 专用的分类符和分隔符。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 重点关注两个主流实现</h3>
+<p><strong>目标</strong>：理解现在最常用的两种分词方式在这个文件里长什么样。</p>
+<h4>子任务 A: 看 <code>_HuggingFaceTokenizer</code></h4>
+<ul>
+<li><strong>场景</strong>：现在绝大多数人用这个。</li>
+<li><strong>代码逻辑</strong>：它非常偷懒，直接初始化一个 <code>self._tokenizer</code> (来自 HuggingFace)，然后所有的 <code>tokenize</code> 请求都转发给它。</li>
+<li><strong>观点</strong>：这是为了兼容 HuggingFace 生态，让你能直接加载网上的模型权重。</li>
+</ul>
+<h4>子任务 B: 看 <code>_SentencePieceTokenizer</code> (以及 Llama2Tokenizer)</h4>
+<ul>
+<li><strong>场景</strong>：Llama, T5, ChatGLM 等模型常用。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>它加载一个 <code>.model</code> 文件。</li>
+<li><strong>难点</strong>：注意看 <code>_populate_vocab</code> 和 <code>_add_special_token</code>。因为 SentencePiece 原生的词表里可能没有 <code>&lt;EOS&gt;</code>, <code>&lt;BOS&gt;</code> 或者 <code>&lt;extra_id_0&gt;</code> 这种特殊标记，所以这段代码在<strong>手动往词表里塞特殊字符</strong>，并建立映射关系。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 了解高性能黑科技 <code>CustomTikTokenizer</code></h3>
+<p><strong>目标</strong>：了解 OpenAI (GPT-3/4) 风格的分词器。</p>
+<ul>
+<li><strong>位置</strong>：<code>class CustomTikTokenizer</code>。</li>
+<li><strong>背景</strong>：<code>tiktoken</code> 是 OpenAI 开源的一个极快的分词库。</li>
+<li><strong>观点</strong>：这个类稍微复杂一点，因为它涉及到正则表达式 (<code>PATTERN_TIKTOKEN</code>)。它的目的是为了在 Megatron 中复现 GPT-3/4 的分词逻辑，特别是处理空格和特殊字符的方式。它还处理了 <code>reload_mergeable_ranks</code>，这是为了加载二进制的词表文件。</li>
+</ul>
+<hr />
+<h3>✅ Task 6: 最后的扫尾——多模态与空实现</h3>
+<p><strong>目标</strong>：了解边缘情况。</p>
+<ol>
+<li><strong><code>MultimodalTokenizer</code></strong>: 这是给“图生文”或“文生图”模型用的。它不仅处理文字，还要处理代表图片的 Token（比如 <code>&lt;image&gt;</code>）。</li>
+<li><strong><code>_NullTokenizer</code></strong>: 这是一个“假”分词器。它不查字典，直接按空格切分。<ul>
+<li><strong>用途</strong>：通常用于<strong>性能测试</strong>。当你只想测 GPU 跑得有多快，不想浪费时间在真正的分词计算上时，就用这个。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结（你的学习路线图）</h3>
+<ol>
+<li>先看 <strong><code>build_tokenizer</code></strong>：知道它是入口，负责选人。</li>
+<li>再看 <strong><code>_vocab_size_with_padding</code></strong>：知道它为了 GPU 效率会修改词表大小。</li>
+<li>挑一个简单的类 <strong><code>_HuggingFaceTokenizer</code></strong>：明白这就是个“传话筒”。</li>
+<li>看 <strong><code>_SentencePieceTokenizer</code></strong>：明白有时候需要手动给词表加特殊符号。</li>
+</ol>
+<p>按照这个顺序看，这几百行代码其实就是在做一件事：<strong>把五花八门的分词库，统一整形成 Megatron 训练框架喜欢的样子。</strong></p>

@@ -1,0 +1,114 @@
+<h1>recipe/collabllm/process_dataset.py</h1>
+<p>这份代码确实包含了很多细节，如果对大模型训练的数据处理流程不熟悉，看起来会很晕。</p>
+<p>简单来说，这个脚本就像是一个<strong>“食材预处理流水线”</strong>。它的作用是从网上（Hugging Face）下载原始数据，然后根据你想要做哪种“菜”（RL 强化学习训练 还是 SFT 监督微调），把数据清洗、切分、打包成模型能吃的格式（Parquet 文件）。</p>
+<p>下面我为你列一个 <strong>Task Todo List</strong>，按照代码执行的逻辑顺序，一步一步给你拆解。</p>
+<hr />
+<h3>📋 Task Todo List (代码执行流程)</h3>
+<ol>
+<li><strong>准备阶段</strong>：读取命令行参数（决定做哪种数据，存哪里）。</li>
+<li><strong>进货</strong>：加载原始数据集。</li>
+<li><strong>分流处理（核心）</strong>：判断是做 <strong>RL (强化学习)</strong> 数据还是 <strong>SFT (监督微调)</strong> 数据？<ul>
+<li><strong>如果是 RL</strong>：<ul>
+<li>给数据打上任务标签。</li>
+<li>格式化每一条数据（加上系统提示词 System Prompt，整理字段）。</li>
+<li>去重（删掉重复的 Prompt）。</li>
+</ul>
+</li>
+<li><strong>如果是 SFT</strong>：<ul>
+<li>筛选数据（在多轮对话中，只保留得分最高、轮次最后的那一轮）。</li>
+<li>格式化对话（把 System Prompt + User + Assistant 的回答串起来）。</li>
+<li>只保留模型需要的 <code>prompt</code> 字段。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>切分</strong>：按比例切分成“训练集”和“验证集”。</li>
+<li><strong>打包</strong>：把处理好的数据保存为 <code>.parquet</code> 文件。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解</h3>
+<h4>1. 准备阶段 (Arguments)</h4>
+<p>代码最下面的 <code>main()</code> 函数开始。
+*   <strong>动作</strong>：脚本首先看你运行命令时带了什么参数。
+*   <strong>关键参数</strong>：
+    *   <code>--dataset</code>: 原始数据在哪（默认是数学难题集 <code>math-hard</code>）。
+    *   <code>--local_dir</code>: 处理好的文件存哪里。
+    *   <code>--dataset_type</code>: <strong>最重要</strong>，决定是 <code>rl</code> 还是 <code>sft</code>。</p>
+<h4>2. 进货 (Load Dataset)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">ds_dict</span> <span class="o">=</span> <span class="n">load_dataset</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">dataset</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：从 Hugging Face 或本地加载数据。</li>
+<li><strong>现状</strong>：这时候的数据比较杂乱，包含很多字段（如 <code>prompt</code>, <code>completion</code>, <code>score</code>, <code>turn_id</code> 等）。</li>
+</ul>
+<h4>3. 分流处理 (The Fork in the Road)</h4>
+<p>这里代码分成了两条路，我们分别来看：</p>
+<p><strong>👉 路径 A：如果是 <code>dataset_type == "rl"</code> (强化学习数据)</strong></p>
+<p>RL 需要模型根据 Prompt 生成答案，然后由奖励模型打分。</p>
+<ul>
+<li>
+<p><strong>Task 3.1: 格式化 (collapse_example)</strong>
+    代码里定义了一个 <code>collapse_example</code> 函数。它的作用是：</p>
+<ul>
+<li><strong>注入人设</strong>：在 Prompt 最前面加上一段很长的 <code>SYSTEM_PROMPT</code>（代码第 48-73 行），告诉模型：“你是一个乐于助人、积极互动的助手……”。</li>
+<li><strong>整理 Truth</strong>：确定标准答案 (<code>ground_truth</code>)。</li>
+<li><strong>构建 Reward 结构</strong>：把辅助信息（比如这道题的单轮 Prompt、任务描述）塞进 <code>extra_info</code> 字典里。这是为了给后面的 Reward Model（奖励模型）或者仿真环境使用的。</li>
+<li><strong>生成 ID</strong>：给每一条数据生成一个唯一的 UUID。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.2: 去重 (dedup_by_prompt)</strong></p>
+<ul>
+<li>防止训练数据里有完全一模一样的题目，浪费算力或导致过拟合。</li>
+</ul>
+</li>
+</ul>
+<p><strong>👉 路径 B：如果是 <code>dataset_type == "sft"</code> (监督微调数据)</strong></p>
+<p>SFT 是让模型直接模仿“标准答案”。</p>
+<ul>
+<li>
+<p><strong>Task 3.3: 筛选最佳答案 (Pandas 处理)</strong>
+    原始数据可能包含同一个对话的多个回合，或者同一个问题的不同回答（有分高分低）。
+    <code>python
+    # 按照 对话ID -&gt; 轮次(降序) -&gt; 分数(降序) 排序
+    df = df.sort_values(["conv_id", "turn_id", "score"], ascending=[True, False, False])
+    # 每个对话只留第一条（也就是轮次最靠后、分数最高的那条）
+    df = df.drop_duplicates(subset="conv_id", keep="first")</code>
+    <strong>目的</strong>：我们只教模型学最好的、最终的那次回答。</p>
+</li>
+<li>
+<p><strong>Task 3.4: 拼接对话</strong>
+    <code>python
+    # 格式变成：[System Prompt, User Prompt, Assistant Answer]
+    example["prompt"] = (
+        [{"role": "system", "content": SYSTEM_PROMPT}]
+        + example["prompt"]
+        + [{"role": "assistant", "content": example["completion"]}]
+    )</code>
+    <strong>目的</strong>：SFT 需要把“问题”和“答案”连起来喂给模型，让模型学会预测下一个字。</p>
+</li>
+</ul>
+<h4>4. 切分 (Splitting)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">split</span> <span class="o">=</span> <span class="n">ds_all</span><span class="o">.</span><span class="n">train_test_split</span><span class="p">(</span><span class="n">test_size</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">validation_size</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：比如切出 10% 的数据作为验证集（Validation），用来考试；剩下 90% 作为训练集（Train），用来学习。</li>
+</ul>
+<h4>5. 打包 (Saving)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">save_parquet</span><span class="p">(</span><span class="n">train_ds</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">dataset_type</span><span class="si">}</span><span class="s2">_train&quot;</span><span class="p">,</span> <span class="n">out_dir</span><span class="p">)</span>
+<span class="n">save_parquet</span><span class="p">(</span><span class="n">val_ds</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">dataset_type</span><span class="si">}</span><span class="s2">_validation&quot;</span><span class="p">,</span> <span class="n">out_dir</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：把处理好的数据存成 <code>.parquet</code> 格式。</li>
+<li><strong>为什么是 Parquet？</strong> 这种格式读写速度快，压缩率高，是大模型训练的标准数据格式。</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个脚本的核心观点是：<strong>同一份原始数据，为了不同的训练阶段（RL vs SFT），需要加工成不同的样子。</strong></p>
+<ul>
+<li><strong>RL 数据</strong>注重：保留题目（Prompt）和环境信息（Extra Info），不需要把答案拼进去（因为要让模型自己生成去拿奖励）。</li>
+<li><strong>SFT 数据</strong>注重：筛选出质量最高的对话历史，把“问题+标准答案”拼在一起，让模型照着学。</li>
+</ul>

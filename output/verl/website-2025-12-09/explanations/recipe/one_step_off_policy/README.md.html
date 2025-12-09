@@ -1,0 +1,67 @@
+<h1>recipe/one_step_off_policy/README.md</h1>
+<p>这篇文档介绍了一种名为 <strong>“One Step Off Policy Async Trainer”（一步偏差异步训练器）</strong> 的技术方案。</p>
+<p>简单来说，这是一个<strong>用来给强化学习（RL）训练加速的“秘方”</strong>。</p>
+<p>为了让你更容易理解，我把它拆解成三个部分：<strong>为什么要这么做（痛点）</strong>、<strong>具体怎么做（Task List）</strong>、以及<strong>如何配置（使用指南）</strong>。</p>
+<hr />
+<h3>第一部分：为什么要搞这个？（背景与痛点）</h3>
+<p>想象你在厨房做饭，原本的流程（同步训练）是这样的：
+1.  <strong>切菜（生成数据/Rollout）：</strong> 你停下所有手里的活，专心切菜。这时候灶台（训练GPU）是空的，火在白烧。
+2.  <strong>炒菜（模型训练/Train）：</strong> 菜切好了，你开始炒菜。这时候案板（生成GPU）是空的，没人切菜。
+3.  <strong>循环：</strong> 炒完一盘，再去切下一盘。</p>
+<p><strong>问题：</strong>
+*   <strong>效率低：</strong> 灶台和案板总有一个在闲着。
+*   <strong>长尾效应：</strong> 如果遇到很难切的菜（生成长文本），整个厨房都要等很久，大家都在发呆。</p>
+<p><strong>这篇文档的方案（异步训练）：</strong>
+找个帮手，或者把你的一只手专门分出去切菜，另一只手专门炒菜。<strong>一边炒上一轮切好的菜，一边切下一轮要用的菜。</strong></p>
+<hr />
+<h3>第二部分：Task List（核心逻辑一步步拆解）</h3>
+<p>为了实现这个方案，系统内部执行了以下“待办清单”。我们将资源分成了两拨：一拨叫<strong>生成组（Rollout）</strong>，一拨叫<strong>训练组（Trainer）</strong>。</p>
+<h4>Task 1: 资源分家 (Resource Isolation)</h4>
+<ul>
+<li><strong>动作：</strong> 不再让所有显卡一会儿一起干生成，一会儿一起干训练。</li>
+<li><strong>做法：</strong> 比如你有16张卡，强制划分为：4张卡专门负责生成数据，12张卡专门负责训练模型。</li>
+</ul>
+<h4>Task 2: 建立“错位”流水线 (The Pipeline)</h4>
+<p>这是最核心的“One Step Off”逻辑。假设我们正在进行第 $N$ 步训练：</p>
+<ul>
+<li><strong>[生成组的任务]：</strong><ul>
+<li>拿着<strong>第 $N$ 步</strong>的模型参数，开始生成<strong>第 $N+1$ 步</strong>需要的数据。</li>
+<li><em>（注意：它不关心训练组在干嘛，它只管埋头生成）</em></li>
+</ul>
+</li>
+<li><strong>[训练组的任务]：</strong><ul>
+<li>拿着<strong>第 $N-1$ 步</strong>生成好的数据（也就是上一轮存下来的），训练<strong>第 $N$ 步</strong>的模型。</li>
+<li><em>（这就是为什么叫“One Step Off/一步偏差”，因为训练用的数据不是当下最新模型生成的，而是上一个版本的模型生成的，稍微“旧”了一点点，但不影响大局）。</em></li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 极速同步参数 (NCCL Sync)</h4>
+<ul>
+<li><strong>问题：</strong> 训练组把模型更新升级了，生成组还在用旧模型怎么办？</li>
+<li><strong>动作：</strong> 利用 NCCL（一种超快的显卡间通信技术），在极短的时间内（毫秒级），把训练好的新参数“广播”给生成组。</li>
+<li><strong>效果：</strong> 几乎不耽误时间，生成组就能拿到新脑子去生成下一批数据。</li>
+</ul>
+<hr />
+<h3>第三部分：配置指南（怎么用？）</h3>
+<p>如果你想用这个功能，你需要按以下步骤调整你的配置文件（YAML）：</p>
+<h4>1. 开启异步模式</h4>
+<p>在启动命令或配置里，指定使用 <code>one_step_off_policy</code> 相关的配置。</p>
+<h4>2. 分配显卡（关键步骤）</h4>
+<p>你需要决定怎么分蛋糕。文档里给了一个原则：
+*   <strong>Rollout（生成）资源</strong> + <strong>Trainer（训练）资源</strong> = <strong>总资源</strong></p>
+<p><strong>举个栗子（文档中的实验配置）：</strong>
+*   <strong>总共：</strong> 2台机器，每台8张卡（共16张）。
+*   <strong>分配：</strong>
+    *   <strong>生成组：</strong> 4张卡。
+    *   <strong>训练组：</strong> 12张卡。</p>
+<p><strong>怎么调优？（动态调整）：</strong>
+*   <strong>观察 <code>wait_prev_gen</code> 时间：</strong> 这是指“训练组”等“生成组”数据的时间。
+    *   如果<strong>等待时间很长</strong>：说明生成太慢了，切菜供不上炒菜。<strong>对策：</strong> 给生成组多加几张卡（比如改成 6张生成，10张训练）。
+    *   如果<strong>几乎不用等</strong>：说明配合完美，效率最高。</p>
+<h3>总结</h3>
+<p>这个文档讲的就是一种<strong>“一边切菜一边炒菜”</strong>的并行策略。</p>
+<ul>
+<li><strong>优点：</strong> 显卡不闲着，训练总时间缩短了（文档中提到快了 23% 到 40%）。</li>
+<li><strong>代价：</strong> 训练用的数据稍微有点“过时”（差了一个版本），但实验证明这不仅没让效果变差，甚至在某些指标上还更好或持平。</li>
+<li><strong>操作：</strong> 你只需要在配置文件里把显卡数量分配好即可。</li>
+</ul>

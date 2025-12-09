@@ -1,0 +1,113 @@
+<h1>recipe/gkd/test_qwen_sglang.sh</h1>
+<p>这份脚本确实包含了很多术语，看起来是一个用于<strong>大模型训练（特别是知识蒸馏）</strong>的启动脚本。简单来说，它的目的是：<strong>让一个小模型（学生）通过模仿一个大模型（老师）的行为来学习，同时利用 SGLang 进行加速推理。</strong></p>
+<p>为了让你听懂，我把这份复杂的脚本拆解成一个<strong>线性的 To-Do List（任务清单）</strong>。你只需要按照这个顺序去理解或执行，就能明白它在干什么。</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<h4>第一阶段：准备模型文件 (对应脚本中的 #0 和 #1 注释部分)</h4>
+<p>这份脚本虽然文件名叫 <code>qwen</code>，但注释里提到了 <code>DeepSeek</code>，说明它可能是一个模板。</p>
+<ol>
+<li>
+<p><strong>下载配置文件 (<code>config</code>)</strong>：</p>
+<ul>
+<li>你需要去 HuggingFace 下载 DeepSeek 或 Qwen 的配置文件。</li>
+<li><strong>关键动作</strong>：下载后，打开 <code>config.json</code>，找到 <code>quantization_config</code>（量化配置）并删除它（通常为了避免兼容性问题）。</li>
+<li><strong>关键动作</strong>：在配置里设置 <code>num_nextn_predict_layers=0</code>。这意思是禁用“多Token预测”功能，因为当前训练框架还不支持。</li>
+</ul>
+</li>
+<li>
+<p><strong>下载模型权重 (<code>checkpoint</code>)</strong>：</p>
+<ul>
+<li>脚本注释里给了一个链接（<code>BearBiscuit05/...</code>），你需要下载这种 <code>dist_ckpt</code> 格式的模型。</li>
+<li><strong>修改路径</strong>：找到代码中的 <code>HF_MODEL_PATH=/path/to/Qwen3-0.6B</code>，把它改成你硬盘里实际存放模型权重的路径。</li>
+</ul>
+</li>
+<li>
+<p><strong>设置环境变量</strong>：</p>
+<ul>
+<li>脚本里有一堆 <code>export NVTE_...</code>。这是针对 NVIDIA Transformer Engine 的设置，主要为了优化显存和速度。你通常不需要动，保持默认即可。</li>
+</ul>
+</li>
+</ol>
+<h4>第二阶段：准备数据 (对应脚本中的 #2 部分)</h4>
+<ol>
+<li><strong>指定数据集路径</strong>：<ul>
+<li>脚本默认是用 <code>GSM8K</code>（一个数学推理数据集）来训练。</li>
+<li><strong>修改路径</strong>：找到 <code>gsm8k_train_path</code> 和 <code>gsm8k_test_path</code>，把 <code>/path/to/...</code> 改成你本地 <code>.parquet</code> 数据文件的真实路径。</li>
+</ul>
+</li>
+</ol>
+<h4>第三阶段：配置硬件资源 (对应脚本中的 Parallelism 部分)</h4>
+<ol>
+<li><strong>设置显卡并行策略</strong>：<ul>
+<li>这部分决定了模型怎么切分到多张显卡上。</li>
+<li><code>NODES=1</code>：用几台机器（1台）。</li>
+<li><code>TP=1</code> (Tensor Parallel)：张量并行度。如果模型很大单卡放不下，需要调大这个数。</li>
+<li><code>PP=1</code> (Pipeline Parallel)：流水线并行度。</li>
+<li><strong>决策</strong>：如果你跑的是 Qwen-0.6B 这种小模型，保持全为 <code>1</code> 即可。如果是几十B的大模型，需要根据显存调整。</li>
+</ul>
+</li>
+</ol>
+<h4>第四阶段：启动训练 (对应 <code>ray job submit</code> 及其参数)</h4>
+<p>这是脚本的核心，它向 Ray 集群提交了一个任务。</p>
+<ol>
+<li>
+<p><strong>理解“老师”与“学生”的设定</strong>：</p>
+<ul>
+<li>这个脚本是做 <strong>GKD (Generalized Knowledge Distillation)</strong>，即“蒸馏”。</li>
+<li><strong>Teacher (老师)</strong>：脚本里设置了 <code>+teacher.server_ip=127.0.0.1</code> 和端口 <code>15555</code>。<ul>
+<li><strong>隐含任务</strong>：这意味着在运行这个脚本<strong>之前</strong>，你必须先在后台启动一个“老师模型”的服务（vLLM 或 SGLang server），并监听在 15555 端口。否则这脚本跑不通。</li>
+</ul>
+</li>
+<li><strong>Student (学生)</strong>：即 <code>actor_rollout_ref</code>，也就是你上面配置的 <code>HF_MODEL_PATH</code> 指向的模型。</li>
+</ul>
+</li>
+<li>
+<p><strong>配置 SGLang (加速引擎)</strong>：</p>
+<ul>
+<li>脚本里有一行 <code>actor_rollout_ref.rollout.name=sglang</code>。</li>
+<li><strong>含义</strong>：在训练过程中，学生模型需要不断生成（Rollout）答案来做自我探索。这里指定使用 <code>SGLang</code> 这个库来做推理，因为它比普通的 PyTorch 推理快得多。</li>
+</ul>
+</li>
+<li>
+<p><strong>调整训练超参数 (Hyper-parameters)</strong>：</p>
+<ul>
+<li><code>data.train_batch_size=64</code>：一批训练多少数据。</li>
+<li><code>trainer.n_gpus_per_node=4</code>：每台机器用几张卡。你需要根据你实际有的显卡数量修改这个数字（比如你只有1张卡，就改成1）。</li>
+<li><code>trainer.total_training_steps=10</code>：只训练10步（通常用于测试脚本是否跑得通，正式训练要改大）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这脚本到底在讲什么观点？</h3>
+<p>如果把这个脚本看作一篇文章，它的“核心观点”如下：</p>
+<ol>
+<li>
+<p><strong>On-Policy Distillation (在线蒸馏)</strong>：</p>
+<ul>
+<li>它不是简单的“老师教，学生死记硬背”。</li>
+<li>它是“学生自己做题（Rollout），老师在旁边打分或提供参考（Ref/Teacher），学生根据反馈实时调整”。</li>
+</ul>
+</li>
+<li>
+<p><strong>效率至上 (SGLang &amp; Ray)</strong>：</p>
+<ul>
+<li>训练过程中，“学生做题”这一步非常耗时。</li>
+<li>脚本强制使用 <strong>SGLang</strong> 作为推理后端，观点是：<strong>如果不优化推理速度，在线训练（RLHF/GKD）会慢到无法接受。</strong></li>
+<li>使用 <strong>Ray</strong> 是为了分布式管理，把“做题”、“训练”、“老师打分”解耦到不同的进程或机器上。</li>
+</ul>
+</li>
+<li>
+<p><strong>混合架构 (Megatron + HuggingFace)</strong>：</p>
+<ul>
+<li>脚本里出现了很多 <code>megatron</code> 的参数。这说明它底层可能使用了 Megatron-LM 的架构来支持超大模型训练，但接口上尽量兼容 HuggingFace 的路径。</li>
+</ul>
+</li>
+</ol>
+<h3>你现在该怎么做？</h3>
+<p>如果你要运行它，请按以下步骤操作：</p>
+<ol>
+<li><strong>改路径</strong>：把所有 <code>/path/to/...</code> 改成真的路径。</li>
+<li><strong>改显卡数</strong>：把 <code>n_gpus_per_node=4</code> 改成你实际的卡数。</li>
+<li><strong>启动老师</strong>：确保在端口 <code>15555</code> 启动了一个大模型服务（这是脚本里没写但隐含的前提）。</li>
+<li><strong>运行</strong>：在终端执行 <code>bash test_qwen_sglang.sh</code>。</li>
+</ol>

@@ -1,0 +1,135 @@
+<h1>recipe/fully_async_policy/megatron_worker.py</h1>
+<p>这份代码确实比较硬核，因为它处于<strong>分布式强化学习（RL）</strong>、<strong>大模型训练（Megatron）</strong> 和 <strong>底层通信（NCCL/Ray）</strong> 的交叉点。</p>
+<p>简单来说，这个文件的作用是：<strong>在“训练（Actor）”和“推理（Rollout）”两个不同的进程/GPU之间，高效地同步大模型的权重。</strong></p>
+<p>为了让你读懂它，我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>。我们可以把理解这份代码的过程，想象成你在设计一个<strong>“老师（Actor）”</strong>和<strong>“学生（Rollout）”</strong>之间的知识传递系统。</p>
+<hr />
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 搞清楚角色分工 (Who is Who)</h4>
+<ul>
+<li><strong>目标</strong>：理解代码中 <code>Actor</code> 和 <code>Rollout</code> 分别代表什么。</li>
+<li><strong>观点</strong>：<ul>
+<li><strong>Actor (训练者)</strong>：负责计算梯度，更新模型参数（权重）。它手里的模型是最新的。</li>
+<li><strong>Rollout (采样者/推理者)</strong>：负责用模型去玩游戏/生成文本，产生数据。它需要不断从 Actor 那里拿最新的权重。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>DetachActorWorker</code>: 代表 Actor 端的逻辑。</li>
+<li><code>DetachAsyncRolloutWorker</code>: 代表 Rollout 端的逻辑。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 找到传递的目标 (Where to put it)</h4>
+<ul>
+<li><strong>目标</strong>：Rollout 也是一个复杂的系统，权重到底要塞给谁？</li>
+<li><strong>观点</strong>：Rollout 里面通常包裹着一个推理引擎（比如 vLLM）。我们需要剥洋葱一样把最里面的模型找出来。</li>
+<li><strong>代码对应</strong>：<ul>
+<li>函数 <code>get_inference_model(rollout)</code>：这就是个“剥洋葱”函数，不管你用什么引擎，它负责把底层的 <code>model</code> 对象挖出来，准备接收权重。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 建立“发货清单” (The Manifest)</h4>
+<ul>
+<li><strong>目标</strong>：模型太大了，不能乱传。传输前，Actor 需要告诉 Rollout：“我要发给你哪些层？形状是啥？数据类型是啥？”</li>
+<li><strong>观点</strong>：Actor 先扫描一遍自己的参数，生成一个元数据列表（名字、Shape、Dtype），发给 Rollout，让 Rollout 做好接收准备。</li>
+<li><strong>代码对应</strong>：<ul>
+<li>Actor 端：<code>get_actor_weights_info</code>（生成清单）。</li>
+<li>Rollout 端：<code>set_actor_weights_info</code>（接收并保存清单）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 核心任务——同步权重 (The Sync)</h4>
+<ul>
+<li><strong>目标</strong>：这是全篇最难的。如何把几 GB 甚至几百 GB 的参数从 Actor 的 GPU 瞬间复制到 Rollout 的 GPU？</li>
+<li><strong>观点</strong>：<ol>
+<li><strong>准备</strong>：如果模型在 CPU 上（为了省显存），先搬回 GPU。</li>
+<li><strong>循环</strong>：按着“发货清单”一个张量（Tensor）一个张量地处理。</li>
+<li><strong>广播 (Broadcast)</strong>：利用 <code>collective.broadcast</code>（底层是 NCCL），像广播体操领操员一样，Rank 0 (Actor) 做动作，其他人 (Rollout) 跟着做，数据瞬间同步。</li>
+<li><strong>装载</strong>：Rollout 收到数据后，塞进自己的推理引擎里。</li>
+</ol>
+</li>
+<li><strong>代码对应</strong>：<ul>
+<li>类 <code>DetachNcclSync</code> 中的 <code>sync_rollout_weights</code> 方法。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 显存管理 (Save VRAM)</h4>
+<ul>
+<li><strong>目标</strong>：显存太贵了。不训练的时候，能不能把模型踢到 CPU 内存里？</li>
+<li><strong>观点</strong>：支持“显存卸载（Offload）”。当需要同步时，加载到 GPU；同步完，或者保存快照时，存回 CPU。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>save_model_to_cpu</code> / <code>restore_model_from_cpu</code> / <code>clear_cpu_model</code>。</li>
+<li>以及 <code>offload_megatron_model_to_cpu</code> 等工具函数的调用。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🔍 逐行/逐块 详细解读</h3>
+<p>现在我们带着上面的 Task List，一步步看代码细节：</p>
+<h4>1. 辅助工具：<code>get_inference_model</code></h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">get_inference_model</span><span class="p">(</span><span class="n">rollout</span><span class="p">):</span>
+    <span class="c1"># ... 判断 rollout 的类型 ...</span>
+    <span class="c1"># 返回底层的 inference_model</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这就是 <strong>Task 2</strong>。因为推理引擎可能是 vLLM，也可能是别的 WorkerWrapper。这个函数是为了兼容性，确保能找到那个需要被更新权重的对象。</li>
+</ul>
+<h4>2. 基类：<code>DetachNcclSync</code> (最核心的逻辑)</h4>
+<p>这个类是 Actor 和 Rollout 的父类，包含了共用的同步逻辑。</p>
+<ul>
+<li>
+<p><strong><code>sync_rollout_weights</code> (Task 4 核心)</strong>:</p>
+<ul>
+<li><code>@register(...)</code>: 这是一个装饰器，说明这个函数可以被远程调度（比如通过 Ray）。</li>
+<li><code>if self._is_actor and self._is_offload_param:</code>: 如果我是 Actor 且开启了卸载，先把模型从 CPU 搬回 GPU，不然没法通过 NCCL 发送。</li>
+<li><code>params_generator</code>: Actor 创建一个生成器，准备像流水线一样吐出参数。</li>
+<li><code>for key, shape, dtype in self._weights_info:</code>: <strong>按清单循环</strong>。<ul>
+<li><code>tensor = torch.empty(...)</code>: 无论是发方还是收方，都要先在 GPU 上开辟一块空地。</li>
+<li><code>if self._is_actor ... tensor.copy_(weight)</code>: Actor 把真实的权重填入这块空地。</li>
+<li><strong><code>collective.broadcast(tensor, src_rank=0, ...)</code></strong>: <strong>全篇最重要的一行</strong>。这是 GPU 之间的高速公路。Rank 0 (Actor) 把数据广播给组内所有人。此时，Rollout 的那个空 tensor 被填满了 Actor 的数据。</li>
+<li><code>if self._is_rollout: inference_model.load_weights(...)</code>: Rollout 拿到热乎的数据，更新自己的模型。</li>
+</ul>
+</li>
+<li>最后，如果需要，Actor 再把模型卸载回 CPU 省显存。</li>
+</ul>
+</li>
+<li>
+<p><strong>CPU 缓存操作 (Task 5)</strong>:</p>
+<ul>
+<li><code>save_model_to_cpu</code>: 把 GPU 上的模型备份一份到 CPU 内存字典 <code>cpu_saved_models</code> 里。这通常用于保存“旧策略（Reference Model）”或者做 Checkpoint。</li>
+<li><code>restore_model_from_cpu</code>: 从 CPU 内存恢复模型。</li>
+</ul>
+</li>
+</ul>
+<h4>3. Actor 端：<code>DetachActorWorker</code></h4>
+<ul>
+<li><strong><code>_get_actor_params_generator</code></strong>:<ul>
+<li>负责把 Megatron 的大模型拆解成一个个 Tensor，供同步使用。</li>
+</ul>
+</li>
+<li><strong><code>get_actor_weights_info</code> (Task 3)</strong>:<ul>
+<li>它不发送具体数据，只发送元数据（Key, Size, Dtype）。</li>
+<li>逻辑：先生成一遍参数，记录下所有的名字和形状，打包成一个 list 返回。这个 list 会被发送给 Rollout。</li>
+</ul>
+</li>
+</ul>
+<h4>4. Rollout 端：<code>DetachAsyncRolloutWorker</code></h4>
+<ul>
+<li><strong><code>set_actor_weights_info</code> (Task 3)</strong>:<ul>
+<li>很简单，就是接收 Actor 发来的那个 list，存到 <code>self._weights_info</code> 里。</li>
+<li>这样下次执行 <code>sync_rollout_weights</code> 时，Rollout 就知道：“哦，第一个来的包是 Layer1 的权重，大小是 4096...”。</li>
+</ul>
+</li>
+</ul>
+<h3>💡 总结：这篇文章到底在讲啥？</h3>
+<p>这篇文章实现了一个<strong>全异步（Fully Async）的权重同步机制</strong>。</p>
+<ul>
+<li><strong>传统做法</strong>：训练一步 -&gt; 停下来 -&gt; 把权重存硬盘/通过慢速网络发给推理 -&gt; 推理加载 -&gt; 继续。</li>
+<li><strong>这个做法</strong>：<ol>
+<li>利用 <strong>NCCL</strong>（NVIDIA的高速互联库）直接在 GPU 之间广播数据，极快。</li>
+<li>利用 <strong>Detach</strong>（分离）思想，把 Actor 和 Rollout 拆开，通过“清单”和“广播”来协作。</li>
+<li>支持 <strong>CPU Offload</strong>，允许在显存不够时，把暂时不用的模型扔到 CPU 内存里，用时间换空间。</li>
+</ol>
+</li>
+</ul>
+<p><strong>一句话概括</strong>：这是一个让“训练老师”通过 GPU 高速专线，把最新的知识实时、高效地灌输给“做题学生”的 Python 脚本。</p>

@@ -1,0 +1,80 @@
+<h1>tests/test_protocol_v2_on_cpu.py</h1>
+<p>这完全可以理解。测试代码（Test Code）通常写得很枯燥，因为它不是为了“读起来顺畅”，而是为了“覆盖各种边界情况”。</p>
+<p>这个文件的核心目的是测试一个叫 <strong><code>TensorDict</code></strong> 的数据结构工具库（在代码中缩写为 <code>tu</code>，即 <code>tensordict_utils</code>）。</p>
+<p>你可以把 <code>TensorDict</code> 想象成一个 <strong>“超级Excel表格”</strong>：
+*   <strong>每一行</strong> 是一个样本（Batch size）。
+*   <strong>每一列</strong> 是一个特征（比如 <code>obs</code> 观察值, <code>act</code> 动作, <code>rew</code> 奖励）。
+*   <strong>超级之处</strong>：它不仅能存数字（Tensor），还能存字符串、字典、甚至图片，而且可以像操作一个整体一样对它进行切片、合并、移动到GPU等操作。</p>
+<p>下面我按照你的要求，先列一个核心概念 List，再列一个“学习任务 To-Do List”，带你一步步看懂这个文件在干嘛。</p>
+<hr />
+<h3>1. 核心概念 List (词汇表)</h3>
+<p>在看代码前，先建立几个概念：</p>
+<ol>
+<li><strong>TensorDict (张量字典)</strong>: 这是一个容器。普通的 Python 字典 <code>{'a': tensor1, 'b': tensor2}</code> 是松散的，而 TensorDict 强制要求内部所有的 Tensor 第一维度（Batch Size）必须对齐。</li>
+<li><strong>Batch Size</strong>: 数据的行数。比如你有 100 个数据，Batch Size 就是 100。</li>
+<li><strong>Tensor Data</strong>: 纯数值数据，比如矩阵、向量（PyTorch 能直接处理的）。</li>
+<li><strong>Non-Tensor Data (非张量数据)</strong>: PyTorch 处理不了的数据，比如字符串（"Hello"）、嵌套的字典（JSON结构）、列表等。这个库专门写了逻辑来让 TensorDict 也能“带着”这些数据一起跑。</li>
+<li><strong>Union (合并列)</strong>: 把两个表格左右拼起来（行数不变，列变多）。</li>
+<li><strong>Concat (拼接行)</strong>: 把两个表格上下拼起来（列数不变，行变多）。</li>
+</ol>
+<hr />
+<h3>2. 任务 To-Do List (逐步解析)</h3>
+<p>想象你是一个刚入职的开发者，我们要验证这个 <code>TensorDict</code> 库是不是好用。我们按照功能演进的顺序来阅读这些测试。</p>
+<h4>Task 1: 基础建设 —— 造一个数据包</h4>
+<p><strong>目标</strong>：测试能不能成功创建一个 <code>TensorDict</code>，并像访问数组一样访问它。
+*   <strong>对应测试函数</strong>: <code>test_tensor_dict_constructor</code>
+*   <strong>解读</strong>:
+    *   代码创建了 <code>obs</code> (100行), <code>act</code> (100行)。
+    *   调用 <code>tu.get_tensordict</code> 把它们打包。
+    *   <strong>验证</strong>: <code>data[0]</code> 能不能取到第一行数据？<code>data[0:2]</code> 能不能取前两行？
+    *   <strong>结论</strong>: 这个容器支持像数组一样的切片（Slicing）。</p>
+<h4>Task 2: 数据扩充 —— 给数据加点新属性</h4>
+<p><strong>目标</strong>：测试能不能把两个只有部分属性的字典合并成一个全能字典。
+*   <strong>对应测试函数</strong>: <code>test_union_tensor_dict</code>
+*   <strong>解读</strong>:
+    *   <code>data1</code> 只有观察值 (<code>obs</code>)。
+    *   <code>data2</code> 有奖励值 (<code>rew</code>)。
+    *   调用 <code>tu.union_tensor_dict(data1, data2)</code>。
+    *   <strong>验证</strong>: 如果两个字典里有同名但数值不一样的 Key（冲突），程序必须报错 (<code>pytest.raises(AssertionError)</code>)。这是为了防止数据被悄悄覆盖。</p>
+<h4>Task 3: 挑挑拣拣 —— 按照索引选数据</h4>
+<p><strong>目标</strong>：我有 100 条数据，我只想挑出第 1、3、5 条。
+*   <strong>对应测试函数</strong>: <code>test_index_select_tensor_dict</code>, <code>test_dataproto_index</code>, <code>test_select</code>
+*   <strong>解读</strong>:
+    *   <strong>Index Select</strong>: 传入一个索引列表 <code>[1, 3]</code>，看能不能返回一个新的、只包含这两行数据的 TensorDict。
+    *   <strong>Select</strong>: 类似于 SQL 的 <code>SELECT column</code>，测试能不能只把 <code>obs</code> 这一列单独拿出来。</p>
+<h4>Task 4: 难啃的骨头 —— 处理“非数值”数据 (重点)</h4>
+<p><strong>目标</strong>：AI 训练中经常有字符串（Prompt）、嵌套的 JSON（工具调用结果）。PyTorch Tensor 存不了这些，但我们需要 TensorDict 能带着它们一起走。
+*   <strong>对应测试函数</strong>:
+    *   <code>test_assign_non_tensor_stack_with_nested_lists</code> (测试存列表的列表)
+    *   <code>test_assign_non_tensor_stack_with_nested_dicts</code> (测试存字典的列表)
+    *   <code>test_get_tensordict_agent_loop_scenario</code> (模拟真实场景)
+*   <strong>解读</strong>:
+    *   这是这个文件很大篇幅在讲的事情。
+    *   比如 <code>turn_scores</code> 是一个列表，里面有的元素是空 <code>[]</code>，有的是 <code>[0.5, 0.8]</code>。普通的 Tensor 无法对齐这种参差不齐的数据。
+    *   测试验证了 <code>TensorDict</code> 内部使用了特殊的包装器（<code>NonTensorStack</code>），让你存进去是什么样，取出来还是什么样，而且还能跟着 Batch 一起切片。</p>
+<h4>Task 5: 批量处理 —— 拼接与堆叠</h4>
+<p><strong>目标</strong>：把几个小 Batch 拼成一个大 Batch（比如训练时把几个 GPU 的数据凑在一起）。
+*   <strong>对应测试函数</strong>: <code>test_concat_tensordict</code>, <code>test_chunk_concat</code>
+*   <strong>解读</strong>:
+    *   <strong>Concat</strong>: <code>data1</code> 有 10 行，<code>data2</code> 有 10 行。拼起来变成 20 行。
+    *   <strong>Chunk/Split</strong>: 把 20 行切成两个 10 行。
+    *   <strong>重点</strong>: 测试了当数据里包含复杂的“嵌套 Tensor”或者“字符串列表”时，拼接操作会不会崩。</p>
+<h4>Task 6: 进阶操作 —— 迭代器与存取</h4>
+<p><strong>目标</strong>：能不能把这个对象直接放进 <code>DataLoader</code> 里循环？能不能存成文件？
+*   <strong>对应测试函数</strong>:
+    *   <code>test_tensor_dict_make_iterator</code>: 验证能不能把一大坨数据分成小批次（Mini-batch）喂给模型。
+    *   <code>test_torch_save_data_proto</code>: 验证 <code>torch.save</code> 和 <code>torch.load</code> 后数据不丢失。
+    *   <code>test_dataproto_pad_unpad</code>: 验证能不能把数据补齐（Padding），比如把 99 条数据补成 100 条以便整除，处理完再把多余的 1 条扔掉（Unpad）。</p>
+<h4>Task 7: 图像与特殊数据</h4>
+<p><strong>目标</strong>：测试能不能存图片。
+*   <strong>对应测试函数</strong>: <code>test_tensordict_with_images</code>
+*   <strong>解读</strong>: 验证了把 numpy 格式的图片塞进去，取出来数据是一致的。</p>
+<hr />
+<h3>3. 总结：这篇代码在讲什么观点？</h3>
+<p>如果把你当成用户，这篇测试代码实际上是在向你保证（Promise）以下观点：</p>
+<ol>
+<li><strong>“放心存”</strong>：无论你是标准的 Tensor，还是参差不齐的文本列表，还是嵌套的字典，扔进 <code>TensorDict</code> 我都能给你管好。</li>
+<li><strong>“随意切”</strong>：你可以像操作普通数组一样操作这个复杂的字典，索引、切片、拼接，内部的数据（无论多复杂）都会自动对齐。</li>
+<li><strong>“严检查”</strong>：如果合并数据时有冲突，或者维度对不上，我会立刻报错，不会让你在训练跑了一半时才发现数据错了。</li>
+</ol>
+<p><strong>一句话概括</strong>：这个文件在测试一个<strong>“全能数据容器”</strong>的健壮性，确保它能支撑起复杂的 AI 训练流程（特别是包含文本和复杂结构化数据的 LLM 训练）。</p>

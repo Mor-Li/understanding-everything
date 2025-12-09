@@ -1,0 +1,63 @@
+<h1>docs/advance/fsdp_extension.rst</h1>
+<p>这份文档看起来确实非常技术化，主要涉及<strong>大模型训练（FSDP）</strong>和<strong>推理（vLLM）</strong>之间如何“搬运”模型参数的问题。</p>
+<p>简单来说，它的核心观点是：<strong>“不要一次性把整个大象装进冰箱（会导致内存爆炸），要切成块一块一块装。”</strong></p>
+<p>为了让你更容易理解，我把文档内容拆解成一个 <strong>To-Do List（任务清单）</strong>，分为<strong>背景理解</strong>、<strong>检查现状</strong>、<strong>动手实操</strong>三个阶段，一步步给你讲。</p>
+<hr />
+<h3>第一阶段：理解背景（我们在做什么？）</h3>
+<p><strong>Task 1: 理解场景</strong>
+*   <strong>现状</strong>：你正在使用 FSDP（一种并行训练技术）训练模型，同时需要用 vLLM（一种推理加速框架）来生成文本。
+*   <strong>问题</strong>：你需要把训练好的参数（权重）同步给 vLLM。
+*   <strong>痛点</strong>：
+    *   旧方法（<code>hf_weight_loader</code>）：像普通搬家一样，把所有家具（模型参数）一次性全堆在门口。这会导致<strong>OOM（Out Of Memory，显存溢出）</strong>，因为模型太大了。
+    *   新方法（<code>dtensor_weight_loader</code>）：像聪明的搬家，把家具拆开，一件一件、分层地搬进去。这样能大大降低内存峰值。</p>
+<p><strong>Task 2: 明确目标</strong>
+*   文档的目标是教你<strong>如何使用或实现这个“聪明的搬家方法”（DTensor Weight Loader）</strong>。</p>
+<hr />
+<h3>第二阶段：检查清单（我需要写代码吗？）</h3>
+<p><strong>Task 3: 检查你的模型是否已经被支持</strong>
+文档列出了一堆已经支持“聪明搬家”的模型。如果你的模型在下面这个列表里，你<strong>不需要</strong>写代码，直接用就行：
+*   GPT2, Llama, Mistral, InternLM, Aquila, Phi3, Gemma, Qwen2, DeepseekV2 等。</p>
+<p><strong>Task 4: 决定下一步</strong>
+*   <strong>情况 A</strong>：你的模型在上面的列表里。 -&gt; <strong>恭喜，文档看完了，你可以关掉了。</strong>
+*   <strong>情况 B</strong>：你的模型<strong>不在</strong>列表里（比如你用了一个很新的或冷门的架构）。 -&gt; <strong>请继续往下看，你需要写代码来适配。</strong></p>
+<hr />
+<h3>第三阶段：动手实操（如何适配新模型？）</h3>
+<p>如果你处于“情况 B”，你需要自己写一个 <code>dtensor_weight_loader</code>。文档给了你一个 5 步走的教程，以 Gemma 模型为例。</p>
+<p><strong>Task 5: 找到参考代码 (Copy)</strong>
+*   <strong>动作</strong>：去 vLLM 的源代码里，找到你这个模型原本的 <code>load_weights</code> 函数。
+*   <strong>目的</strong>：vLLM 已经知道怎么加载这个模型的权重了，我们不需要从头重写逻辑，直接“抄”过来改。</p>
+<p><strong>Task 6: 修改函数签名 (Modify Arguments)</strong>
+*   <strong>动作</strong>：把函数名改了，比如改成 <code>my_model_dtensor_weight_loader</code>。
+*   <strong>修改参数</strong>：
+    *   原版：接收 <code>self</code> 和 <code>weights</code>。
+    *   新版：接收 <code>actor_weights</code> (训练端的权重字典) 和 <code>vllm_model</code> (推理端的模型对象)。</p>
+<p><strong>Task 7: 替换对象 (Replace Self)</strong>
+*   <strong>动作</strong>：代码里原来用 <code>self</code> 的地方，全部改成 <code>vllm_model</code>。
+*   <strong>原因</strong>：因为在这个脚本里，我们不是在类的方法里，而是在操作一个外部传入的模型对象。</p>
+<p><strong>Task 8: 加入“切块”逻辑 (关键步骤！)</strong>
+*   <strong>动作</strong>：这是最核心的一步。在代码加载每一层参数之前，插入一行代码：
+    <code>local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)</code>
+*   <strong>解释</strong>：
+    *   原来的代码是直接拿权重。
+    *   现在的代码是：先调用 <code>redistribute_dtensor</code>，这个函数会自动处理分布式张量（DTensor），只把当前这块 GPU 需要的那一小部分权重拿出来。这就是“省显存”的奥秘。</p>
+<p><strong>Task 9: 注册新函数 (Register)</strong>
+*   <strong>动作</strong>：把写好的函数注册到 <code>__MODEL_DTENSOR_WEIGHT_LOADER_REGISTRY__</code> 里。
+*   <strong>目的</strong>：告诉系统，“嘿，如果遇到这个新模型，请用我刚才写的这个函数来加载权重。”</p>
+<hr />
+<h3>总结一下代码对比图 (Diff)</h3>
+<p>文档最后那段代码对比（Diff），就是在演示 <strong>Task 6, 7, 8</strong> 具体是怎么改的：</p>
+<ol>
+<li><strong><code>-</code> (红色行)</strong> 代表 vLLM 原本的代码。</li>
+<li><strong><code>+</code> (绿色行)</strong> 代表你需要改成的样子。</li>
+</ol>
+<p><strong>核心改动点：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 原来：直接加载</span>
+<span class="c1"># weight_loader(param, loaded_weight, shard_id)</span>
+
+<span class="c1"># 现在：先经过 redistribute_dtensor 处理，变成 local_loaded_weight 再加载</span>
+<span class="n">local_loaded_weight</span> <span class="o">=</span> <span class="n">redistribute_dtensor</span><span class="p">(</span><span class="n">param_name</span><span class="o">=</span><span class="n">name</span><span class="p">,</span> <span class="n">loaded_weights</span><span class="o">=</span><span class="n">loaded_weight</span><span class="p">)</span>
+<span class="n">weight_loader</span><span class="p">(</span><span class="n">param</span><span class="p">,</span> <span class="n">local_loaded_weight</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="n">param</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span> <span class="n">shard_id</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>一句话总结这篇文档：</strong>
+为了防止显存爆炸，我们建议用一种“分块加载”的方式同步权重。如果你的模型不在支持列表里，请去 vLLM 抄代码，然后加上 <code>redistribute_dtensor</code> 这一行“魔法代码”即可。</p>

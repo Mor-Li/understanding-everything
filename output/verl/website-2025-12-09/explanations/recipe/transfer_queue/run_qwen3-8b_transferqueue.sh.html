@@ -1,0 +1,60 @@
+<h1>recipe/transfer_queue/run_qwen3-8b_transferqueue.sh</h1>
+<p>这份脚本确实看起来很复杂，因为它堆砌了大量的配置参数。</p>
+<p>简单来说，这是一个<strong>启动脚本</strong>，目的是<strong>使用强化学习（具体是 PPO/GRPO 算法）来训练一个 Qwen3-8B 模型，让它更擅长做 GSM8K 数学题</strong>。</p>
+<p>为了让你看懂，我们可以把这个过程想象成<strong>“给一个学生（模型）搞数学特训”</strong>。我把脚本里的内容拆解成下面这份 <strong>“特训任务清单 (Todo List)”</strong>，一步步带你过一遍：</p>
+<hr />
+<h3>任务清单：Qwen3 数学特训计划</h3>
+<h4>第一步：准备“课本”和“学生” (基础设置)</h4>
+<p>在脚本的最开头，定义了这次训练的基础环境。
+*   <strong>TODO 1.1：指定学生是谁</strong>
+    *   代码：<code>MODEL_PATH="/workspace/models/Qwen3-8B"</code>
+    *   <strong>解读</strong>：我们要训练的基础模型是 Qwen3-8B。
+*   <strong>TODO 1.2：指定教材（习题册）</strong>
+    *   代码：<code>TRAIN_FILE=.../gsm8k/train.parquet</code>
+    *   <strong>解读</strong>：使用 <strong>GSM8K</strong> 数据集（经典的小学数学应用题）作为训练材料。
+*   <strong>TODO 1.3：准备笔记本（日志）</strong>
+    *   代码：<code>log_dir</code> 和 <code>mkdir</code>
+    *   <strong>解读</strong>：创建日志文件夹，用来记录训练过程中的分数和报错。</p>
+<h4>第二步：确定“教学方法” (算法核心)</h4>
+<p>这是脚本里 <code>python3 -m ...</code> 后面那一长串参数的核心逻辑。
+*   <strong>TODO 2.1：选择教学法 (GRPO)</strong>
+    *   代码：<code>algorithm.adv_estimator=grpo</code>
+    *   <strong>解读</strong>：这是一个关键点。它没有用普通的 PPO，而是用了 <strong>GRPO (Group Relative Policy Optimization)</strong>。
+    *   <em>白话解释</em>：普通的强化学习需要一个额外的“打分老师模型”（Critic）。GRPO 省略了这个巨型老师，而是让学生对同一道题做多次回答，然后让这些回答<strong>互相比较</strong>（比如谁算对了谁就得分高，谁算错了得分低），以此来优化。这和 DeepSeek-R1 的训练思路类似。
+*   <strong>TODO 2.2：设置回答模式</strong>
+    *   代码：<code>rollout_mode="async"</code>, <code>rollout_name="vllm"</code>
+    *   <strong>解读</strong>：使用 <strong>vLLM</strong>（一个超快的推理引擎）来生成答案，并且是<strong>异步</strong>的。这意味着“一边做题，一边改卷子”，效率极高。</p>
+<h4>第三步：安排“模拟考试” (Rollout 生成)</h4>
+<p>强化学习的核心是：尝试 -&gt; 获得反馈 -&gt; 改进。这一步是“尝试”。
+*   <strong>TODO 3.1：每道题做几遍？</strong>
+    *   代码：<code>actor_rollout_ref.rollout.n=5</code>
+    *   <strong>解读</strong>：对于每一个数学问题，让模型生成 <strong>5 个</strong> 不同的解题过程。GRPO 算法需要这 5 个结果来互相比较优劣。
+*   <strong>TODO 3.2：怎么分配显卡来做题？</strong>
+    *   代码：<code>tensor_model_parallel_size=4</code>
+    *   <strong>解读</strong>：模型可能比较大，或者为了算得快，把模型切分到 <strong>4 张显卡</strong> 上并行计算。</p>
+<h4>第四步：设定“奖惩规则” (Actor &amp; Reference)</h4>
+<p>模型不能为了得分而胡言乱语，需要约束。
+*   <strong>TODO 4.1：防止“走火入魔” (KL Loss)</strong>
+    *   代码：<code>actor.use_kl_loss=True</code>, <code>kl_loss_coef=0.001</code>
+    *   <strong>解读</strong>：训练时会保留一个原始模型作为“参照系”（Reference）。如果训练后的模型说话方式和原始模型差别太大（KL散度过大），就会受到惩罚。这保证模型只学数学逻辑，不要把语言能力学崩了。
+*   <strong>TODO 4.2：学习率 (Learning Rate)</strong>
+    *   代码：<code>actor.optim.lr=1e-6</code>
+    *   <strong>解读</strong>：学习率设得很小（百万分之一）。这是因为这是微调阶段，我们希望模型稳步改进，不要步子迈太大扯着蛋。</p>
+<h4>第五步：硬件资源调度 (Trainer &amp; FSDP)</h4>
+<p>这是关于如何榨干机器性能的设置。
+*   <strong>TODO 5.1：显存不够怎么办？</strong>
+    *   代码：<code>fsdp_config.param_offload=True</code>
+    *   <strong>解读</strong>：开启了 <strong>FSDP (Fully Sharded Data Parallel)</strong> 和 <strong>Offload</strong>。简单说，就是显存放不下的时候，把暂时不用的参数扔到内存（CPU RAM）里去，虽然慢一点点，但能防止显存溢出（OOM）。
+*   <strong>TODO 5.2：训练规模</strong>
+    *   代码：<code>n_gpus_per_node=8</code>, <code>total_epochs=15</code>
+    *   <strong>解读</strong>：使用单机 8 卡进行训练，计划把教材学 15 遍（Epochs）。</p>
+<hr />
+<h3>总结：这脚本到底在干啥？</h3>
+<p>如果不看代码细节，这个脚本就在做一件事：</p>
+<blockquote>
+<p><strong>利用 8 张显卡，使用 vLLM 加速推理，让 Qwen3-8B 模型对 GSM8K 数学题进行“一题多解”（每题生成5个答案），通过 GRPO 算法让这 5 个答案内部竞争，从而提升模型的数学解题能力。</strong></p>
+</blockquote>
+<p><strong>核心关键词：</strong>
+1.  <strong>Transfer Queue / Async</strong>: 这是一个高性能的架构，把“生成数据”和“训练更新”解耦了，速度更快。
+2.  <strong>GRPO</strong>: 最近很火的强化学习算法（省显存，效果好）。
+3.  <strong>vLLM</strong>: 用来加速生成答案的工具。</p>

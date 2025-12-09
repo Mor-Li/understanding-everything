@@ -1,0 +1,72 @@
+<h1>recipe/fully_async_policy</h1>
+<p>这实际上是一套<strong>“为了让大模型训练速度快到飞起”</strong>而设计的<strong>全异步（Fully Async）强化学习系统</strong>。</p>
+<p>为了让你秒懂，我们把整个训练过程比作一家<strong>“顶级创意餐厅”</strong>的运作。</p>
+<hr />
+<h3>1. 这个文件夹主要负责什么功能？</h3>
+<p><strong>核心功能：把“接力赛”变成“双轨并行”。</strong></p>
+<ul>
+<li><strong>以前的模式（同步）</strong>：像<strong>接力赛</strong>。厨师（生成数据）做完菜，品鉴师（训练模型）才开始吃和评判；品鉴师评判的时候，厨师只能干站着等。显卡有一半时间是闲着的。</li>
+<li><strong>现在的模式（全异步）</strong>：像<strong>双轨并行</strong>。<ul>
+<li><strong>厨师组（Rollouter）</strong>：只管疯狂做菜，做完往传送带上一扔，不管别的。</li>
+<li><strong>品鉴师组（Trainer）</strong>：只管从传送带上拿菜吃，吃完升级菜谱。</li>
+<li><strong>结果</strong>：两拨人同时干活，谁也不等谁，显卡利用率拉满，训练速度翻倍。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>2. 各个文件是干什么的？</h3>
+<p>我们可以把这些文件看作餐厅里的不同角色和设施：</p>
+<h4>👮‍♂️ <strong>总指挥与核心部门</strong></h4>
+<ul>
+<li><strong><code>fully_async_main.py</code>（餐厅经理）</strong>：<ul>
+<li>负责开店。他决定招多少个厨师、多少个品鉴师，把大家安排在不同的房间（GPU），按下启动键。</li>
+</ul>
+</li>
+<li><strong><code>fully_async_trainer.py</code>（品鉴师/主厨）</strong>：<ul>
+<li><strong>大脑</strong>。他负责吃传送带上的菜（数据），计算哪里做得好哪里不好（Loss），然后更新菜谱（模型参数）。</li>
+</ul>
+</li>
+<li><strong><code>fully_async_rollouter.py</code>（流水线厨师）</strong>：<ul>
+<li><strong>苦力</strong>。他拿着菜谱（模型权重），对着题目（Prompt）疯狂炒菜（生成文本），炒完就扔给传送带。他有两个特点：不知疲倦、允许用稍微旧一点的菜谱（异步容忍度）。</li>
+</ul>
+</li>
+</ul>
+<h4>🚚 <strong>物流与通信系统</strong></h4>
+<ul>
+<li><strong><code>message_queue.py</code>（传送带）</strong>：<ul>
+<li>连接厨师和品鉴师的通道。厨师把做好的数据（Sample）放上去，品鉴师从这里取。它有容量限制，满了会把最旧的菜扔掉。</li>
+</ul>
+</li>
+<li><strong><code>param_sync.py</code>（菜谱复印机）</strong>：<ul>
+<li>品鉴师升级了菜谱（更新了模型参数）后，这个脚本负责把新菜谱复印几百份，通过高速管道（NCCL）瞬间发给所有厨师。</li>
+</ul>
+</li>
+</ul>
+<h4>🏗️ <strong>底层基建与搬运工</strong></h4>
+<ul>
+<li><strong><code>fsdp_workers.py</code> / <code>megatron_worker.py</code> / <code>megatron_utils.py</code>（重型搬运工）</strong>：<ul>
+<li>大模型（菜谱）太厚了，一本可能有几十 GB。这些文件负责把这本厚书撕开（切片/Sharding），分给不同的人拿，或者在没地方放的时候暂时搬到仓库（CPU Offload）去。</li>
+</ul>
+</li>
+<li><strong><code>ray_trainer.py</code>（分身术管理）</strong>：<ul>
+<li>利用 Ray 框架，让这些复杂的角色可以在多台机器、多张显卡上远程分身，协同工作。</li>
+</ul>
+</li>
+<li><strong><code>detach_utils.py</code>（切菜小工）</strong>：<ul>
+<li>负责把数据整理好，打包、清洗、格式化，让品鉴师吃起来更方便。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>3. 高层认知：一句话理解这套代码</h3>
+<p><strong>这套代码是一个“生产者-消费者”模型的大型分布式实现。</strong></p>
+<ul>
+<li><strong>左边（生产者）</strong>：一群 GPU 没日没夜地玩游戏/写作文（Rollout）。</li>
+<li><strong>右边（消费者）</strong>：一群 GPU 没日没夜地学习/改作业（Train）。</li>
+<li><strong>中间（管道）</strong>：<ul>
+<li>一条管子往右送<strong>数据</strong>（MessageQueue）。</li>
+<li>一条管子往左送<strong>新脑子</strong>（ParamSync）。</li>
+</ul>
+</li>
+</ul>
+<p>它的核心价值在于<strong>“解耦”</strong>——把原本纠缠在一起的“生成”和“训练”拆开，容忍一点点“由于传输延迟导致的脑子版本滞后（Staleness）”，换取了<strong>极致的速度</strong>。</p>

@@ -1,0 +1,101 @@
+<h1>examples/export/trtllm_export/README.md</h1>
+<p>这份文档其实是一份<strong>技术操作指南</strong>，主要目的是教你<strong>如何把一个用 Megatron Core 训练好的模型（比如 GPT），转换成 NVIDIA TensorRT-LLM (TRT-LLM) 格式</strong>。</p>
+<p>为什么要这么做？因为 Megatron 是用来<strong>训练</strong>的（更重、更灵活），而 TRT-LLM 是用来<strong>推理/部署</strong>的（速度极快、显存优化好）。</p>
+<p>为了让你看懂，我把这份文档拆解成一个<strong>开发者的任务清单 (To-Do List)</strong>，你只需要按顺序理解这几个步骤，就明白了全文的逻辑。</p>
+<hr />
+<h3>📋 任务清单：从 Megatron 到 TRT-LLM 的导出之路</h3>
+<h4>任务一：准备阶段 (环境与概念)</h4>
+<ul>
+<li><strong>目标</strong>：搞清楚我们要干嘛。</li>
+<li><strong>文档解读</strong>：<ul>
+<li>文档开头说了，我们要用 <code>megatron core export</code> 工具。</li>
+<li>主要分为两种模式：<ol>
+<li><strong>CPU/单卡模式 (Quick Start)</strong>：适合模型较小，或者想简单跑通流程。</li>
+<li><strong>GPU/多卡模式 (GPU Export)</strong>：适合模型很大，单张卡放不下，需要多卡并行处理。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>任务二：编写转换脚本 (核心代码逻辑)</h4>
+<p>文档的 <code>1.1 Understanding The Code</code> 部分详细拆解了 Python 脚本里要做哪 5 件事。想象你正在写这个 Python 脚本：</p>
+<ul>
+<li>
+<p><strong>Step 1: 初始化“假”的分布式环境</strong></p>
+<ul>
+<li><strong>Todo</strong>: 调用 <code>initialize_distributed</code>。</li>
+<li><strong>解释</strong>: 即使你只用一张卡或者 CPU，Megatron 的代码也依赖分布式环境。这里我们要把并行度（TP/PP）都设为 1，假装我们在跑分布式，实际上是为了把完整模型加载到内存里。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2: 加载你的 GPT 模型</strong></p>
+<ul>
+<li><strong>Todo</strong>: 配置 <code>TransformerConfig</code> 并实例化 <code>GPTModel</code>。</li>
+<li><strong>解释</strong>: 这里你需要定义模型长什么样（几层、隐藏层多大、几个头）。代码里演示的是创建一个空的 GPT 模型，实际使用时，你需要在这里加载你训练好的 Checkpoint（权重文件）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3: 召唤“转换助手” (TRTLLM Helper)</strong></p>
+<ul>
+<li><strong>Todo</strong>: 实例化 <code>TRTLLMHelper</code> 类。</li>
+<li><strong>解释</strong>: 这是一个中间人工具。你需要把 GPT 模型的参数（比如位置编码类型、RoPE设置、激活函数类型）告诉这个助手，它负责沟通 Megatron 和 TRT-LLM 之间的配置差异。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 4: 转换权重 (Weight Conversion)</strong></p>
+<ul>
+<li><strong>Todo</strong>: 调用 <code>get_trtllm_pretrained_config_and_model_weights</code>。</li>
+<li><strong>解释</strong>: 这是关键一步。<ul>
+<li>输入：Megatron 的模型参数字典 (<code>state_dict</code>)。</li>
+<li>动作：助手会把这些参数“翻译”成 TRT-LLM 能看懂的格式。</li>
+<li>设置：这里还可以设置 <code>inference_tp_size=2</code>，意思是“虽然我现在是一张卡导出的，但我希望转换后的模型以后可以用 2 张卡并行推理”。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 5: 编译并保存引擎 (Build Engine)</strong></p>
+<ul>
+<li><strong>Todo</strong>: 调用 <code>build_and_save_engine</code>。</li>
+<li><strong>解释</strong>: 拿到转换好的权重后，要把它编译成二进制的 <code>.engine</code> 文件。这个文件就是最终用来部署的高性能文件。你可以设置最大 Batch Size、最大序列长度等推理参数。</li>
+</ul>
+</li>
+</ul>
+<h4>任务三：执行转换 (运行代码)</h4>
+<p>文档的 <code>1.2 Running The Code</code> 部分教你怎么把上面写好的脚本跑起来。</p>
+<ul>
+<li><strong>Todo 1: 准备 Docker 环境</strong><ul>
+<li>你需要一个装好 NVIDIA 环境的 Docker 容器（文档里给了一个示例镜像地址）。</li>
+</ul>
+</li>
+<li><strong>Todo 2: 运行命令</strong><ul>
+<li>使用 <code>torchrun</code> 命令来启动脚本。</li>
+<li>命令示例：<code>CUDA_VISIBLE_DEVICES=0 torchrun ... gpt_single_device_cpu_export.py</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>任务四：进阶操作 (GPU 分布式导出)</h4>
+<p>文档的 <code>2. GPU Export</code> 部分。</p>
+<ul>
+<li><strong>场景</strong>: 如果你的模型特别大（比如 175B 的 GPT-3），CPU 内存放不下，或者单张 GPU 放不下。</li>
+<li><strong>做法</strong>:<ul>
+<li>不要把所有权重都挤在一个地方。</li>
+<li>使用 <code>gpt_distributed_gpu_export.py</code>。</li>
+<li><strong>原理</strong>: 每张 GPU 只加载属于它自己的那部分权重，在 GPU 上直接转换，最后保存。这比 CPU 模式更快且能处理更大模型。</li>
+</ul>
+</li>
+</ul>
+<h4>任务五：未来展望 (画饼)</h4>
+<p>文档的 <code>3. Future work</code> 部分。</p>
+<ul>
+<li>开发者列出了还没做完的功能：<ul>
+<li>支持流水线并行 (Pipeline Parallelism) 的导出。</li>
+<li>支持更多种类的模型。</li>
+<li>支持 VLLM (另一个很火的推理框架)。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>简单来说，这篇文章就是告诉你：
+<strong>“嘿，别直接用训练代码去跑服务，太慢了。用我提供的这个 Python 脚本模板，把你的 Megatron 模型参数洗一遍，编译成 TensorRT 引擎，这样跑起来飞快。”</strong></p>

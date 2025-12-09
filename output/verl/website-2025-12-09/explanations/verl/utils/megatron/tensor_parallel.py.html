@@ -1,0 +1,97 @@
+<h1>verl/utils/megatron/tensor_parallel.py</h1>
+<p>这份代码确实比较晦涩，因为它处于<strong>深度学习框架（Verl）</strong>和<strong>底层分布式计算库（Megatron-LM）</strong>的交界处。</p>
+<p>简单来说，这是一个<strong>工具箱</strong>。它的核心目的是：<strong>让 Verl 这个框架能够方便地利用 Megatron 的“张量并行（Tensor Parallel）”技术来训练大模型。</strong></p>
+<p>为了让你听懂，我们假设你正在<strong>训练一个巨大的 LLM（大语言模型）</strong>，这个模型太大了，一张显卡放不下，你需要把它切开（切西瓜一样）放在多张显卡上算。这就叫<strong>张量并行（Tensor Parallel, TP）</strong>。</p>
+<p>我把你当作这个项目的<strong>新入职工程师</strong>，给你列一个 <strong>Task List (任务清单)</strong>，我们一步步把这个文件的功能“做”出来，你就懂了。</p>
+<hr />
+<h3>Task 1: 搞定繁琐的“入场券” (配置管理)</h3>
+<p><strong>背景</strong>：Megatron 库虽然强大，但很难伺候。每次你想创建一个简单的并行全连接层（Linear Layer），它都要求你传一堆复杂的配置对象 (<code>ModelParallelConfig</code>)。
+<strong>痛点</strong>：如果你在代码里到处写这些配置初始化，代码会乱成一团麻。</p>
+<ul>
+<li>
+<p><strong>Todo 1.1: 制造“默认套餐”</strong></p>
+<ul>
+<li><strong>代码对应</strong>：<code>get_default_kwargs_for_model_parallel_config</code>, <code>get_default_model_parallel_config</code></li>
+<li><strong>解释</strong>：就像去麦当劳点餐，你不想每次都说“我要一个面包、两片肉、一片生菜...”，你只想说“来个巨无霸套餐”。这些函数就是生成“默认配置套餐”的，比如默认用 <code>float32</code>，默认不做梯度累加融合等。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 1.2: 制造“并行层套餐”</strong></p>
+<ul>
+<li><strong>代码对应</strong>：<code>get_default_kwargs_for_column_parallel_linear</code>, <code>get_default_kwargs_for_row_parallel_linear</code></li>
+<li><strong>解释</strong>：大模型的矩阵切分有两种切法：<strong>竖着切（Column Parallel）</strong>和<strong>横着切（Row Parallel）</strong>。这些函数帮你自动填好这两种切法所需的参数，让你一键调用就能生成并行的 Linear 层。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 2: 识别“谁是切开的西瓜” (参数检查)</h3>
+<p><strong>背景</strong>：模型里有些参数是完整的（比如 LayerNorm 的参数），有些是被切分到不同显卡上的（比如 Attention 的权重）。
+<strong>痛点</strong>：优化器（Optimizer）在更新参数时，需要知道哪些参数是切开的，怎么切的，否则更新就会出错。</p>
+<ul>
+<li><strong>Todo 2.1: 查户口</strong><ul>
+<li><strong>代码对应</strong>：<code>is_tensor_parallel_param</code>, <code>get_tensor_parallel_partition_dim</code></li>
+<li><strong>解释</strong>：这几个函数就是<strong>安检员</strong>。拿来一个参数张量，看一眼它身上有没有 <code>tensor_model_parallel</code> 这个标记。如果有，再看看它是按第几维切分的。这主要是给后续保存模型或参数更新时用的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 在“群岛”上算数学 (分布式熵计算)</h3>
+<p><strong>背景</strong>：这是最难理解的部分。我们要计算模型的<strong>熵（Entropy）</strong>，通常用来衡量模型有多“不确定”。
+<strong>痛点</strong>：模型的输出层（Logits）非常大（比如词表有10万个词）。在张量并行中，<strong>这10万个词的概率值是分散在不同显卡上的</strong>（显卡A存前5万个，显卡B存后5万个）。你不能把它们简单地加起来，也不能把它们都拉到一张卡上（显存会爆）。</p>
+<ul>
+<li><strong>Todo 3.1: 实现“不拼合”的熵计算</strong><ul>
+<li><strong>代码对应</strong>：<code>class _VocabParallelEntropy</code> (及 <code>forward</code>, <code>backward</code>)</li>
+<li><strong>解释</strong>：<ol>
+<li><strong>问题</strong>：计算 Softmax 需要知道全局最大值和全局总和。但数据在不同显卡上。</li>
+<li><strong>解决</strong>：<ul>
+<li>显卡们先各自算自己的最大值。</li>
+<li>用 <code>dist.all_reduce</code>（一种通信操作）让大家交换信息，得到<strong>全局最大值</strong>。</li>
+<li>各自算指数和，再 <code>all_reduce</code> 得到<strong>全局总和</strong>。</li>
+<li>最后计算熵。</li>
+</ul>
+</li>
+<li><strong>核心</strong>：这个类的作用是<strong>在不把巨大的 Logits 张量合并到一起的前提下，正确算出熵，并且支持反向传播（训练）</strong>。这能极大节省显存。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 算分与对齐 (RLHF 专用工具)</h3>
+<p><strong>背景</strong>：Verl 是一个做 RLHF（根据人类反馈强化学习）的框架。在 PPO 或 DPO 算法中，我们需要算出模型生成某个回复的<strong>对数概率（Log Prob）</strong>。
+<strong>痛点</strong>：为了训练快，我们用了 <strong>FlashAttention</strong> 的技巧，把一个 Batch 里的句子里的 <code>padding</code>（填充的0）全部删掉了，把所有句子拼成了一长条（这叫 <code>rmpad</code> 或 <code>unpad</code>）。这时候数据是乱的，且分布在不同显卡上。</p>
+<ul>
+<li>
+<p><strong>Todo 4.1: 基础概率计算</strong></p>
+<ul>
+<li><strong>代码对应</strong>：<code>vocab_parallel_log_probs_from_logits</code></li>
+<li><strong>解释</strong>：这是一个简单的包装，调用 Megatron 现成的函数来计算交叉熵（Cross Entropy），加上负号就是 Log Prob。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 4.2: 高难度动作 —— 去除 Padding 后的分布式概率计算</strong></p>
+<ul>
+<li><strong>代码对应</strong>：<code>vocab_parallel_log_probs_from_logits_response_rmpad</code></li>
+<li><strong>解释</strong>：这是全篇最复杂的业务逻辑。<ol>
+<li><strong>输入</strong>：一堆去掉 Padding 的 Logits（分布在多张卡上），和原始的 Input IDs。</li>
+<li><strong>步骤</strong>：<ul>
+<li><code>unpad_input</code>: 把输入的 Token ID 也去掉 Padding，变成一长条，跟 Logits 对齐。</li>
+<li><code>vocab_parallel_log_probs</code>: 算每一个 Token 的概率。</li>
+<li><code>pad_input</code>: <strong>关键一步</strong>。算完概率后，把这一长条数据，根据原来的索引，重新<strong>填充（Pad）</strong>回 <code>[Batch_Size, Sequence_Length]</code> 的整齐形状。</li>
+<li><code>slice</code>: 只截取模型生成的 <strong>Response（回复）</strong> 部分，去掉 Prompt 部分。</li>
+</ul>
+</li>
+<li><strong>目的</strong>：让 RLHF 算法能拿到正确的、形状对齐的概率值，以便计算 Reward（奖励）。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>你看不懂是因为这文件里混合了三个层面的知识：
+1.  <strong>Megatron 配置</strong>（为了跑起来）。
+2.  <strong>分布式通信原语</strong>（为了省显存，手动写 <code>all_reduce</code> 算数学）。
+3.  <strong>RLHF 训练的数据处理</strong>（处理 <code>rmpad</code> 这种为了加速而产生的变态数据格式）。</p>
+<p><strong>一句话概括这个文件：</strong>
+它是 Verl 框架的<strong>翻译官</strong>，帮 Verl 把复杂的数学计算和数据格式，翻译成 Megatron 能听懂的分布式指令，同时帮开发者屏蔽了底层初始化的繁琐细节。</p>

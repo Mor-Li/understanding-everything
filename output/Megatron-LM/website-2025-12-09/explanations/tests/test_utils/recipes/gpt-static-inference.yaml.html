@@ -1,0 +1,114 @@
+<h1>tests/test_utils/recipes/gpt-static-inference.yaml</h1>
+<p>这份文件其实是一个 <strong>自动化测试的“食谱”（Recipe）</strong>。</p>
+<p>简单来说，它的作用是告诉计算机（通常是像 CI/CD 这样的自动化流水线）：<strong>“请帮我用几组不同的配置，去跑一下 GPT 模型的推理（Inference）任务，并检查结果对不对。”</strong></p>
+<p>为了让你好理解，我把它拆解成一个 <strong>“任务清单 (To-Do List)”</strong>，就像你给一个实习生布置任务一样。</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<h4><strong>第一阶段：准备工作 (Setup)</strong></h4>
+<ol>
+<li><strong>[环境]</strong> 找一台带 GPU 的服务器（这里指定了 NVIDIA DGX A100 或 H100）。</li>
+<li><strong>[代码]</strong> 把旧的代码删干净，从仓库里把最新的代码拉下来。</li>
+<li><strong>[兼容]</strong> 除了拉取最新代码，还要拉取一个“旧版本”的代码（Legacy），用来做对比或依赖。</li>
+</ol>
+<h4><strong>第二阶段：配置参数 (Configuration)</strong></h4>
+<ol>
+<li><strong>[路径]</strong> 告诉程序：模型权重（Checkpoint）在哪里？测试数据在哪里？</li>
+<li><strong>[脚本]</strong> 指定要运行哪个 Python 脚本（这里是 GPT 的静态推理脚本）。</li>
+<li><strong>[标准]</strong> 指定“标准答案”（Golden Values）在哪里，跑完要跟它对答案。</li>
+</ol>
+<h4><strong>第三阶段：执行测试 (Execution)</strong></h4>
+<ol>
+<li><strong>[运行]</strong> 把上面配置好的参数打包，运行一个通用的测试 Shell 脚本。</li>
+</ol>
+<h4><strong>第四阶段：测试变体 (Test Variations)</strong></h4>
+<ol>
+<li><strong>[矩阵]</strong> 同样一套流程，要分别测哪几种情况？（比如：测 FP8 精度、测 CUDA Graph 加速等）。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<p>现在我们对照文件内容，一步步看它是怎么实现上面这个清单的：</p>
+<h4>1. 基础信息 (Header)</h4>
+<div class="codehilite"><pre><span></span><code><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">basic</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gpt</span>
+<span class="w">  </span><span class="nt">nodes</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="w">  </span><span class="nt">gpus</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">dgx_a100</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 这里定义了基础硬件需求。我们需要 1 个节点，1 张 GPU，默认平台是 DGX A100。</li>
+</ul>
+<h4>2. 准备代码 (对应任务清单 Step 2 &amp; 3)</h4>
+<p>看 <code>script_setup</code> 部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">script_setup</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">    </span><span class="no"># ... 登录 gitlab ...</span>
+
+<span class="w">    </span><span class="no"># 1. 拉取最新代码 (Checkout latest)</span>
+<span class="w">    </span><span class="no">rm -rf /opt/megatron-lm; mkdir megatron-lm...</span>
+<span class="w">    </span><span class="no">git fetch origin $MCORE_MR_COMMIT</span>
+<span class="w">    </span><span class="no">git checkout $MCORE_MR_COMMIT</span>
+
+<span class="w">    </span><span class="no"># 2. 拉取旧版本代码 (Checkout backwards-ref)</span>
+<span class="w">    </span><span class="no">rm -rf /opt/megatron-lm-legacy...</span>
+<span class="w">    </span><span class="no">git fetch origin $MCORE_BACKWARDS_COMMIT</span>
+<span class="w">    </span><span class="no"># 把新代码里的核心库拷到旧目录里去 (可能是为了测试新核心在旧环境的表现)</span>
+<span class="w">    </span><span class="no">rm -rf megatron; cp -a /opt/megatron-lm/megatron ./</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 这段脚本就像是“大扫除”和“进货”。它确保测试用的代码是刚才提交的最新版本（MR Commit），同时也准备了一份旧版本环境。</li>
+</ul>
+<h4>3. 设定运行参数 (对应任务清单 Step 4 &amp; 5 &amp; 6)</h4>
+<p>看 <code>script</code> 部分的 <code>ARGUMENTS</code> 数组：</p>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="l l-Scalar l-Scalar-Plain">ARGUMENTS=(</span>
+<span class="w">        </span><span class="l l-Scalar l-Scalar-Plain">&quot;CHECKPOINT_LOAD_PATH=/mnt/artifacts/&quot;</span><span class="w">       </span><span class="c1"># 模型权重在哪里？</span>
+<span class="w">        </span><span class="s">&quot;TRAINING_SCRIPT_PATH=examples/inference/gpt/gpt_static_inference.py&quot;</span><span class="w"> </span><span class="c1"># 跑哪个脚本？(GPT静态推理)</span>
+<span class="w">        </span><span class="s">&quot;GOLDEN_VALUES_PATH=.../golden_values_{environment}_{platforms}.json&quot;</span><span class="w"> </span><span class="c1"># 标准答案在哪里？</span>
+<span class="w">        </span><span class="s">&quot;OUTPUT_PATH={assets_dir}&quot;</span><span class="w">                    </span><span class="c1"># 结果存哪里？</span>
+<span class="w">        </span><span class="s">&quot;ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}&quot;</span><span class="w"> </span><span class="c1"># 是否开启轻量模式？</span>
+<span class="w">    </span><span class="l l-Scalar l-Scalar-Plain">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 这里是在拼凑命令行的参数。重点是它指定了要跑 <code>gpt_static_inference.py</code>，并且指定了 <code>GOLDEN_VALUES_PATH</code>。这意味着测试跑完后，会自动比对生成的文本或 Logits 数值是否和 JSON 文件里的“标准答案”一致。</li>
+</ul>
+<h4>4. 执行 (对应任务清单 Step 7)</h4>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="l l-Scalar l-Scalar-Plain">bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 这里就是“按下启动按钮”。它调用了一个通用的 CI 测试脚本 <code>run_ci_test.sh</code>，并把上面准备好的参数传进去。</li>
+</ul>
+<h4>5. 具体要测哪些案例？ (对应任务清单 Step 8)</h4>
+<p>这是文件最底部的 <code>products</code> 部分。这里列出了 <strong>4 个具体的测试任务</strong>，它们会复用上面的流程，但参数略有不同：</p>
+<ol>
+<li>
+<p><strong><code>gpt_static_inference_tp1_pp1_583m_logitsmatch</code></strong></p>
+<ul>
+<li><strong>含义：</strong> 测 5.83亿参数的模型，检查输出的 Logits（概率分布数值）是否匹配。</li>
+<li><strong>平台：</strong> 在 DGX H100 上跑。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>gpt_static_inference_tp1_pp1_583m_cudagraphs</code></strong></p>
+<ul>
+<li><strong>含义：</strong> 同样是 5.83亿模型，但开启 <strong>CUDA Graphs</strong>（一种加速技术），看能不能正常跑通。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>gpt_static_inference_tp1_pp1_583m_fp8_cudagraphs</code></strong></p>
+<ul>
+<li><strong>含义：</strong> 开启 <strong>FP8</strong>（8位浮点数，精度更低但速度更快）加上 CUDA Graphs，测试这种高性能模式是否正常。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>gpt_static_inference_tp1_pp1_16b_multiprompt_tokensmatch</code></strong></p>
+<ul>
+<li><strong>含义：</strong> 测一个更大的 <strong>160亿 (16b)</strong> 参数的模型，测试 <strong>多提示词 (Multiprompt)</strong> 的情况，并检查生成的 Token 是否匹配。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件就是告诉测试系统：
+<strong>“去 H100 机器上，拉最新代码，用 GPT 推理脚本分别跑一下 583M 和 16B 的模型。记得测一下 FP8 和 CUDA Graphs 这种加速功能坏没坏，最后把结果跟标准答案对一下。”</strong></p>

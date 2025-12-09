@@ -1,0 +1,109 @@
+<h1>tests/special_e2e/run_genrm_remote.sh</h1>
+<p>这份脚本实际上是在执行一个 <strong>端到端（End-to-End）的测试流程</strong>。</p>
+<p>简单来说，它的目的是：<strong>模拟一种“远程打分”的训练场景</strong>。即，把“负责写作业的学生模型”和“负责批改作业的老师模型”分开部署，通过网络（HTTP）进行通信，然后让学生模型通过强化学习（PPO/GRPO）变强。</p>
+<p>为了让你看懂，我把这个脚本拆解成一个 <strong>Task Todo List（任务清单）</strong>，脚本的执行过程就是按顺序划掉这些任务：</p>
+<h3>📋 任务清单 (Task Todo List)</h3>
+<h4>1. 🛠️ 准备阶段：配置环境</h4>
+<ul>
+<li><strong>任务</strong>：告诉电脑，如果是访问 <code>localhost</code>（本地），不要走代理服务器，直接连。</li>
+<li><strong>代码对应</strong>：<code>export no_proxy="localhost,127.0.0.1"</code></li>
+<li><strong>目的</strong>：防止网络设置导致自己连不上自己。</li>
+</ul>
+<h4>2. 👨‍🏫 启动“裁判/老师” (Reward Model Server)</h4>
+<ul>
+<li><strong>任务</strong>：在后台启动一个 AI 模型服务（vLLM），它专门负责给答案打分。</li>
+<li><strong>细节</strong>：<ul>
+<li>使用 <strong>0号 GPU</strong>。</li>
+<li>模型名字叫 <code>GenRM-CI-Test-1.5B</code>（这是一个生成式奖励模型）。</li>
+<li>它监听 <strong>30000 端口</strong>。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<code>CUDA_VISIBLE_DEVICES=0 vllm serve ... &amp;</code></li>
+<li><strong>通俗解释</strong>：这就像是请了一位老师坐在 0 号房间（GPU 0），准备在 30000 电话分机（端口）接听电话批改作业。</li>
+</ul>
+<h4>3. 🧹 设置“善后机制” (Cleanup Trap)</h4>
+<ul>
+<li><strong>任务</strong>：设定一个规则——不管脚本是正常跑完还是中途报错退出，都要把刚才启动的那个“裁判”服务杀掉。</li>
+<li><strong>代码对应</strong>：<code>cleanup() { ... }</code> 和 <code>trap cleanup EXIT</code></li>
+<li><strong>目的</strong>：防止测试跑完了，那个占显卡的 vLLM 服务还在后台偷偷运行，浪费资源。</li>
+</ul>
+<h4>4. ⏳ 等待“裁判”就位 (Wait for Server)</h4>
+<ul>
+<li><strong>任务</strong>：每隔 10 秒打个电话（curl 请求）问一下 30000 端口：“老师你准备好了吗？”</li>
+<li><strong>逻辑</strong>：<ul>
+<li>如果通了（HTTP 200），就继续下一步。</li>
+<li>如果没通，就继续等。</li>
+<li>如果等了 60 次（10分钟）还没好，就报错退出。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<code>wait_for_server() { ... }</code> 及其下方的调用。</li>
+<li><strong>目的</strong>：因为 vLLM 启动模型加载权重需要时间，不能还没加载完就开始训练。</li>
+</ul>
+<h4>5. 🧑‍🎓 启动“学生”进行训练 (Start Training)</h4>
+<ul>
+<li><strong>任务</strong>：这是脚本的核心。启动强化学习训练程序。</li>
+<li><strong>细节</strong>：<ul>
+<li>使用 <strong>4,5,6,7 号 GPU</strong>（和裁判分开，互不干扰）。</li>
+<li>运行 <code>verl.trainer.main_ppo</code>（PPO/GRPO 算法的主程序）。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<code>CUDA_VISIBLE_DEVICES=4,5,6,7 python3 -m verl.trainer.main_ppo ...</code></li>
+</ul>
+<hr />
+<h3>🔍 深度解析：最后那个很长的 Python 命令在干啥？</h3>
+<p>那个 Python 命令虽然长，但其实是在配置训练的参数。我们可以把它看作给“学生”设定的课程表：</p>
+<ol>
+<li>
+<p><strong>算法设定 (<code>algorithm.adv_estimator=grpo</code>)</strong>：</p>
+<ul>
+<li>我们要用 <strong>GRPO</strong> (Group Relative Policy Optimization) 算法来训练。</li>
+</ul>
+</li>
+<li>
+<p><strong>教材设定 (<code>data...</code>)</strong>：</p>
+<ul>
+<li>我们用 <strong>GSM8K</strong> 数据集（小学数学题）来训练。</li>
+</ul>
+</li>
+<li>
+<p><strong>学生模型 (<code>actor_rollout_ref...</code>)</strong>：</p>
+<ul>
+<li><strong>学生是谁</strong>：<code>Qwen2.5-0.5B-Instruct</code>（千问 0.5B 模型）。</li>
+<li><strong>怎么上课</strong>：<ul>
+<li><code>rollout.name=vllm</code>：学生做题时也用 vLLM 加速推理。</li>
+<li><code>rollout.n=4</code>：每道题生成 4 个不同的答案让老师挑。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>关键点：评分方式 (<code>custom_reward_function...</code>)</strong>：</p>
+<ul>
+<li><strong>重点在这里</strong>：<ul>
+<li><code>path=recipe/genrm_remote/reward_function.py</code></li>
+<li><code>name=compute_score</code></li>
+</ul>
+</li>
+<li><strong>解释</strong>：这里告诉训练程序，不要在本地算分，而是去调用这个 Python 文件里的 <code>compute_score</code> 函数。这个函数内部会<strong>发送 HTTP 请求给 localhost:30000</strong>（就是第 2 步启动的那个裁判），拿到分数后再返回给训练程序。</li>
+</ul>
+</li>
+<li>
+<p><strong>训练目标 (<code>trainer...</code>)</strong>：</p>
+<ul>
+<li>只跑 10 个 Epoch，甚至只跑 1 步 (<code>total_training_steps=1</code>)。</li>
+<li><strong>为什么只跑 1 步？</strong> 因为这是个 <strong>CI Test (测试脚本)</strong>，它只是为了证明“这套流程能跑通”，而不是为了真的把模型训练出来。</li>
+</ul>
+</li>
+</ol>
+<h3>💡 总结文中的核心观点</h3>
+<p>这个脚本实际上展示了一种<strong>解耦（Decoupled）的训练架构</strong>：</p>
+<ol>
+<li><strong>资源分离</strong>：训练（Actor）和打分（Reward Model）可以使用不同的 GPU，甚至不同的机器。<ul>
+<li>脚本里：训练用 GPU 4-7，打分用 GPU 0。</li>
+</ul>
+</li>
+<li><strong>远程打分</strong>：通过 HTTP 接口调用 Reward Model。这对于超大参数量的 Reward Model（跑不动在本地）或者闭源的 Reward Model（只能通过 API 访问）非常有用。</li>
+<li><strong>生成式奖励 (GenRM)</strong>：它使用的不是传统的只输出一个数字的奖励模型，而是 <code>GenRM</code>，通常这种模型会生成一段文本评价，然后解析出分数。</li>
+</ol>
+<p><strong>一句话总结：</strong>
+这是一个自动化测试脚本，它先在后台启动一个远程打分服务，然后启动训练程序去连接这个服务，跑一步训练，验证“远程打分+强化学习”这套流程没有 Bug。</p>

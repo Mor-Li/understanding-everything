@@ -1,0 +1,73 @@
+<h1>docs/source/api-guide/pipeline_parallel.rst</h1>
+<p>这份文档确实非常技术化，它是深度学习框架（很可能是 Megatron-LM 或其衍生品）的 API 说明文档。如果你没有分布式训练的背景知识，看这就好比在看一份“火箭发动机维修手册”的目录，看不懂很正常。</p>
+<p>为了让你理解，我把这个文档的内容拆解成一个 <strong>“学习任务清单 (To-Do List)”</strong>。我们不直接读代码，而是通过 5 个步骤，从概念到代码，逐步讲清楚它在干什么。</p>
+<hr />
+<h3>任务清单：一步步理解 Pipeline Parallel (流水线并行)</h3>
+<h4>✅ Task 1: 理解背景 —— 为什么我们需要“切分”模型？</h4>
+<ul>
+<li><strong>概念</strong>：现在的 AI 模型（比如 GPT-3, GPT-4）太大了，大到一个 GPU 显存根本装不下。</li>
+<li><strong>解决办法</strong>：我们需要把模型像切蛋糕一样切开。假设模型有 100 层，我们可以把前 50 层放在 GPU 0 上，后 50 层放在 GPU 1 上。</li>
+<li><strong>术语</strong>：这就是 <strong>Pipeline Parallelism (流水线并行)</strong> 的基础。</li>
+</ul>
+<h4>✅ Task 2: 理解通信 —— 不同的 GPU 怎么“交接棒”？</h4>
+<ul>
+<li><strong>场景</strong>：数据先进入 GPU 0 计算，算出结果后，必须传给 GPU 1 继续算。反向传播（训练）时，GPU 1 算完梯度，又要传回给 GPU 0。</li>
+<li><strong>文档对应部分</strong>：<code>pipeline_parallel.p2p_communication module</code></li>
+<li><strong>解释</strong>：<ul>
+<li>这个模块里的 <code>recv_forward</code>（接收前向数据）和 <code>recv_backward</code>（接收反向梯度）就是负责 GPU 之间互相扔数据包的。</li>
+<li><strong>P2P (Point-to-Point)</strong>：指的是点对点通信，即 GPU 0 直接发给 GPU 1，而不是广播给所有人。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 理解调度 (Schedule) —— 怎么安排大家干活不偷懒？</h4>
+<ul>
+<li><strong>难点</strong>：如果 GPU 0 在算的时候，GPU 1 没事干（因为它在等数据）；等 GPU 1 算的时候，GPU 0 又没事干了。这就叫“气泡 (Bubble)”，即计算资源的浪费。</li>
+<li><strong>解决办法</strong>：我们需要一个聪明的<strong>时间表 (Schedule)</strong>，让大家尽可能同时都在忙。</li>
+<li><strong>文档对应部分</strong>：<code>pipeline_parallel.schedules module</code></li>
+<li><strong>解释</strong>：这个模块就是制定“排班表”的指挥官。</li>
+</ul>
+<h4>✅ Task 4: 区分三种“排班表” (文中的核心观点)</h4>
+<p>文中提到了三种具体的 Schedule（调度方式），这是该文档最核心的内容：</p>
+<ol>
+<li>
+<p><strong>Default no-pipelining (无流水线)</strong>：</p>
+<ul>
+<li><strong>情况</strong>：如果你只有一个 GPU，或者模型没切分。</li>
+<li><strong>对应函数</strong>：<code>forward_backward_no_pipelining</code>。</li>
+<li><strong>解释</strong>：这就跟普通训练一样，没啥花哨的。</li>
+</ul>
+</li>
+<li>
+<p><strong>Without Interleaving (无交错流水线)</strong>：</p>
+<ul>
+<li><strong>情况</strong>：最基础的流水线。大家排队，一批批数据进去，比如先做完所有前向传播，再做反向传播（或者经典的 1F1B 策略）。</li>
+<li><strong>对应函数</strong>：<code>forward_backward_pipelining_without_interleaving</code>。</li>
+<li><strong>缺点</strong>：会有一些等待时间（气泡）。</li>
+</ul>
+</li>
+<li>
+<p><strong>With Interleaving (带交错流水线 - 高级版)</strong>：</p>
+<ul>
+<li><strong>情况</strong>：文中提到的那篇论文（Efficient Large-Scale...）里的技术。</li>
+<li><strong>原理</strong>：把模型切得更碎。比如 GPU 0 不只负责 1-10 层，而是负责 "1-5层" 和 "21-25层"。这样可以让 GPU 更早地接到任务，减少空转等待时间。</li>
+<li><strong>对应函数</strong>：<code>forward_backward_pipelining_with_interleaving</code>。</li>
+<li><strong>优点</strong>：效率更高，显存利用更复杂。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 5: 回到文档 —— 这个文件到底是干嘛的？</h4>
+<p>现在你再看这个文件，就会发现它其实是一个<strong>“目录”</strong>或<strong>“入口”</strong>：</p>
+<ol>
+<li>它告诉开发者：我们这个包 (<code>pipeline_parallel package</code>) 提供了两套主要的并行策略（交错的、不交错的）。</li>
+<li><strong><code>p2p_communication</code> 模块</strong>：这里面放着怎么发消息的代码。</li>
+<li><strong><code>schedules</code> 模块</strong>：这里面放着怎么安排计算顺序的代码。有一个辅助函数 <code>get_forward_backward_func</code>，它会自动判断：“如果你只有 1 张卡，我就给你用‘无流水线’模式；如果你配置了复杂参数，我就给你用‘交错’模式”。</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这篇文档不是教你原理的，它是给程序员看的 <strong>API 列表</strong>。它在说：</p>
+<blockquote>
+<p>“嘿，你要搞大模型训练吗？我这里封装好了<strong>通信功能（P2P）</strong>和<strong>调度逻辑（Schedules）</strong>。</p>
+<p>你可以选择<strong>普通模式</strong>、<strong>基础流水线模式</strong>，或者<strong>高级的交错流水线模式</strong>（省显存、速度快，参考那篇论文）。</p>
+<p>直接调用 <code>get_forward_backward_func</code>，我会把适合你的那个函数给你。”</p>
+</blockquote>
+<p>这样讲是不是清晰了一些？</p>

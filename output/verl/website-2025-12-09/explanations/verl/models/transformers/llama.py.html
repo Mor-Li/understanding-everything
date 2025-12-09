@@ -1,0 +1,72 @@
+<h1>verl/models/transformers/llama.py</h1>
+<p>这份代码乍一看确实很复杂，因为它涉及到<strong>大模型分布式训练</strong>中一个非常核心且高级的技术，叫做 <strong>Ulysses Sequence Parallelism（尤利西斯序列并行）</strong>。</p>
+<p>简单来说，这个文件的作用是：<strong>“魔改”了 Llama 模型的注意力（Attention）计算过程，让它能够跨多个 GPU 处理超长的文本序列。</strong></p>
+<p>为了让你看懂，我把这段代码做的事情拆解成一个 <strong>“处理超长文章的流水线 Task List”</strong>。</p>
+<p>假设我们有一篇 <strong>100万字</strong> 的超长文章要喂给模型，单张显卡（GPU）显存根本放不下。我们把这 100 万字切成了 4 段，分给 4 张显卡（GPU A, B, C, D），每张卡原本只拿到了 25 万字。</p>
+<h3>核心任务清单 (Todo List)</h3>
+<p>这个代码文件定义了一个函数（<code>llama_flash_attn_forward</code>），它在每张显卡上运行，执行以下步骤：</p>
+<h4>✅ Task 1: 拿到“碎片”数据 (投影 Q, K, V)</h4>
+<ul>
+<li><strong>现状</strong>：当前显卡只持有文章的 <strong>一部分</strong>（比如第 0-25万字）。</li>
+<li><strong>动作</strong>：计算 Query (Q), Key (K), Value (V)。</li>
+<li><strong>代码对应</strong>：<code>self.q_proj(...)</code>, <code>self.k_proj(...)</code>。</li>
+<li><strong>问题</strong>：计算注意力（Attention）时，第 1 个字可能需要关注第 99 万个字。但第 99 万个字在别人的显卡上，我看不到！这就是我们要解决的核心痛点。</li>
+</ul>
+<h4>✅ Task 2: 【关键步骤】乾坤大挪移 (All-to-All 通信 / Ulysses 变换)</h4>
+<p>这是这段代码最核心的逻辑。
+*   <strong>目标</strong>：为了算注意力，我必须看到<strong>全文</strong>，但我不需要负责所有的<strong>注意力头（Heads）</strong>。
+*   <strong>动作</strong>：4 张显卡互相交换数据。
+    *   <strong>交换前</strong>：我负责“第1段文字”的“所有头”。
+    *   <strong>交换后</strong>：我负责“整篇文章”的“第1组头”（比如前8个头）。
+*   <strong>通俗解释</strong>：大家把手里的书页凑在一起，原本我是“读第一章的人”，现在变成了“专门负责分析全文语法的人”。
+*   <strong>代码对应</strong>：
+    <code>python
+    if ulysses_sp_size &gt; 1:
+        # 把“按序列切分”变成“按头切分”
+        query_states = gather_seq_scatter_heads(...)
+        key_states = gather_seq_scatter_heads(...)
+        value_states = gather_seq_scatter_heads(...)</code></p>
+<h4>✅ Task 3: 加上位置信息 (RoPE)</h4>
+<ul>
+<li><strong>动作</strong>：给 Q 和 K 加上旋转位置编码（Rotary Embedding）。</li>
+<li><strong>原因</strong>：让模型知道每个字在文章中的相对位置。因为现在我手里拿的是全文的某个“头”，位置信息必须对齐。</li>
+<li><strong>代码对应</strong>：<code>apply_rotary_pos_emb(...)</code>。</li>
+</ul>
+<h4>✅ Task 4: 计算注意力 (Flash Attention)</h4>
+<ul>
+<li><strong>动作</strong>：执行标准的注意力计算 <code>Softmax(Q @ K.T) @ V</code>。</li>
+<li><strong>为什么现在能算了？</strong>：因为经过 Task 2 的交换，当前显卡手里已经有了<strong>整篇文章</strong>在特定“头”下的 Q、K、V 数据。虽然我只算了一部分头，但这些头能看到全文，不会漏掉信息。</li>
+<li><strong>代码对应</strong>：<code>_flash_attention_forward(...)</code> 或 <code>attention_interface(...)</code>。</li>
+</ul>
+<h4>✅ Task 5: 【关键步骤】各回各家 (All-to-All 通信 / 逆变换)</h4>
+<ul>
+<li><strong>目标</strong>：计算完注意力后，下一层网络（MLP层）通常还是希望数据是按“文章段落”切分的，而不是按“头”切分的。我们需要把数据换回去。</li>
+<li><strong>动作</strong>：4 张显卡再次互相交换数据。<ul>
+<li><strong>交换前</strong>：我手里是“整篇文章”的“部分结果”。</li>
+<li><strong>交换后</strong>：我手里变回了“第1段文字”的“所有结果”。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    if ulysses_sp_size &gt; 1:
+        # 把“按头切分”变回“按序列切分”
+        attn_output = gather_heads_scatter_seq(...)</code></li>
+</ul>
+<h4>✅ Task 6: 输出与收尾</h4>
+<ul>
+<li><strong>动作</strong>：做最后一次线性投影（Output Projection），然后输出结果。</li>
+<li><strong>代码对应</strong>：<code>self.o_proj(attn_output)</code>。</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在讲啥？</h3>
+<p>这段代码就是给 Llama 模型打了一个补丁，让它支持 <strong>Ulysses（尤利西斯）并行</strong>。</p>
+<p><strong>它的核心逻辑就是一句话：</strong></p>
+<blockquote>
+<p>在算 Attention 之前，把数据从 <strong>“切分序列”</strong> 变成 <strong>“切分注意力头”</strong>（这样单卡就能看到全文了）；算完之后，再变回来。</p>
+</blockquote>
+<p><strong>如果没有这段代码：</strong>
+Llama 模型在多卡训练时，如果序列太长，单卡显存会爆，或者因为看不到其他卡上的文字而无法正确计算长文本的因果关系。</p>
+<p><strong>有了这段代码：</strong>
+<code>verl</code> 框架就可以利用多张显卡，训练几十万甚至上百万 token 长度的 Llama 模型。</p>
+<p><strong>补充说明：</strong>
+文件里有两个函数 <code>llama_flash_attn_forward</code> 和 <code>llama_attn_forward</code>，逻辑是一模一样的，只是为了兼容不同版本的 <code>transformers</code> 库（比如 v4.47 和 v4.49 的接口微调）。</p>

@@ -1,0 +1,64 @@
+<h1>tests/test_utils/python_scripts/notify.py</h1>
+<p>没问题，这段代码乍一看确实涉及了很多概念（GitLab API, 环境变量, Slack 消息, 命令行参数）。</p>
+<p>简单来说，这是一个 <strong>“自动汇报员”</strong> 脚本。它的工作是：<strong>去 GitLab 上查一下刚刚跑完的测试是通过了还是挂了，然后把结果发到 Slack 群里告诉大家。</strong></p>
+<p>为了让你彻底看懂，我把这个脚本的工作流程拆解成一个 <strong>To-Do List（任务清单）</strong>，我们可以把它想象成这个脚本脑子里的“待办事项”。</p>
+<hr />
+<h3>📋 脚本的 To-Do List (任务清单)</h3>
+<ol>
+<li><strong>准备阶段：</strong> 搞清楚我是谁，我要查哪个项目，我要发给谁。</li>
+<li><strong>听取指令：</strong> 搞清楚这次具体要查哪一次的测试（Pipeline ID），是查单元测试还是集成测试？</li>
+<li><strong>搜集情报：</strong> 登录 GitLab，顺藤摸瓜找到具体的测试任务（Jobs）。</li>
+<li><strong>分析结果：</strong> 像老师批改卷子一样，看哪些任务通过了，哪些挂了。</li>
+<li><strong>撰写报告：</strong> 组织语言，如果全过就发“庆祝表情”，有错就发“警告表情”并点名负责人。</li>
+<li><strong>发送消息：</strong> 把写好的报告推送到 Slack 群组。</li>
+</ol>
+<hr />
+<h3>📝 逐步详细讲解</h3>
+<p>下面我们按照这个清单，一步一步对照代码来看：</p>
+<h4>Task 1: 准备阶段 (读取环境变量)</h4>
+<p>脚本启动时，先从系统里读取一些基本配置。
+*   <strong>代码位置：</strong> 开头的 <code>import</code> 和 <code>PROJECT_ID = ...</code> 那几行。
+*   <strong>它在做什么：</strong>
+    *   <code>PROJECT_ID</code>: 它是哪个 GitLab 项目的？
+    *   <code>WEBHOOK_URL</code>: 发送 Slack 消息的地址在哪里？
+    *   <code>GITLAB_ENDPOINT</code>: GitLab 的网址是多少？
+    *   <code>TAG_TEAM</code>: 如果出错了，要不要 @所有人？</p>
+<h4>Task 2: 听取指令 (解析命令行参数)</h4>
+<p>这个脚本是被别人调用的（通常是 CI/CD 系统），调用时会给它传参。
+*   <strong>代码位置：</strong> <code>@click.command()</code> 和 <code>def main(...)</code> 的参数定义。
+*   <strong>它在做什么：</strong> 它要求用户提供以下信息：
+    *   <code>--pipeline-id</code>: 具体查哪一次运行流水线（ID 是多少）？
+    *   <code>--check-for</code>: 查什么类型的测试？（选项：<code>unit-tests</code> 单元测试, <code>integration-tests</code> 集成测试, 等）。
+    *   <code>--pipeline-context</code>: 这次测试的上下文名字叫什么（方便写在报告里）。</p>
+<h4>Task 3: 搜集情报 (获取 GitLab 任务数据)</h4>
+<p>这是最核心、也最复杂的一步。它需要去 GitLab API 拉取数据。
+*   <strong>代码位置：</strong>
+    *   <code>main</code> 函数里的 <code>if check_for == ...</code>
+    *   核心函数 <code>get_jobs_per_bridge(...)</code>
+*   <strong>逻辑详解：</strong>
+    1.  <strong>登录：</strong> <code>get_gitlab_handle()</code> 用 Token 登录 GitLab。
+    2.  <strong>找“桥梁”(Bridge)：</strong> 在 GitLab CI 中，一个主流水线（Parent Pipeline）可以触发子流水线（Child Pipeline）。这个触发关系叫“Bridge”。
+    3.  <strong>筛选：</strong> 脚本会遍历所有的 Bridge，只关心名字以特定前缀开头的（比如 <code>test:unit_tests</code>）。
+    4.  <strong>抓取子任务：</strong> 找到 Bridge 后，顺藤摸瓜找到它触发的下游流水线（Downstream Pipeline），然后把里面的所有具体任务（Jobs）抓出来放到一个列表里。</p>
+<h4>Task 4: 分析结果 (判断成功还是失败)</h4>
+<p>拿到任务列表后，脚本开始统计。
+*   <strong>代码位置：</strong> <code>main</code> 函数里的 <code>for bridge_name in bridges.keys():</code> 循环。
+*   <strong>逻辑详解：</strong>
+    *   <strong>情况 A (全过)：</strong> 如果所有 Job 的状态都是 <code>"success"</code>，那就准备一条好消息。
+        *   代码：<code>messages.append(f":doge3d: ... All {total_num_jobs} passed.")</code>
+        *   意思：发个 3D 狗头表情，告诉大家全过了。
+    *   <strong>情况 B (有失败)：</strong> 如果有 Job 没通过。
+        *   找出所有失败的任务：<code>unsuccessful_jobs</code>。
+        *   准备坏消息：<code>messages.append(f":doctorge: ... failed.")</code> (发个医生表情)。
+        *   <strong>紧急呼叫：</strong> 如果设置了 <code>TAG_TEAM</code>，就加上一句 <code>cc {TEAM_SLUG}</code> (比如 @dev-team) 喊人来修。
+        *   <strong>列出罪证：</strong> 循环遍历失败的任务，把它们的链接贴出来，方便点击查看。</p>
+<h4>Task 5: 发送消息 (推送到 Slack)</h4>
+<p>报告写好了，最后一步就是发出去。
+*   <strong>代码位置：</strong> <code>main</code> 函数的最后几行。
+*   <strong>它在做什么：</strong>
+    *   <code>slack_sdk.webhook.WebhookClient(WEBHOOK_URL).send(text=message)</code>
+    *   把刚才拼接好的字符串列表，一条一条地发到 Slack 群里。</p>
+<hr />
+<h3>总结</h3>
+<p><strong>这个脚本的观点/目的：</strong>
+在自动化测试流程中，<strong>人是懒惰的</strong>，不想每次都去 GitLab 网页刷新看结果。所以写了这个脚本，<strong>只有当测试跑完时</strong>，自动把结果推送到工作群里。如果全绿（通过），大家开心；如果有红（失败），直接 @团队并给出失败任务的链接，从而提高修复 Bug 的效率。</p>

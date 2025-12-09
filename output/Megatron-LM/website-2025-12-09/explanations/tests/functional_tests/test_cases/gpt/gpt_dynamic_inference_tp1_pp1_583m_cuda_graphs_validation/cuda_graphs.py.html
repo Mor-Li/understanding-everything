@@ -1,0 +1,97 @@
+<h1>tests/functional_tests/test_cases/gpt/gpt_dynamic_inference_tp1_pp1_583m_cuda_graphs_validation/cuda_graphs.py</h1>
+<p>这份代码是一个<strong>自动化测试脚本</strong>。它的核心目的是测试 GPT 模型在推理（Inference）过程中使用 <strong>CUDA Graphs</strong> 技术时的正确性和行为表现。</p>
+<p>简单来说，它就像一个质检员，控制变量（CUDA Graph 的数量），跑几次模型，然后检查结果对不对、性能有没有按预期变化。</p>
+<p>为了让你更容易理解，我把这个脚本的工作流程拆解成一个 <strong>Task List（任务清单）</strong>，然后逐步讲解每一个步骤背后的逻辑。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<p>这个脚本执行时，实际上是在按顺序完成以下任务：</p>
+<ol>
+<li><strong>[准备工作]</strong>：清理旧的测试结果文件夹，读取用户传入的模型路径参数。</li>
+<li><strong>[做实验]</strong>：跑多轮测试。<ul>
+<li>第 1 轮：完全<strong>不使用</strong> CUDA Graph（作为基准/对照组）。</li>
+<li>第 2 轮：使用 <strong>1</strong> 个 CUDA Graph。</li>
+<li>第 3 轮：使用 <strong>2</strong> 个 CUDA Graph。</li>
+<li>...以此类推，直到使用 <strong>16</strong> 个。</li>
+<li><em>注：每一轮都会调用外部脚本 <code>cuda_graphs.sh</code> 来真正运行模型。</em></li>
+</ul>
+</li>
+<li><strong>[收数据]</strong>：把每一轮实验生成的 JSON 结果文件读进内存。</li>
+<li><strong>[验真伪 - 行为检查]</strong>：检查在不同配置下，CUDA Graph 是否被正确“触发”了（即模型是否真的用到了这些优化）。</li>
+<li><strong>[验真伪 - 结果一致性]</strong>：检查不管用不用 CUDA Graph，模型输出的步数（Step count）和概率值（Logprobs）是否完全一样。不能因为优化了速度就把结果算错了。</li>
+<li><strong>[验真伪 - 性能趋势]</strong>：检查随着 CUDA Graph 数量增加，某种“延迟代理指标”是否在下降（意味着效率在提升）。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细讲解</h3>
+<p>下面我对应上面的清单，结合代码给你讲讲它具体在干啥。</p>
+<h4>第一步：准备工作</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>main()</code> 函数开头 和 <code>clear_output_dir()</code>。</li>
+<li><strong>解释</strong>：<ul>
+<li>脚本首先创建一个临时目录 <code>/tmp/dyn-inf-cuda-graph-test</code> 用来存报告。如果目录里有旧东西，先删干净。</li>
+<li>它需要你告诉它模型在哪里（<code>--checkpoint-dir</code>），就像你让它干活得给它工具箱一样。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：做实验 (Run Tests)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>run_tests()</code> 函数。</li>
+<li><strong>核心逻辑</strong>：<ul>
+<li>这里有一个列表 <code>NUM_CUDA_GRAPHS_LIST = [0, 1, 2, 4, 8, 16]</code>。</li>
+<li>脚本写了一个 <code>for</code> 循环，遍历这个列表。</li>
+<li><strong>关键点</strong>：它使用 <code>subprocess.run</code> 调用了一个 Shell 脚本 <code>cuda_graphs.sh</code>。</li>
+<li><strong>环境变量</strong>：它把 <code>NUM_CUDA_GRAPHS</code>（比如设为 4）传给那个 Shell 脚本。意思就是：“嘿，这次跑模型，给我开启 4 个 CUDA Graph 槽位看看效果。”</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>什么是 CUDA Graph？</strong> (背景知识)
+通常 GPU 是一步一步听 CPU 指挥干活的。CUDA Graph 就像是把一整套连招（多个计算步骤）录下来。下次再用时，CPU 只要说“放连招 A”，GPU 就自己哐哐哐干完了，省去了 CPU 啰嗦的时间。这个测试就是看“录制”不同数量的连招，对系统有什么影响。</p>
+</blockquote>
+<h4>第三步：收数据 (Load Results)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>load_results()</code> 函数。</li>
+<li><strong>解释</strong>：<ul>
+<li>实验跑完后，会生成一堆 <code>.json</code> 文件。</li>
+<li>这个函数负责把这些文件读进来，提取出关键信息：比如跑了多久（latency）、每个 Graph 用了几次、输出的概率是多少。</li>
+</ul>
+</li>
+</ul>
+<h4>第四步：验证 - 行为检查 (Validate Request Counts)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>validate_cuda_graph_request_counts()</code>。</li>
+<li><strong>这是最难懂的部分，讲一下逻辑</strong>：<ul>
+<li>当你设置 <code>NUM_CUDA_GRAPHS = 4</code> 时，系统会把所有可能的输入长度（比如 1 到 2000）划分成 4 个档位（Bucket）。</li>
+<li>这个函数里有一个硬编码的字典 <code>expected_cuda_graph_request_count_maps</code>。这其实是<strong>标准答案</strong>。</li>
+<li><strong>举例</strong>：代码里写着 <code>4: {2000: 65, 1512: 63, 1008: 63, 504: 86}</code>。<ul>
+<li>意思是：如果你开了 4 个 Graph，我预期你会用到“长度2000的图”65次，“长度1512的图”63次……</li>
+</ul>
+</li>
+<li>如果实际跑出来的次数和这个对不上，说明系统的<strong>分桶逻辑</strong>（Bucket logic）坏了，或者没按预期调用优化。</li>
+</ul>
+</li>
+</ul>
+<h4>第五步：验证 - 结果一致性 (Validate Step &amp; Logprobs)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>validate_step_counts()</code> 和 <code>validate_logprobs()</code>。</li>
+<li><strong>解释</strong>：<ul>
+<li>这是为了确保<strong>安全性</strong>。</li>
+<li><strong>Step Count</strong>：不管你怎么优化，跑的步数不能变。</li>
+<li><strong>Logprobs (对数概率)</strong>：这是模型输出的数值结果。</li>
+<li>代码逻辑：拿 <code>0</code> 个 Graph（基准）的结果，去跟 <code>1, 2...16</code> 个 Graph 的结果比。必须 <code>assert ... == ...</code> （完全相等）。如果用了优化导致算出的数变了，那就是严重的 Bug。</li>
+</ul>
+</li>
+</ul>
+<h4>第六步：验证 - 性能趋势 (Validate Latency Proxies)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>validate_latency_proxies()</code>。</li>
+<li><strong>解释</strong>：<ul>
+<li>通常我们会直接比时间（Latency），但因为测试环境可能不稳定（比如机器突然卡了一下），直接比秒数有时不准。</li>
+<li>这里作者发明了一个 <code>latency_proxy</code>（延迟代理指标）。</li>
+<li><strong>原理</strong>：它是计算 <code>Sum(图的大小 * 使用次数)</code>。</li>
+<li><strong>观点</strong>：随着 CUDA Graphs 数量增加（分桶更细），这个计算出来的“代价/代理值”应该越来越小。代码里检查 <code>crnt_latency_proxy &lt; prev_latency_proxy</code>，确保优化是生效的（即：分得越细，浪费的计算资源越少）。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的观点是：
+<strong>“我要通过一组严格的对比测试，证明当我们增加 CUDA Graphs 的数量时，模型不仅算得结果完全正确（和不优化时一样），而且内部的调度逻辑（分桶）符合预期，且理论上的计算效率在提升。”</strong></p>

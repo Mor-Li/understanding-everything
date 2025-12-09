@@ -1,0 +1,109 @@
+<h1>tests/unit_tests/dist_checkpointing/models/test_mamba.py</h1>
+<p>这段代码确实涉及了很多分布式训练（Distributed Training）和深度学习框架（Megatron-LM）的专业术语。没关系，我们把它拆解开来。</p>
+<p>简单来说，这个文件的核心目的是：<strong>测试 Mamba 模型在改变分布式并行策略（如 GPU 数量变了、切分方式变了）时，能否正确地保存和加载模型权重。</strong></p>
+<p>打个比方：你把一个乐高城堡（模型）拆成 4 块装箱（保存）；下次拿出来时，你想把它重新拼好，但这次想由 8 个人分工来拼（加载到不同的并行配置中）。这个测试就是要确保无论怎么拆、怎么分工，最后的城堡是一模一样的。</p>
+<p>下面我为你列一个 <strong>Task List</strong>，我们按照这个顺序一步步解读。</p>
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>背景理解</strong>：搞懂这个测试是在测什么（什么是 Distributed Checkpointing）。</li>
+<li><strong>工具函数分析</strong>：看懂 <code>initialize_mamba</code> 是干嘛的。</li>
+<li><strong>测试参数解读</strong>：看懂 <code>src_tp_pp...</code> 和 <code>dest_tp_pp...</code> 代表什么意思。</li>
+<li><strong>核心流程拆解</strong>：一步步看 <code>test_parallel_reconfiguration_e2e</code> 是怎么跑通“保存 -&gt; 变形 -&gt; 加载 -&gt; 验证”的。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 背景理解 (Distributed Checkpointing)</h4>
+<p>在训练超大模型（如 GPT、Mamba）时，一个 GPU 放不下，需要把模型切碎了放在多个 GPU 上。
+*   <strong>TP (Tensor Parallel)</strong>: 张量并行，把一个大的矩阵切几块。
+*   <strong>PP (Pipeline Parallel)</strong>: 流水线并行，把模型的层切几段。
+*   <strong>CP (Context Parallel)</strong>: 上下文并行。
+*   <strong>Exp (Expert Parallel)</strong>: 混合专家模型的并行。</p>
+<p><strong>痛点</strong>：如果你用 2 个 GPU 训练的模型保存了，想在 4 个 GPU 上继续微调，或者反过来，传统的加载方式会报错，因为权重形状对不上。
+<strong>解决</strong>：Megatron 的 <code>dist_checkpointing</code> 模块就是为了解决这个问题，它能自动处理这种“变形”。</p>
+<h4>Task 2: 工具函数分析 (<code>initialize_mamba</code>)</h4>
+<p>代码第 29 行定义的函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">initialize_mamba</span><span class="p">(</span><span class="n">seed</span><span class="p">,</span> <span class="n">glu</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">**</span><span class="n">config_kwargs</span><span class="p">):</span>
+    <span class="c1"># ... 省略代码 ...</span>
+    <span class="k">return</span> <span class="n">model</span>
+</code></pre></div>
+
+<ul>
+<li><strong>作用</strong>：这是一个“工厂函数”，用来快速创建一个 Mamba 模型实例。</li>
+<li><strong>细节</strong>：<ul>
+<li>它设置了随机种子（保证每次跑结果一样）。</li>
+<li>它配置了 <code>TransformerConfig</code>（虽然叫 TransformerConfig，但这里用于 Mamba 的参数配置）。</li>
+<li>它初始化了 <code>MambaMixer</code>（这是 Mamba 模型的核心结构）。</li>
+<li><strong>结论</strong>：不用深究内部，只要知道调用它就能得到一个配置好的 Mamba 模型对象。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 测试参数解读 (<code>TestMambaReconfiguration</code>)</h4>
+<p>代码第 61 行的 <code>@pytest.mark.parametrize</code> 是 pytest 的参数化测试功能。它定义了一堆测试用例的场景。</p>
+<p>重点看这一行及下面的列表：
+<code>"use_fpsl, src_tp_pp_exp_cp, dest_tp_pp_exp_cp, use_glu"</code></p>
+<p>这四个参数分别代表：
+1.  <strong><code>use_fpsl</code></strong>: 是否使用“全并行保存/加载策略”（一种优化策略，不用太纠结）。
+2.  <strong><code>src_tp_pp_exp_cp</code> (Source)</strong>: <strong>原始</strong>的并行配置。(TP数, PP数, Expert数, CP数)。
+3.  <strong><code>dest_tp_pp_exp_cp</code> (Destination)</strong>: <strong>目标</strong>的并行配置。
+4.  <strong><code>use_glu</code></strong>: 是否使用 Gated Linear Unit（模型结构的一个变体）。</p>
+<p><strong>举例解读其中的一行：</strong>
+<code>(False, (2, 4, 1, 1), (2, 4, 1, 1), False)</code>
+*   意思是：先在 TP=2, PP=4 的环境下创建模型，保存。然后在同样的 TP=2, PP=4 环境下加载。这是最基础的“原样加载”测试。</p>
+<p><strong>再看一行更有趣的：</strong>
+<code>(False, (2, 2, 2, 1), (4, 2, 1, 1), False)</code>
+*   意思是：
+    *   <strong>存的时候</strong>：TP=2, PP=2, Expert=2。
+    *   <strong>取的时候</strong>：TP=4, PP=2, Expert=1。
+    *   <strong>目的</strong>：测试系统能不能自动把 TP=2 的权重切分转换成 TP=4 的权重，同时把 Expert 并行关掉。</p>
+<h4>Task 4: 核心流程拆解 (<code>test_parallel_reconfiguration_e2e</code>)</h4>
+<p>这是最主要的代码块（第 85 行开始）。<code>e2e</code> 意味着 End-to-End（端到端测试）。</p>
+<p>我们把这个函数的执行过程像电影脚本一样分幕讲解：</p>
+<p><strong>第一幕：搭建环境 A 并保存 (Save)</strong>
+1.  <strong>初始化环境</strong>：<code>Utils.initialize_model_parallel(src_tp, ...)</code>
+    *   根据 <code>src</code> 参数，模拟出原始的并行环境（比如假装现在有 2 个 GPU）。
+2.  <strong>创建模型 A</strong>：<code>model_A = initialize_mamba(...)</code>
+    *   在这个环境下创建一个 Mamba 模型。
+3.  <strong>保存模型 A</strong>：<code>save(..., ckpt_dir_A, ...)</code>
+    *   把模型 A 的权重保存到文件夹 <code>ckpt_dir_A</code>。
+4.  <strong>销毁环境</strong>：<code>Utils.destroy_model_parallel()</code>
+    *   清理现场，准备下一幕。</p>
+<p><strong>第二幕：搭建环境 B 并加载 (Load &amp; Resave)</strong>
+1.  <strong>初始化环境</strong>：<code>Utils.initialize_model_parallel(dest_tp, ...)</code>
+    *   根据 <code>dest</code> 参数，模拟出目标的并行环境（比如假装现在有 4 个 GPU）。
+    *   <em>注意：环境变了！</em>
+2.  <strong>创建模型 B</strong>：<code>model_B = initialize_mamba(...)</code>
+    *   在这个新环境下创建一个结构相同但并行切分不同的 Mamba 模型（此时它是随机初始化的）。
+3.  <strong>加载权重</strong>：<code>state_dict = load(..., ckpt_dir_A, ...)</code>
+    *   <strong>关键步骤</strong>：从 <code>ckpt_dir_A</code> 读取权重。虽然 A 是按 2 个 GPU 存的，B 是按 4 个 GPU 跑的，但 <code>load</code> 函数会自动计算，把权重正确地塞进 <code>model_B</code> 里。
+4.  <strong>保存模型 B</strong>：<code>save(..., ckpt_dir_B)</code>
+    *   把加载好权重的模型 B 保存到文件夹 <code>ckpt_dir_B</code>。
+5.  <strong>销毁环境</strong>：再次清理现场。</p>
+<p><strong>第三幕：验证真伪 (Validation)</strong>
+现在我们有两个文件夹：<code>ckpt_dir_A</code>（原始）和 <code>ckpt_dir_B</code>（转换后）。我们需要证明它们在数学上是相等的。</p>
+<ol>
+<li><strong>初始化单机环境</strong>：<code>Utils.initialize_model_parallel(1, 1)</code><ul>
+<li>搞一个最简单的单 GPU 环境，方便对比。</li>
+</ul>
+</li>
+<li><strong>读取纯张量</strong>：<ul>
+<li><code>state_dict_A = load_plain_tensors(ckpt_dir_A)</code></li>
+<li><code>state_dict_B = load_plain_tensors(ckpt_dir_B)</code></li>
+<li><code>load_plain_tensors</code> 会忽略所有的并行切分信息，直接把权重拼成完整的矩阵读出来。</li>
+</ul>
+</li>
+<li><strong>找茬 (Diff)</strong>：<code>diffs = diff(state_dict_A, state_dict_B)</code><ul>
+<li>对比两个字典里的每一个数字。</li>
+</ul>
+</li>
+<li><strong>断言</strong>：<code>assert not any(...)</code><ul>
+<li>如果 <code>diffs</code> 是空的，说明转换完美成功！测试通过。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件的逻辑是：
+1.  <strong>建模型 A</strong> (配置 X) -&gt; <strong>存盘</strong>。
+2.  <strong>建模型 B</strong> (配置 Y) -&gt; <strong>读盘</strong> (把 A 的权重读给 B)。
+3.  <strong>存模型 B</strong>。
+4.  <strong>对比</strong>：A 和 B 的文件内容在数学数值上是否完全一致。</p>
+<p>如果这个测试通过，就证明 Megatron 的 Mamba 模型支持在不同硬件配置之间随意切换训练和推理，非常灵活。</p>

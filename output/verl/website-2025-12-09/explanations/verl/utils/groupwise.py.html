@@ -1,0 +1,121 @@
+<h1>verl/utils/groupwise.py</h1>
+<p>这个文件 <code>verl/utils/groupwise.py</code> 是<strong>强化学习（RL）训练中的一个“数据分组统计”工具包</strong>。</p>
+<p>为了让你听懂，我举个通俗的例子：
+假设你是一个老师，你收到了来自 3 个不同班级（A班、B班、C班）的试卷。
+*   A班的卷子很难，平均分只有 40 分。
+*   B班的卷子很简单，平均分有 90 分。
+*   <strong>你的任务</strong>：你要公平地给这三个班的学生排名。你不能直接比分数，因为题目难度不一样。你需要算出每个学生<strong>在自己班级里</strong>的相对表现（比如：比班级平均分高多少）。</p>
+<p>这个文件就是做这件事的数学工具。</p>
+<hr />
+<h3>📋 任务清单 (ToDo List)</h3>
+<p>为了完成上述任务，计算机需要按顺序执行以下步骤。这个文件的代码就是对应这些步骤的：</p>
+<ol>
+<li><strong>[环境准备] 确定计算设备</strong><ul>
+<li>决定是用 CPU 算还是 GPU 算？（对应函数 <code>_resolve_device</code>）</li>
+</ul>
+</li>
+<li><strong>[数据清洗] 统一班级标签 (Group Indexing)</strong><ul>
+<li>输入的数据很乱，班级名可能是 "Class A", "Class B"，也可能是 ID "101", "102"。</li>
+<li><strong>目标</strong>：把它们全部变成计算机喜欢的整数索引：0, 1, 2...</li>
+<li>（对应函数 <code>as_torch_index</code>）</li>
+</ul>
+</li>
+<li><strong>[核心计算] 计算分组的均值和方差 (Group Stats)</strong><ul>
+<li>算出 0号组的平均分、标准差；1号组的平均分、标准差...</li>
+<li><strong>目标</strong>：得到每个组的统计数据，以便后续做归一化。</li>
+<li>（对应函数 <code>group_mean_std</code>）</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步讲解 (Step-by-Step)</h3>
+<p>下面我把代码拆解开，按照上面的逻辑一步步讲。</p>
+<h4>第一步：确定设备 (<code>_resolve_device</code>)</h4>
+<ul>
+<li><strong>痛点</strong>：有时候你在跑测试（Pytest），有时候你在服务器上跑（CUDA），有时候你想强制用 CPU。</li>
+<li><strong>代码逻辑</strong>：<ol>
+<li>如果你直接告诉它用啥（<code>explicit</code>），就听你的。</li>
+<li>如果没说，看环境变量 <code>VERL_FORCE_DEVICE</code> 有没有强制设定。</li>
+<li>如果是测试环境（Pytest），为了省事强制用 CPU。</li>
+<li>最后，如果有显卡就用显卡，没有就用 CPU。</li>
+</ol>
+</li>
+</ul>
+<h4>第二步：把乱七八糟的标签变成整数 (<code>as_torch_index</code>)</h4>
+<p>这是这个文件中最复杂的脏活累活。</p>
+<ul>
+<li>
+<p><strong>痛点</strong>：你的数据（<code>index</code>）可能是各种奇怪的格式：</p>
+<ul>
+<li><code>[1.0, 1.0, 2.0]</code> (浮点数)</li>
+<li><code>["prompt_1", "prompt_1", "prompt_2"]</code> (字符串)</li>
+<li><code>[True, False, True]</code> (布尔值)</li>
+<li>甚至是一些奇怪的对象 ID。</li>
+<li>PyTorch 只能处理整数索引 <code>[0, 0, 1]</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>代码逻辑</strong>：</p>
+<ol>
+<li><strong>如果是 PyTorch Tensor</strong>：<ul>
+<li>如果是整数：直接转成 <code>long</code> 类型。</li>
+<li>如果是浮点数（比如 1.000001）：尝试四舍五入。如果四舍五入后很完美，就当整数用；如果不行，就转成字符串处理。</li>
+</ul>
+</li>
+<li><strong>如果是 Numpy 或 列表</strong>：<ul>
+<li>先转成 Numpy 数组。</li>
+<li>尝试转整数。</li>
+</ul>
+</li>
+<li><strong>终极方案 (Factorization)</strong>：<ul>
+<li>如果上面都行不通（比如是字符串 "A", "B"），它使用 <code>np.unique(..., return_inverse=True)</code>。</li>
+<li>这个函数会自动给每个<strong>不一样的值</strong>分配一个唯一的 ID。</li>
+<li>例如：<code>["apple", "banana", "apple"]</code> -&gt; <code>[0, 1, 0]</code>。</li>
+</ul>
+</li>
+<li><strong>结果</strong>：无论你怎么折腾输入，输出永远是干净整洁的 <code>[0, 1, 0, 2...]</code> 这种整数 Tensor。</li>
+</ol>
+</li>
+</ul>
+<h4>第三步：分组计算均值和标准差 (<code>group_mean_std</code>)</h4>
+<p>这是核心数学部分。</p>
+<ul>
+<li>
+<p><strong>输入</strong>：</p>
+<ul>
+<li><code>scores</code>: 分数列表，例如 <code>[10, 20, 50, 60]</code></li>
+<li><code>gidx</code>: 组 ID (由上一步生成)，例如 <code>[0, 0, 1, 1]</code> (前两个是第0组，后两个是第1组)</li>
+</ul>
+</li>
+<li>
+<p><strong>代码逻辑</strong>：</p>
+<ol>
+<li><strong>准备容器</strong>：创建三个全 0 的数组，长度等于组的数量。<ul>
+<li><code>count</code>: 记录每组有几个人。</li>
+<li><code>s1</code>: 记录每组分数的总和 ($\sum x$)。</li>
+<li><code>s2</code>: 记录每组分数的平方和 ($\sum x^2$)。</li>
+</ul>
+</li>
+<li><strong>并行加法 (<code>index_add_</code>)</strong>：<ul>
+<li>这是 PyTorch 的一个魔法操作。它不需要写 <code>for</code> 循环，直接把 <code>scores</code> 根据 <code>gidx</code> 加到对应的桶里。</li>
+<li>瞬间算完所有组的总和、平方和、人数。</li>
+</ul>
+</li>
+<li><strong>套公式</strong>：<ul>
+<li>均值 <code>mean</code> = 总和 / 人数。</li>
+<li>方差 <code>var</code> = (平方和 - 总和的平方/人数) / (人数 - 1)。<em>(注：这里用了贝塞尔校正，分母是 N-1)</em></li>
+<li>标准差 <code>std</code> = 方差开根号。</li>
+</ul>
+</li>
+<li><strong>特殊情况处理 (Singleton)</strong>：<ul>
+<li>如果某一组<strong>只有 1 个人</strong> (<code>count &lt;= 1</code>)。</li>
+<li>数学上，1个人的方差是没法算的（分母是0），或者没有意义。</li>
+<li><strong>策略</strong>：代码强制把这一组的 <code>mean</code> 设为 0，<code>std</code> 设为 1。这是为了防止除以 0 报错，也符合强化学习中“如果不确定，就不要缩放”的惯例。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>总结</h3>
+<p><strong>这一坨代码就是为了解决强化学习（RL）中 Advantage Normalization（优势归一化）的问题。</strong></p>
+<p>它确保了无论你的数据来自多少个不同的 Prompt（组），或者标签写得多么乱，它都能快速、稳定地算出每一组内部的平均分和标准差，从而让模型训练更稳定。</p>

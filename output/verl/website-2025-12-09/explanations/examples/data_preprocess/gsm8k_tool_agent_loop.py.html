@@ -1,0 +1,104 @@
+<h1>examples/data_preprocess/gsm8k_tool_agent_loop.py</h1>
+<p>这份代码其实是一个<strong>“数据加工流水线”</strong>的脚本。</p>
+<p>简单来说，它的作用是：<strong>把原始的数学题库（GSM8k），改写成一种特殊的格式，用来训练一个会使用工具（Tool-use）的AI智能体。</strong></p>
+<p>为了让你听懂，我把这个脚本的工作流程拆解成一个 <strong>Todo List（任务清单）</strong>，然后一步步解释每一步在做什么。</p>
+<hr />
+<h3>📋 脚本任务清单 (Todo List)</h3>
+<ol>
+<li><strong>准备阶段</strong>：接收命令行参数（决定文件存哪、读哪）。</li>
+<li><strong>进货阶段</strong>：加载原始的数学题数据集（GSM8k）。</li>
+<li><strong>核心加工阶段（最重要）</strong>：<ul>
+<li>把答案里的最终数字提取出来。</li>
+<li><strong>编写剧本</strong>：给AI写一段“系统提示词”（System Prompt），告诉它：“你是一个数学专家，你要一步步推理，并且要用工具来验证答案”。</li>
+<li><strong>打包数据</strong>：把题目、提示词、正确答案、工具配置都塞进一个字典里。</li>
+</ul>
+</li>
+<li><strong>出货阶段</strong>：把加工好的数据保存成 <code>.parquet</code> 格式（一种高效的数据存储格式）。</li>
+<li><strong>归档阶段</strong>：如果有需要，把文件复制到云端存储（HDFS）。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详解 (Step-by-Step)</h3>
+<h4>1. 准备阶段 (Setup)</h4>
+<p>代码最下面 <code>if __name__ == "__main__":</code> 开始的地方。
+*   <strong>动作</strong>：脚本先看你运行命令时带了什么参数（比如 <code>--local_save_dir</code>）。
+*   <strong>目的</strong>：确定一会儿把加工好的“菜”端到哪个桌子上。</p>
+<h4>2. 进货阶段 (Load Data)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">local_dataset_path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">dataset</span> <span class="o">=</span> <span class="n">datasets</span><span class="o">.</span><span class="n">load_dataset</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">dataset</span> <span class="o">=</span> <span class="n">datasets</span><span class="o">.</span><span class="n">load_dataset</span><span class="p">(</span><span class="n">data_source</span><span class="p">,</span> <span class="s2">&quot;main&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：去 HuggingFace 下载 <code>openai/gsm8k</code> 数据集，或者读取你本地已经下载好的文件。</li>
+<li><strong>内容</strong>：GSM8k 是一个经典的小学数学应用题库。<ul>
+<li>原始数据长这样：<ul>
+<li><strong>问</strong>：小明有3个苹果，吃了1个，还剩几个？</li>
+<li><strong>答</strong>：3减1等于2 #### 2</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>3. 核心加工阶段 (Data Transformation)</h4>
+<p>这是代码里 <code>make_map_fn</code> 函数做的事情，也是最难懂的部分。脚本遍历每一道题，做以下改装：</p>
+<p><strong>Task 3.1: 提取纯数字答案</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">extract_solution</span><span class="p">(</span><span class="n">solution_str</span><span class="p">):</span>
+    <span class="o">...</span>
+    <span class="c1"># 比如从 &quot;#### 2&quot; 里提取出 &quot;2&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>目的</strong>：为了后面让工具能自动判断AI算得对不对，必须先把标准答案里的数字抠出来。</li>
+</ul>
+<p><strong>Task 3.2: 编写“剧本” (Prompt Engineering)</strong>
+代码构建了一个 <code>prompt</code> 列表，包含 <code>system</code>（系统指令）和 <code>user</code>（题目）。
+*   <strong>System Content (系统指令)</strong>：
+    &gt; "You are a math expert... You should use the <code>calc_gsm8k_reward</code> tool..."
+    *   <strong>翻译</strong>：脚本强行给AI植入一个人设：“你是个数学专家。你必须一步步推理。在给出最终答案前，你<strong>必须</strong>调用一个叫 <code>calc_gsm8k_reward</code> 的工具来检查你的推理对不对。”
+*   <strong>目的</strong>：这不仅仅是做题，而是训练AI学会<strong>“写代码/调工具来自我验证”</strong>。</p>
+<p><strong>Task 3.3: 配置工具参数 (Tools Config)</strong>
+看 <code>extra_info</code> 里的 <code>tools_kwargs</code> 部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="s2">&quot;tools_kwargs&quot;</span><span class="p">:</span> <span class="p">{</span>
+    <span class="s2">&quot;calc_gsm8k_reward&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="s2">&quot;create_kwargs&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;ground_truth&quot;</span><span class="p">:</span> <span class="n">solution</span><span class="p">},</span>
+    <span class="p">},</span>
+<span class="p">},</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：这里是在告诉训练框架（Verl），这道题配备了一个叫“奖励计算器”的工具。</li>
+<li><strong>关键点</strong>：把正确答案 (<code>solution</code>) 偷偷塞给这个工具。这样当AI调用工具时，工具拿AI算的数和这个正确答案比对，告诉AI是对是错。</li>
+</ul>
+<h4>4. 出货阶段 (Save)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">train_dataset</span><span class="o">.</span><span class="n">to_parquet</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">test_dataset</span><span class="o">.</span><span class="n">to_parquet</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：把上面改写好的所有数据，存成 <code>train.parquet</code> 和 <code>test.parquet</code>。</li>
+<li><strong>目的</strong>：Parquet 格式读写快，适合喂给显卡去训练模型。</li>
+</ul>
+<h4>5. 归档阶段 (HDFS Copy)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">hdfs_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">copy</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：如果你在大公司（比如字节跳动，因为代码头有 Bytedance 版权），通常数据要存到公司的大数据集群（HDFS）上。这一步就是把本地做好的文件上传上去。</li>
+</ul>
+<hr />
+<h3>💡 总结：这篇文章观点的核心</h3>
+<p>这个脚本不仅仅是处理数据，它体现了一种<strong>训练 AI 的新思路</strong>：</p>
+<ol>
+<li><strong>不再只是“问答”</strong>：以前是 问-&gt;答。</li>
+<li><strong>变成了“思考+工具循环”</strong>：<ul>
+<li>AI 拿到题。</li>
+<li>AI 思考步骤。</li>
+<li>AI <strong>主动调用工具</strong>（这里是一个奖励模型工具）来看看自己目前的思路对不对。</li>
+<li>根据工具反馈，AI 调整答案。</li>
+<li>最后输出结果。</li>
+</ul>
+</li>
+</ol>
+<p><strong>这个脚本就是为了准备这种“带工具交互”的训练数据而存在的。</strong></p>

@@ -1,0 +1,63 @@
+<h1>recipe/fully_async_policy/message_queue.py</h1>
+<p>这份代码乍一看确实涉及很多概念（Ray, Asyncio, 队列, 锁），如果不熟悉分布式编程很容易晕。</p>
+<p>为了让你听懂，我们把这个文件想象成一个 <strong>“回转寿司店的传送带”</strong>。</p>
+<ul>
+<li><strong>Rollouter (采样器/厨师)</strong>：负责做寿司（生产数据）。</li>
+<li><strong>Trainer (训练器/顾客)</strong>：负责吃寿司（消费数据/训练模型）。</li>
+<li><strong>MessageQueue (这个文件)</strong>：就是中间那个 <strong>传送带</strong>。</li>
+</ul>
+<p>下面我列一个 <strong>Task Todo List</strong>，带你一步步拆解这段代码在做什么。</p>
+<hr />
+<h3>Task List: 打造一个异步传送带</h3>
+<h4>✅ Task 1: 建立一个独立的“传送带”进程 (Class <code>MessageQueue</code>)</h4>
+<p><strong>代码位置：</strong> <code>@ray.remote class MessageQueue</code>
+*   <strong>目标</strong>：我们需要一个地方专门存数据，而且它必须独立运行，不能卡住厨师做饭，也不能卡住顾客吃饭。
+*   <strong>怎么做</strong>：
+    *   使用了 <code>ray.remote</code>：这意味着这个类会在一个<strong>独立的进程</strong>（甚至不同的机器）上运行。
+    *   初始化 <code>self.queue = deque(...)</code>：这就是传送带本体，用来放寿司（数据 Sample）。
+    *   设置 <code>max_queue_size</code>：传送带长度有限，不能无限放。</p>
+<h4>✅ Task 2: 处理“多线程打架”问题 (Asyncio Locks)</h4>
+<p><strong>代码位置：</strong> <code>self._lock = asyncio.Lock()</code>
+*   <strong>目标</strong>：如果有两个厨师同时往同一个位置放盘子，或者厨师放的时候顾客刚好伸手拿，就会出乱子（数据竞争）。
+*   <strong>怎么做</strong>：
+    *   代码里所有重要操作（放数据、拿数据）都包在 <code>async with self._lock:</code> 里面。
+    *   <strong>通俗解释</strong>：就像传送带前有个红绿灯，一次只允许一只手伸进去操作。</p>
+<h4>✅ Task 3: 厨师上菜 (Function <code>put_sample</code>)</h4>
+<p><strong>代码位置：</strong> <code>async def put_sample(...)</code>
+*   <strong>目标</strong>：把生产好的数据放到队列里。
+*   <strong>逻辑流程</strong>：
+    1.  <strong>上锁</strong>。
+    2.  <strong>检查是否满了</strong>：如果传送带满了 (<code>len &gt;= max</code>)，代码选择<strong>扔掉最旧的一盘</strong> (<code>popleft</code>)，把新菜放上去。这在强化学习里很常见，因为我们更想要最新的数据。
+    3.  <strong>放入新数据</strong> (<code>append</code>)。
+    4.  <strong>按铃通知</strong> (<code>notify_all</code>)：告诉正在发呆等待的顾客“有新菜啦！”。
+    5.  <strong>解锁</strong>。</p>
+<h4>✅ Task 4: 顾客取菜 (Function <code>get_sample</code>)</h4>
+<p><strong>代码位置：</strong> <code>async def get_sample(...)</code>
+*   <strong>目标</strong>：从队列里拿出一个数据给训练器。
+*   <strong>逻辑流程</strong>：
+    1.  <strong>上锁</strong>。
+    2.  <strong>等待</strong>：如果传送带是空的 (<code>len == 0</code>)，顾客就进入<strong>休眠等待状态</strong> (<code>wait()</code>)，直到被厨师的“按铃”叫醒。这比一直盯着看（轮询）要省力。
+    3.  <strong>取走数据</strong> (<code>popleft</code>)。
+    4.  <strong>解锁</strong>并返回数据。</p>
+<h4>✅ Task 5: 搞个“遥控器”方便操作 (Class <code>MessageQueueClient</code>)</h4>
+<p><strong>代码位置：</strong> <code>class MessageQueueClient</code>
+*   <strong>目标</strong>：上面的 <code>MessageQueue</code> 是运行在远端（Ray Actor）的。如果我们每次都要写复杂的 Ray 通信代码很麻烦。我们需要一个“遥控器”或者“代理”。
+*   <strong>怎么做</strong>：
+    *   这个类只是一个包装壳（Wrapper）。
+    *   比如你调用 <code>client.put_sample()</code>，它内部其实是帮你在发信号给远端的 Ray Actor：<code>self.queue_actor.put_sample.remote()</code>。
+    *   它把 Ray 的 <code>Future</code> 对象转换成了 Python 标准的 <code>async/await</code> 对象，让你在写主程序时感觉不到这是在跨进程通信。</p>
+<h4>✅ Task 6: 辅助功能 (监控与版本控制)</h4>
+<ul>
+<li><strong>更新参数版本 (<code>update_param_version</code>)</strong>：告诉传送带现在的模型进化到第几代了。</li>
+<li><strong>统计信息 (<code>get_statistics</code>)</strong>：老板要看报表——一共生产了多少？吃了多少？扔了多少？</li>
+<li><strong>内存监控 (<code>get_memory_usage</code>)</strong>：防止传送带上的菜太多，把桌子压垮（内存溢出）。</li>
+</ul>
+<hr />
+<h3>总结：这段代码的核心逻辑</h3>
+<ol>
+<li><strong>它是一个中间件</strong>：解耦了数据生产（Rollout）和数据训练（Train）。</li>
+<li><strong>它是异步的</strong>：使用了 <code>asyncio</code>，厨师放完菜不用等顾客吃完，直接去接着做；顾客拿不到菜就睡觉，不占资源。</li>
+<li><strong>它是分布式的</strong>：使用了 <code>Ray</code>，这个队列可以跑在服务器的任意位置，连接不同机器上的组件。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这是一个<strong>基于 Ray 和 Asyncio 实现的、线程安全的、带有容量限制和自动丢弃旧数据功能的“生产者-消费者”队列</strong>，专门用于强化学习训练中传输采样数据。</p>

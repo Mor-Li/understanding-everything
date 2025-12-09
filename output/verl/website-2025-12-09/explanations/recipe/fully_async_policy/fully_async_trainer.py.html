@@ -1,0 +1,120 @@
+<h1>recipe/fully_async_policy/fully_async_trainer.py</h1>
+<p>这份代码实现了一个<strong>全异步（Fully Async）的 PPO 训练器</strong>。</p>
+<p>为了让你更容易理解，我们可以把这个 <code>FullyAsyncTrainer</code> 想象成一个<strong>“中央厨房的主厨”</strong>。他的工作不是去田里（环境）收菜（采样），而是坐在厨房里，等着别人把菜送来，炒好（训练模型），然后把新的菜谱（模型参数）发给收菜的人。</p>
+<p>下面我列一个 <strong>“主厨的一天（Task Todo List）”</strong>，带你一步步看懂这个文件在干什么。</p>
+<hr />
+<h3>📋 Task Todo List：主厨（Trainer）的工作流程</h3>
+<h4>Phase 1: 开工前的准备 (Initialization)</h4>
+<p>在这个阶段，主厨刚走进厨房，需要把设备和帮手都安排好。</p>
+<ol>
+<li>
+<p><strong>[Task] 准备工具和帮手</strong> (<code>__init__</code>)</p>
+<ul>
+<li><strong>动作</strong>：加载分词器（Tokenizer）、配置（Config）、奖励函数（Reward Function）。</li>
+<li><strong>关键点</strong>：确认是否需要 Critic（评论家模型）或 Reward Model（奖励模型）。</li>
+<li><strong>代码对应</strong>：<code>__init__</code> 方法中初始化各种 <code>self.xxx</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>[Task] 建立通讯渠道</strong> (<code>set_message_queue_client</code>, <code>set_parameter_synchronizer</code>)</p>
+<ul>
+<li><strong>观点</strong>：因为是“全异步”，主厨不直接指挥收菜员。</li>
+<li><strong>动作</strong>：<ul>
+<li>连接 <strong>MessageQueue（消息队列）</strong>：这是一个传送带，收菜员（Rollout Workers）会把采集到的数据（Samples）扔进去，主厨从这里拿。</li>
+<li>连接 <strong>ParamSynchronizer（参数同步器）</strong>：这是一个广播站，主厨更新完模型后，通过它告诉外面的人“模型更新了，用新参数去干活”。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[Task] 启动灶台（模型）</strong> (<code>_init_models</code>)</p>
+<ul>
+<li><strong>动作</strong>：在 Ray 集群上启动 Actor（演员/策略模型）和 Critic（价值模型）的进程。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Phase 2: 疯狂炒菜循环 (The Training Loop - <code>fit</code> 方法)</h4>
+<p>这是代码的核心部分，主厨开始不停地工作。只要不下班（<code>while True</code>），就一直循环做下面的事。</p>
+<ol>
+<li>
+<p><strong>[Task] 从传送带上拿食材</strong> (<code>_get_samples_from_queue</code>)</p>
+<ul>
+<li><strong>观点</strong>：主厨不等待。</li>
+<li><strong>动作</strong>：<ul>
+<li>去 MessageQueue 里看有没有数据。</li>
+<li>如果数据不够（<code>required_samples</code>），就一直拿，直到凑够一锅（Batch）。</li>
+<li><strong>注意</strong>：这里有一个 <code>while</code> 循环，直到凑齐数据才会往下走。如果传送带送来 <code>None</code>，说明收菜员下班了，主厨也准备收工。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<code>_get_samples_from_queue</code> 中的 <code>while len(queue_samples) &lt; self.required_samples</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>[Task] 炒菜（训练/更新模型）</strong> (<code>fit</code> 里的 <code>_process_batch_common</code>)</p>
+<ul>
+<li><strong>动作</strong>：<ul>
+<li>拿着凑好的数据（Batch），计算梯度，更新神经网络的参数（PPO 算法的核心步骤）。</li>
+<li>统计这次炒菜的指标（Metrics），比如 Loss 是多少，奖励是多少。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[Task] 广播新菜谱（同步参数）</strong> (<code>_trigger_parameter_sync_after_step</code>)</p>
+<ul>
+<li><strong>观点</strong>：这是“异步”最关键的一步。</li>
+<li><strong>问题</strong>：主厨在炒菜的时候，外面的收菜员还在用“旧模型”收菜。</li>
+<li><strong>动作</strong>：<ul>
+<li>主厨每炒完几次菜（<code>trigger_parameter_sync_step</code>），就会把最新的模型参数版本号（<code>current_param_version</code>）和权重发送出去。</li>
+<li>外面的收菜员收到后，就会更新他们的模型，用更聪明的策略去采集数据。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<code>self.param_synchronizer.sync_weights.remote(...)</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>[Task] 检查菜品质量（验证 Validation）</strong> (<code>_log_validation_data</code>)</p>
+<ul>
+<li><strong>动作</strong>：从队列里看看有没有验证任务的结果（Validation Metrics），如果有，就记录到日志里（比如 WandB），看看模型是不是变聪明了。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Phase 3: 收工与存档 (Checkpoint &amp; Cleanup)</h4>
+<p>每隔一段时间，或者任务结束时。</p>
+<ol>
+<li>
+<p><strong>[Task] 记日记（存档 Checkpoint）</strong> (<code>_check_save_checkpoint</code>)</p>
+<ul>
+<li><strong>动作</strong>：如果到了规定的时间（比如每 100 步），就把当前的模型参数保存到硬盘上（Save Checkpoint）。防止停电或者崩了白干。</li>
+<li><strong>代码对应</strong>：<code>_save_checkpoint</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>[Task] 统计这一天的效率</strong> (<code>_collect_metrics_from_samples</code>)</p>
+<ul>
+<li><strong>观点</strong>：因为是异步的，可能主厨已经更新到第 10 版模型了，但刚才拿到的食材是第 8 版模型采集的。这叫 <strong>"Stale Data" (陈旧数据)</strong>。</li>
+<li><strong>动作</strong>：统计一下有多少数据是滞后的（Stale），这对于调试异步算法的稳定性很重要。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这个文件在讲什么？</h3>
+<p><strong>简单一句话：</strong>
+这是一个<strong>管理者</strong>，它利用 Ray（分布式框架）和消息队列，把“数据采集”和“模型训练”解耦了。</p>
+<p><strong>传统模式（同步）：</strong>
+1. 采集数据 -&gt; (等待) -&gt; 2. 训练模型 -&gt; (等待) -&gt; 3. 用新模型采集数据...
+<em>(效率低，因为训练时采集工人在休息，采集时训练工人在休息)</em></p>
+<p><strong>这个文件的模式（全异步）：</strong>
+*   <strong>采集工人</strong>：一直在外面跑，采到数据就扔进队列，不管主厨在干嘛。
+*   <strong>主厨（本文件）</strong>：
+    1.  从队列拿数据。
+    2.  训练。
+    3.  把新参数扔出去。
+    4.  回到第1步。
+<em>(效率高，大家都在不停干活，通过队列缓冲)</em></p>
+<p><strong>你需要关注的核心函数：</strong>
+1.  <code>fit()</code>: 整个流程的总指挥。
+2.  <code>_get_samples_from_queue()</code>: 怎么拿数据。
+3.  <code>_trigger_parameter_sync_after_step()</code>: 怎么更新别人的模型。</p>

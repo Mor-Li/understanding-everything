@@ -1,0 +1,66 @@
+<h1>verl/single_controller/base/decorator.py</h1>
+<p>这份代码确实看起来很“劝退”，因为它属于<strong>分布式计算框架的基础设施层</strong>。它的核心作用不是“做具体的算法”，而是“制定规则”。</p>
+<p>你可以把它想象成一个<strong>大包工头（Controller）</strong>的手册，用来管理手下的一群<strong>工人（Workers/GPUs）</strong>。</p>
+<p>为了让你看懂，我把这个文件的逻辑拆解成一个<strong>Task List（任务清单）</strong>，带你一步步走完这个流程。</p>
+<hr />
+<h3>核心任务：如何指挥一群人干活？</h3>
+<p>假设你写了一个函数 <code>train_step(data)</code>，你想在 8 张 GPU 上同时运行它。这个文件就是用来解决以下三个问题的：
+1.  <strong>Dispatch（分发）</strong>：怎么把数据 <code>data</code> 分给这 8 个人？是每个人拿一份一样的？还是每个人拿 1/8？
+2.  <strong>Execute（执行）</strong>：是谁来执行这个命令？是所有人都要动，还是只要 1 号工人动？
+3.  <strong>Collect（汇总）</strong>：大家干完活了，结果怎么收回来？是拼成一个大结果，还是丢掉？</p>
+<hr />
+<h3>📜 Task List：一步步读懂代码</h3>
+<h4>Task 1: 定义“分发模式” (Dispatch Mode)</h4>
+<p><strong>代码对应：</strong> <code>class Dispatch(DynamicEnum)</code>, <code>dispatch_*</code> 系列函数</p>
+<p>在这个系统中，我们需要定义几种发任务的套路：
+*   <strong>套路 A (ONE_TO_ALL)</strong>: 我有一份文件，复印 8 份，每个工人发一份一模一样的。
+    *   <em>代码:</em> <code>dispatch_one_to_all</code>
+*   <strong>套路 B (DP_COMPUTE / Data Parallel)</strong>: 我有一个大蛋糕（比如 800 条数据），切成 8 块，每个工人拿 100 条。
+    *   <em>代码:</em> <code>dispatch_dp_compute</code>
+*   <strong>套路 C (DP_COMPUTE_PROTO)</strong>: 同上，但是专门针对一种叫 <code>DataProto</code> 的特殊数据格式（可以理解为一种高级的打包箱），并且支持自动填充（Padding）以防切不匀。
+    *   <em>代码:</em> <code>dispatch_dp_compute_data_proto</code></p>
+<h4>Task 2: 定义“汇总模式” (Collect Mode)</h4>
+<p><strong>代码对应：</strong> <code>collect_*</code> 系列函数</p>
+<p>工人们干完活了，手里都有结果，怎么收上来？
+*   <strong>模式 A</strong>: 大家的都一样，随便收一个就行，或者把它们拼起来。
+    *   <em>代码:</em> <code>collect_all_to_all</code>
+*   <strong>模式 B</strong>: 大家手里各有一部分结果（比如每个人算出了 1/8 的梯度），我要把它们按顺序拼成一个完整的。
+    *   <em>代码:</em> <code>collect_dp_compute</code> (拼接列表), <code>_concat_data_proto_or_future</code> (拼接特殊数据包)。</p>
+<h4>Task 3: 注册规则 (The Registry)</h4>
+<p><strong>代码对应：</strong> <code>DISPATCH_MODE_FN_REGISTRY</code> 字典</p>
+<p>为了方便使用，代码里建立了一个<strong>查阅表</strong>。
+*   如果你说我要用 <code>DP_COMPUTE</code> 模式，系统就自动去查表，找到对应的 <code>dispatch_fn</code>（分发函数）和 <code>collect_fn</code>（汇总函数）。
+*   <em>代码片段:</em>
+    <code>python
+    Dispatch.DP_COMPUTE: {
+        "dispatch_fn": dispatch_dp_compute,  # 怎么发
+        "collect_fn": collect_dp_compute     # 怎么收
+    }</code></p>
+<h4>Task 4: 定义“谁来干活” (Execute Mode)</h4>
+<p><strong>代码对应：</strong> <code>class Execute(DynamicEnum)</code></p>
+<p>有时候不需要所有人动手。
+*   <strong>ALL</strong>: 所有人（所有 GPU）都要运行这个函数。
+*   <strong>RANK_ZERO</strong>: 只有 0 号工人（主节点）运行，其他人休息。</p>
+<h4>Task 5: 贴标签 (The Decorator) —— 最重要的一步</h4>
+<p><strong>代码对应：</strong> <code>def register(...)</code></p>
+<p>这是给用户（也就是写算法的人）用的接口。你想把哪个函数变成分布式的，就在上面贴个标签。</p>
+<p><strong>工作流程如下：</strong>
+1.  你写了一个函数 <code>def my_func(data): ...</code>
+2.  你加上装饰器 <code>@register(dispatch_mode=Dispatch.DP_COMPUTE)</code>。
+3.  <strong>装饰器的作用</strong>：它没有立刻运行函数，而是给这个函数贴了个“便利贴”（<code>MAGIC_ATTR</code>），上面写着：“注意！这个函数运行时，请把数据切分给所有工人，最后把结果拼起来。”
+4.  当程序真的运行时，Controller 会看到这个便利贴，然后根据 Task 3 的查阅表，自动调用对应的分发和汇总逻辑。</p>
+<hr />
+<h3>总结：这段代码到底讲了啥？</h3>
+<p>这个文件并没有做实际的“计算”，它是在<strong>定义分布式通信的协议</strong>。</p>
+<ul>
+<li><strong>如果你是使用者</strong>：你只需要关心最后的 <code>register</code> 装饰器。你知道把 <code>@register(dispatch_mode=Dispatch.DP_COMPUTE)</code> 加在你的函数头上，系统就会自动帮你把数据切片分发给多张显卡，再帮你把结果拼回来。</li>
+<li><strong>如果你是开发者</strong>：中间那些 <code>_split_args...</code> 和 <code>concat...</code> 就是在处理脏活累活——比如怎么把一个巨大的 Tensor 字典切开，怎么处理数据长度不一致的 Padding 问题。</li>
+</ul>
+<h3>关键术语速查表</h3>
+<ul>
+<li><strong>DataProto</strong>: 字节跳动/Verl 定义的一种数据容器（类似强化后的字典），代码里很多逻辑都是为了专门处理这种格式的切分和合并。</li>
+<li><strong>World Size</strong>: 工人总数（比如 GPU 数量）。</li>
+<li><strong>Rank</strong>: 工人的编号（0号, 1号...）。</li>
+<li><strong>Magic Number</strong>: 为了防止属性名冲突，特意起了一个很奇怪的名字 <code>attrs_3141562937</code> 来存配置信息。</li>
+</ul>
+<p>现在再看代码，是不是觉得它就是一个<strong>复杂的快递分拣中心操作手册</strong>？</p>

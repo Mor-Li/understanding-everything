@@ -1,0 +1,113 @@
+<h1>recipe/collabllm/collabllm_agent_loop.py</h1>
+<p>这份代码确实涉及很多底层逻辑，如果不了解背景（比如强化学习 RLHF 或 Agent 框架），读起来会很晕。</p>
+<p>简单来说，这个文件定义了一个 <strong>“排练导演” (CollabLLMAgentLoop)</strong>。它的工作是指挥一个 AI 模型（Agent）去完成任务，并在必要时引入一个 <strong>“陪练” (Interaction)</strong> 来跟 AI 进行多轮对话，最后把整个过程录下来打包。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>Task To-Do List（任务清单）</strong>，然后逐步讲解它是如何执行的。</p>
+<hr />
+<h3>📋 Task To-Do List：该代码的核心流程</h3>
+<p>想象你是一个导演，你要指挥 AI 演员完成一场戏。你的任务清单如下：</p>
+<ol>
+<li><strong>[准备阶段]</strong>：拿到剧本（Prompt），并请出“陪练人员”（模拟环境/用户）。</li>
+<li><strong>[初次亮相]</strong>：让 AI 演员根据剧本说出第一段台词。</li>
+<li><strong>[状态检查]</strong>：检查 AI 第一句说得对不对，如果直接崩了，就取消后续排练。</li>
+<li><strong>[多轮排练]</strong>：如果第一句没问题，开始正式的互动排练（可能要排好几次）。<ul>
+<li>让“陪练”根据 AI 的话给出反馈（Interaction）。</li>
+<li>让 AI 根据反馈继续回答。</li>
+<li>循环直到对话结束。</li>
+</ul>
+</li>
+<li><strong>[打包杀青]</strong>：把所有台词、动作、得分整理好，交给后期制作（训练系统）。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详解：代码在做什么？</h3>
+<p>现在我们对照代码，一步步把上面的 To-Do List 展开。</p>
+<h4>Step 1: 准备阶段 (初始化)</h4>
+<p><strong>代码位置：</strong> <code>run</code> 方法的开头 (约第 34-64 行)</p>
+<ul>
+<li><strong>做什么</strong>：<ul>
+<li><code>messages = list(kwargs["raw_prompt"])</code>：拿到初始提示词。</li>
+<li><code>interaction = ...</code>：代码检查是否有 <code>interaction_config_file</code>。如果有，它会加载一个 <strong>Interaction（交互对象）</strong>。</li>
+<li><strong>观点解读</strong>：这里的 <code>Interaction</code> 非常关键。在普通的 LLM 训练中，模型只是续写文本；但在 CollabLLM 中，模型需要和一个“环境”或“模拟用户”互动。代码在这里把这个“对手戏演员”准备好。</li>
+<li><code>AgentData(...)</code>：把所有东西（图片、Prompt、交互对象）打包进一个数据包里，方便后面传递。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 2: 初次亮相 (生成第一响应)</h4>
+<p><strong>代码位置：</strong> (约第 66-68 行)</p>
+<div class="codehilite"><pre><span></span><code><span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_pending_state</span><span class="p">(</span><span class="n">agent_data</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+<span class="n">status</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_generating_state</span><span class="p">(</span><span class="n">agent_data</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>做什么</strong>：<ul>
+<li>导演喊“Action”！</li>
+<li><code>_handle_pending_state</code>：准备好生成的上下文。</li>
+<li><code>_handle_generating_state</code>：调用大模型生成<strong>第一轮回复</strong>。</li>
+</ul>
+</li>
+<li><strong>观点解读</strong>：CollabLLM 似乎很看重“第一印象”。它先让模型生成一个回复，然后再决定要不要进入复杂的交互模式。</li>
+</ul>
+<h4>Step 3: 状态检查 (决定是否继续)</h4>
+<p><strong>代码位置：</strong> (约第 70-76 行)</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">status</span> <span class="o">==</span> <span class="n">AgentState</span><span class="o">.</span><span class="n">TERMINATED</span><span class="p">:</span>
+    <span class="n">num_repeats</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># 如果第一句就挂了，后面不用演了</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">num_repeats</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">...</span> <span class="c1"># 否则，看配置要排练几次</span>
+</code></pre></div>
+
+<ul>
+<li><strong>做什么</strong>：如果模型第一句话就触发了终止信号（比如报错、或者直接输出了结束符），那么后续的交互就没有意义了，直接跳过。</li>
+</ul>
+<h4>Step 4: 多轮排练 (核心循环)</h4>
+<p><strong>代码位置：</strong> (约第 78-93 行)</p>
+<p>这是该文件最核心的逻辑。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">interaction_requests</span> <span class="o">=</span> <span class="p">[</span><span class="n">deepcopy</span><span class="p">(</span><span class="n">agent_data</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_repeats</span><span class="p">)]</span>
+
+<span class="k">for</span> <span class="n">_agent_data</span> <span class="ow">in</span> <span class="n">interaction_requests</span><span class="p">:</span>
+    <span class="c1"># ... 检查消息有效性 ...</span>
+
+    <span class="c1"># 关键点：进入交互状态循环</span>
+    <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">run_agent_data_loop</span><span class="p">(</span><span class="n">_agent_data</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">,</span> <span class="n">AgentState</span><span class="o">.</span><span class="n">INTERACTING</span><span class="p">)</span>
+
+    <span class="c1"># 记录对话历史</span>
+    <span class="n">messages_lst</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>做什么</strong>：<ol>
+<li><code>deepcopy</code>：复制多份数据。为什么要复制？因为可能需要让 AI 尝试多种不同的对话路径（Rollout），互不干扰。</li>
+<li><code>run_agent_data_loop(..., AgentState.INTERACTING)</code>：这是一个<strong>状态机循环</strong>（见文件底部的函数）。<ul>
+<li>它会在 <strong>INTERACTING</strong>（等待环境/陪练反馈） -&gt; <strong>GENERATING</strong>（AI 思考回答） -&gt; <strong>PROCESSING_TOOLS</strong>（使用工具）之间反复横跳。</li>
+<li>直到对话自然结束。</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>观点解读</strong>：这里的观点是 <strong>“交互即数据”</strong>。通过让 Agent 在模拟环境中跑完整个流程，收集到的不仅仅是结果，而是整个交互链条（Message History），这些数据稍后会被用来训练模型（RLHF）。</li>
+</ul>
+<h4>Step 5: 打包杀青 (输出结果)</h4>
+<p><strong>代码位置：</strong> (约第 96-115 行)</p>
+<div class="codehilite"><pre><span></span><code><span class="n">output</span> <span class="o">=</span> <span class="n">AgentLoopOutput</span><span class="p">(</span>
+    <span class="n">prompt_ids</span><span class="o">=...</span><span class="p">,</span>
+    <span class="n">response_ids</span><span class="o">=...</span><span class="p">,</span>
+    <span class="n">extra_fields</span><span class="o">=</span><span class="p">{</span>
+        <span class="s2">&quot;messages&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;messages&quot;</span><span class="p">:</span> <span class="n">messages_lst</span><span class="p">},</span> <span class="c1"># 把整个对话记录存下来</span>
+    <span class="p">},</span>
+<span class="p">)</span>
+<span class="k">return</span> <span class="n">output</span>
+</code></pre></div>
+
+<ul>
+<li><strong>做什么</strong>：把刚才发生的一切整理成数据格式。<ul>
+<li><code>prompt_ids</code> / <code>response_ids</code>：Token 化的输入输出，给模型算梯度用的。</li>
+<li><code>messages_lst</code>：人类可读的对话历史，可能用于奖励模型（Reward Model）打分。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这个文件到底在讲啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>自动化排练管家</strong>。它负责把大模型（Agent）扔进一个模拟环境（Interaction）里，让它们互相聊一会儿，然后把聊天的全过程录下来，作为训练素材。</p>
+<p><strong>它的核心观点（Viewpoint）：</strong>
+1.  <strong>Agent 需要环境反馈</strong>：不能只是闭门造车（只生成文本），必须引入 <code>Interaction</code> 模块来提供外部反馈（可能是模拟用户，也可能是代码执行器）。
+2.  <strong>多路径探索</strong>：通过 <code>num_repeats</code> 和 <code>deepcopy</code>，它支持从同一个起点探索多种可能的对话走向。
+3.  <strong>状态机控制</strong>：Agent 的行为被抽象为状态（生成中、交互中、使用工具中），通过循环来驱动这些状态流转。</p>

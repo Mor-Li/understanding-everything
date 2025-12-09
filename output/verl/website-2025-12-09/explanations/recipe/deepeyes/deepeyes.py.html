@@ -1,0 +1,112 @@
+<h1>recipe/deepeyes/deepeyes.py</h1>
+<p>这份代码确实比较硬核，它是一个用于<strong>训练多模态大模型（Vision-Language Model）的强化学习（RLHF）配置脚本</strong>。</p>
+<p>简单来说，这个脚本定义了<strong>“怎么把数据喂给模型”</strong>以及<strong>“怎么给模型的回答打分”</strong>。</p>
+<p>为了让你更容易理解，我把阅读这份代码拆解成一个 <strong>5步走的 Task List</strong>，我们一步步来通关。</p>
+<hr />
+<h3>Task 1：搞清楚这代码是干嘛的 (宏观视角)</h3>
+<p><strong>核心目标</strong>：这是一个基于 <code>verl</code> 框架（一个强化学习库）的脚本，目的是训练一个能看图、能回答问题，并且<strong>学会使用工具（比如放大图片）</strong>的 AI 模型。</p>
+<ul>
+<li><strong>文件角色</strong>：它不仅处理数据，还定义了“老师（Reward Model）”怎么给“学生（AI）”打分。</li>
+<li><strong>关键词</strong>：RLHF（人类反馈强化学习）、VLM（视觉语言模型）、Tool Use（工具调用）。</li>
+</ul>
+<hr />
+<h3>Task 2：看懂数据是怎么“喂”进去的 (<code>CustomRLHFDataset</code> 类)</h3>
+<p>这个类负责把原始数据变成模型能吃进去的格式。</p>
+<ul>
+<li>
+<p><strong>Step 2.1 - 设定人设 (System Prompt)</strong>：
+    代码里有一段 <code>row_dict[self.prompt_key] = ...</code>。
+    它给模型植入了一个“系统指令”：
+    &gt; "You are a helpful assistant. You can call functions..."
+    &gt; （你是个助手，你可以调用函数，但一次只能调一个，调完要等结果。）
+    <strong>目的</strong>：教模型学会只要遇到困难，就可以尝试调用工具。</p>
+</li>
+<li>
+<p><strong>Step 2.2 - 处理图片</strong>：
+    代码里有 <code>Image.open(io.BytesIO(image["bytes"]))</code>。
+    它把二进制的图片数据转成图片对象，准备喂给视觉模型（比如 Qwen2-VL）。</p>
+</li>
+<li>
+<p><strong>Step 2.3 - 定义工具 (Tools)</strong>：
+    注意这段代码：
+    <code>python
+    tools_kwargs = {
+        "image_zoom_in_tool": { ... }
+    }</code>
+    <strong>目的</strong>：它明确告诉模型，“你现在手里有一个叫 <code>image_zoom_in_tool</code>（图片放大）的工具可以用”。这是为了训练模型在看不清细节时，主动去“放大”图片。</p>
+</li>
+</ul>
+<hr />
+<h3>Task 3：看懂怎么给模型“判卷子” (<code>compute_score</code> 函数)</h3>
+<p>这是强化学习的核心。模型生成了一个回答，我们需要计算它得多少分（Reward）。</p>
+<ul>
+<li>
+<p><strong>Step 3.1 - 格式检查</strong>：
+    代码检查模型是否输出了 <code>&lt;think&gt;</code>（思考过程）和 <code>&lt;answer&gt;</code>（最终答案）标签。
+    如果标签没闭合（比如只有 <code>&lt;think&gt;</code> 没有 <code>&lt;/think&gt;</code>），会被认定为格式错误。</p>
+</li>
+<li>
+<p><strong>Step 3.2 - 提取答案</strong>：
+    代码写了很多正则（<code>re.search</code>），为了从模型乱七八糟的输出里把真正的答案抠出来。</p>
+<ul>
+<li>策略1：找 <code>&lt;answer&gt;</code> 标签里的字。</li>
+<li>策略2：如果用了工具，找工具输出后面的字。</li>
+<li>策略3：如果都没找到，就把剩下的字当答案。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.3 - 核心打分逻辑 (重点)</strong>：
+    代码最后有一个加权公式：
+    <code>python
+    final_score = 0.8 * acc_reward + 0.2 * format_reward + 1.2 * tool_reward</code>
+    这里非常有意思：</p>
+<ul>
+<li><strong>Accuracy (准确率)</strong>：占 0.8 分。</li>
+<li><strong>Format (格式)</strong>：占 0.2 分。</li>
+<li><strong>Tool (工具使用)</strong>：占 <strong>1.2 分</strong>！
+<strong>解读</strong>：这个权重的设计非常有导向性。它在<strong>疯狂鼓励模型使用工具</strong>。只要模型用了工具且答对了，分数会非常高；如果只答对不用工具，分数反而低。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4：看懂“谁”在负责打分 (LLM-as-a-Judge)</h3>
+<p>在 <code>compute_score</code> 函数里，并没有写死答案匹配规则，而是请了外援。</p>
+<ul>
+<li>
+<p><strong>Step 4.1 - 请裁判</strong>：
+    代码初始化了一个 <code>OpenAI</code> client。
+    它把“问题”、“标准答案”和“模型的回答”打包发给一个更强的模型（比如 GPT-4 或者内部的大模型）。</p>
+</li>
+<li>
+<p><strong>Step 4.2 - 裁判指令</strong>：
+    系统提示词写着：
+    &gt; "You are an expert evaluator... provide your final judgement as a single word: either 'CORRECT' or 'INCORRECT'."
+    （你是个专家，别废话，只告诉我“正确”还是“错误”。）</p>
+</li>
+<li>
+<p><strong>Step 4.3 - 判定结果</strong>：
+    如果裁判回了 "CORRECT"，<code>acc_reward</code> 就是 1.0，否则是 0.0。</p>
+</li>
+</ul>
+<hr />
+<h3>Task 5：实战演练 (<code>if __name__ == "__main__":</code>)</h3>
+<p>文件最下面的部分是用来<strong>测试</strong>上面那个打分函数好不好用的。</p>
+<ul>
+<li><strong>测试案例 1</strong>：普通回答。</li>
+<li><strong>测试案例 2</strong>：这是个<strong>反面教材</strong>（Problematic case）。模型用了工具，但是没有写 <code>&lt;answer&gt;</code> 标签。用来测试代码能不能兼容这种格式错误的回答。</li>
+<li><strong>测试案例 3</strong>：这是个<strong>完美模范</strong>。有思考 <code>&lt;think&gt;</code>，有工具调用 <code>&lt;tool_call&gt;</code>，有工具返回 <code>&lt;tool_response&gt;</code>，还有最终答案 <code>&lt;answer&gt;</code>。</li>
+</ul>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<p>这个文件的逻辑链条是：</p>
+<ol>
+<li><strong>准备数据</strong>：给每条数据加上“你可以用放大镜工具”的系统提示。</li>
+<li><strong>训练目标</strong>：让模型学会看图回答问题。</li>
+<li><strong>奖惩机制</strong>：<ul>
+<li>答对了给糖吃。</li>
+<li>格式写对了给糖吃。</li>
+<li><strong>如果用了工具还答对了，给双倍糖吃！</strong>（这是核心目的：训练模型学会用工具）。</li>
+</ul>
+</li>
+<li><strong>判卷方式</strong>：找一个更厉害的 AI 老师来判断对错。</li>
+</ol>

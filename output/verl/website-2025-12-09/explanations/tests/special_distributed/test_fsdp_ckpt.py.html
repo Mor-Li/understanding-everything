@@ -1,0 +1,106 @@
+<h1>tests/special_distributed/test_fsdp_ckpt.py</h1>
+<p>这份代码其实是一个<strong>自动化测试脚本</strong>（Unit Test）。</p>
+<p>它的核心目的是：<strong>验证“模型存档（Save Checkpoint）”和“读档（Load Checkpoint）”功能在分布式训练（FSDP）下是否正常工作。</strong></p>
+<p>简单来说，它在做这样一个实验：
+1.  玩游戏（训练模型）玩到第一关，<strong>存档</strong>。
+2.  继续玩到第二关，记录下得分。
+3.  <strong>读档</strong>回到第一关结束的状态，重新玩一遍第二关。
+4.  对比两次玩第二关的得分。如果得分完全一样，说明存/读档功能是完美的。</p>
+<p>下面我为你列一个<strong>Task List</strong>，按照代码的执行逻辑，一步步拆解给你看：</p>
+<hr />
+<h3>Task List: FSDP Checkpoint 测试流程</h3>
+<h4>1. 准备工作：搭建分布式环境与模型</h4>
+<p><strong>目标</strong>：准备好显卡、通信环境，并造一个可以在多张卡上跑的小模型。</p>
+<ul>
+<li><strong>检查显卡</strong>：确认至少有 2 张 GPU（因为测的是分布式 FSDP，单卡没意义）。</li>
+<li><strong>初始化通信</strong>：启动分布式进程组（<code>initialize_global_process_group</code>），让显卡之间能“打电话”。</li>
+<li><strong>创建模型</strong>：用 <code>Qwen2Config</code> 创建一个小型的 Qwen 模型（只有1层，为了跑得快）。</li>
+<li><strong>切分模型 (FSDP)</strong>：<ul>
+<li>这是重点。代码根据 <code>strategy="fsdp"</code> 判断。</li>
+<li>它把模型“切碎”（Sharding），分散存储在不同的显卡上。这是为了省显存。</li>
+<li>配置了混合精度（Mixed Precision），用 <code>bfloat16</code> 计算以加快速度。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 准备数据与工具</h4>
+<p><strong>目标</strong>：准备好优化器、存档管理器和假数据。</p>
+<ul>
+<li><strong>优化器</strong>：设置 <code>AdamW</code> 优化器（负责更新模型参数）和 <code>StepLR</code> 学习率调整器。</li>
+<li><strong>存档管理员</strong>：初始化 <code>FSDPCheckpointManager</code>。<strong>这是本次测试的主角</strong>，负责存取模型。</li>
+<li><strong>造假数据</strong>：<ul>
+<li><code>input_ids1</code>: 第一批数据（用于第一步训练）。</li>
+<li><code>input_ids2</code>: 第二批数据（用于验证对比）。</li>
+<li><em>注：这里用了 <code>flash_attn</code> 的工具处理数据 padding，是为了模拟真实的 LLM 训练场景。</em></li>
+</ul>
+</li>
+</ul>
+<h4>3. 第一阶段：训练并存档 (Save)</h4>
+<p><strong>目标</strong>：让模型学一点东西，然后保存状态。</p>
+<ul>
+<li><strong>Step 1 训练</strong>：<ul>
+<li>把 <code>input_ids1</code> 喂给模型。</li>
+<li>算 Loss，反向传播（Backward），更新参数（Optimizer step）。</li>
+</ul>
+</li>
+<li><strong>保存 (Checkpoint)</strong>：<ul>
+<li><strong>关键动作</strong>：调用 <code>checkpoint_manager.save_checkpoint(...)</code>。</li>
+<li>它把当前的<strong>模型参数</strong>、<strong>优化器状态</strong>（比如动量）、<strong>学习率</strong>全部保存到临时文件夹里。</li>
+<li>同时，代码在内存里也备份了一份 <code>saved_state_dict</code>，用于稍后比对。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 第二阶段：继续训练 (参照组)</h4>
+<p><strong>目标</strong>：不读档，直接往下练，看看结果是多少。</p>
+<ul>
+<li><strong>Step 2 训练</strong>：<ul>
+<li>接着刚才的状态，把 <code>input_ids2</code> 喂给模型。</li>
+<li>算 Loss，更新参数。</li>
+</ul>
+</li>
+<li><strong>记录结果 A</strong>：<ul>
+<li>再跑一次前向传播（Forward），记下此时模型的输出结果 <code>logits_before_load</code>。</li>
+<li><em>这代表：“如果我不读档，一直顺畅玩下去，第二关应该是这个分。”</em></li>
+</ul>
+</li>
+</ul>
+<h4>5. 第三阶段：读档并重试 (实验组)</h4>
+<p><strong>目标</strong>：时光倒流，回到 Step 1 结束时，用同样的数据再跑一次 Step 2。</p>
+<ul>
+<li><strong>读档 (Load)</strong>：<ul>
+<li><strong>关键动作</strong>：调用 <code>checkpoint_manager.load_checkpoint(...)</code>。</li>
+<li>这会把模型和优化器强行恢复到<strong>第3阶段刚结束</strong>时的样子。</li>
+<li>代码还顺便对比了一下加载后的参数和当初保存的是不是完全一致（<code>torch.testing.assert_close</code>）。</li>
+</ul>
+</li>
+<li><strong>Step 2 重训</strong>：<ul>
+<li><strong>关键点</strong>：必须用和第二阶段<strong>完全一样的数据</strong> (<code>input_ids2</code>)。</li>
+<li>再次算 Loss，更新参数。</li>
+</ul>
+</li>
+<li><strong>记录结果 B</strong>：<ul>
+<li>跑前向传播，记下此时的输出结果 <code>logits_after_load</code>。</li>
+<li><em>这代表：“读档重玩后，第二关是这个分。”</em></li>
+</ul>
+</li>
+</ul>
+<h4>6. 第四阶段：最终验证</h4>
+<p><strong>目标</strong>：对比结果 A 和 结果 B。</p>
+<ul>
+<li><strong>对比 (Assert)</strong>：<ul>
+<li>代码执行 <code>torch.testing.assert_close(logits_before_load, logits_after_load)</code>。</li>
+<li><strong>逻辑</strong>：如果存档/读档机制是完美的，且计算是确定性的（Deterministic），那么结果 A 和 结果 B 必须<strong>连小数点后几十位都一模一样</strong>。</li>
+</ul>
+</li>
+<li><strong>清理</strong>：删掉临时文件夹，关闭分布式进程。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇文章（代码）实际上在说：</p>
+<blockquote>
+<p>“嘿，我写了一个管理 FSDP 模型存取的工具 <code>FSDPCheckpointManager</code>。
+为了证明它是靠谱的，我做了一个实验：
+我先练一步存个盘，然后继续练一步看结果；
+接着我读档回去，用同样的数据再练一步。
+如果两次结果完全一致，就说明我的存取档工具没有丢失任何信息（比如优化器状态、随机种子等），可以通过测试。”</p>
+</blockquote>
+<p>如果你是开发者，看到最后打印出 <code>Checkpoint save/load test passed!</code>，你就可以放心地在几百张显卡的大规模训练中使用这个存档工具了。</p>

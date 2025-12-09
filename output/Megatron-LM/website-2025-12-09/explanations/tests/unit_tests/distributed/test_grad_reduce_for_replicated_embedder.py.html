@@ -1,0 +1,125 @@
+<h1>tests/unit_tests/distributed/test_grad_reduce_for_replicated_embedder.py</h1>
+<p>这段代码确实比较抽象，因为它涉及到了<strong>深度学习分布式训练（Distributed Training）</strong>中非常具体的底层细节——<strong>流水线并行（Pipeline Parallelism）下的梯度同步</strong>。</p>
+<p>别担心，我们把它拆解成一个“任务清单（To-Do List）”，把这段代码想象成是在<strong>模拟一次多人协作的数学作业</strong>。</p>
+<h3>核心背景故事</h3>
+<p>想象有 4 个学生（代表 4 个 GPU/进程），他们组成了一个流水线（Pipeline）。通常在流水线并行中，模型是被切开的，每个人负责不同的一段，互不干扰。</p>
+<p><strong>但是</strong>，有一种特殊的组件（比如 Conditional Embedder，通常用于扩散模型或控制生成的条件嵌入），它需要<strong>复制</strong>一份放在每个学生手里。</p>
+<p>既然每个人手里都有一份一模一样的组件，训练时大家都会算出这份组件的“修改意见”（梯度）。<strong>问题来了：</strong> 我们必须把所有人的意见汇总（求和），然后统一修改，保证下一轮大家手里的组件还是一样的。</p>
+<p>这个测试文件，就是在测试<strong>“汇总意见”</strong>这个功能是否好用。</p>
+<hr />
+<h3>Task List：一步步读懂代码</h3>
+<h4>Task 1: 搭建模拟教室 (Initialize Environment)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">Utils</span><span class="o">.</span><span class="n">initialize_model_parallel</span><span class="p">(</span><span class="n">tensor_model_parallel_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">pipeline_model_parallel_size</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解：</strong><ul>
+<li>这里初始化了一个模拟环境。</li>
+<li><code>pipeline_model_parallel_size=4</code>：设定有 4 个学生（Rank 0, 1, 2, 3）在做流水线并行。</li>
+<li>这意味着接下来的代码，虽然你只看到一份，但在运行时，会有 4 个进程同时跑这段代码，每个进程的 <code>pp_rank</code> (Rank ID) 不一样。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 准备作业本 (Create Model)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 创建两个简单的线性层作为模型</span>
+<span class="n">model</span> <span class="o">=</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="mi">10</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">2</span><span class="p">)]</span>
+
+<span class="c1"># 给 Weight 打上标记，Bias 不打标记</span>
+<span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">model</span><span class="p">:</span>
+    <span class="nb">setattr</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="s2">&quot;pipeline_parallel&quot;</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解：</strong><ul>
+<li>我们创建了一个极简模型（两个 Linear 层）。</li>
+<li><strong>关键点</strong>：我们给 <code>weight</code>（权重）手动贴了个标签 <code>pipeline_parallel=True</code>。这相当于告诉系统：“这个权重是特殊的，大家都有，最后需要汇总”。</li>
+<li>注意 <code>bias</code>（偏置）没有贴标签。这相当于对照组：“这个偏置是私有的，不需要汇总”。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 开启“特殊同步”开关 (Config Setup)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">config</span> <span class="o">=</span> <span class="n">ModelParallelConfig</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">config</span><span class="o">.</span><span class="n">has_cond_embedder</span> <span class="o">=</span> <span class="kc">True</span>  <span class="c1"># &lt;--- 重点</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解：</strong><ul>
+<li>配置项中打开了 <code>has_cond_embedder = True</code>。</li>
+<li>这就像按下了一个开关，告诉 Megatron 框架：“嘿，我的模型里有一些特殊的嵌入层（Embedder），请帮我检查并同步它们的梯度。”</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 每个人瞎填一些答案 (Init Gradients)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">pp_rank</span> <span class="o">=</span> <span class="n">parallel_state</span><span class="o">.</span><span class="n">get_pipeline_model_parallel_rank</span><span class="p">()</span>
+<span class="c1"># ...</span>
+<span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">model</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">param</span> <span class="ow">in</span> <span class="n">chunk</span><span class="o">.</span><span class="n">parameters</span><span class="p">():</span>
+        <span class="c1"># 每个人的梯度值 = 自己的座号(rank) * 10 + 第几层(i)</span>
+        <span class="n">param</span><span class="o">.</span><span class="n">main_grad</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones_like</span><span class="p">(</span><span class="n">param</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">pp_rank</span> <span class="o">*</span> <span class="mf">10.0</span> <span class="o">+</span> <span class="n">i</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解：</strong><ul>
+<li>在真实的训练中，梯度是算出来的。但在测试里，我们需要<strong>手动造假数据</strong>，方便验证算得对不对。</li>
+<li>每个学生（Rank）给自己的参数填入不同的梯度值：<ul>
+<li><strong>Rank 0</strong> 填的是 0, 1</li>
+<li><strong>Rank 1</strong> 填的是 10, 11</li>
+<li><strong>Rank 2</strong> 填的是 20, 21</li>
+<li><strong>Rank 3</strong> 填的是 30, 31</li>
+</ul>
+</li>
+<li>这样做的好处是，如果我们把它们加起来，结果是唯一的，很容易验证。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 执行“汇总”操作 (Run the Action)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">_allreduce_conditional_embedding_grads</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">parallel_state</span><span class="o">.</span><span class="n">get_pipeline_model_parallel_group</span><span class="p">()</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解：</strong><ul>
+<li>这是<strong>全篇最核心</strong>的一行。</li>
+<li>调用这个函数，系统会检查模型中哪些参数需要同步。</li>
+<li><strong>预期行为</strong>：<ul>
+<li>它应该发现 <code>weight</code> 被标记了，于是把 4 个 Rank 的 <code>weight.grad</code> 加在一起，然后分发给大家。</li>
+<li>它应该发现 <code>bias</code> 没标记，于是完全不动它。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: 老师检查作业 (Verification)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 算出预期的总和是多少</span>
+<span class="n">expect_value</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">model</span><span class="p">)):</span>
+    <span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">pp_world_size</span><span class="p">):</span> <span class="c1"># j 代表 rank 0,1,2,3</span>
+        <span class="n">expect_value</span> <span class="o">+=</span> <span class="n">j</span> <span class="o">*</span> <span class="mf">10.0</span> <span class="o">+</span> <span class="n">i</span> 
+<span class="c1"># 预期总和 = (0+10+20+30) + (层级偏移...)</span>
+
+<span class="c1"># 2. 检查 Weight (权重)</span>
+<span class="n">expect_weight_grad</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">([</span><span class="mi">10</span><span class="p">,</span> <span class="mi">10</span><span class="p">])</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span> <span class="o">*</span> <span class="n">expect_value</span>
+<span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">main_grad</span><span class="p">,</span> <span class="n">expect_weight_grad</span><span class="p">)</span>
+
+<span class="c1"># 3. 检查 Bias (偏置)</span>
+<span class="n">expect_bias_grad</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">([</span><span class="mi">10</span><span class="p">])</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span> <span class="o">*</span> <span class="p">(</span><span class="n">pp_rank</span> <span class="o">*</span> <span class="mf">10.0</span> <span class="o">+</span> <span class="n">i</span><span class="p">)</span>
+<span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">main_grad</span><span class="p">,</span> <span class="n">expect_bias_grad</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解：</strong><ul>
+<li><strong>检查 Weight</strong>：所有的 Rank 现在的 <code>weight.grad</code> 应该都变成了<strong>总和</strong>。如果代码写对了，Rank 0 手里的权重梯度不再是 0，而是所有人的总和。</li>
+<li><strong>检查 Bias</strong>：因为 Bias 没参与同步，所以 Rank 0 手里的 <code>bias.grad</code> 应该<strong>还是</strong> 0，Rank 1 还是 10。它应该保持“原样”。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的目的是为了<strong>防止修 bug 时改坏逻辑</strong>。它验证了：
+当 <code>has_cond_embedder=True</code> 时，Megatron 是否能<strong>正确识别</strong>并<strong>只同步</strong>那些被标记为共享的参数（这里是 weight），同时<strong>放过</strong>那些不需要同步的参数（这里是 bias）。</p>

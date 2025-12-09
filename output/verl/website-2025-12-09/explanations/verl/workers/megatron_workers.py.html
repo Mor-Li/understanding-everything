@@ -1,0 +1,133 @@
+<h1>verl/workers/megatron_workers.py</h1>
+<p>这份代码确实比较复杂，因为它处于 <strong>分布式深度学习（Distributed Deep Learning）</strong> 和 <strong>强化学习（RLHF - PPO）</strong> 的交叉点，而且是用 <strong>Megatron-LM</strong>（一种用于训练超大模型的底层框架）来实现的。</p>
+<p>简单来说，这个文件定义了在训练大模型 RLHF 过程中，<strong>各个节点（Worker）具体要干什么活</strong>。</p>
+<p>为了让你看懂，我把这个文件的逻辑拆解成一个 <strong>“PPO 训练任务的 To-Do List”</strong>。你可以把这个文件看作是一个 <strong>工头分配任务的手册</strong>。</p>
+<hr />
+<h3>核心角色介绍（三大类工种）</h3>
+<p>在这个文件中，定义了三种主要的“工人”（Worker Class），它们分别负责 PPO 算法的不同部分：</p>
+<ol>
+<li><strong><code>ActorRolloutRefWorker</code> (身兼数职的主角)</strong>：<ul>
+<li><strong>Actor</strong>: 当前正在训练的模型（也就是我们要优化的策略）。</li>
+<li><strong>Rollout</strong>: 负责让模型“说话”，生成文本（通常需要极快的推理速度）。</li>
+<li><strong>Ref (Reference)</strong>: 参考模型（原始模型），用来防止训练后的模型偏离太远（计算 KL 散度）。</li>
+<li><em>注：为了省显存和通信，这三个角色通常被合并在同一个进程里。</em></li>
+</ul>
+</li>
+<li><strong><code>CriticWorker</code> (评论家)</strong>：<ul>
+<li>负责训练 Value Model（价值模型），它负责给 Actor 的每一步打分，预估未来的收益。</li>
+</ul>
+</li>
+<li><strong><code>RewardModelWorker</code> (裁判)</strong>：<ul>
+<li>负责运行 Reward Model（奖励模型），给生成的完整文本打一个最终分数。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>任务清单 (Task To-Do List)</h3>
+<p>下面是代码中实现的逻辑流程，按照 PPO 训练的一步步过程来拆解：</p>
+<h4>Phase 1: 准备工作 (Initialization)</h4>
+<ul>
+<li><strong>[TODO 1] 组建分布式集群</strong><ul>
+<li><strong>代码对应</strong>: <code>__init__</code> 方法中的 <code>torch.distributed.init_process_group</code> 和 <code>mpu.initialize_model_parallel</code>。</li>
+<li><strong>解释</strong>: 因为模型太大，单张卡放不下。这里在切分模型（张量并行 TP、流水线并行 PP），让多张显卡像一个整体一样工作。</li>
+</ul>
+</li>
+<li><strong>[TODO 2] 加载模型与权重</strong><ul>
+<li><strong>代码对应</strong>: <code>_build_model_optimizer</code> 和 <code>init_model</code>。</li>
+<li><strong>解释</strong>: 把 HuggingFace 格式的权重转换成 Megatron 的格式加载到 GPU 上。如果用了 <code>ActorRolloutRefWorker</code>，它还得初始化一个专门用于推理的引擎（比如 vLLM 或 SGLang）。</li>
+</ul>
+</li>
+<li><strong>[TODO 3] 显存管理 (Offloading)</strong><ul>
+<li><strong>代码对应</strong>: <code>offload_megatron_model_to_cpu</code> / <code>load_megatron_model_to_gpu</code>。</li>
+<li><strong>解释</strong>: 显存不够怎么办？代码里写了逻辑，如果不计算时，就把模型参数搬运到 CPU 内存里，用的时候再搬回 GPU。</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 2: 采样阶段 (Rollout - 生成数据)</h4>
+<ul>
+<li><strong>[TODO 4] 切换到推理模式 (Hybrid Engine Context Switch)</strong><ul>
+<li><strong>代码对应</strong>: <code>rollout_mode</code>。</li>
+<li><strong>解释</strong>: 这是一个难点。训练用的模型（PyTorch/Megatron）比较慢，推理用的模型（vLLM/SGLang）比较快。</li>
+<li><strong>动作</strong>:<ol>
+<li>清空缓存。</li>
+<li>把训练好的权重（Actor）同步给推理引擎（Rollout）。</li>
+<li>告诉推理引擎：“准备干活了”。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li><strong>[TODO 5] 生成文本 (Generate)</strong><ul>
+<li><strong>代码对应</strong>: <code>generate_sequences</code>。</li>
+<li><strong>解释</strong>: 给定 Prompt，让模型生成回复。这是 PPO 训练的原材料。</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 3: 评估阶段 (Evaluation)</h4>
+<ul>
+<li><strong>[TODO 6] 裁判打分 (Reward)</strong><ul>
+<li><strong>代码对应</strong>: <code>RewardModelWorker.compute_rm_score</code>。</li>
+<li><strong>解释</strong>: 把生成的文本喂给奖励模型，算出一个分数（好不好）。</li>
+</ul>
+</li>
+<li><strong>[TODO 7] 价值预估 (Value)</strong><ul>
+<li><strong>代码对应</strong>: <code>CriticWorker.compute_values</code>。</li>
+<li><strong>解释</strong>: Critic 模型看一眼输入，预估一下这句回复值多少分。</li>
+</ul>
+</li>
+<li><strong>[TODO 8] 计算参考概率 (Ref Log Prob)</strong><ul>
+<li><strong>代码对应</strong>: <code>compute_ref_log_prob</code>。</li>
+<li><strong>解释</strong>: 让原始模型（Ref Model）也看一遍生成的文本，算一下概率。用来计算 KL 散度（惩罚项），防止模型为了高分乱说话。</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 4: 学习阶段 (Training - 核心 PPO)</h4>
+<ul>
+<li><strong>[TODO 9] 计算当前概率 (Actor Log Prob)</strong><ul>
+<li><strong>代码对应</strong>: <code>compute_log_prob</code>。</li>
+<li><strong>解释</strong>: 切换回训练模式 (<code>trainer_mode</code>)，计算当前策略下生成这些文本的概率。</li>
+</ul>
+</li>
+<li><strong>[TODO 10] 更新 Actor 模型 (Update Policy)</strong><ul>
+<li><strong>代码对应</strong>: <code>update_actor</code>。</li>
+<li><strong>解释</strong>: <ol>
+<li>接收数据（包含 Advantage 优势函数）。</li>
+<li>正向传播算 Loss。</li>
+<li>反向传播算梯度。</li>
+<li><code>optimizer.step()</code> 更新权重。</li>
+<li>统计 FLOPs（算力使用率）和显存占用。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li><strong>[TODO 11] 更新 Critic 模型 (Update Value Model)</strong><ul>
+<li><strong>代码对应</strong>: <code>CriticWorker.update_critic</code>。</li>
+<li><strong>解释</strong>: 既然 Critic 也要准，那就得算 Critic 的预测值和真实回报的差距（Loss），然后更新 Critic 的权重。</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 5: 收尾与维护</h4>
+<ul>
+<li><strong>[TODO 12] 保存检查点 (Checkpointing)</strong><ul>
+<li><strong>代码对应</strong>: <code>save_checkpoint</code> / <code>load_checkpoint</code>。</li>
+<li><strong>解释</strong>: 定期把训练好的模型存到硬盘或 HDFS 上。</li>
+</ul>
+</li>
+<li><strong>[TODO 13] 性能监控 (Profiling)</strong><ul>
+<li><strong>代码对应</strong>: <code>start_profile</code> / <code>stop_profile</code> / <code>FlopsCounter</code>。</li>
+<li><strong>解释</strong>: 记录每一步花了多少时间，显存用了多少，算力有没有浪费。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件到底在讲啥？</h3>
+<p><strong>一句话总结：</strong>
+这个文件是 <strong>Verl 框架中基于 Megatron-LM 的“车间主任”</strong>。</p>
+<p>它不负责指挥（那是 Controller 的事），它负责<strong>执行</strong>。它把复杂的分布式大模型操作封装成了几个标准动作：
+1.  <strong>“生成文本”</strong> (<code>generate_sequences</code>)
+2.  <strong>“算分”</strong> (<code>compute_rm_score</code> / <code>compute_values</code>)
+3.  <strong>“更新参数”</strong> (<code>update_actor</code> / <code>update_critic</code>)</p>
+<p><strong>最难懂的地方在于 <code>ActorRolloutRefWorker</code> 类：</strong>
+因为它要在一个进程里搞定“训练”和“推理”两件事。
+*   <strong>训练时</strong>：它是 Megatron 模型，用 PyTorch 跑梯度下降。
+*   <strong>推理时</strong>：它变身成推理引擎（Rollout），为了速度极快地生成文本。
+*   代码里大量的 <code>rollout_mode</code> 和 <code>trainer_mode</code> 就是在做这种<strong>“变身”</strong>（权重同步和显存置换）。</p>

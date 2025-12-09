@@ -1,0 +1,74 @@
+<h1>recipe/gkd/teacher_utils.py</h1>
+<p>这份代码的核心目的是为了实现 <strong>“知识蒸馏” (Knowledge Distillation)</strong> 中的一个关键步骤：<strong>向“老师模型”提问，并把它的回答整理好</strong>。</p>
+<p>想象你正在训练一个“学生模型”（小模型），你希望它模仿一个“老师模型”（大模型）。为了做到这一点，你需要把同样的问题（数据）发给老师，看看老师会预测什么（给出什么概率和词表），然后拿这些数据回来教学生。</p>
+<p>这份文件 <code>teacher_utils.py</code> 就是负责<strong>“跑腿”</strong>的：它拿着数据去问老师，然后把老师零散的回答重新整理成整齐的格式。</p>
+<p>为了让你看懂，我把这个过程拆解成一个 <strong>5步的 To-Do List</strong>，对应代码的执行逻辑：</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>数据清洗 (Preparation)</strong>：把输入数据里的“废话”（Padding/填充符）去掉，只提取有效的问题内容。</li>
+<li><strong>分发任务 (Dispatch)</strong>：把这些问题打包，并发（Parallel）发送给远程的“老师模型”服务器。</li>
+<li><strong>回收答案 (Collection)</strong>：等待老师计算完成，把老师返回的“Top-K 预测结果”和“概率值”收集起来。</li>
+<li><strong>格式还原 (Reconstruction)</strong>：因为老师返回的答案长短不一，需要把它们重新填回到一个整齐的矩阵（Tensor）中，跟原始数据的形状对齐。</li>
+<li><strong>打包发货 (Packaging)</strong>：把整理好的数据封装成标准格式 (<code>DataProto</code>) 返回给训练程序。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详解 (Step-by-Step)</h3>
+<p>下面我结合代码，一步步给你讲这 5 个任务是怎么完成的。</p>
+<h4>1. 数据清洗 (Preparation)</h4>
+<p><strong>代码位置：</strong> 函数 <code>get_teacher_knowledge</code> 的开头部分。
+<strong>观点/逻辑：</strong>
+我们在训练时，为了把不同长度的句子凑成一个 Batch，通常会补 0 (Padding)。但是发给老师模型做推理时，不能把这些 0 发过去，否则会干扰老师。
+*   <strong>代码行为</strong>：利用 <code>attention_mask</code>（标记哪些是真词，哪些是补位），把 <code>input_ids</code> 里的有效内容提取出来，存入 <code>input_ids</code> 列表。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的循环就是根据 mask 把有效的 token 取出来</span>
+<span class="k">for</span> <span class="n">ids</span><span class="p">,</span> <span class="n">mask</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">batch</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">],</span> <span class="n">attention_mask</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+    <span class="n">input_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ids</span><span class="p">[</span><span class="n">mask</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span>
+</code></pre></div>
+
+<h4>2. 分发任务 (Dispatch)</h4>
+<p><strong>代码位置：</strong> <code>for i in range(0, batch_size, micro_batch_size):</code> 这一段。
+<strong>观点/逻辑：</strong>
+如果数据量很大，一次性发过去可能会堵塞，或者我们想利用多线程/多进程加速。
+*   <strong>代码行为</strong>：
+    *   把数据切分成小块 (<code>micro_batch_size</code>)。
+    *   使用 <code>teacher_client.submit(...)</code> 把问题发给老师。
+    *   <code>futures.append(fut)</code>：这里是<strong>异步</strong>的，发出去就不管了，拿到一个“取货凭证”（Future），继续发下一批，不用干等。</p>
+<h4>3. 回收答案 (Collection)</h4>
+<p><strong>代码位置：</strong> <code>handle_futures</code> 函数内部的第一个循环。
+<strong>观点/逻辑：</strong>
+现在任务都发出去了，我们需要拿着“凭证”去取结果。
+*   <strong>代码行为</strong>：
+    *   遍历所有的 <code>futures</code>。
+    *   调用 <code>future.result()</code>：如果老师算完了，就拿结果；没算完就等到算完。
+    *   拿到两个关键数据：
+        *   <code>teacher_topk_logps</code>: 老师认为下个词是啥的概率（对数概率）。
+        *   <code>teacher_topk_indices</code>: 老师认为下个词是词表里的哪一个。
+    *   把所有小批次的结果拼成一个大列表 <code>all_teacher_topk_...</code>。</p>
+<h4>4. 格式还原 (Reconstruction) —— 这是最难读懂的部分</h4>
+<p><strong>代码位置：</strong> <code>handle_futures</code> 函数的后半部分（从 <code>global teacher_topk_logps_padded</code> 开始）。
+<strong>观点/逻辑：</strong>
+老师返回的数据是“变长”的（因为每个句子长度不一样）。但深度学习框架（如 PyTorch）喜欢整齐的矩阵（Batch Size × Sequence Length × TopK）。我们需要把老师给的“变长面条”塞回到“整齐的方格”里。
+*   <strong>代码行为</strong>：
+    *   <strong>申请内存</strong>：创建全 0 的大张量 <code>teacher_topk_logps_padded</code>。这里用了 <code>global</code> 变量做缓存，为了避免反复申请内存（一种性能优化）。
+    *   <strong>填空</strong>：利用 <code>attention_mask</code>，把老师返回的数据，精准地填回到非 0 的位置。
+    *   <strong>效果</strong>：原本被清洗掉 Padding 的位置，现在在结果里依然是 0；有效的位置填上了老师的预测值。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这行代码的意思是：</span>
+<span class="c1"># 在 padded（整齐矩阵）的第 i 行，只把数据填入 mask 为 True（有效）的位置</span>
+<span class="n">teacher_topk_logps_padded</span><span class="p">[</span><span class="n">i</span><span class="p">][</span><span class="n">attention_mask</span><span class="p">[</span><span class="n">i</span><span class="p">]]</span> <span class="o">=</span> <span class="n">teacher_topk_logps</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+</code></pre></div>
+
+<h4>5. 打包发货 (Packaging)</h4>
+<p><strong>代码位置：</strong> <code>output_batch = DataProto.from_single_dict(...)</code>
+<strong>观点/逻辑：</strong>
+数据处理完了，需要变成 <code>verl</code> 框架认识的对象。
+*   <strong>代码行为</strong>：
+    *   把处理好的 numpy 数组放入 <code>DataProto</code>。
+    *   计算一下耗时 (<code>timing</code>)，方便监控性能。
+    *   如果是异步模式 (<code>is_async=True</code>)，返回一个可以稍后调用的对象；如果是同步，直接返回结果。</p>
+<hr />
+<h3>总结</h3>
+<p>这段代码就像一个<strong>“整理员”</strong>：
+1.  把带杂质的原始数据（带 Padding）<strong>剥离</strong>成纯净数据。
+2.  送去加工（Teacher Inference）。
+3.  把加工好的纯净数据，按照原始的模具（Mask），重新<strong>填充</strong>回整齐的形状。</p>
+<p><strong>核心难点</strong>就在于：输入是 Padding 过的 -&gt; 变长处理 -&gt; 输出又要还原成 Padding 过的形状。理解了这一点，你就看懂了这段代码。</p>

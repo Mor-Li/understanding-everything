@@ -1,0 +1,109 @@
+<h1>tools/autoformat.sh</h1>
+<p>这份脚本 <code>tools/autoformat.sh</code> 的核心作用是：<strong>只针对你修改过的 Python 代码，进行自动格式化、代码风格检查和错误排查。</strong></p>
+<p>它通常用于开发者提交代码前（Pre-commit）或者 CI/CD 流程中，确保代码整洁且没有低级错误。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>任务清单 (ToDo List)</strong>，然后一步步解释它是怎么做的。</p>
+<hr />
+<h3>📋 脚本执行任务清单 (ToDo List)</h3>
+<ol>
+<li><strong>环境检查</strong>：确认你的 Git 版本是否足够新。</li>
+<li><strong>准备工作</strong>：设置脚本运行的模式（是“只检查不修改”还是“自动修复”？是否跳过文档检查？）。</li>
+<li><strong>锁定目标</strong>：找出你到底修改了哪些 Python 文件（只检查改动的文件，不检查整个项目）。</li>
+<li><strong>配置工具</strong>：根据第 2 步的模式，给各个代码检查工具（Black, Ruff 等）准备好参数。</li>
+<li><strong>执行任务</strong>：对锁定的文件依次运行格式化和检查工具。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细解读</h3>
+<p>下面我按照上面的清单，把代码拆开给你讲：</p>
+<h4>第一步：环境检查 (Git 版本)</h4>
+<p><strong>目的</strong>：脚本后面用到了一些高级的 Git 命令，老版本不支持，所以先检查版本。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>bash
+    GIT_VERSION=$(git version | awk '{print $3}')
+    # ... (中间省略提取主版本号和次版本号的代码)
+    if [[ $GIT_MAJOR -eq 2 &amp;&amp; $GIT_MINOR -lt 31 ]]; then
+        echo "Git version must be at least 2.31.0..."
+        exit 1
+    fi</code></li>
+<li><strong>解释</strong>：它获取你的 Git 版本号。如果你用的版本低于 <code>2.31.0</code>，脚本就会报错并停止运行。</li>
+</ul>
+<h4>第二步：准备工作 (设置开关)</h4>
+<p><strong>目的</strong>：读取环境变量，决定脚本“有多严格”或者“是否只读”。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>bash
+    CHECK_ONLY=${CHECK_ONLY:-false}
+    SKIP_DOCS=${SKIP_DOCS:-false}
+    BASE_REF=${BASE_REF:-main}</code></li>
+<li><strong>解释</strong>：<ul>
+<li><code>CHECK_ONLY</code>：如果是 <code>true</code>，脚本只会告诉你哪里格式不对，<strong>不会</strong>帮你自动改代码（通常用于服务器自动测试）。默认是 <code>false</code>（会帮你改）。</li>
+<li><code>SKIP_DOCS</code>：如果是 <code>true</code>，就不检查你有没有写函数注释（Docstring）。</li>
+<li><code>BASE_REF</code>：指定对比的基准分支，默认是 <code>main</code> 分支。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：锁定目标 (找出变动的文件)</h4>
+<p><strong>目的</strong>：这是脚本最聪明的地方。它不检查成千上万个文件，<strong>只检查你修改过的文件</strong>。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>bash
+    git remote add autoformatter-remote "https://github.com/NVIDIA/Megatron-LM.git" || true
+    git fetch autoformatter-remote ${BASE_REF}
+    CHANGED_FILES=$(git diff --name-only ... | grep '\.py$' || true)</code></li>
+<li><strong>解释</strong>：<ol>
+<li>它先确保你连接到了官方的 NVIDIA 仓库（起名为 <code>autoformatter-remote</code>）。</li>
+<li>它把官方仓库的 <code>main</code> 分支代码拉下来。</li>
+<li><strong>关键点</strong>：<code>git diff</code> 对比你当前的代码和官方 <code>main</code> 分支的代码。</li>
+<li>它只筛选出在 <code>megatron/core</code> 和 <code>tests/</code> 目录下，且后缀是 <code>.py</code> 的文件。</li>
+<li>这些文件被存入 <code>CHANGED_FILES</code> 变量中。</li>
+</ol>
+</li>
+</ul>
+<h4>第四步：配置工具 (准备参数)</h4>
+<p><strong>目的</strong>：根据第二步的开关，给工具们“穿装备”。</p>
+<ul>
+<li>
+<p><strong>代码片段</strong>：
+    ```bash
+    if [[ $CHECK_ONLY == true ]]; then
+        ADDITIONAL_ARGS="--check"
+        # ... (设置 black 为 diff 模式, ruff 为不修复模式)
+    else
+        ADDITIONAL_RUFF_ARGS="--fix" # 允许 ruff 自动修复代码
+    fi</p>
+<p>if [[ $SKIP_DOCS == true ]]; then
+    ADDITIONAL_PYLINT_ARGS="--disable=C0115,C0116" # 禁用缺少文档的报错
+fi
+<code>``
+*   **解释**：
+*   如果开启了“只检查模式”，就告诉工具们：只许看，不许改文件内容。
+*   如果开启了“跳过文档”，就告诉</code>pylint`（代码检查器）：别管 C0115 和 C0116 这两个关于注释缺失的错误。</p>
+</li>
+</ul>
+<h4>第五步：执行任务 (运行工具)</h4>
+<p><strong>目的</strong>：真正开始干活。如果找到了变动的文件，就依次运行以下 5 个工具。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>bash
+    if [[ -n "$CHANGED_FILES" ]]; then
+        black ... $CHANGED_FILES
+        isort ... $CHANGED_FILES
+        pylint ... $CHANGED_FILES
+        ruff check ... $CHANGED_FILES
+        mypy ... $CHANGED_FILES || true
+    else
+        echo Changeset is empty, all good.
+    fi</code></li>
+<li><strong>解释</strong>：<ol>
+<li><strong>Black</strong>：代码格式化工具。它会强制把你的代码排版变得整齐（比如缩进、空格）。</li>
+<li><strong>Isort</strong>：导入排序工具。它会把你代码开头的 <code>import numpy</code>, <code>import os</code> 等整理得井井有条。</li>
+<li><strong>Pylint</strong>：老牌代码检查工具。它检查有没有逻辑错误、变量命名是否规范等。</li>
+<li><strong>Ruff</strong>：新型极速代码检查工具。功能和 Pylint 类似但更快，这里也用来自动修复一些简单错误。</li>
+<li><strong>Mypy</strong>：类型检查工具。检查你的变量类型是否正确（比如函数需要整数你却传了字符串）。</li>
+</ol>
+</li>
+</ul>
+<h3>总结</h3>
+<p><strong>一句话概括：</strong>
+当你运行这个脚本时，它会对比官方仓库，找出你修改的那几个 Python 文件，然后自动帮你排版代码、整理 import 顺序，并检查有没有写错代码或类型错误。</p>
+<p><strong>如果没有报错</strong>，说明你的代码格式规范，可以放心地提交（Push）了。</p>

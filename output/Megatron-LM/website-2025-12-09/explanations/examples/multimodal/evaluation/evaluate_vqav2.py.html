@@ -1,0 +1,94 @@
+<h1>examples/multimodal/evaluation/evaluate_vqav2.py</h1>
+<p>这份代码其实是一个<strong>“自动阅卷机”</strong>。</p>
+<p>它的核心作用是：<strong>评估一个多模态大模型（AI）做“看图说话”题目（VQA）做得好不好，并给它打分。</strong></p>
+<p>为了让你彻底搞懂，我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>。我们将把代码拆解成 5 个小任务，一步步完成，你就能完全理解它的逻辑了。</p>
+<hr />
+<h3>📋 任务清单 (Task List)</h3>
+<ol>
+<li><strong>任务一：理解核心目标</strong> —— 搞清楚我们在干什么（阅卷）。</li>
+<li><strong>任务二：整理试卷</strong> —— 对应代码中的 <code>merge_input_files</code>。</li>
+<li><strong>任务三：预处理答案</strong> —— 对应代码中的 <code>vqa.process...</code>。</li>
+<li><strong>任务四：制定评分标准（核心）</strong> —— 对应代码中的 <code>compute_vqa_accuracy</code> 和 <code>anls_score</code>。</li>
+<li><strong>任务五：计算总分</strong> —— 对应代码中的 <code>vqav2_eval</code> 和 <code>main</code>。</li>
+</ol>
+<hr />
+<h3>🔍 逐步讲解</h3>
+<h4>✅ 任务一：理解核心目标 (What is this?)</h4>
+<p>想象你是一个老师，你手头有一堆 AI 做的作业。
+*   <strong>题目 (Input):</strong> 一张图片 + 一个问题（比如“图里的猫是什么颜色的？”）。
+*   <strong>AI 的回答 (Prediction/Pred):</strong> 比如“黑色”。
+*   <strong>标准答案 (Ground Truth/GT):</strong> 比如“黑”、“黑色”、“纯黑”。</p>
+<p>这个脚本的目的就是：<strong>拿着 AI 的回答去和标准答案比对，算出一个准确率。</strong></p>
+<hr />
+<h4>✅ 任务二：整理试卷 (Data Prep)</h4>
+<p><strong>代码位置：</strong> <code>merge_input_files</code> 函数</p>
+<p>在阅卷之前，先把考卷收上来整理好。
+*   <strong>问题：</strong> 模型的输出结果可能分散在几个文件里，或者有重复的记录。
+*   <strong>代码逻辑：</strong>
+    1.  读取输入文件。
+    2.  用 <code>sample_id</code>（题目ID）来去重。如果这道题已经存过了，就跳过。
+    3.  把整理好的、干净的数据存成一个新的 JSON 文件，方便后面评分。</p>
+<blockquote>
+<p><strong>白话总结：</strong> 把乱七八糟的答题卡整理成一张整洁的成绩单。</p>
+</blockquote>
+<hr />
+<h4>✅ 任务三：预处理答案 (Normalization)</h4>
+<p><strong>代码位置：</strong> <code>compute_vqa_accuracy</code> 函数的前几行</p>
+<div class="codehilite"><pre><span></span><code><span class="n">vqa</span> <span class="o">=</span> <span class="n">VQAEval</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># ...</span>
+<span class="n">pred</span> <span class="o">=</span> <span class="n">vqa</span><span class="o">.</span><span class="n">processPunctuation</span><span class="p">(</span><span class="n">pred</span><span class="p">)</span> <span class="c1"># 去掉标点</span>
+<span class="n">pred</span> <span class="o">=</span> <span class="n">vqa</span><span class="o">.</span><span class="n">processDigitArticle</span><span class="p">(</span><span class="n">pred</span><span class="p">)</span> <span class="c1"># 处理数字和冠词(a, an, the)</span>
+</code></pre></div>
+
+<p><strong>问题：</strong> 假如标准答案是 "cat"，但 AI 写的是 "Cat." (有大写，有句号)。如果直接用 <code>==</code> 判断，电脑会判定为<strong>错误</strong>。这显然不公平。
+<strong>代码逻辑：</strong>
+*   <strong>去标点：</strong> 把句号、逗号删掉。
+*   <strong>小写化：</strong> 统一变成小写。
+*   <strong>去冠词：</strong> 把 "a cat" 变成 "cat"。</p>
+<blockquote>
+<p><strong>白话总结：</strong> 老师阅卷时如果不拘小节，忽略大小写和标点符号，只看核心词对不对。</p>
+</blockquote>
+<hr />
+<h4>✅ 任务四：制定评分标准 (Scoring Logic) —— <strong>这是最难也是最核心的部分</strong></h4>
+<p><strong>代码位置：</strong> <code>compute_vqa_accuracy</code> 函数里的 <code>if/elif</code> 判断块</p>
+<p>不同的考试（Task），评分规则不一样。代码里写了好几种规则：</p>
+<p><strong>1. 数学/图表题 (ChartQA)</strong>
+*   <strong>规则：</strong> 允许有误差。
+*   <strong>逻辑：</strong>
+    *   如果是数字：只要 AI 算的数在标准答案的 <strong>±5%</strong> 范围内，就算对。
+    *   如果是文字：必须完全一样。</p>
+<p><strong>2. 传统看图说话 (VQAv2, TextVQA)</strong> —— <em>这是本文件的重点</em>
+*   <strong>规则：</strong> “少数服从多数”机制（软准确率）。
+*   <strong>代码：</strong> <code>acc = min(1.0, num_match / 3.0)</code>
+*   <strong>逻辑：</strong> 这种数据集通常每道题有 10 个真人写的标准答案（因为不同人说法不一样）。
+    *   如果 AI 的回答匹配了至少 3 个人的答案，得 1 分（满分）。
+    *   如果只匹配了 1 个人，得 0.33 分。
+    *   这是 VQA 领域的标准计分法。</p>
+<p><strong>3. 文档阅读题 (SPDocVQA, InfoVQA)</strong>
+*   <strong>规则：</strong> 允许拼写错误 (ANLS Score)。
+*   <strong>代码：</strong> <code>anls_score(...)</code>
+*   <strong>逻辑：</strong> 这里的 <code>levenshtein_distance</code> 是在算“编辑距离”。
+    *   比如答案是 "Google"，AI 写成 "Gooogle"。
+    *   虽然不一样，但很接近。代码会计算两个字符串的相似度。如果相似度高于阈值（比如 0.5），就给分；否则 0 分。</p>
+<p><strong>4. 选择题 (AI2D, RealworldQA)</strong>
+*   <strong>规则：</strong> 必须一模一样。
+*   <strong>逻辑：</strong> <code>acc = pred == gt[0]</code>。非黑即白。</p>
+<hr />
+<h4>✅ 任务五：计算总分 (Final Execution)</h4>
+<p><strong>代码位置：</strong> <code>vqav2_eval</code> 和 <code>if __name__ == "__main__":</code></p>
+<p>这是整个流程的启动按钮。
+1.  <strong><code>argparse</code></strong>: 接收你在命令行输入的文件路径。
+2.  <strong><code>vqav2_eval</code></strong>:
+    *   调用任务二（整理文件）。
+    *   调用任务四（计算每一题的分数）。
+3.  <strong><code>acc_avg</code></strong>: 把所有题目的分数加起来除以题目数量，乘以 100，得到百分制的平均分。
+4.  <strong><code>print</code></strong>: 打印出结果，比如 <code>===== VQAv2 Accuracy 65.40% =====</code>。</p>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件的逻辑就是：
+1.  <strong>读取</strong> AI 的答题结果。
+2.  <strong>清洗</strong> 文本（去掉标点、统一格式）。
+3.  根据题目类型（是看图说话、还是读图表、还是读文档），选择<strong>不同的尺子</strong>去量 AI 的答案对不对。
+    *   <em>VQAv2 用的是“命中3个标准答案即满分”的尺子。</em>
+    *   <em>文档题用的是“拼写相似度”的尺子。</em>
+4.  最后算个<strong>平均分</strong>告诉你 AI 强不强。</p>

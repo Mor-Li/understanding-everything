@@ -1,0 +1,143 @@
+<h1>tests/unit_tests/dist_checkpointing/test_mapping.py</h1>
+<p>这份代码确实比较抽象，因为它涉及到<strong>深度学习分布式训练（Distributed Training）</strong>中最底层的<strong>检查点（Checkpointing）</strong>保存逻辑。</p>
+<p>简单来说，这段代码是为了解决这个问题：<strong>“当模型太大，被切分到100张显卡上时，我们怎么把这100个碎片拼凑起来，或者正确地保存成文件？”</strong></p>
+<p>我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>，我们一步一步拆解这个文件，从基础概念到复杂逻辑。</p>
+<hr />
+<h3>✅ Task 1: 理解核心背景 (Context)</h3>
+<p>在看代码前，先建立这个概念：
+*   <strong>场景</strong>：Megatron-LM 是用来训练超大模型的（比如 GPT-3）。模型参数非常大，单张显卡放不下。
+*   <strong>问题</strong>：参数被切碎（Shard）了。比如一个大矩阵 <code>[1000, 1000]</code>，可能被切成了 4 份 <code>[500, 500]</code> 分别放在 4 张卡上。
+*   <strong>目标</strong>：<code>ShardedTensor</code> 这个类，就是给每一块“碎片”贴上标签。标签上写着：“我是整个大矩阵的左上角，我的坐标是(0,0)，我的大小是...”</p>
+<hr />
+<h3>✅ Task 2: 理解基础构造 (<code>test_from_rank_offsets_constructor</code>)</h3>
+<p>这是最简单的测试用例。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>python
+    rank_offsets = [(0, 0, 10), (2, 3, 6)]
+    sh_ten = ShardedTensor.from_rank_offsets('keyA', data, *rank_offsets)</code></li>
+<li><strong>解读</strong>：<ul>
+<li><code>data</code>: 当前显卡上的数据，形状是 <code>(1, 3, 7, 9)</code>。</li>
+<li><code>rank_offsets</code>: 这是核心“藏宝图”。<ul>
+<li><code>(0, 0, 10)</code> 意思是：在第 <strong>0</strong> 维度，我的偏移量(offset)是 <strong>0</strong>，这个维度在所有卡上的总份数是 <strong>10</strong> 份。</li>
+<li><code>(2, 3, 6)</code> 意思是：在第 <strong>2</strong> 维度，我的偏移量是 <strong>3</strong>，这个维度总共有 <strong>6</strong> 份。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>结果验证</strong>：<ul>
+<li><code>local_shape</code>: 本地就是 <code>(1, 3, 7, 9)</code>。</li>
+<li><code>global_shape</code>:<ul>
+<li>第0维：本地 <code>1</code> * 总份数 <code>10</code> = <strong>10</strong>。</li>
+<li>第2维：本地 <code>7</code> * 总份数 <code>6</code> = <strong>42</strong>。</li>
+<li>最终变成 <code>(10, 3, 42, 9)</code>。</li>
+</ul>
+</li>
+<li><code>global_offset</code>: 计算出这块碎片在全局大图中的坐标。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论</strong>：这个测试是在验证“能不能根据切分规则，算出全局大矩阵的样子”。</p>
+<hr />
+<h3>✅ Task 3: 挑战难点 —— 扁平化数据 (<code>test_from_rank_offsets_flat_constructor</code>)</h3>
+<p>这个测试有点绕，是因为为了省内存，有时候多维张量在内存里是<strong>拍扁（Flatten）</strong>存的。</p>
+<ul>
+<li><strong>场景</strong>：<ul>
+<li>逻辑上：这是一个 <code>(4, 7)</code> 的矩阵。</li>
+<li>物理上：它是一个长度 28 的一维数组。</li>
+<li>更复杂的是：我们只取了这个一维数组中间的一段 <code>slice(4, 9)</code>。</li>
+</ul>
+</li>
+<li><strong>代码片段</strong>：
+    <code>python
+    sh_ten = ShardedTensor.from_rank_offsets_flat(
+        'keyA', flat_data, data.shape, *rank_offsets, flattened_range=flattened_range
+    )</code></li>
+<li><strong>解读</strong>：<ul>
+<li>这个函数的作用是：即使你给我的是一坨拍扁的数据片段，我也要能根据 <code>rank_offsets</code> 把它还原回它在多维空间里的位置。</li>
+</ul>
+</li>
+<li><strong>验证</strong>：<ul>
+<li>测试验证了 <code>global_shape</code> 和 <code>axis_fragmentations</code>（轴切分份数）是否计算正确。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论</strong>：这是为了处理极端情况——数据在内存里不是标准的形状，而是被压缩或切片过的。</p>
+<hr />
+<h3>✅ Task 4: 安全检查 (<code>test_metadata_integrity_violation</code>)</h3>
+<p>这个测试是为了防止程序员写出 Bug。</p>
+<ul>
+<li><strong>逻辑</strong>：<ol>
+<li>你创建了一个 <code>ShardedTensor</code>。</li>
+<li>然后你试图手动修改它的属性（比如 <code>local_shape</code>）。</li>
+<li>代码会运行 <code>validate_metadata_integrity()</code>。</li>
+<li><strong>报错</strong>：因为你修改后的形状和实际的数据形状对不上了。</li>
+</ol>
+</li>
+<li><strong>例子</strong>：<ul>
+<li>数据里有 5 个数，你非要在元数据里写你只有 4 个数，系统就会抛出 <code>CheckpointingException</code>。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论</strong>：确保“标签”和“实际货物”是对得上的。</p>
+<hr />
+<h3>✅ Task 5: 切片操作 (<code>test_narrowing</code>)</h3>
+<p>这是最实用的功能。Narrow 在 PyTorch 里就是“切片”的意思。</p>
+<ul>
+<li><strong>场景</strong>：<ul>
+<li>我想保存模型，但我不想保存整个张量，我只想保存其中的一部分。</li>
+</ul>
+</li>
+<li><strong>代码片段</strong>：
+    <code>python
+    (narr_sh_ten,) = sh_ten.narrow(1, 1, 2)</code>
+    意思是：在第 <strong>1</strong> 维度，从索引 <strong>1</strong> 开始，取长度 <strong>2</strong>。</li>
+<li><strong>难点</strong>：<ul>
+<li>如果我对“碎片”进行了切片，那么这个“新碎片”在“全局大图”里的坐标也会变！</li>
+</ul>
+</li>
+<li><strong>验证</strong>：<ul>
+<li><code>global_offset</code> 必须自动更新。比如原先在 0 的位置，切掉了前 10 个，新坐标就该变成 10。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论</strong>：验证对碎片进行裁剪后，坐标计算依然准确。</p>
+<hr />
+<h3>✅ Task 6: 进阶 —— 工厂模式 (<code>TestShardedTensorFactory</code>)</h3>
+<p>这个类 <code>ShardedTensorFactory</code> 是为了解决 <strong>“保存时转换”</strong> 的问题。</p>
+<ul>
+<li><strong>场景</strong>：<ul>
+<li>模型在训练时，参数叫 <code>level1</code>。</li>
+<li>但在保存到硬盘时，我们需要把它拆成 <code>level2_a</code> 和 <code>level2_b</code> 两个文件存。</li>
+<li>加载回来时，又需要把 <code>level2_b</code> 变回 <code>level1</code>。</li>
+</ul>
+</li>
+<li><strong>流程</strong>：<ol>
+<li><strong>Build (保存)</strong>: 定义一个 <code>build_fn</code>，把一个 Tensor 变成两个 <code>ShardedTensor</code>。</li>
+<li><strong>Merge (加载)</strong>: 定义一个 <code>merge_fn</code>，决定加载时怎么处理读取到的数据。</li>
+</ol>
+</li>
+<li><strong>测试逻辑</strong>：<ul>
+<li><code>apply_factories</code>: 模拟保存过程，把 <code>level1</code> 变成了 a 和 b。</li>
+<li><code>apply_factory_merges</code>: 模拟加载过程，验证能否正确读回数据。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论</strong>：这是为了支持复杂的模型架构变更（比如训练用一种结构，推理/保存用另一种结构）。</p>
+<hr />
+<h3>✅ Task 7: 小工具 (<code>test_is_main_replica</code>)</h3>
+<p>这是最简单的。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>在分布式训练中，通常 Rank 0 (第0号进程) 是“主进程”，负责打印日志或保存文件。</li>
+<li>这个函数 <code>is_main_replica(rank)</code> 就是判断你是不是 0。</li>
+<li>它支持传入整数 <code>0</code>，或者元组 <code>(0, 0)</code>（用于多维并行的坐标）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心故事是：</p>
+<blockquote>
+<p><strong>“我们在做大模型训练，数据被打散在很多显卡上。这个文件测试了一套工具（ShardedTensor），这套工具能给每个数据碎片贴上精准的GPS定位标签（Rank Offsets），不管数据是被切片了、被拍扁了，还是被重组了，这套工具都能算出它在全局里的正确位置，确保保存和加载不出错。”</strong></p>
+</blockquote>

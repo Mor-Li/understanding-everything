@@ -1,0 +1,139 @@
+<h1>recipe/gkd/megatron_workers.py</h1>
+<p>这份代码确实比较复杂，因为它涉及到了<strong>大规模分布式训练（Megatron-LM）</strong>、<strong>强化学习（RLHF/PPO）</strong>以及<strong>异构计算（训练和推理分离）</strong>。</p>
+<p>简单来说，这个文件定义了两个核心角色的工作方式：
+1.  <strong>Actor（演员/训练者）：</strong> 负责根据数据更新模型参数（学习）。
+2.  <strong>Rollout（采样/推理者）：</strong> 负责用模型生成文本（考试）。</p>
+<p>为了让你看懂，我把这个文件拆解成一个 <strong>Task Todo List</strong>，我们一步一步来完成阅读任务：</p>
+<hr />
+<h3>Task 1: 理解搬运工 —— <code>TensorBuffer</code> 类</h3>
+<p><strong>目标</strong>：弄懂怎么高效地在显卡之间传输数据。</p>
+<ul>
+<li><strong>代码位置</strong>：第 63 行 <code>class TensorBuffer</code>。</li>
+<li><strong>通俗解释</strong>：<ul>
+<li>想象你要搬家。如果你每拿一本书就跑一趟楼下（发送一个网络包），效率极低。</li>
+<li>这个类的作用就是<strong>打包箱</strong>。它把很多小的张量（Tensor）拼成一个大的连续内存块（Buffer）。</li>
+<li><strong>核心方法</strong>：<ul>
+<li><code>append</code>: 把小东西塞进箱子。</li>
+<li><code>to_tensors</code>: 到达目的地后，把箱子里的东西拆出来还原。</li>
+</ul>
+</li>
+<li><strong>为什么需要它</strong>：为了在“训练工人”和“推理工人”之间同步几十GB的模型权重时，减少网络通信次数，提高速度。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 2: 理解训练大脑 —— <code>OnPolicyDistillActor</code> 类</h3>
+<p><strong>目标</strong>：弄懂模型是如何进行一次“学习”的。</p>
+<ul>
+<li><strong>代码位置</strong>：第 95 行 <code>class OnPolicyDistillActor</code>。</li>
+<li><strong>核心逻辑</strong>：这是纯粹的数学计算和梯度更新逻辑，不涉及外围的调度。</li>
+<li><strong>Todo 细分</strong>：<ol>
+<li><strong>初始化 (<code>__init__</code>)</strong>: 接收模型配置、优化器（Optimizer）。它使用 Megatron 的分布式优化器。</li>
+<li><strong>前向后向传播 (<code>forward_backward_batch</code>)</strong>:<ul>
+<li>这是最复杂的部分。它处理<strong>流水线并行（Pipeline Parallelism）</strong>。</li>
+<li>它把一大批数据切分成微批次（micro-batches）。</li>
+<li><strong>计算 Loss</strong>：它计算 KL 散度（防止模型偏离旧模型太远）和 PPO 的 Loss。</li>
+<li>它定义了 <code>forward_step</code>，在里面调用模型的前向传播。</li>
+</ul>
+</li>
+<li><strong>更新策略 (<code>update_policy</code>)</strong>:<ul>
+<li>这是外部调用的入口。</li>
+<li>流程是：<code>清空梯度</code> -&gt; <code>计算前向后向(算出梯度)</code> -&gt; <code>optimizer.step()(更新参数)</code> -&gt; <code>返回监控指标(metrics)</code>。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 理解训练工头 —— <code>MegatronOnPolicyDistillActorWorker</code> 类</h3>
+<p><strong>目标</strong>：弄懂一个负责训练的 Worker 进程平时在干啥。</p>
+<ul>
+<li><strong>代码位置</strong>：第 310 行 <code>class MegatronOnPolicyDistillActorWorker</code>。</li>
+<li><strong>核心逻辑</strong>：这是一个 Ray Worker（分布式进程），它持有上面的 <code>OnPolicyDistillActor</code>。</li>
+<li><strong>Todo 细分</strong>：<ol>
+<li><strong>初始化 (<code>init_model</code>)</strong>:<ul>
+<li>加载 Megatron 模型，设置优化器，准备好 Checkpoint 管理器。</li>
+</ul>
+</li>
+<li><strong>干活 (<code>update_actor</code>)</strong>:<ul>
+<li>接收数据 <code>data</code>。</li>
+<li>调用内部大脑 <code>self.actor.update_policy(data)</code> 来更新权重。</li>
+<li>计算一下吞吐量（Flops），看看显卡有没有偷懒。</li>
+</ul>
+</li>
+<li><strong>同步权重 (<code>sync_rollout_weights</code>)</strong>:<ul>
+<li><strong>关键点</strong>：训练完一步后，模型变强了。必须把新的权重发给“推理工人”。</li>
+<li>这里用到了 Task 1 的 <code>TensorBuffer</code>。它把参数打包，通过 <code>collective.broadcast</code> 广播给 Rollout Worker。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 理解推理工头 —— <code>MegatronOnPolicyDistillRolloutWorker</code> 类</h3>
+<p><strong>目标</strong>：弄懂一个负责生成文本的 Worker 进程平时在干啥。</p>
+<ul>
+<li><strong>代码位置</strong>：第 480 行 <code>class MegatronOnPolicyDistillRolloutWorker</code>。</li>
+<li><strong>核心逻辑</strong>：这个 Worker <strong>不训练</strong>，只负责用 vLLM 或 SGLang 这种推理引擎来快速生成文本。</li>
+<li><strong>Todo 细分</strong>：<ol>
+<li><strong>初始化 (<code>init_model</code>)</strong>:<ul>
+<li>它不加载优化器（省显存），只加载推理引擎（vLLM/SGLang）。</li>
+</ul>
+</li>
+<li><strong>干活 (<code>generate_sequences</code>)</strong>:<ul>
+<li>接收提示词（Prompts）。</li>
+<li>调用推理引擎生成回复。</li>
+<li>返回生成的结果。</li>
+</ul>
+</li>
+<li><strong>接收权重 (<code>sync_rollout_weights</code>)</strong>:<ul>
+<li>这是与 Task 3 对应的部分。</li>
+<li>它作为接收方，接收 Actor 发过来的新权重包。</li>
+<li><strong>热更新</strong>：收到权重后，它直接把新权重塞进正在运行的 vLLM/SGLang 引擎里，这样下一次生成就是用最新的模型了。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：整个文件的剧情走向</h3>
+<p>如果把这个文件拍成一部电影，剧情是这样的：</p>
+<ol>
+<li>
+<p><strong>准备阶段</strong>：</p>
+<ul>
+<li><strong>Actor Worker</strong> 启动，加载模型，准备好优化器。</li>
+<li><strong>Rollout Worker</strong> 启动，加载推理引擎（vLLM）。</li>
+</ul>
+</li>
+<li>
+<p><strong>第一幕：同步</strong>：</p>
+<ul>
+<li>Actor 把初始权重打包 (<code>TensorBuffer</code>)，广播给 Rollout。</li>
+<li>Rollout 接收并更新自己的引擎。</li>
+</ul>
+</li>
+<li>
+<p><strong>第二幕：采样 (Rollout)</strong>：</p>
+<ul>
+<li>Rollout Worker 收到 Prompt，生成一堆数据（Prompt + Response）。</li>
+<li>这些数据被发回给系统（不在这个文件里，但在逻辑链中）。</li>
+</ul>
+</li>
+<li>
+<p><strong>第三幕：训练 (Actor)</strong>：</p>
+<ul>
+<li>Actor Worker 收到数据 (<code>DataProto</code>)。</li>
+<li>Actor 调用 <code>update_policy</code>，计算梯度，更新自己的权重。</li>
+</ul>
+</li>
+<li>
+<p><strong>第四幕：循环</strong>：</p>
+<ul>
+<li>Actor 再次调用 <code>sync_rollout_weights</code>，把更新后的权重扔给 Rollout。</li>
+<li>回到第二幕。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结：</strong>
+这个文件实现了<strong>将训练（Actor）和推理（Rollout）分离到不同的显卡组上</strong>，并利用 Megatron 进行训练，利用 vLLM 进行推理，中间通过高效的权重广播机制（TensorBuffer + Broadcast）来保持两者模型同步。</p>

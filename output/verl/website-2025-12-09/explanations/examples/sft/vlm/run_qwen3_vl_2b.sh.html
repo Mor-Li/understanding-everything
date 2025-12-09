@@ -1,0 +1,125 @@
+<h1>examples/sft/vlm/run_qwen3_vl_2b.sh</h1>
+<p>这份脚本确实看起来很复杂，充满了各种大写的变量和参数。别担心，我们把它想象成<strong>“做一道菜”</strong>的过程。</p>
+<p>这个脚本本质上就是一张<strong>“烹饪清单” (Recipe)</strong>，告诉计算机如何去训练（微调）一个叫 <strong>Qwen3-VL-2B</strong> 的人工智能模型。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>Task To-Do List（任务清单）</strong>，我们按照计算机执行的顺序，一步一步来看。</p>
+<hr />
+<h3>📋 任务清单 (Task To-Do List)</h3>
+<p>如果你是计算机，拿到这个脚本，你需要按顺序完成以下 5 件事：</p>
+<ol>
+<li><strong>【准备食材】</strong>：确定数据在哪里，模型在哪里。</li>
+<li><strong>【选择厨具】</strong>：确定用什么框架（Backend）来训练。</li>
+<li><strong>【设定火候】</strong>：配置显卡如何分工（并行策略）以及学习率等参数。</li>
+<li><strong>【确定菜名】</strong>：给这次训练任务起个名字，方便保存。</li>
+<li><strong>【开始烹饪】</strong>：执行最终的启动命令 (<code>torchrun</code>)。</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<h4>1. 【准备食材】环境与数据准备</h4>
+<p>脚本最开始的几行是在设置路径。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 遇到错误立即停止，打印执行过程</span>
+<span class="nb">set</span><span class="w"> </span>-xeuo<span class="w"> </span>pipefail<span class="w"> </span>
+
+<span class="c1"># 定义根目录（如果没设置过，就用当前目录）</span>
+<span class="nv">HDFS_ROOT</span><span class="o">=</span><span class="si">${</span><span class="nv">HDFS_ROOT</span><span class="k">:-</span><span class="nv">$PWD</span><span class="si">}</span>
+<span class="nv">DATA_ROOT</span><span class="o">=</span><span class="si">${</span><span class="nv">DATA_ROOT</span><span class="k">:-</span><span class="nv">$PWD</span><span class="si">}</span>
+
+<span class="c1"># 定义启动程序的入口（这就是我们要运行的Python代码）</span>
+<span class="nv">ENTRYPOINT</span><span class="o">=</span><span class="si">${</span><span class="nv">ENTRYPOINT</span><span class="k">:-</span><span class="s2">&quot;-m verl.trainer.sft_trainer&quot;</span><span class="si">}</span>
+
+<span class="c1"># 定义“食材”：训练数据在哪里？（这里用的是 Pokemon 的描述数据）</span>
+<span class="nv">TRAIN_FILES</span><span class="o">=</span><span class="si">${</span><span class="nv">HOME</span><span class="si">}</span>/data/pokemon-gpt4o-captions/train.parquet
+
+<span class="c1"># 定义“初始底料”：我们要微调哪个模型？（Qwen3-VL-2B）</span>
+<span class="nv">MODEL_ID</span><span class="o">=</span><span class="si">${</span><span class="nv">HDFS_ROOT</span><span class="si">}</span>/model/Qwen3-VL-2B-Instruct
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这里就像在厨房把肉和菜拿出来。它告诉机器：我们要用 <code>verl</code> 这个库的 SFT（监督微调）功能，基于 <code>Qwen3</code> 模型，用 <code>Pokemon</code> 数据集进行训练。</li>
+</ul>
+<h4>2. 【选择厨具】选择训练后端</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 默认后端是 fsdp (PyTorch自带的一种省显存技术)</span>
+<span class="nv">backend</span><span class="o">=</span><span class="si">${</span><span class="nv">BACKEND</span><span class="k">:-</span><span class="nv">fsdp</span><span class="si">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这里决定了“怎么切菜”。是用 <code>fsdp</code> 这种方式，还是用 <code>megatron</code>（一种更重型的分布式框架）。脚本默认选了 <code>fsdp</code>。</li>
+</ul>
+<h4>3. 【设定火候】配置并行策略与优化器</h4>
+<p>这部分最长，也最难懂，但逻辑很简单：<strong>如何榨干显卡的性能。</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 定义一些并行参数（SP, TP, PP... 都是把大模型切碎塞进不同显卡的技术）</span>
+<span class="nv">SP_SIZE</span><span class="o">=</span><span class="si">${</span><span class="nv">SP_SIZE</span><span class="k">:-</span><span class="nv">2</span><span class="si">}</span>
+<span class="c1"># ... (省略部分并行参数)</span>
+
+<span class="c1"># 配置 FSDP 引擎的参数（如果选了 fsdp 就用这一段）</span>
+<span class="nv">FSDP_ENGINE_CONFIG</span><span class="o">=</span><span class="s2">&quot;\</span>
+<span class="s2">    engine=</span><span class="si">${</span><span class="nv">backend</span><span class="si">}</span><span class="s2"> \</span>
+<span class="s2">    optim.lr=2e-5 \       # 学习率（火候大小）</span>
+<span class="s2">    optim.weight_decay=0.1 \ # 防止过拟合</span>
+<span class="s2">    ...</span>
+<span class="s2">    engine.ulysses_sequence_parallel_size=</span><span class="si">${</span><span class="nv">SP_SIZE</span><span class="si">}</span><span class="s2"> ...&quot;</span><span class="w"> </span><span class="c1"># 序列并行大小</span>
+
+<span class="c1"># 配置 Megatron 引擎的参数（如果选了 megatron 就用这一段）</span>
+<span class="nv">MEGATRON_ENGINE_CONFIG</span><span class="o">=</span><span class="s2">&quot;...&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：<ul>
+<li><strong>如果你显卡多、模型巨大</strong>，你需要把模型切开（模型并行 TP/PP）。</li>
+<li><strong>如果你显卡少、模型小</strong>，或者只是想简单点，用 <code>fsdp</code> 就行。</li>
+<li>这里还设置了 <strong>学习率 (lr=2e-5)</strong>，就像设定烤箱温度。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 【确定菜名】逻辑判断与命名</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="o">[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$backend</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;fsdp&quot;</span><span class="w"> </span><span class="o">]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="c1"># 如果用 fsdp，就加载 FSDP 的配置</span>
+<span class="w">    </span><span class="nv">ENGINE_CONFIG</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$FSDP_ENGINE_CONFIG</span><span class="s2">&quot;</span>
+<span class="w">    </span><span class="c1"># 给这次实验起个名，带上日期和配置，方便以后找</span>
+<span class="w">    </span><span class="nv">exp_name</span><span class="o">=</span>pokemon-qwen3-2b-<span class="si">${</span><span class="nv">backend</span><span class="si">}</span>-<span class="si">${</span><span class="nv">FSDP_STRATEGY</span><span class="si">}</span>-sp<span class="si">${</span><span class="nv">SP_SIZE</span><span class="si">}</span>-fsdp-1202a1
+<span class="k">else</span>
+<span class="w">    </span><span class="c1"># 否则用 megatron 配置</span>
+<span class="w">    </span><span class="nv">ENGINE_CONFIG</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$MEGATRON_ENGINE_CONFIG</span><span class="s2">&quot;</span>
+<span class="w">    </span><span class="nv">exp_name</span><span class="o">=</span>pokemon-qwen3-2b-<span class="si">${</span><span class="nv">backend</span><span class="si">}</span>-tp<span class="si">${</span><span class="nv">TP_SIZE</span><span class="si">}</span>-...
+<span class="k">fi</span>
+
+<span class="c1"># 创建保存模型的文件夹</span>
+<span class="nv">CKPT_HOME</span><span class="o">=</span>...
+mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">CKPT_HOME</span><span class="si">}</span><span class="s2">&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：机器根据你刚才选的“厨具”（backend），自动决定加载哪一套参数，并给这次训练结果起一个独一无二的文件名。</li>
+</ul>
+<h4>5. 【开始烹饪】执行 Torchrun</h4>
+<p>这是脚本的最后一步，也是真正干活的一步。</p>
+<div class="codehilite"><pre><span></span><code>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">1</span><span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="si">${</span><span class="nv">NUM_TRAINERS</span><span class="k">:-</span><span class="nv">8</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="si">${</span><span class="nv">ENTRYPOINT</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>data.train_files<span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">TRAIN_FILES</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>data.train_batch_size<span class="o">=</span><span class="m">96</span><span class="w"> </span><span class="se">\ </span><span class="w">    </span><span class="c1"># 一次吃多少数据</span>
+<span class="w">    </span>data.max_length<span class="o">=</span><span class="m">2048</span><span class="w"> </span><span class="se">\ </span><span class="w">        </span><span class="c1"># 一句话最长多少</span>
+<span class="w">    </span>model.path<span class="o">=</span><span class="nv">$MODEL_ID</span><span class="w"> </span><span class="se">\ </span><span class="w">        </span><span class="c1"># 模型路径</span>
+<span class="w">    </span><span class="si">${</span><span class="nv">ENGINE_CONFIG</span><span class="si">}</span><span class="w"> </span><span class="se">\ </span><span class="w">            </span><span class="c1"># 刚才选好的引擎配置</span>
+<span class="w">    </span>trainer.save_freq<span class="o">=</span><span class="m">4000</span><span class="w"> </span><span class="se">\ </span><span class="w">      </span><span class="c1"># 跑4000步存个档</span>
+<span class="w">    </span>trainer.total_epochs<span class="o">=</span><span class="m">10</span><span class="w"> </span><span class="se">\ </span><span class="w">     </span><span class="c1"># 总共学10遍</span>
+<span class="w">    </span>...
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：<ul>
+<li><code>torchrun</code>：这是 PyTorch 的启动器，负责管理多张显卡。</li>
+<li><code>--nproc-per-node=8</code>：假设你有 8 张显卡一起跑。</li>
+<li>后面跟的一大串 <code>data...</code> 和 <code>trainer...</code> 就是把前面所有准备好的“食材”和“参数”一股脑传给 Python 程序。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这脚本到底是干啥的？</h3>
+<p>用一句话概括：
+<strong>这个脚本使用 8 张显卡（默认），通过 FSDP 并行加速技术，把 Qwen3-VL-2B 这个视觉大模型，在 Pokemon（宝可梦）数据集上训练 10 轮，让模型学会看图说话（描述宝可梦）。</strong></p>
+<h3>你的 Action Item (如果你要运行它)</h3>
+<p>如果你想跑这个脚本，你需要关注这几个点（To-Do）：</p>
+<ol>
+<li><strong>检查路径</strong>：确认 <code>MODEL_ID</code> 指向的路径里真的有 Qwen3 的模型文件。</li>
+<li><strong>检查数据</strong>：确认 <code>TRAIN_FILES</code> 指向的路径里真的有 Pokemon 的数据。</li>
+<li><strong>显卡数量</strong>：脚本默认觉得你有 8 张卡 (<code>NUM_TRAINERS:-8</code>)。如果你只有 1 张或 4 张，需要在运行前改一下，或者通过命令行传参覆盖它。</li>
+</ol>

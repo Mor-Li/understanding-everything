@@ -1,0 +1,56 @@
+<h1>recipe/vla/fsdp_workers.py</h1>
+<p>这份代码确实比较硬核，它属于 <strong>大规模分布式强化学习（RL）系统</strong> 的一部分，特别是针对 <strong>VLA（Vision-Language-Action，视觉-语言-动作）</strong> 机器人大模型的训练代码。</p>
+<p>简单来说，这个文件的作用是定义一个“打工人”（Worker），这个打工人很特殊，它<strong>既负责学习（训练），又负责干活（推理/生成数据）</strong>。为了省显存，它使用了 FSDP（Fully Sharded Data Parallel）技术。</p>
+<p>我们可以把理解这份代码的过程想象成<strong>为了训练一个机器人大脑，你需要完成的一系列任务清单（To-Do List）</strong>。</p>
+<p>以下是按逻辑顺序列出的任务清单，带你一步步看懂它的观点：</p>
+<hr />
+<h3>📝 任务清单：如何打造一个“混合动力”的训练工人</h3>
+<h4>✅ Task 1: 确定身份 —— 我是谁？</h4>
+<p><strong>代码对应：</strong> <code>class RobActorRolloutRefWorker(ActorRolloutRefWorker)</code>
+*   <strong>观点：</strong> 这是一个“多面手”类。
+*   <strong>解释：</strong> 在强化学习里，通常需要有人负责“玩游戏”（Rollout，生成数据），有人负责“学习”（Actor，更新参数）。
+*   <strong>核心逻辑：</strong> 这个类继承自 <code>ActorRolloutRefWorker</code>，说明它是一个<strong>混合引擎（Hybrid Engine）</strong>。它在同一个 GPU 上，一会切换成“训练模式”去更新权重，一会切换成“推理模式”去生成数据，而不是用两组不同的机器。</p>
+<h4>✅ Task 2: 准备大脑 —— 加载特制的模型</h4>
+<p><strong>代码对应：</strong> <code>init_model</code> 方法中的 <code>AutoConfig.register("openvla", ...)</code>
+*   <strong>观点：</strong> 我们用的不是普通的 GPT，是 OpenVLA（机器人模型）。
+*   <strong>解释：</strong>
+    1.  代码注册了 <code>OpenVLA</code> 相关的配置、处理器和模型类。这是为了让 HuggingFace 的库能识别这个特殊的机器人模型。
+    2.  它初始化了模型，并用 <strong>FSDP</strong>（显存切片技术）把模型包裹起来。
+    3.  <strong>FSDP 的作用：</strong> 模型太大了，单卡放不下，所以把模型参数切碎了放在不同显卡上。</p>
+<h4>✅ Task 3: 准备干活的环境 —— 构建 Rollout</h4>
+<p><strong>代码对应：</strong> <code>_build_rollout</code> 方法
+*   <strong>观点：</strong> 推理（生成数据）需要独立的随机数种子和通信组。
+*   <strong>解释：</strong>
+    1.  <strong>随机性控制：</strong> 这一点非常重要。代码里反复出现了 <code>manual_seed</code> 和 <code>rng_state</code>。这是为了保证在多卡环境下，每张卡生成的随机动作既符合预期，又能复现。
+    2.  它初始化了一个 <code>NaiveRolloutRob</code>，这是专门用来做机器人推理的模块。</p>
+<h4>✅ Task 4: 核心难点 —— 模式切换（“变身”机制）</h4>
+<p>这是这份代码最核心、最复杂的观点。因为用了 FSDP，参数平时是“碎”的，推理时需要“拼”起来。</p>
+<p><strong>👉 子任务 4.1: 切换到“推理模式” (Rollout Mode)</strong>
+<strong>代码对应：</strong> <code>rollout_mode</code> 方法
+*   <strong>观点：</strong> 只有把碎掉的参数拼回来，才能高效推理。
+*   <strong>解释：</strong>
+    1.  <code>aggressive_empty_cache()</code>: 先清空显存，腾地儿。
+    2.  <code>_unshard_params_for_summon</code>: <strong>这是全篇最关键的函数</strong>。它的意思是“召唤全量参数”。FSDP 平时为了省显存把参数切碎了，但在推理时，为了速度和方便，代码临时把参数从各个卡上“收集”回来，变成一个完整的模型。
+    3.  保存训练时的随机状态，加载推理用的随机状态（防止训练和推理的随机性互相干扰）。</p>
+<p><strong>👉 子任务 4.2: 切换回“训练模式” (Trainer Mode)</strong>
+<strong>代码对应：</strong> <code>trainer_mode</code> 方法
+*   <strong>观点：</strong> 干完活了，把参数切碎回去继续训练。
+*   <strong>解释：</strong>
+    1.  <code>fsdp_unshard_exit_stack.close()</code>: 退出上下文管理器。这意味着刚才“召唤”出来的全量参数被释放了，模型又变回了 FSDP 的切片状态（Sharded），以此节省显存用于计算梯度。
+    2.  恢复训练时的随机数种子。</p>
+<h4>✅ Task 5: 执行任务 —— 生成序列</h4>
+<p><strong>代码对应：</strong> <code>generate_sequences</code> 方法
+*   <strong>观点：</strong> 接收提示词（Prompts），产出动作/文本。
+*   <strong>解释：</strong>
+    1.  这是实际干活的函数。它接收 <code>prompts</code>（比如机器人的摄像头图像+指令）。
+    2.  调用 <code>self.rollout.generate_sequences</code> 进行推理。
+    3.  <strong>性能监控：</strong> 代码里加了很多计时器 (<code>simple_timer</code>)，用来统计生成花了多长时间，便于后续优化。
+    4.  最后把结果转回 CPU 并清空 GPU 缓存。</p>
+<hr />
+<h3>总结：这段代码到底在讲什么？</h3>
+<p>如果用一句话概括：
+<strong>这是一个为了训练 OpenVLA 机器人模型而写的“混合工人类”，它利用 FSDP 技术解决了大模型显存不够的问题，并通过精细的“参数聚合/切片”和“随机种子管理”，实现在同一张显卡上高效地轮流进行“推理”和“训练”。</strong></p>
+<p><strong>你需要关注的重点是：</strong>
+1.  <strong>FSDP 的上下文切换</strong>（<code>_unshard_params_for_summon</code>）：这是如何在省显存的同时还能做推理的黑科技。
+2.  <strong>OpenVLA 的注册</strong>：这是针对特定业务（机器人）的定制。
+3.  <strong>RNG（随机数）管理</strong>：确保训练和推理的随机性隔离，互不影响。</p>

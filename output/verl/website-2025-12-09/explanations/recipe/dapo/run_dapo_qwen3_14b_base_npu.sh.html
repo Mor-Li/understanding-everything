@@ -1,0 +1,88 @@
+<h1>recipe/dapo/run_dapo_qwen3_14b_base_npu.sh</h1>
+<p>这份脚本确实看起来很复杂，因为它是一个<strong>大规模分布式训练</strong>的启动脚本，涉及了深度强化学习（RL）、底层硬件优化（NPU/GPU）和分布式计算框架（Ray）。</p>
+<p>为了让你能看懂，我把它拆解成一个 <strong>“学习任务清单 (To-Do List)”</strong>。我们可以把它想象成你在<strong>指挥一个庞大的厨师团队（AI集群）去学习做一道新菜（训练模型）</strong>。</p>
+<p>请按照以下 5 个步骤来理解：</p>
+<hr />
+<h3>✅ Task 1: 搞清楚“我们在做什么？”（宏观目标）</h3>
+<p><strong>任务目标：</strong> 确认这到底是在干嘛。
+<strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nv">project_name</span><span class="o">=</span><span class="s1">&#39;DAPO&#39;</span>
+<span class="nv">exp_name</span><span class="o">=</span><span class="s1">&#39;DAPO-Qwen3-14B-Base&#39;</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+*   <strong>你在做什么：</strong> 你正在训练一个叫 <strong>Qwen3-14B-Base</strong> 的大模型。
+*   <strong>用什么方法：</strong> 项目名叫 <strong>DAPO</strong>。从脚本里的 <code>adv_estimator=grpo</code> 可以看出，这是一种<strong>强化学习（RL）</strong>训练，特别像是最近很火的 DeepSeek-R1 用的 <strong>GRPO</strong>（Group Relative Policy Optimization）算法的变体。
+*   <strong>简单理解：</strong> 你不是在给模型“喂书”看（预训练），而是在给模型“出题”，让它生成答案，然后给它打分，让它学会如何更好地回答问题（特别是数学题，看后面的数据路径）。</p>
+<hr />
+<h3>✅ Task 2: 搞清楚“用什么资源做？”（基础设施）</h3>
+<p><strong>任务目标：</strong> 确认代码在哪里运行，用什么硬件。
+<strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code>trainer.device<span class="o">=</span>npu
+<span class="nv">RAY_ADDRESS</span><span class="o">=</span><span class="si">${</span><span class="nv">RAY_ADDRESS</span><span class="k">:-</span><span class="s2">&quot;http://localhost:8265&quot;</span><span class="si">}</span>
+trainer.nnodes<span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">NNODES</span><span class="si">}</span><span class="s2">&quot;</span><span class="w">  </span><span class="c1"># 节点数量</span>
+trainer.n_gpus_per_node<span class="o">=</span><span class="m">16</span><span class="w">  </span><span class="c1"># 虽然变量名写gpus，但在NPU环境下指NPU卡数</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+*   <strong>核心硬件：</strong> <code>trainer.device=npu</code>。这很关键，说明你用的不是英伟达的 GPU，而是 <strong>华为昇腾 NPU</strong>（通常指 910B 等芯片）。
+*   <strong>调度指挥：</strong> <code>Ray</code>。这是一个分布式计算框架。因为模型太大（14B参数），单张卡放不下，或者训练太慢，需要用 Ray 把多台机器（Node）连起来一起算。
+*   <strong>规模：</strong> 这是一个大阵仗，动用了多个节点，每个节点有 16 张卡。</p>
+<hr />
+<h3>✅ Task 3: 搞清楚“训练规则是什么？”（算法核心）</h3>
+<p><strong>任务目标：</strong> 理解如何“教育”这个模型。
+<strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nv">adv_estimator</span><span class="o">=</span>grpo<span class="w">          </span><span class="c1"># 核心算法：GRPO</span>
+<span class="nv">n_resp_per_prompt</span><span class="o">=</span><span class="m">16</span><span class="w">        </span><span class="c1"># 每个问题让模型生成16个回答</span>
+<span class="nv">use_kl_in_reward</span><span class="o">=</span>False<span class="w">      </span><span class="c1"># 是否在奖励里惩罚它偏离原模型（这里关掉了）</span>
+<span class="nv">max_prompt_length</span><span class="o">=</span><span class="k">$((</span><span class="m">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">2</span><span class="k">))</span><span class="w">  </span><span class="c1"># 问题最长多长</span>
+<span class="nv">max_response_length</span><span class="o">=</span><span class="k">$((</span><span class="m">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">20</span><span class="k">))</span><span class="w"> </span><span class="c1"># 回答允许非常长（适合长思维链 CoT）</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+这是 GRPO 算法的典型特征：
+1.  <strong>出题：</strong> 给模型一个数学题。
+2.  <strong>群策群力：</strong> 让模型一口气生成 <strong>16 个不同的答案</strong> (<code>n_resp_per_prompt=16</code>)。
+3.  <strong>打分对比：</strong> 比较这 16 个答案，谁对谁错，谁的步骤好。
+4.  <strong>限制长度：</strong> 允许模型进行很长的思考（20k token），这通常是为了训练它像人类一样进行“思维链”推理。</p>
+<hr />
+<h3>✅ Task 4: 搞清楚“怎么塞进显存里？”（性能优化）</h3>
+<p><strong>任务目标：</strong> 模型很大，显存有限，怎么优化？
+<strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nv">sp_size</span><span class="o">=</span><span class="m">2</span><span class="w">             </span><span class="c1"># 序列并行 (Sequence Parallel)</span>
+<span class="nv">offload</span><span class="o">=</span>True<span class="w">          </span><span class="c1"># 显存不够，把参数卸载到内存</span>
+<span class="nv">gen_tp</span><span class="o">=</span><span class="m">2</span><span class="w">              </span><span class="c1"># 生成时的张量并行 (Tensor Parallel)</span>
+actor_rollout_ref...fsdp_config...<span class="w"> </span><span class="c1"># FSDP 全分片数据并行</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+14B 的模型在训练时占用的显存非常大。这里用了一堆技术手段来“切分”模型：
+*   <strong>TP (Tensor Parallel) / SP (Sequence Parallel)：</strong> 把模型切开，横着切或竖着切，分给不同的卡处理。这里 <code>sp_size=2</code> 意味着长文本被切分到了 2 张卡上处理。
+*   <strong>Offload：</strong> 如果显存实在不够，就把暂时不用的数据搬到 CPU 内存里去（虽然慢点，但能跑通）。
+*   <strong>FSDP：</strong> 把模型的参数和优化器状态打碎，散落在所有卡上，用的时候再拼起来。</p>
+<hr />
+<h3>✅ Task 5: 搞清楚“数据从哪来？”（食材）</h3>
+<p><strong>任务目标：</strong> 确认训练数据。
+<strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nv">TRAIN_FILE</span><span class="o">=</span>.../dapo-math-17k.parquet<span class="w">  </span><span class="c1"># 训练集：数学题</span>
+<span class="nv">TEST_FILE</span><span class="o">=</span>.../aime-2024.parquet<span class="w">       </span><span class="c1"># 测试集：AIME 数学竞赛题</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+*   这再次印证了 Task 1 的猜想。这是一个<strong>数学能力的强化训练</strong>。
+*   训练集是 <code>dapo-math</code>，测试集是高难度的 <code>AIME</code> 竞赛题。</p>
+<hr />
+<h3>总结：这段代码在讲一个什么故事？</h3>
+<p>如果用人话把这个脚本翻译一遍，它是对机器说：</p>
+<blockquote>
+<p>“嘿，Ray（调度员），帮我启动一个任务。</p>
+<p>我们要训练 <strong>Qwen3-14B</strong> 这个模型。
+用 <strong>华为 NPU</strong> 集群来跑。</p>
+<p><strong>训练方法是：</strong> 给它做 <strong>Math 17k</strong> 的数学题。每道题让它写 <strong>16 个</strong> 不同的解题过程。我们用 <strong>GRPO</strong> 算法来分析这些答案，好的奖励，坏的惩罚。</p>
+<p><strong>注意事项：</strong>
+1. 允许它写很长（2万字以内）的思考过程。
+2. 如果显存不够，就开启 <strong>Offload</strong> 和 <strong>切分并行（SP=2）</strong>。
+3. 各种超参数（学习率、Batch Size）我都列在下面了，照着做。”</p>
+</blockquote>
+<p><strong>现在的建议：</strong>
+你不需要逐行读懂每一个参数（比如 <code>clip_ratio</code> 这种是微调数学公式的），你只需要知道：<strong>这是一个针对 Qwen 14B 模型的数学推理能力强化学习脚本，运行在 NPU 集群上。</strong></p>

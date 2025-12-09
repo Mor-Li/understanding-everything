@@ -1,0 +1,77 @@
+<h1>examples/multimodal/image_processing.py</h1>
+<p>这份代码确实包含了很多图像处理的细节，特别是针对现代多模态大模型（如 InternVL, LLaVA 等）的<strong>动态分辨率（Dynamic High Resolution）</strong>处理逻辑。如果不了解背景，确实很难看懂。</p>
+<p>别担心，我们把它想象成一个<strong>“把图片喂给AI之前的厨房”</strong>。我为你列了一个学习任务清单（To-Do List），我们按照这个顺序，一步一步把这个文件“吃透”。</p>
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1：理解核心目标</strong> —— 为什么要写这个文件？</li>
+<li><strong>Task 2：准备调料 (Normalization)</strong> —— 顶部的那些数字是干嘛的？</li>
+<li><strong>Task 3：基础烹饪 (Build Transform)</strong> —— 如何把一张图变成模型能懂的数字？</li>
+<li><strong>Task 4：高级刀工 (Dynamic Tiling)</strong> —— 这是最难的部分，如何处理长条形或不规则图片？</li>
+<li><strong>Task 5：大厨总管 (ImageTransform)</strong> —— 怎么把上面所有步骤封装起来？</li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>Task 1：理解核心目标</h4>
+<p><strong>观点：</strong> 计算机视觉模型（Vision Encoder）不能直接看 <code>.jpg</code> 图片，它们只能看特定形状、特定数值范围的<strong>张量（Tensor）</strong>。
+<strong>解释：</strong> 这个文件的作用就是把用户上传的各种各样的图片（大的、小的、长的、扁的），转换成模型训练时见过的标准格式。</p>
+<hr />
+<h4>Task 2：准备调料 (Normalization)</h4>
+<p><strong>代码位置：</strong> 开头的一大堆 <code>IMAGENET_PIXEL_MEAN</code>, <code>pixel_statistics</code> 等。
+<strong>观点：</strong> 不同的模型（CLIP, SigLIP, InternViT）口味不同，必须“对味”才能通过。
+<strong>解释：</strong>
+*   <strong>归一化 (Normalization)：</strong> 比如 <code>IMAGENET_PIXEL_MEAN</code>。模型在训练时，输入的图片数据是经过减去均值（Mean）、除以标准差（Std）处理的。
+*   <strong>字典映射：</strong> <code>pixel_statistics</code> 这个字典告诉程序：如果你用的是 <code>clip</code> 模型，就用 CLIP 的参数；如果用 <code>siglip</code>，就用 SigLIP 的参数。
+*   <strong>作用：</strong> 保证推理（Inference）时的数据分布和训练（Training）时一致，否则模型效果会大打折扣。</p>
+<hr />
+<h4>Task 3：基础烹饪 (Build Transform)</h4>
+<p><strong>代码位置：</strong> 最底部的 <code>_build_transform</code> 函数。
+<strong>观点：</strong> 这是最简单的处理流程，适用于不需要切片的简单图片。
+<strong>解释：</strong> 这个函数建立了一个“流水线”（Compose）：
+1.  <strong>Convert RGB：</strong> 哪怕是黑白图或带透明度的图，统统转成 3通道 RGB。
+2.  <strong>Resize：</strong> 把图片暴力拉伸/压缩成正方形（比如 <code>448x448</code>）。
+3.  <strong>ToTensor：</strong> 把像素值从 0-255 变成 0.0-1.0 的浮点数。
+4.  <strong>Normalize：</strong> 用 Task 2 里的参数进行标准化。</p>
+<blockquote>
+<p><strong>注意：</strong> 代码里还专门处理了 <code>huggingface</code> 的模型，直接调用 HF 官方的处理器，省事。</p>
+</blockquote>
+<hr />
+<h4>Task 4：高级刀工 (Dynamic Tiling) —— <strong>核心难点</strong></h4>
+<p><strong>代码位置：</strong> <code>find_closest_aspect_ratio</code>, <code>dynamic_preprocess</code>。
+<strong>观点：</strong> 简单的 Resize 会让长图变形（比如把长颈鹿压扁）。为了看清细节，我们需要把大图<strong>切成</strong>多个小图块（Tiles）。
+<strong>解释：</strong> 这是源自 <strong>InternVL</strong> 等模型的技术。</p>
+<ol>
+<li>
+<p><strong><code>find_closest_aspect_ratio</code> (切几刀？)：</strong></p>
+<ul>
+<li>假设你有一张很长的全景图。</li>
+<li>这个函数会计算：我是把它切成 <code>1x2</code>（横着两块），还是 <code>1x3</code>，还是 <code>2x2</code>？</li>
+<li>它会在 <code>min_num</code> 到 <code>max_num</code> 之间寻找一个最接近原图长宽比的切分方案。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>dynamic_preprocess</code> (开始切)：</strong></p>
+<ul>
+<li><strong>Resize：</strong> 先把原图缩放到“目标块数 x 块大小”的尺寸。</li>
+<li><strong>Crop (切分)：</strong> 按照算好的网格（比如 2x2），把图切成 4 个 <code>448x448</code> 的小图。</li>
+<li><strong>Thumbnail (缩略图)：</strong> <em>这步很关键！</em> 除了切片看细节，通常还会把<strong>整张原图</strong>缩放成一个 <code>448x448</code> 的图作为“全局视野”。</li>
+<li><strong>结果：</strong> 输入一张大图，输出一个列表 <code>[全局缩略图, 切片1, 切片2, ...]</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Task 5：大厨总管 (ImageTransform)</h4>
+<p><strong>代码位置：</strong> <code>class ImageTransform</code>。
+<strong>观点：</strong> 这是一个对外接口，它决定是用“简单模式”还是“高级切片模式”。
+<strong>解释：</strong>
+*   <strong><code>__init__</code>：</strong> 初始化时，根据模型类型（如 <code>siglip</code>）准备好 Task 3 中的基础转换器 <code>self._transform</code>。
+*   <strong><code>__call__</code> (被调用时)：</strong>
+    *   <strong>情况 A (<code>use_tiling=True</code>)：</strong> 调用 <code>dynamic_preprocess</code> 把图切成好几块 -&gt; 对每一块分别做基础转换 -&gt; 返回一堆 Tensor。
+    *   <strong>情况 B (<code>use_tiling=False</code>)：</strong> 直接对原图做基础转换 -&gt; 返回一个 Tensor。</p>
+<h3>📝 总结 (Summary)</h3>
+<p>这个文件就是为了解决 <strong>“如何把人类看的图片，完美地喂给多模态大模型”</strong> 这个问题。</p>
+<ol>
+<li>它存了各种模型的<strong>口味参数</strong>（均值/方差）。</li>
+<li>它提供了<strong>切图算法</strong>（Dynamic Tiling），防止长图被压扁，保证模型既能看到全局（缩略图），又能看清细节（切片）。</li>
+<li>它把这些逻辑封装成了一个 <code>ImageTransform</code> 类，供训练或推理代码直接调用。</li>
+</ol>
+<p><strong>一句话概括：</strong> 这是一个支持<strong>动态分辨率切片</strong>的智能图片预处理器。</p>

@@ -1,0 +1,117 @@
+<h1>tests/unit_tests/distributed/test_torch_fully_sharded_parallel.py</h1>
+<p>这份代码确实涉及了很多深度学习系统（System）层面的概念，特别是关于<strong>模型并行（Model Parallelism）</strong>和<strong>FSDP（Fully Sharded Data Parallel）</strong>的。如果没接触过Megatron-LM或分布式训练，看不懂是很正常的。</p>
+<p>简单来说，这是一个<strong>单元测试（Unit Test）</strong>文件。它的目的是测试 Megatron-Core 库中的 <code>TorchFullyShardedDataParallel</code> 这个类是否能正常工作。</p>
+<p>为了让你读懂，我制定了一个 <strong>“学习任务清单 (Todo List)”</strong>，我们一步一步来拆解这个文件。</p>
+<hr />
+<h3>📋 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>【概念】理解什么是 FSDP (Fully Sharded Data Parallel)</strong></li>
+<li><strong>【准备】看懂“小白鼠”模型 (<code>DummyModel</code>)</strong></li>
+<li><strong>【环境】理解测试前的准备 (<code>init_model_parallel</code>)</strong></li>
+<li><strong>【核心】拆解主测试函数 (<code>test_fsdp2_constructor</code>)</strong></li>
+<li><strong>【验证】看懂它是如何检查结果的 (Assertions)</strong></li>
+<li><strong>【进阶】理解第二个测试用例 (Process Group)</strong></li>
+</ol>
+<hr />
+<h3>📜 逐步讲解</h3>
+<h4>1. 【概念】理解什么是 FSDP</h4>
+<ul>
+<li><strong>背景</strong>：现在的模型（如GPT）太大，一张显卡装不下。</li>
+<li><strong>FSDP (Fully Sharded Data Parallel)</strong>：这是一种技术，它把模型的参数、梯度等数据“切碎”（Sharded），分散存放到多张显卡上。</li>
+<li><strong>Wrapper（包装器）</strong>：在PyTorch中，FSDP通常像一层“包装纸”一样包裹住你的模型。包裹之后，模型在训练时就会自动处理这些切碎的数据。</li>
+<li><strong>本文目的</strong>：这个文件就是测试 Megatron 写的这个“包装纸”（<code>TorchFullyShardedDataParallel</code>）能不能正确地把模型包起来。</li>
+</ul>
+<h4>2. 【准备】看懂“小白鼠”模型 (<code>DummyModel</code>)</h4>
+<p>测试需要一个简单的模型做实验对象。请看代码中的 <code>class DummyModel(MegatronModule):</code></p>
+<ul>
+<li><strong>它的结构</strong>：<ul>
+<li><code>self.linear</code>: 一个普通的 PyTorch 线性层。</li>
+<li><code>self.column_parallel_linear</code>: 一个 Megatron 特有的并行线性层。</li>
+<li><code>self.conv</code>: 一个卷积层。</li>
+</ul>
+</li>
+<li><strong>关键点</strong>：注意这行代码 <code>_fsdp_modules = [torch.nn.Linear]</code>。<ul>
+<li>这是在告诉系统：“除了默认要切分的层之外，请把普通的 <code>torch.nn.Linear</code> 也切分（Wrap）掉。”</li>
+<li>这就像给包装工人的便利贴：“把这个也包起来。”</li>
+</ul>
+</li>
+</ul>
+<h4>3. 【环境】理解测试前的准备 (<code>init_model_parallel</code>)</h4>
+<p>请看 <code>@pytest.fixture</code> 装饰的 <code>init_model_parallel</code> 函数。</p>
+<ul>
+<li><strong>作用</strong>：这是 Pytest 的“夹具”。它会在运行测试前，把“虚拟的分布式环境”搭建好（比如模拟有多张显卡），并在测试结束后清理现场。</li>
+<li><strong>忽略细节</strong>：你只需要知道，有了它，代码才能假装自己在多卡环境下运行。</li>
+</ul>
+<h4>4. 【核心】拆解主测试函数 (<code>test_fsdp2_constructor</code>)</h4>
+<p>这是最重要的部分。</p>
+<ul>
+<li><strong>版本检查</strong>：<code>if not is_torch_min_version("2.4.0"):</code><ul>
+<li>FSDP2 是 PyTorch 新版本特性，旧版本跑不了，直接跳过。</li>
+</ul>
+</li>
+<li><strong>配置与实例化</strong>：<ul>
+<li>创建了 <code>TransformerConfig</code>（模型配置）和 <code>DistributedDataParallelConfig</code>（分布式配置）。</li>
+<li><code>model = DummyModel(config)</code>: 造出了上面的“小白鼠”模型。</li>
+</ul>
+</li>
+<li><strong>关键动作</strong>：
+    <code>python
+    fsdp_model = TorchFullyShardedDataParallel(config, ddp_config, model)</code><ul>
+<li><strong>这就是在测试的核心功能！</strong> 它把普通的 <code>model</code> 塞进了 <code>TorchFullyShardedDataParallel</code> 这个包装器里。</li>
+<li>我们期望的结果是：这个包装器会遍历模型内部的层，根据规则，把该包的层包上 FSDP，不该包的不管。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 【验证】看懂它是如何检查结果的 (Assertions)</h4>
+<p>包装完了，怎么知道对不对？通过检查每一层是否变成了 <code>FSDP</code> 开头的类。</p>
+<p>定义了一个辅助函数 <code>_is_fsdp_wrapped_module</code>，只要类名以 "FSDP" 开头，就说明被包住了。</p>
+<ul>
+<li>
+<p><strong>检查点 1</strong>：
+    <code>python
+    assert _is_fsdp_wrapped_module(fsdp_model.module.module.linear)</code></p>
+<ul>
+<li><strong>结果</strong>：必须为 True。</li>
+<li><strong>原因</strong>：因为在 <code>DummyModel</code> 里我们手动写了 <code>_fsdp_modules = [torch.nn.Linear]</code>，所以普通线性层<strong>应该</strong>被包住。</li>
+</ul>
+</li>
+<li>
+<p><strong>检查点 2</strong>：
+    <code>python
+    assert _is_fsdp_wrapped_module(fsdp_model.module.module.column_parallel_linear)</code></p>
+<ul>
+<li><strong>结果</strong>：必须为 True。</li>
+<li><strong>原因</strong>：Megatron 默认就会把并行层（如 <code>ColumnParallelLinear</code>）包起来，这是系统默认行为。</li>
+</ul>
+</li>
+<li>
+<p><strong>检查点 3 (反向测试)</strong>：
+    <code>python
+    assert not _is_fsdp_wrapped_module(fsdp_model.module.module.conv)</code></p>
+<ul>
+<li><strong>结果</strong>：必须为 <strong>False</strong>（即 <code>not True</code>）。</li>
+<li><strong>原因</strong>：卷积层 <code>Conv2d</code> 既不在默认列表里，也不在我们的手动列表里。所以它<strong>不应该</strong>被包住。这证明了包装器没有“乱包东西”。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 【进阶】理解第二个测试用例 (<code>...with_process_group</code>)</h4>
+<p>这个测试函数 <code>test_fsdp2_constructor_with_process_group</code> 和上面几乎一样，只多了一个参数。</p>
+<ul>
+<li><strong>Process Group (进程组)</strong>：在分布式训练中，决定哪些显卡是一组的。</li>
+<li><strong>测试点</strong>：
+    <code>python
+    fsdp_model = TorchFullyShardedDataParallel(
+        ..., process_group=custom_process_group
+    )
+    assert fsdp_model.process_group is custom_process_group</code><ul>
+<li>这里测试的是：如果用户手动指定了“通信组”，这个类能不能正确识别并存下来，而不是用默认的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结 (Takeaway)</h3>
+<p>这篇文章其实就在讲一件事：</p>
+<blockquote>
+<p><strong>“嘿，Megatron，我写了一个 FSDP 包装器。我现在要测试一下：当我把一个模型扔进去时，它能不能按照我的白名单（默认支持的层 + 我手动指定的层）正确地给模型穿上‘FSDP马甲’，同时放过那些不需要穿马甲的层？”</strong></p>
+</blockquote>
+<p>现在再回看代码，是不是清晰多了？</p>

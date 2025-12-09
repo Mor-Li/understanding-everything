@@ -1,0 +1,74 @@
+<h1>recipe/r1_ascend/README.md</h1>
+<p>这份文档确实写得非常硬核，因为它是一份<strong>技术配方（Recipe）</strong>，主要面向的是那些手里有华为昇腾（Ascend）算力卡，并且想复现 DeepSeek-R1-Zero 这种强化学习训练的高级算法工程师。</p>
+<p>简单来说，这份文档讲的是：<strong>“如何把 DeepSeek-V3-Base 这个大模型，搬到华为昇腾 NPU 上，用 GRPO 算法进行强化学习训练，让它学会思考。”</strong></p>
+<p>为了让你看懂，我把它拆解成两个部分：
+1.  <strong>一份通俗易懂的“任务清单（To-Do List）”</strong>：如果你要干这件事，你需要按顺序做哪些步骤。
+2.  <strong>分步观点解读</strong>：文中提到的那些复杂的修改，到底是想解决什么问题。</p>
+<hr />
+<h3>第一部分：任务清单 (Task To-Do List)</h3>
+<p>如果老板让你照着这个文档跑起来，你的工作流程应该是这样的：</p>
+<p><strong>阶段一：环境搭建 (搭台子)</strong>
+*   [ ] <strong>准备硬件</strong>：你需要华为昇腾 Atlas 800T A3 服务器（文档里用了128张卡，这规模很大）。
+*   [ ] <strong>搞定基础软件</strong>：
+    *   阅读中文文档 <code>ascend_quick_start.rst</code> 配置基础环境。
+    *   或者直接用 Docker 构建镜像（推荐）。
+*   [ ] <strong>下载并魔改源码</strong>：
+    *   下载 <code>verl</code> (强化学习框架)。
+    *   下载 <code>vLLM</code> (推理框架) 并切换到指定版本。
+    *   下载 <code>vLLM-Ascend</code> (适配昇腾的版本)。
+    *   下载 <code>MindSpeed</code> (华为的大模型训练框架)。
+    *   <strong>关键动作</strong>：把上面下载的这些库的代码，复制粘贴覆盖到 <code>verl</code> 目录里（这是为了打补丁）。</p>
+<p><strong>阶段二：数据准备 (备课本)</strong>
+*   [ ] <strong>下载数据</strong>：去 HuggingFace 下载 <code>deepscaler.json</code> 数据集。
+*   [ ] <strong>格式转换</strong>：运行脚本 <code>json_to_parquet.py</code>。
+    *   <em>注意</em>：这个脚本会自动给数据加上 <code>&lt;think&gt;...&lt;/think&gt;</code> 这种模板，为了激发模型的思考能力。</p>
+<p><strong>阶段三：模型权重准备 (请老师)</strong>
+*   [ ] <strong>下载模型</strong>：下载 DeepSeek-V3-Base 的 FP8 权重（需要650GB磁盘）。
+*   [ ] <strong>修改配置</strong>：替换 <code>config.json</code>，去掉一些昇腾暂时不支持的配置（如 MTP）。
+*   [ ] <strong>权重转换</strong>：把 FP8 格式转成 BF16 格式（这步需要巨大的磁盘空间，1.3TB）。
+*   [ ] <strong>权重切分</strong>：因为模型太大（671B），单机内存放不下。需要用脚本把模型切碎（Sharding），切成分布式权重。</p>
+<p><strong>阶段四：代码微调 (修Bug)</strong>
+*   [ ] <strong>修改策略代码</strong>：在 <code>megatron_actor.py</code> 里改几行代码，确保 On-Policy 训练时概率计算的数值精确性。</p>
+<p><strong>阶段五：开始训练 (开跑)</strong>
+*   [ ] <strong>运行脚本</strong>：执行 <code>bash ./recipe/r1_ascend/ray_start_grpo_npu.sh</code>，开始烧钱训练。</p>
+<hr />
+<h3>第二部分：逐步解读文中的核心观点</h3>
+<p>文档的每个部分其实都在回答一个问题：“为什么要这么做？”</p>
+<h4>1. 为什么要做这么多“代码修改”？ (Implementation Details)</h4>
+<p>文档在“Implementation Details”里列了一堆修改点，核心观点是：<strong>开源软件（vLLM/PyTorch）对华为 NPU 的原生支持还不够完美，我们需要手动打补丁。</strong></p>
+<ul>
+<li><strong>观点 1（奖励函数）：</strong> 既然是强化学习，得告诉模型什么是对的。作者写了个简单的规则：格式对不对？答案对不对？（参考了 GSM8K 的做法）。</li>
+<li><strong>观点 2（内存管理）：</strong> NPU 在“睡眠”时内存释放不干净。<ul>
+<li><em>动作</em>：手动写代码控制模型权重和缓存（KV Cache）的搬进搬出（Offloading/Onloading）。</li>
+</ul>
+</li>
+<li><strong>观点 3（并行通信）：</strong> vLLM 在 NPU 上跑专家并行（Expert Parallelism）有问题。<ul>
+<li><em>动作</em>：手动修复通信组的构建逻辑，让 NPU 之间能正确“聊天”。</li>
+</ul>
+</li>
+<li><strong>观点 4（编译加速）：</strong> 华为的训练框架 MindSpeed 有个坑，训练时开 <code>torch.compile</code> 会报错，但推理时不开又慢。<ul>
+<li><em>动作</em>：写个补丁，让它“推理时开启编译，训练时关闭编译”。</li>
+</ul>
+</li>
+<li><strong>观点 5（内存踩踏）：</strong> 多个缓存操作同时进行会导致内存混乱（Memory Trampling）。<ul>
+<li><em>动作</em>：修复 <code>engine_core.py</code> 里的调度逻辑。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 训练配置说明了什么？ (Training Details)</h4>
+<ul>
+<li><strong>观点 1（资源消耗）：</strong> 这是一个<strong>巨无霸</strong>任务。<ul>
+<li>使用了 128 张 A3 NPU 卡。</li>
+<li>采用了极其复杂的并行策略：TP2（张量并行）+ EP256（专家并行）+ PP8（流水线并行）。</li>
+<li><em>人话</em>：这模型太大，一张卡根本装不下，必须切碎了放在几百张卡里一起跑。</li>
+</ul>
+</li>
+<li><strong>观点 2（性能）：</strong> 即使这么大阵仗，吞吐量大概是 95.5 tokens/秒/卡。这数据是用来给后来者做参考基准的。</li>
+</ul>
+<h4>3. 为什么要特别处理数据和权重？ (Quick Start)</h4>
+<ul>
+<li><strong>数据观点：</strong> DeepSeek-R1 的核心是“思考链”。所以在数据转换时，必须强行插入 <code>&lt;think&gt;</code> 标签模板，强迫模型在输出答案前先输出思考过程。</li>
+<li><strong>权重观点：</strong> 原版模型是 FP8（8位精度，为了省显存），但为了训练稳定，必须转回 BF16（16位精度）。而且因为模型太大，普通 CPU 内存（2TB）都处理不了切分任务，必须用 64 张 NPU 一起协作才能把权重切好。</li>
+</ul>
+<h3>总结</h3>
+<p>这篇文档在说：<strong>“要在国产昇腾卡上复现 DeepSeek 的强化学习训练，虽然硬件支持了，但软件层面还有很多坑。我们（作者）已经把这些坑（内存泄漏、编译失败、并行通信）都填好了，代码都在这儿，你只要照着我给的‘变态’硬件配置和繁琐步骤操作，就能跑通。”</strong></p>

@@ -1,0 +1,82 @@
+<h1>examples/multimodal/radio/radio_g.py</h1>
+<p>这份代码确实非常抽象，因为它不是在“写逻辑”（比如 <code>if a &gt; b then c</code>），而是在<strong>“写配置单”</strong>（Configuration）。</p>
+<p>它是基于 NVIDIA 的 <strong>Megatron-Core</strong> 框架写的。你可以把它想象成你在组装一台超级电脑，这份文件就是在列出“显卡用什么型号”、“内存用什么牌子”、“主板怎么插”。</p>
+<p>为了让你看懂，我制定了一个 <strong>6步走的学习 Task List</strong>。我们一步一步来拆解这份“配置单”。</p>
+<hr />
+<h3>📝 学习任务清单 (Task List)</h3>
+<h4>✅ Task 1: 理解这份文件的核心目的</h4>
+<p><strong>核心观点</strong>：这不是在运行模型，而是在<strong>定义</strong>模型长什么样。
+*   <strong>背景</strong>：Megatron-Core 是 NVIDIA 用来训练超大模型（像 GPT-4 这种级别）的库。
+*   <strong>ModuleSpec 是什么</strong>：代码里到处都是 <code>ModuleSpec</code>。你可以把它理解为<strong>“图纸”</strong>。
+    *   普通代码：直接盖房子（实例化对象）。
+    *   <code>ModuleSpec</code>：画一张图纸，告诉施工队（Megatron 框架）：“这里我要一个窗户，窗户的材质是玻璃”。
+*   <strong>RADIO-G 是什么</strong>：从文件名看，这是 NVIDIA 的一个多模态模型（RADIO），这份文件定义了它的 Transformer 层的结构。</p>
+<hr />
+<h4>✅ Task 2: 检查工具箱 (Imports &amp; Try-Except)</h4>
+<p><strong>核心观点</strong>：看看手里有哪些“加速外挂”可以用。</p>
+<p>代码开头的一大堆 <code>try...except</code> 是在检查环境：
+1.  <strong>TE (Transformer Engine)</strong>:
+    *   <code>HAVE_TE = True</code>：这是 NVIDIA 的大杀器，专门为 H100/A100 显卡优化的库。如果装了它，计算速度会飞快。
+2.  <strong>Apex / FusedLayerNorm</strong>:
+    *   这是另一个加速库。代码在检查：“有没有装 Apex？有的话用 <code>FusedLayerNorm</code>（融合归一化），没有的话就用 PyTorch 自带的慢一点的 <code>WrappedTorchNorm</code>。”</p>
+<hr />
+<h4>✅ Task 3: 定义“肌肉”部件 (MLP)</h4>
+<p><strong>核心观点</strong>：定义 Transformer 中的前馈神经网络（MLP）部分。</p>
+<p>请看函数 <code>get_mlp_module_spec</code>：
+*   <strong>任务</strong>：定义一个最基础的 MLP（多层感知机）。
+*   <strong>细节</strong>：
+    *   它包含两层线性层：<code>linear_fc1</code> 和 <code>linear_fc2</code>。
+    *   <strong>并行化 (Parallel)</strong>：注意看 <code>ColumnParallelLinear</code> 和 <code>RowParallelLinear</code>。这是 Megatron 的精髓。为了在多张显卡上跑，它把大矩阵切开了。第一层竖着切（Column），第二层横着切（Row），这样能把计算分摊到不同显卡上。</p>
+<hr />
+<h4>✅ Task 4: 定义“普通版”图纸 (Standard Layer Spec)</h4>
+<p><strong>核心观点</strong>：组合出一个标准的、通用的 Transformer 层。</p>
+<p>请看函数 <code>get_radio_g_layer_spec(normalization)</code>：
+这是构建一整层楼（Layer）的图纸。</p>
+<ol>
+<li><strong>Normalization (归一化)</strong>：<ul>
+<li>代码先判断你要用 <code>LayerNorm</code> 还是 <code>RMSNorm</code>，然后选好对应的零件（是普通的还是加速版的）。</li>
+</ul>
+</li>
+<li><strong>Attention (注意力机制)</strong>：<ul>
+<li><code>attn_mask_type = AttnMaskType.no_mask</code>：这很重要。说明这个模型<strong>不使用遮罩</strong>（不像 GPT 那样只能看左边的词）。这通常意味着它是用来处理图像（Vision）或者理解任务的，因为它可以同时看到所有信息。</li>
+</ul>
+</li>
+<li><strong>LayerScaling (层缩放)</strong>：<ul>
+<li><code>module=LayerScalingTransformerLayer</code>：它没有用普通的 TransformerLayer，而是用了带 Scaling（缩放）的版本。这通常是为了让模型训练更稳定。</li>
+</ul>
+</li>
+<li><strong>组装</strong>：<ul>
+<li>它把 <code>input_layernorm</code>（输入归一化）、<code>self_attention</code>（自注意力）、<code>mlp</code>（上面定义的肌肉）全部填到了 <code>submodules</code> 里。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 5: 定义“竞速版”图纸 (TE Layer Spec)</h4>
+<p><strong>核心观点</strong>：利用 NVIDIA 的黑科技（Transformer Engine）进行极致优化。</p>
+<p>请看函数 <code>get_radio_g_layer_spec_te()</code>：
+如果不差钱、显卡好（比如有 H800），就用这个配置。</p>
+<ul>
+<li><strong>融合 (Fusion)</strong>：<ul>
+<li>注意看 MLP 部分变成了 <code>get_norm_mlp_module_spec_te</code>。</li>
+<li>里面的零件变成了 <code>TELayerNormColumnParallelLinear</code>。</li>
+<li><strong>这是啥意思？</strong> 普通做法是：先做 Norm，存结果，再做 Linear。TE 的做法是：<strong>一边做 Norm 一边直接做 Linear</strong>，中间不存结果，速度极快。</li>
+</ul>
+</li>
+<li><strong>Attention 的变化</strong>：<ul>
+<li>用了 <code>TEDotProductAttention</code>（TE 优化的点积注意力）。</li>
+<li><code>pre_mlp_layernorm=IdentityOp</code>：因为上面的 MLP 已经把 Norm 融合进去了，所以这里原本放 Norm 的地方就放了一个 <code>IdentityOp</code>（空操作/占位符），避免重复计算。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 6: 总结全貌</h4>
+<p><strong>核心观点</strong>：这份文件就是给系统两个选择。</p>
+<p>当你运行训练脚本时，系统会问：“你的环境支持 TE 吗？”
+*   <strong>支持</strong> -&gt; 调用 <code>get_radio_g_layer_spec_te()</code> -&gt; 获得一份全融合、极致并行的图纸 -&gt; <strong>跑得飞快</strong>。
+*   <strong>不支持</strong> -&gt; 调用 <code>get_radio_g_layer_spec()</code> -&gt; 获得一份标准的、兼容性好的图纸 -&gt; <strong>也能跑，但慢点</strong>。</p>
+<h3>💡 简单回顾 (TL;DR)</h3>
+<ol>
+<li><strong>文件作用</strong>：给 Megatron 模型提供架构配置图纸。</li>
+<li><strong>核心技术</strong>：用了模型并行（Tensor Parallel）和层缩放（Layer Scaling）。</li>
+<li><strong>主要逻辑</strong>：根据你有没有安装 NVIDIA 的加速库 (TE)，提供“普通版”和“极速版”两套构建方案。</li>
+</ol>

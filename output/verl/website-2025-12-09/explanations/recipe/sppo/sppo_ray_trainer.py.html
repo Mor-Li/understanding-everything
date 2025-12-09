@@ -1,0 +1,140 @@
+<h1>recipe/sppo/sppo_ray_trainer.py</h1>
+<p>这份代码实现了一个基于 <strong>Ray</strong>（分布式计算框架）的 <strong>SPPO (Self-Play Preference Optimization)</strong> 训练器。</p>
+<p>简单来说，这是一个<strong>训练大模型（LLM）的管家</strong>。它的工作是指挥多个计算节点（Worker），让模型自己生成数据、自己根据奖励打分，然后根据“虽然没有裁判（Critic模型），但我知道我比平均水平好多少”的逻辑来更新模型。</p>
+<p>为了让你看懂，我把它拆解成三个部分：<strong>核心观点（它想干啥）</strong>、<strong>任务清单（流程是啥）</strong>、<strong>逐行/逐块解析（代码细节）</strong>。</p>
+<hr />
+<h3>一、 核心观点 (The Core Idea)</h3>
+<p>这个文件的核心观点是实现 <strong>SPPO 算法</strong>。与传统的 PPO（Proximal Policy Optimization）相比，SPPO 在这里体现了几个关键不同点：</p>
+<ol>
+<li><strong>抛弃 Critic (评论家模型)</strong>：传统的 PPO 需要一个 Critic 模型来预测“当前状态好不好”。SPPO 在这里显式地将 <code>self.use_critic</code> 设为 <code>False</code>。</li>
+<li><strong>软平均 (SoftMean) 基线</strong>：它不依赖 Critic 来计算优势（Advantage），而是利用同一批次生成的多个结果的奖励（Reward），计算一个“软平均值”作为基准线。</li>
+<li><strong>优势计算 (Advantage Calculation)</strong>：<ul>
+<li><em>传统 PPO</em>：优势 = 实际奖励 - Critic预测的奖励。</li>
+<li><em>SPPO</em>：优势 = 实际奖励 - SoftMean(这一批的奖励)。</li>
+<li><strong>直白理解</strong>：只要我的表现比这一批生成的“加权平均水平”好，我就应该被鼓励。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>二、 任务清单 (Task To-Do List)</h3>
+<p>想象这个脚本是一个<strong>监考老师</strong>，他要负责提升班级（模型）的成绩。他的工作流程如下：</p>
+<ol>
+<li><strong>[准备] 初始化考场</strong>：分配资源，连接各个计算节点（Ray），加载模型，关闭 Critic 模式。</li>
+<li><strong>[考试] 学生答题 (Rollout)</strong>：让 Actor（演员/学生）模型根据题目（Prompt）生成一批答案。</li>
+<li><strong>[阅卷] 计算分数 (Reward)</strong>：用奖励模型（Reward Model）或者规则给这些答案打分。</li>
+<li><strong>[复盘] 计算概率 (Log Prob)</strong>：计算学生生成这些字词时的原始概率，以及参考模型（Reference Model）的概率（防止跑偏）。</li>
+<li><strong>[分析] 计算相对优势 (Advantage - 核心步骤)</strong>：<ul>
+<li>计算这一批分数的 SoftMean（软平均值）。</li>
+<li>计算每个答案相对于平均值的“优势”。</li>
+</ul>
+</li>
+<li><strong>[教学] 更新模型 (Update)</strong>：根据“优势”调整模型参数。分数高的答案对应的生成路径，下次生成的概率要提高。</li>
+<li><strong>[记录] 写日志</strong>：记录这一轮的平均分、训练步数，保存进度。</li>
+</ol>
+<hr />
+<h3>三、 逐步讲解 (Step-by-Step Code Walkthrough)</h3>
+<p>我们按照代码的执行逻辑，一步步看它是怎么完成上面这个 To-Do List 的。</p>
+<h4>1. 工具函数：数学核心</h4>
+<p>代码最开头定义了两个函数，这是 SPPO 的灵魂。</p>
+<ul>
+<li><strong><code>softmean(x, beta)</code></strong>:<ul>
+<li><strong>作用</strong>：计算软平均值。公式是 $\frac{1}{\beta} \log (\frac{1}{n} \sum e^{\beta x_i})$。</li>
+<li><strong>观点</strong>：当 $\beta$ 很大时，它接近最大值；当 $\beta=0$ 时，它是普通平均值。这是一种平滑的基准线计算方式。</li>
+</ul>
+</li>
+<li><strong><code>compute_advantage(data, beta)</code></strong>:<ul>
+<li><strong>作用</strong>：计算优势。</li>
+<li><strong>逻辑</strong>：<code>rewards - softmean(rewards)</code>。</li>
+<li><strong>人话</strong>：你的得分减去大家的软平均分，就是你的“优势”。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 类初始化：<code>RaySPPOTrainer</code></h4>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">RaySPPOTrainer</span><span class="p">(</span><span class="n">RayPPOTrainer</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="c1"># ... 初始化配置 ...</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_critic</span> <span class="o">=</span> <span class="kc">False</span>  <span class="c1"># &lt;--- 重点！SPPO 不需要 Critic 模型</span>
+        <span class="c1"># ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这里继承了 PPO 训练器，但修改了关键设定，禁用了 Critic，说明这是一个 Policy-based 的方法，不依赖 Value function。</li>
+</ul>
+<h4>3. 训练主循环：<code>fit()</code></h4>
+<p>这是 <code>fit</code> 函数内部的逻辑流：</p>
+<p><strong>Step 1: 验证与准备</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 加载存档，做一次初始验证</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">_load_checkpoint</span><span class="p">()</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">val_reward_fn</span> <span class="o">...</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_validate</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>Step 2: 开始 Epoch 循环 (for epoch in ...)</strong>
+进入数据加载循环，拿到一批提示词（Prompts）。</p>
+<p><strong>Step 3: 生成 (Rollout)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">simple_timer</span><span class="p">(</span><span class="s2">&quot;gen&quot;</span><span class="p">,</span> <span class="n">timing_raw</span><span class="p">):</span>
+    <span class="c1"># 让 Actor 模型生成文本</span>
+    <span class="n">gen_batch_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">actor_rollout_wg</span><span class="o">.</span><span class="n">generate_sequences</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：模型根据 Prompt 写作文。</li>
+</ul>
+<p><strong>Step 4: 数据整理</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 给每条数据打上唯一 ID (uid)</span>
+<span class="n">batch</span><span class="o">.</span><span class="n">non_tensor_batch</span><span class="p">[</span><span class="s2">&quot;uid&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="o">...</span>
+<span class="c1"># 平衡不同 GPU 之间的数据量</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">trainer</span><span class="o">.</span><span class="n">balance_batch</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_balance_batch</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Step 5: 计算奖励 (Reward)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">simple_timer</span><span class="p">(</span><span class="s2">&quot;reward&quot;</span><span class="p">,</span> <span class="n">timing_raw</span><span class="p">):</span>
+    <span class="c1"># 调用 RM (Reward Model) 给作文打分</span>
+    <span class="n">reward_tensor</span><span class="p">,</span> <span class="o">...</span> <span class="o">=</span> <span class="n">compute_reward</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">reward_fn</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：阅卷老师打分。</li>
+</ul>
+<p><strong>Step 6: 重新计算概率 (Old Log Prob)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">simple_timer</span><span class="p">(</span><span class="s2">&quot;old_log_prob&quot;</span><span class="p">,</span> <span class="n">timing_raw</span><span class="p">):</span>
+    <span class="c1"># 计算生成这些文本时的概率，用于后续 PPO Loss 计算</span>
+    <span class="n">old_log_prob</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">actor_rollout_wg</span><span class="o">.</span><span class="n">compute_log_prob</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Step 7: 参考模型概率 (Ref Log Prob)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_reference_policy</span><span class="p">:</span>
+    <span class="c1"># 计算 Reference Model 的概率，用于计算 KL 散度，防止模型改动太大</span>
+    <span class="n">ref_log_prob</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ref_policy_wg</span><span class="o">.</span><span class="n">compute_ref_log_prob</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Step 8: 计算优势 (Advantage) —— SPPO 的核心差异</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">simple_timer</span><span class="p">(</span><span class="s2">&quot;adv&quot;</span><span class="p">,</span> <span class="n">timing_raw</span><span class="p">):</span>
+    <span class="c1"># ... 获取奖励分数 ...</span>
+
+    <span class="c1"># 核心差异点在这里！</span>
+    <span class="n">beta</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">algorithm</span><span class="o">.</span><span class="n">sppo_eta</span>
+    <span class="c1"># 调用之前定义的函数，用 SoftMean 计算优势</span>
+    <span class="n">batch</span> <span class="o">=</span> <span class="n">compute_advantage</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">beta</span><span class="o">=</span><span class="n">beta</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这里没有调用 <code>compute_gae</code> (PPO常用的)，而是用了 <code>compute_advantage</code>。这意味着它不关心“状态价值”，只关心“在这个Batch里我排第几”。</li>
+</ul>
+<p><strong>Step 9: 更新模型 (Update Actor)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 注意：代码里虽然有 if self.use_critic: ... 但因为 init 里设为 False，所以跳过 Critic 更新</span>
+
+<span class="c1"># 更新 Actor 模型</span>
+<span class="k">with</span> <span class="n">simple_timer</span><span class="p">(</span><span class="s2">&quot;update_actor&quot;</span><span class="p">,</span> <span class="n">timing_raw</span><span class="p">):</span>
+    <span class="n">actor_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">actor_rollout_wg</span><span class="o">.</span><span class="n">update_actor</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：根据 Step 8 算出来的优势，调整模型参数。优势大的样本，其生成概率会被拉高。</li>
+</ul>
+<p><strong>Step 10: 收尾</strong>
+*   验证 (Validate)
+*   保存模型 (Save Checkpoint)
+*   打印日志 (Logger)</p>
+<h3>总结</h3>
+<p>这个文件其实就是一个<strong>简化版、改了算分逻辑的 PPO</strong>。
+你只需要记住：<strong>它把 PPO 里负责打分的裁判（Critic）开除了，改用“全班同学这次考试的平均分（SoftMean）”作为基准线来衡量每个学生的表现。</strong></p>

@@ -1,0 +1,78 @@
+<h1>megatron/core/extensions/TransformerEngineMixedPrecision.md</h1>
+<p>这份文档确实写得很技术化，充满了术语。它主要讲的是<strong>Megatron框架中如何使用Transformer Engine (TE) 进行更精细的混合精度训练配置</strong>。</p>
+<p>简单来说，以前我们训练模型，通常是“一刀切”：要么全用BF16，要么全用FP8。但这个文档介绍了一种功能，允许你<strong>针对具体的某一层（Layer）</strong>来指定它使用什么精度。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>5步的学习任务清单 (To-Do List)</strong>，我们一步一步来看：</p>
+<hr />
+<h3>✅ Task 1: 理解核心目标 (为什么要搞这个？)</h3>
+<p><strong>原文对应：</strong> <code># About</code> 和 <code>## Design Goals</code></p>
+<ul>
+<li><strong>背景：</strong> 在训练大模型时，我们经常用 FP8（8位浮点数）来加速。但有时候，某些特定的层（比如Attention里的某些计算）如果用了 FP8，模型效果会变差，或者容易崩溃。</li>
+<li><strong>痛点：</strong> 以前只能全局开启或关闭 FP8。</li>
+<li><strong>解决方案：</strong> 这个文档介绍了一个新参数 <code>--te-precision-config-file</code>。</li>
+<li><strong>核心观点：</strong><ul>
+<li>允许你传入一个配置文件。</li>
+<li>你可以决定网络中<strong>哪些模块</strong>使用 FP8，<strong>哪些模块</strong>保持 BF16/FP16。</li>
+<li>这就叫“细粒度控制 (Fine-grained control)”。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>通俗比喻：</strong> 以前装修房子，只能全屋刷白墙或者全屋贴壁纸。现在允许你：客厅贴壁纸（FP8），但卧室刷白墙（BF16）。</p>
+</blockquote>
+<hr />
+<h3>✅ Task 2: 学习“配方” (怎么定义精度？)</h3>
+<p><strong>原文对应：</strong> <code>## Recipe configuration</code> 和 <code>configs:</code> 代码块</p>
+<ul>
+<li><strong>概念：</strong> 文档里提到了 <code>Recipe</code>（配方/食谱）。在这里，一个配方就是一种“精度设置”。</li>
+<li><strong>你需要看懂的配置：</strong>
+    在配置文件里，你需要定义几种模式。文档举了几个例子：<ol>
+<li><strong><code>mxfp8</code></strong>: 训练时用 FP8 格式。</li>
+<li><strong><code>bf16</code></strong>: 训练时用 BF16 格式（不量化，精度更高）。</li>
+<li><strong><code>mxfp8_evaluate_bf16</code></strong>: 这是一个混合技。<strong>训练(Training)</strong> 时为了快用 FP8，但在<strong>验证(Validation/Evaluation)</strong> 时为了测得准，切回 BF16。</li>
+<li><strong><code>nvfp4_evaluate_bf16</code></strong>: 训练用更激进的 FP4，验证用 BF16。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>关键点：</strong> 你得先在字典里定义好这些“套餐”，后面才能给不同的层分配套餐。</p>
+</blockquote>
+<hr />
+<h3>✅ Task 3: 学习“点名” (怎么选中特定的层？)</h3>
+<p><strong>原文对应：</strong> <code>matchers:</code> 代码块</p>
+<ul>
+<li><strong>概念：</strong> 定义好“配方”后，你需要告诉程序，谁吃哪种配方。这通过 <code>Matchers</code>（匹配器）来实现。</li>
+<li><strong>机制：</strong> 使用通配符（glob style）来匹配层的名字。</li>
+<li><strong>文档中的例子解读：</strong><ul>
+<li><code>pattern: "*.linear_qkv"</code> -&gt; 只要名字里带 <code>linear_qkv</code> 的层（通常是注意力机制里的），就给它分配 <code>bf16</code> 配方。</li>
+<li><code>pattern: "*mixer.out_proj"</code> -&gt; 只要名字带 <code>mixer.out_proj</code> 的层（Mamba模型里的），就给它分配 <code>mxfp8</code> 配方。</li>
+</ul>
+</li>
+<li><strong>优先级：</strong> 系统会按顺序检查，一旦匹配上，就用那个配置。如果都没匹配上，就用默认的全局设置。</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 理解“训练 vs 验证”的分离</h3>
+<p><strong>原文对应：</strong> <code>## Validation precision</code></p>
+<ul>
+<li><strong>观点：</strong> 训练（学习过程）和验证（考试过程）可以使用不同的精度。</li>
+<li><strong>为什么这么做？</strong><ul>
+<li>如果你在验证集上也用 FP8，可能会因为精度损失导致你看不到模型真实的表现。</li>
+<li><strong>Baseline隔离：</strong> 文档建议在验证时使用高精度（如 BF16），这样你可以区分出“是模型没学好”还是“是FP8量化导致测不准”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 了解局限性 (有什么坑？)</h3>
+<p><strong>原文对应：</strong> <code>## Limitations</code></p>
+<ul>
+<li><strong>坑 1 (初始化)：</strong> 这种配置是在模型初始化<strong>之后</strong>生效的。这意味着你不能通过这个配置来改变参数在显存里的存储格式（比如 <code>fp8-param</code>），只能改变计算时的精度。</li>
+<li><strong>坑 2 (兼容性)：</strong> 这种自定义精度目前还没完全验证是否能跟 <code>cuda-graphs</code>（一种加速技术）或 <code>activation recompute</code>（重计算，省显存技术）完美配合。如果开启了这些，可能会报错。</li>
+<li><strong>坑 3 (覆盖范围)：</strong> Megatron 代码里有些地方是硬编码读取全局配置的，你的这个配置文件可能覆盖不到那些角落。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇文档就是在使用说明书，教你写一个 YAML 配置文件。</p>
+<p><strong>核心逻辑是：</strong>
+1.  写一个 YAML 文件。
+2.  在 <code>configs</code> 里定义几种精度模式（全FP8、全BF16、训练FP8+验证BF16）。
+3.  在 <code>matchers</code> 里写规则，通过名字（如 <code>*.linear_qkv</code>）选中特定的层，强制它们使用上面定义的某种模式。
+4.  运行训练脚本时，加上参数 <code>--te-precision-config-file 你的文件.yaml</code>。</p>

@@ -1,0 +1,96 @@
+<h1>recipe/entropy/32b_clip_cov.sh</h1>
+<p>这个脚本确实看起来非常复杂，因为它是一个用于<strong>大规模模型分布式强化学习（RL）训练</strong>的配置文件。</p>
+<p>简单来说，这个脚本的作用是：<strong>配置好所有参数，然后启动一个训练任务，让 Qwen2.5-32B 这个大模型通过强化学习（具体是 GRPO 算法的一个变体）变得更聪明。</strong></p>
+<p>为了让你听懂，我把理解这个脚本的过程拆解成一个 <strong>5步的 Task List (待办清单)</strong>，我们一步步来“通关”。</p>
+<hr />
+<h3>✅ Task 1: 搞清楚“我们在训练谁？在哪里训练？”</h3>
+<p><strong>关注代码块：</strong> 开头的基础设置部分。</p>
+<ul>
+<li><strong><code>project_name='Qwen2.5-32B'</code></strong>:<ul>
+<li><strong>解读</strong>：这是本次训练的主角。你正在训练通义千问 2.5 的 32B 版本。</li>
+</ul>
+</li>
+<li><strong><code>WANDB_API_KEY</code></strong>:<ul>
+<li><strong>解读</strong>：这是用来画图和监控训练过程的工具（Weights &amp; Biases）的钥匙。</li>
+</ul>
+</li>
+<li><strong><code>RAY_ADDRESS</code> / <code>NNODES</code></strong>:<ul>
+<li><strong>解读</strong>：这说明训练不是在一张显卡上跑的，而是用 <strong>Ray</strong> 这个框架在多台机器（Node）上分布式运行的。<code>NNODES=4</code> 意味着可能用了4台服务器一起跑。</li>
+</ul>
+</li>
+</ul>
+<p><strong>💡 总结</strong>：我们在一个多机集群上，准备训练 Qwen-32B 模型，并把训练数据上传到 WandB 监控。</p>
+<hr />
+<h3>✅ Task 2: 搞清楚“用什么方法训练？”（核心算法）</h3>
+<p><strong>关注代码块：</strong> <code>Algorithm</code> 和 <code>adv_estimator</code> 部分。</p>
+<ul>
+<li><strong><code>adv_estimator=grpo</code></strong>:<ul>
+<li><strong>解读</strong>：这是核心算法。<strong>GRPO (Group Relative Policy Optimization)</strong>。</li>
+<li><strong>通俗解释</strong>：传统的 PPO 算法需要一个额外的“老师模型”（Critic）来打分，但这很占显存。GRPO 的做法是：给同一个问题生成一组（Group）回答，让它们互相比较（Relative），谁好就学谁。这样可以省掉那个“老师模型”，节省显存。</li>
+</ul>
+</li>
+<li><strong><code>n_resp_per_prompt=8</code></strong>:<ul>
+<li><strong>解读</strong>：对于每一个问题，模型会生成 8 个不同的回答，然后在这 8 个回答里通过比较来学习。</li>
+</ul>
+</li>
+</ul>
+<p><strong>💡 总结</strong>：我们使用 GRPO 算法，让模型通过“自我生成、组内比较”的方式来学习，这样比传统 PPO 更省资源。</p>
+<hr />
+<h3>✅ Task 3: 搞清楚“本次实验的特殊之处”（Clip Cov）</h3>
+<p><strong>关注代码块：</strong> 文件名 <code>clip_cov</code> 和相关参数。</p>
+<ul>
+<li><strong><code>loss_mode="clip_cov"</code></strong>:<ul>
+<li><strong>解读</strong>：这是这个脚本最独特的地方。通常 GRPO 只是比较好坏，但这个实验加了一个特殊的限制机制，叫 <strong>Clip Covariance (剪裁协方差/方差)</strong>。</li>
+</ul>
+</li>
+<li><strong><code>clip_cov_ratio=0.0002</code> / <code>clip_cov_lb=1.0</code></strong>:<ul>
+<li><strong>解读</strong>：这些是控制参数。</li>
+<li><strong>通俗解释</strong>：在强化学习中，模型很容易“学过头”，导致输出变得很极端（比如只会重复某句话）。这些参数的作用是给模型的更新<strong>加一把锁</strong>。它限制了模型概率分布变化的幅度（Entropy/Covariance），确保模型在学习新东西的同时，不会丢失“多样性”或变得“太疯狂”。</li>
+</ul>
+</li>
+</ul>
+<p><strong>💡 总结</strong>：这不是普通的 GRPO，而是一种<strong>带防抖动机制</strong>的 GRPO。目的是让训练更稳定，防止模型学坏。</p>
+<hr />
+<h3>✅ Task 4: 搞清楚“硬件怎么吃得消？”（显存与性能）</h3>
+<p><strong>关注代码块：</strong> 各种 <code>bsz</code> (Batch Size) 和 <code>length</code>。</p>
+<ul>
+<li><strong><code>max_prompt_length</code> / <code>max_response_length</code></strong>:<ul>
+<li><strong>解读</strong>：限制输入 2048 token，输出 8192 token。这是为了防止显存爆掉。</li>
+</ul>
+</li>
+<li><strong><code>train_prompt_bsz=256</code></strong>:<ul>
+<li><strong>解读</strong>：训练的总批次大小。</li>
+</ul>
+</li>
+<li><strong><code>actor_rollout_ref.actor.fsdp_config.param_offload=${offload}</code></strong>:<ul>
+<li><strong>解读</strong>：FSDP (Fully Sharded Data Parallel) 是一种显存优化技术。这里设置了是否要把参数卸载到 CPU 内存（offload），用来在显存不够时救急。</li>
+</ul>
+</li>
+</ul>
+<p><strong>💡 总结</strong>：这一大堆参数都是为了在有限的显卡资源下，尽可能塞入更多的数据进行训练，同时防止 OOM (Out Of Memory)。</p>
+<hr />
+<h3>✅ Task 5: 执行发射指令（Python 命令）</h3>
+<p><strong>关注代码块：</strong> 最后那一大段 <code>HYDRA_FULL_ERROR=1 python -m ...</code>。</p>
+<ul>
+<li><strong><code>python -m recipe.entropy.main_entropy</code></strong>:<ul>
+<li><strong>解读</strong>：这是真正的启动命令。它运行了 Python 代码。</li>
+</ul>
+</li>
+<li><strong><code>data.train_files="${TRAIN_FILE}" ...</code></strong>:<ul>
+<li><strong>解读</strong>：你看到的后面那几十行缩进的代码，其实全都是<strong>传参</strong>。</li>
+<li>Bash 脚本把上面定义的变量（如 <code>lr</code>, <code>batch_size</code>），通过这种 <code>key=value</code> 的格式，全部喂给了 Python 程序。这个 Python 程序使用了 <strong>Hydra</strong> 配置库，所以格式是点号分隔的（如 <code>actor.optim.lr</code>）。</li>
+</ul>
+</li>
+</ul>
+<p><strong>💡 总结</strong>：最后这一步就是把上面准备好的所有“食材”（变量），一股脑倒进锅里（Python脚本），开始烹饪（训练）。</p>
+<hr />
+<h3>🚀 极简版总结 (Takeaway)</h3>
+<p>如果你要向老板汇报这个脚本在干嘛，你可以这么说：</p>
+<blockquote>
+<p>“这是一个针对 <strong>Qwen2.5-32B</strong> 模型的<strong>分布式强化学习</strong>启动脚本。</p>
+<ol>
+<li>它使用的是 <strong>GRPO 算法</strong>（比 PPO 更省显存）。</li>
+<li>它开启了一个叫 <strong>Clip Covariance</strong> 的特殊实验配置，目的是<strong>控制模型更新的幅度，防止训练不稳定</strong>。</li>
+<li>它配置了多机多卡环境（Ray + FSDP），并设置好了数据路径和超参数，最后调用 Python 代码开始训练。”</li>
+</ol>
+</blockquote>

@@ -1,0 +1,115 @@
+<h1>recipe/gkd/main_gkd.py</h1>
+<p>这份代码是一个<strong>分布式训练任务的启动脚本</strong>。</p>
+<p>简单来说，它的作用就像是一个<strong>“工程总指挥”</strong>。它负责读取图纸（配置）、搭建工地（初始化Ray集群）、招募工人（分配GPU资源）、准备材料（下载模型和数据），最后一声令下开始干活（开始训练）。</p>
+<p>这个脚本的具体任务是运行一个叫 <strong>"On-Policy Distill"（在线策略蒸馏）</strong> 的训练任务。这通常用于大模型的强化学习（RLHF）或者特定的微调阶段。</p>
+<p>为了让你更容易理解，我把代码的执行逻辑拆解成了一个 <strong>“任务清单 (Todo List)”</strong>。代码运行的过程，就是按顺序打勾完成下面这些事项的过程：</p>
+<hr />
+<h3>📋 任务清单：GKD 在线蒸馏训练流程</h3>
+<h4>第一阶段：前期准备 (Main Process)</h4>
+<p>在这个阶段，程序刚启动，主要是在做环境配置。</p>
+<ol>
+<li>
+<p><strong>[ ] 读取任务说明书 (Configuration)</strong></p>
+<ul>
+<li><strong>代码位置:</strong> <code>@hydra.main(...)</code></li>
+<li><strong>解释:</strong> 使用 <code>Hydra</code> 工具加载配置文件（比如学习率多少、用几张卡、模型路径在哪）。这是整个任务的“图纸”。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 搭建施工现场 (Initialize Ray)</strong></p>
+<ul>
+<li><strong>代码位置:</strong> <code>ray.init(...)</code></li>
+<li><strong>解释:</strong> 启动 <code>Ray</code> 分布式计算框架。你可以把 Ray 想象成一个包工头，它负责管理所有的机器和 CPU/GPU 资源。这里还设置了一些环境变量（比如 VLLM 的日志级别、CUDA 设置）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 聘请现场指挥官 (Spawn TaskRunner)</strong></p>
+<ul>
+<li><strong>代码位置:</strong> <code>runner = TaskRunner.remote(...)</code> 和 <code>ray.get(...)</code></li>
+<li><strong>解释:</strong> 为了不阻塞主线程，代码创建了一个远程的 <code>TaskRunner</code>（任务运行器）。接下来的所有脏活累活，都交给这个指挥官在后台去完成。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>第二阶段：指挥官进场 (Inside TaskRunner)</h4>
+<p>现在进入 <code>TaskRunner.run()</code> 方法内部，这是实际干活的地方。</p>
+<ol>
+<li>
+<p><strong>[ ] 核对图纸 (Check Config)</strong></p>
+<ul>
+<li><strong>代码位置:</strong> <code>pprint(...)</code>, <code>OmegaConf.resolve(...)</code></li>
+<li><strong>解释:</strong> 把最终确定的配置打印出来，方便人类检查参数对不对。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 搬运原材料 (Download Model)</strong></p>
+<ul>
+<li><strong>代码位置:</strong> <code>copy_to_local(...)</code></li>
+<li><strong>解释:</strong> 训练需要基于一个旧模型。这一步把模型文件从远程存储（如 HDFS）下载到本地机器，或者加载到共享内存中。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 准备翻译工具 (Load Tokenizer)</strong></p>
+<ul>
+<li><strong>代码位置:</strong> <code>tokenizer = hf_tokenizer(...)</code></li>
+<li><strong>解释:</strong> 加载分词器（Tokenizer），用于把人类的文字转换成模型能看懂的数字。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 检查工具版本 (Version Check)</strong></p>
+<ul>
+<li><strong>代码位置:</strong> <code>if config...name in ["vllm"]...</code></li>
+<li><strong>解释:</strong> 检查推理框架 <code>vllm</code> 的版本是否够新。如果用了 LoRA 技术但版本太老，就直接报错罢工。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 组建施工队 (Define Workers)</strong></p>
+<ul>
+<li><strong>代码位置:</strong> <code>if config...strategy == "megatron": ...</code></li>
+<li><strong>解释:</strong> 这是一个大模型训练，需要分工。代码定义了两种角色的工人：<ul>
+<li><strong>Rollout Worker (采样工):</strong> 负责用模型生成数据（写作业）。</li>
+<li><strong>Actor Worker (学习工):</strong> 负责根据数据更新模型参数（根据作业改错）。</li>
+<li>这里指定了使用 <code>Megatron</code> 架构来实现这些工人。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 分配工位 (Resource Allocation)</strong></p>
+<ul>
+<li><strong>代码位置:</strong> <code>ResourcePoolManager(...)</code></li>
+<li><strong>解释:</strong> 根据配置文件，计算需要多少个节点（Node）和 GPU。<ul>
+<li>比如：Actor 组分给 4 张卡，Rollout 组分给 4 张卡。确保大家都有地方坐，互不冲突。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 准备教材 (Load Dataset)</strong></p>
+<ul>
+<li><strong>代码位置:</strong> <code>train_dataset = RLHFDataset(...)</code></li>
+<li><strong>解释:</strong> 加载训练数据和验证数据。这些是模型要学习的内容。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 启动总教练 (Init Trainer)</strong></p>
+<ul>
+<li><strong>代码位置:</strong> <code>trainer = OnPolicyDistillTrainer(...)</code></li>
+<li><strong>解释:</strong> 初始化核心训练器。把上面准备好的分词器、工人名单、资源池、数据集全部塞给它。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 开始特训 (Start Training)</strong></p>
+<ul>
+<li><strong>代码位置:</strong> <code>trainer.init_workers()</code> 然后 <code>trainer.fit()</code></li>
+<li><strong>解释:</strong><ul>
+<li><code>init_workers()</code>: 让所有工人在 GPU 上把模型加载起来，准备就绪。</li>
+<li><code>fit()</code>: 正式开始循环训练（生成数据 -&gt; 计算奖励 -&gt; 更新模型 -&gt; 重复）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这篇代码实际上就是一个<strong>胶水代码（Glue Code）</strong>。它自己不包含复杂的数学公式，而是负责把数据读取、分布式框架（Ray）、大模型训练框架（Megatron/vLLM）和具体的训练算法（OnPolicyDistillTrainer）<strong>组装</strong>在一起，让它们能协同工作。</p>

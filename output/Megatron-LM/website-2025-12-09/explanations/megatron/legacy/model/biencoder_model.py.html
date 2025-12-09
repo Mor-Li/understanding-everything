@@ -1,0 +1,90 @@
+<h1>megatron/legacy/model/biencoder_model.py</h1>
+<p>这份代码确实涉及很多深度学习框架（Megatron-LM）的底层细节，乍一看很容易晕。</p>
+<p>简单来说，这个文件定义了一个<strong>“双塔模型”（Bi-Encoder）</strong>。这是在搜索、推荐系统或RAG（检索增强生成）中非常经典的模型架构。它的核心作用是：<strong>把“问题”和“答案（或文档）”分别变成向量，看看它们匹不匹配。</strong></p>
+<p>为了让你听懂，我把阅读这份代码的过程拆解成一个 <strong>“打造一个智能搜索引擎”</strong> 的 To-Do List（任务清单）。我们一步步来看代码是如何完成这些任务的。</p>
+<hr />
+<h3>任务清单：如何打造一个双塔检索模型</h3>
+<h4>Task 1: 定义基础单元——我们需要一个“大脑”来读懂文字</h4>
+<p><strong>目标</strong>：我们需要一个能把文字转换成数学向量的模型（BERT）。
+<strong>代码对应</strong>：<code>class PretrainedBertModel</code> (代码后半部分)</p>
+<ul>
+<li><strong>它的工作</strong>：这是一个标准的 BERT 模型。</li>
+<li><strong>关键逻辑</strong>：<ul>
+<li><code>get_language_model</code>: 召唤一个 BERT 语言模型。</li>
+<li><code>forward</code> 函数中的 <code>pooled_output = lm_output[0, :, :]</code>: 这里取出了 BERT 输出的第一个 Token（也就是 <code>[CLS]</code> 标记）的向量。这就好比读完一篇文章，让你用一句话总结中心思想。</li>
+<li><code>projection_enc</code>: 如果设置了 <code>biencoder_projection_dim</code>，它会加一个全连接层（Linear Layer），把那个很长的向量压缩一下（比如从 1024 维压缩到 128 维），为了节省存储空间。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 搭建架构——我们需要“两座塔”</h4>
+<p><strong>目标</strong>：搜索是两个东西的匹配：一个是用户的<strong>搜索词（Query）</strong>，一个是数据库里的<strong>文档（Context）</strong>。我们需要两个大脑分别处理它们。
+<strong>代码对应</strong>：<code>class BiEncoderModel</code> 的 <code>__init__</code> 部分</p>
+<ul>
+<li><strong>它的工作</strong>：这是整个文件的核心类，它像一个容器，里面装着两个 BERT。</li>
+<li><strong>关键逻辑</strong>：<ul>
+<li><code>self.query_model</code>: 专门用来读“搜索词”的 BERT（左塔）。</li>
+<li><code>self.context_model</code>: 专门用来读“文档/段落”的 BERT（右塔）。</li>
+<li><strong>特殊情况</strong>：<code>biencoder_shared_query_context_model</code>。代码里有个判断，如果设为 True，那么“左塔”和“右塔”其实是同一个 BERT（共享权重）。这意味着处理问题和处理答案用的是同一个脑子。如果不共享，就是两个独立的脑子。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 规定工作流程——数据进来怎么走？</h4>
+<p><strong>目标</strong>：当数据喂给模型时，规定好谁去处理什么。
+<strong>代码对应</strong>：<code>class BiEncoderModel</code> 的 <code>forward</code> 方法</p>
+<ul>
+<li><strong>它的工作</strong>：这是模型的“流水线”控制台。</li>
+<li><strong>关键逻辑</strong>：<ol>
+<li>你给它 <code>query_tokens</code>（问题），它调用 <code>self.query_model</code>，算出问题的向量 <code>query_logits</code>。</li>
+<li>你给它 <code>context_tokens</code>（文档），它调用 <code>self.context_model</code>，算出文档的向量 <code>context_logits</code>。</li>
+<li>最后把这两个向量都返回给你。</li>
+<li><em>下一步隐含操作（不在代码里）</em>：通常拿到这两个向量后，你会算它们的“点积”或“余弦相似度”。相似度越高，说明这个文档越能回答这个问题。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 4: 初始化技能——不能从零开始学</h4>
+<p><strong>目标</strong>：BERT 如果从零训练太慢了，我们需要加载别人训练好的通用 BERT 模型（比如 Google 发布的，或者之前预训练好的），然后在此基础上微调。
+<strong>代码对应</strong>：<code>BiEncoderModel</code> 的 <code>init_state_dict_from_bert</code> 方法</p>
+<ul>
+<li><strong>它的工作</strong>：这是“继承遗产”的一步。</li>
+<li><strong>关键逻辑</strong>：<ul>
+<li>读取 <code>args.bert_load</code> 路径下的 Checkpoint。</li>
+<li>把加载进来的通用 BERT 权重，分别塞进我们的 <code>query_model</code>（左塔）和 <code>context_model</code>（右塔）。</li>
+<li>这一步通常在训练的最开始（Iteration 0）执行，也就是所谓的 ICT（Inverse Cloze Task）预训练的准备阶段。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 打包与保存——方便以后使用</h4>
+<p><strong>目标</strong>：模型训练一半需要保存，或者需要加载之前的进度。
+<strong>代码对应</strong>：<code>state_dict_for_save_checkpoint</code> 和 <code>load_state_dict</code></p>
+<ul>
+<li><strong>它的工作</strong>：管理存档。</li>
+<li><strong>关键逻辑</strong>：<ul>
+<li>因为我们有两个塔，保存的时候不能只保存一个。代码里写了逻辑：如果有共享模型就存一份；如果不共享，就分别保存 <code>query_model</code> 和 <code>context_model</code> 的参数。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: 制造工厂——对外提供接口</h4>
+<p><strong>目标</strong>：为了让 Megatron 的训练主程序能方便地创建这个模型，需要一个统一的入口函数。
+<strong>代码对应</strong>：<code>get_model_provider</code> 和 <code>biencoder_model_provider</code></p>
+<ul>
+<li><strong>它的工作</strong>：这是一个“工厂模式”的函数。</li>
+<li><strong>关键逻辑</strong>：<ul>
+<li>它接收参数（比如是只要 Query 模型，还是要共享模型）。</li>
+<li>它实例化 <code>BiEncoderModel</code> 类并返回。</li>
+<li>它还加了一个断言（Assert）：<code>Model parallel size &gt; 1 not supported</code>。这说明这个特定的双塔模型代码目前不支持把一个模型切碎了放在多张卡上跑（Model Parallelism），每张卡必须跑一个完整的模型。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件就是<strong>用 Megatron 框架实现的一个双塔（Bi-Encoder）检索模型</strong>。</p>
+<ol>
+<li><strong>输入</strong>：你的问题 + 候选文档。</li>
+<li><strong>处理</strong>：<ul>
+<li><strong>PretrainedBertModel</strong> 把文字变成向量。</li>
+<li><strong>BiEncoderModel</strong> 指挥两个 BERT 分别处理问题和文档。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：问题的向量 + 文档的向量。</li>
+</ol>
+<p>它的主要用途是作为<strong>神经检索器（Neural Retriever）</strong>，比如在训练 REALM 或 Retro 等 RAG 模型时，用来从海量数据中捞出相关的文章。</p>

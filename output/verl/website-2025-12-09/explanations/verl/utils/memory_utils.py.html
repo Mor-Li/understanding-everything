@@ -1,0 +1,88 @@
+<h1>verl/utils/memory_utils.py</h1>
+<p>这份代码文件 <code>verl/utils/memory_utils.py</code> 其实是一个<strong>GPU 显存管理的工具箱</strong>。</p>
+<p>在训练大模型（LLM）时，显存（GPU Memory）是最宝贵的资源。如果显存爆了（OOM - Out Of Memory），程序就会崩溃。这个文件的作用就是帮程序员<strong>监控</strong>、<strong>清理</strong>和<strong>调试</strong>显存的使用情况。</p>
+<p>为了让你更容易理解，我把你当作一个<strong>显卡管理员</strong>，这份代码就是你的<strong>操作手册</strong>。我们可以把这个文件的功能拆解成下面这个 <strong>Task To-Do List（任务清单）</strong>：</p>
+<h3>📋 显卡管理员的任务清单 (Task List)</h3>
+<ol>
+<li><strong>【大扫除】强制清理显存</strong>：当显存快满时，暴力回收垃圾。</li>
+<li><strong>【看仪表盘】查看和记录当前状态</strong>：看看现在用了多少显存，还剩多少。</li>
+<li><strong>【切换模式】根据场景优化配置</strong>：是“训练模式”还是“推理模式”？调整显存占用上限。</li>
+<li><strong>【装监控】开启显存录像</strong>：为了查Bug，开启显存使用的历史记录。</li>
+<li><strong>【取录像】导出显存快照</strong>：把记录下来的显存使用情况保存成文件，拿去分析。</li>
+</ol>
+<hr />
+<p>接下来，我按照这个清单，一步步给你讲代码里是怎么实现的：</p>
+<h3>1. 【大扫除】强制清理显存</h3>
+<p><strong>对应函数：</strong> <code>aggressive_empty_cache</code></p>
+<p>你有没有遇到过电脑很卡，然后你疯狂点击“内存清理”球？这个函数就是干这个的，而且它很“暴力”（Aggressive）。</p>
+<ul>
+<li><strong>它的逻辑</strong>：<ol>
+<li><strong>GC (Garbage Collection)</strong>：先叫 Python 的垃圾回收机制，把不再用的变量扔掉。</li>
+<li><strong>Empty Cache</strong>：告诉 PyTorch，“把你占着茅坑不拉屎的显存（Reserved但未Allocated）还给操作系统”。</li>
+<li><strong>重试机制</strong>：它有一个 <code>for</code> 循环，默认试 3 次。如果清理出来的空间不到 1GB，它就不试了；如果还能清出很多，它就继续清。</li>
+<li><strong>同步 (Synchronize)</strong>：<code>force_sync=True</code> 会强制 GPU 把手头的活儿干完再清理，确保清理得更干净。</li>
+</ol>
+</li>
+</ul>
+<h3>2. 【看仪表盘】查看和记录当前状态</h3>
+<p><strong>对应函数：</strong>
+*   <code>reset_memory_stats</code> (重置计数器)
+*   <code>get_memory_info</code> (获取数据)
+*   <code>log_memory_usage</code> (打印日志)</p>
+<p>作为管理员，你得随时知道显存用了多少。</p>
+<ul>
+<li><strong>核心指标</strong>：<ul>
+<li><strong>Total</strong>: 显卡总共有多少显存（比如 A100 80G）。</li>
+<li><strong>Allocated (已分配)</strong>：你的模型和数据实际占用了多少。</li>
+<li><strong>Reserved (已预留)</strong>：PyTorch 找显卡申请了多少（PyTorch 为了快，通常会多申请一些拿在手里备用，这部分叫 Cache）。</li>
+</ul>
+</li>
+<li><strong>代码逻辑</strong>：<code>log_memory_usage</code> 会调用 <code>get_memory_info</code>，算出上面这几个数值，然后打印一行日志，告诉你：“现在是训练阶段，用了 40GB，预留了 50GB”。</li>
+</ul>
+<h3>3. 【切换模式】根据场景优化配置</h3>
+<p><strong>对应函数：</strong>
+*   <code>optimize_memory_for_inference</code> (推理优化)
+*   <code>optimize_memory_for_training</code> (训练优化)</p>
+<p>训练和推理对显存的需求不同，这个代码提供了两种“套餐”。</p>
+<ul>
+<li><strong>推理模式 (Inference)</strong>：<ul>
+<li>这时候模型不更新参数，不需要存梯度的中间状态。</li>
+<li><strong>策略</strong>：比较激进，允许程序占用 <strong>95%</strong> 的显存 (<code>set_per_process_memory_fraction(0.95)</code>)，并且做一次大扫除。</li>
+</ul>
+</li>
+<li><strong>训练模式 (Training)</strong>：<ul>
+<li>训练时显存波动大，容易崩。</li>
+<li><strong>策略</strong>：稍微保守一点，限制只用 <strong>90%</strong> 的显存，留 10% 当缓冲安全区，防止突然溢出。</li>
+</ul>
+</li>
+</ul>
+<h3>4. 【装监控】开启显存录像</h3>
+<p><strong>对应函数：</strong> <code>enable_memory_visualize</code></p>
+<p>这是用来<strong>查 Bug</strong> 的高级功能。比如你的程序跑着跑着突然炸了，你想知道炸之前显存里到底塞了什么东西。</p>
+<ul>
+<li><strong>它的逻辑</strong>：<ul>
+<li>它调用了 PyTorch 底层的 <code>_record_memory_history</code>。</li>
+<li>这就像给显存装了一个 CCTV 摄像头，它会记录每一次内存的申请（Alloc）和释放（Free）。</li>
+<li><strong>代码细节</strong>：你会看到里面有很多 <code>if-else</code> 和 <code>try-except</code>，那是为了兼容不同版本的 PyTorch（因为 PyTorch 这个功能的 API 经常变），它在努力适配各种情况。</li>
+</ul>
+</li>
+</ul>
+<h3>5. 【取录像】导出显存快照</h3>
+<p><strong>对应类：</strong> <code>class MemorySnapshotSampler</code>
+<strong>对应方法：</strong> <code>dump_memory_snapshot</code></p>
+<p>监控录像（步骤4）开启后，你需要把录像带拿出来看。</p>
+<ul>
+<li><strong>它的逻辑</strong>：<ul>
+<li>它会在硬盘上创建一个文件夹（比如 <code>./mem_snapshots</code>）。</li>
+<li>它会把当前 GPU 的显存历史记录保存成一个 <code>.pickle</code> 文件。</li>
+<li>文件名会包含时间戳、Rank（第几张卡）、PID（进程ID）。</li>
+</ul>
+</li>
+<li><strong>怎么用？</strong>：生成的这个文件，你可以上传到 <a href="https://pytorch.org/memory_viz">PyTorch Memory Viz</a> 这个网站，它会画出一张非常漂亮的火焰图，告诉你哪一行代码吃掉了你的显存。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个 <code>memory_utils.py</code> 文件不是什么复杂的算法，它就是<strong>后勤保障部</strong>：
+1.  <strong>平时</strong>：负责打扫卫生（<code>aggressive_empty_cache</code>）。
+2.  <strong>汇报</strong>：负责报告资源使用情况（<code>log_memory_usage</code>）。
+3.  <strong>出事了</strong>：负责调取监控录像，帮你分析为什么显存爆了（<code>enable_memory_visualize</code> + <code>dump_memory_snapshot</code>）。</p>

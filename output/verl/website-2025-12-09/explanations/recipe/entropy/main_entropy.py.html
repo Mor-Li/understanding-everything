@@ -1,0 +1,111 @@
+<h1>recipe/entropy/main_entropy.py</h1>
+<p>这份代码是一个基于 <strong>Ray</strong>（分布式计算框架）和 <strong>Hydra</strong>（配置管理工具）的 <strong>强化学习（RL）训练启动脚本</strong>。它的核心目的是启动一个 PPO（Proximal Policy Optimization）算法来训练大模型。</p>
+<p>简单来说，这个文件就像是一个<strong>“总包工头”</strong>，它的任务是把工人（GPU/计算节点）、原材料（数据）、图纸（模型配置）和质检标准（奖励函数）全部组装起来，然后按下“开始”按钮。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>Task To-Do List</strong>，按执行顺序一步步讲：</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>[读取图纸]</strong>: 加载配置文件（超参数、路径等）。</li>
+<li><strong>[搭建工地]</strong>: 初始化 Ray 分布式集群。</li>
+<li><strong>[指派项目经理]</strong>: 启动 <code>TaskRunner</code> 来负责具体调度。</li>
+<li><strong>[准备工具]</strong>: 下载模型权重，加载分词器（Tokenizer）。</li>
+<li><strong>[招募工人]</strong>: 定义并分配 Actor（演员）、Critic（评论家）和 Reward Model（奖励模型）的角色和显卡资源。</li>
+<li><strong>[制定评分标准]</strong>: 加载奖励函数（Reward Manager）。</li>
+<li><strong>[进货]</strong>: 加载训练数据和验证数据。</li>
+<li><strong>[开工]</strong>: 初始化训练器（Trainer）并开始循环训练（Fit）。</li>
+</ol>
+<hr />
+<h3>🧐 详细步骤解析</h3>
+<p>下面我结合代码，逐步解释上面列出的每一个 Task。</p>
+<h4>1. [读取图纸] 加载配置</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>@hydra.main(...)</code> 和 <code>def main(config)</code></li>
+<li><strong>解释</strong>:<ul>
+<li>程序入口。使用 <code>Hydra</code> 工具读取 <code>config/entropy_trainer.yaml</code> 里的配置。</li>
+<li><code>config</code> 对象里包含了所有你需要的信息：用什么模型、学习率是多少、数据在哪里等。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [搭建工地] 初始化 Ray</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>run_ppo</code> 函数中的 <code>if not ray.is_initialized(): ... ray.init(...)</code></li>
+<li><strong>解释</strong>:<ul>
+<li>Ray 是一个能让 Python 代码在多张显卡或多台机器上跑的工具。</li>
+<li>这一步是为了确保“计算集群”已经启动。如果是在本地跑，它会设置一些环境变量（如 <code>NCCL_DEBUG</code>）并启动 Ray。</li>
+</ul>
+</li>
+</ul>
+<h4>3. [指派项目经理] 启动 TaskRunner</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>runner = TaskRunner.remote()</code> 和 <code>ray.get(runner.run.remote(config))</code></li>
+<li><strong>解释</strong>:<ul>
+<li>为了不阻塞主线程，代码创建了一个 <code>TaskRunner</code> 类（这是一个 Ray Actor，相当于一个独立的进程）。</li>
+<li>所有的重活累活都扔给这个 <code>runner.run</code> 去做。</li>
+</ul>
+</li>
+</ul>
+<h4>4. [准备工具] 准备模型和分词器</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>TaskRunner.run</code> 内部<ul>
+<li><code>copy_to_local(...)</code></li>
+<li><code>tokenizer = hf_tokenizer(...)</code></li>
+</ul>
+</li>
+<li><strong>解释</strong>:<ul>
+<li><strong>下载模型</strong>: 训练的大模型通常很大，可能存储在 HDFS（云存储）上。这一步把它下载到本地硬盘。</li>
+<li><strong>加载分词器</strong>: 大模型听不懂中文或英文，只懂数字 token。<code>tokenizer</code> 负责把文字变成数字。</li>
+</ul>
+</li>
+</ul>
+<h4>5. [招募工人] 定义 Worker 策略</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}: ...</code></li>
+<li><strong>解释</strong>:<ul>
+<li>这是最复杂的调度部分。PPO 算法通常需要四个角色（Role）：<ol>
+<li><strong>Actor (演员)</strong>: 生成回答的模型（我们要训练的主角）。</li>
+<li><strong>Ref Policy (参考模型)</strong>: 原始模型，用来防止 Actor 跑偏（计算 KL 散度）。</li>
+<li><strong>Critic (评论家)</strong>: 预估当前状态价值的模型。</li>
+<li><strong>Reward Model (奖励模型)</strong>: 给 Actor 写的回答打分的模型。</li>
+</ol>
+</li>
+<li>代码根据配置（是使用 <code>FSDP</code> 切片技术还是 <code>Megatron</code> 并行技术）来决定加载哪种 Worker 类（比如 <code>ActorRolloutRefWorker</code>）。</li>
+<li><code>role_worker_mapping</code> 和 <code>resource_pool_manager</code> 负责把这些角色分配到具体的 GPU 上。</li>
+</ul>
+</li>
+</ul>
+<h4>6. [制定评分标准] 加载奖励函数</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>reward_fn = load_reward_manager(...)</code></li>
+<li><strong>解释</strong>:<ul>
+<li>强化学习的核心是“奖励”。</li>
+<li>这里加载了 <code>reward_fn</code>（训练用）和 <code>val_reward_fn</code>（验证用）。</li>
+<li>奖励可以是规则（比如输出长度限制），也可以是一个专门的模型（Reward Model）。</li>
+</ul>
+</li>
+</ul>
+<h4>7. [进货] 准备数据</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>train_dataset = create_rl_dataset(...)</code></li>
+<li><strong>解释</strong>:<ul>
+<li>调用 <code>create_rl_dataset</code> 读取训练文件（比如 parquet 或 jsonl 格式）。</li>
+<li>调用 <code>create_rl_sampler</code> 决定怎么取数据（是随机取 <code>RandomSampler</code> 还是按顺序取 <code>SequentialSampler</code>）。</li>
+</ul>
+</li>
+</ul>
+<h4>8. [开工] 初始化 Trainer 并开始</h4>
+<ul>
+<li><strong>代码位置</strong>:
+    <code>python
+    trainer = RayEntropyTrainer(...)
+    trainer.init_workers()
+    trainer.fit()</code></li>
+<li><strong>解释</strong>:<ul>
+<li>最后，把上面所有的东西（工人、资源、数据、奖励）打包塞给 <code>RayEntropyTrainer</code>。</li>
+<li><code>trainer.init_workers()</code>: 让所有显卡上的模型加载权重，准备就绪。</li>
+<li><code>trainer.fit()</code>: <strong>正式开始训练循环</strong>（生成数据 -&gt; 打分 -&gt; 计算 Loss -&gt; 更新参数）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>组装车间</strong>。它不包含具体的数学公式（那些在 Trainer 和 Worker 里），它的作用是<strong>根据配置文件，把分布式环境配好，把数据和模型加载好，然后启动训练引擎</strong>。</p>

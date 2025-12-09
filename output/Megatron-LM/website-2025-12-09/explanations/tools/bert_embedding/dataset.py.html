@@ -1,0 +1,127 @@
+<h1>tools/bert_embedding/dataset.py</h1>
+<p>完全没问题。这段代码看起来全是术语，但它的核心逻辑其实非常简单：<strong>它就是一个“翻译官”兼“打包员”</strong>。</p>
+<p>它的作用是把<strong>人类能读懂的文本</strong>（比如“今天天气不错”），转换成<strong>BERT模型能读懂的格式</strong>（一串数字+特定的标记）。</p>
+<p>为了让你好理解，我把你当作这个程序的执行者，给你列一个 <strong>“BERT 数据处理流水线” 的 Todo List（待办事项清单）</strong>。</p>
+<hr />
+<h3>📝 任务清单：如何把一句话喂给 BERT？</h3>
+<p>假设你现在就是这个 <code>BertEmbeddingDataset</code> 类，你的老板（Megatron 训练框架）给了你一堆原始文本，让你按以下步骤处理：</p>
+<ol>
+<li>
+<p><strong>[准备阶段] 领工具和原料</strong> (<code>__init__</code>)</p>
+<ul>
+<li>拿到原始文本数据。</li>
+<li>拿到一本字典（Tokenizer，用来查词对应的数字）。</li>
+<li>记住老板规定的最大长度（<code>max_seq_length</code>）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[开始工作] 抽取一条数据</strong> (<code>__getitem__</code>)</p>
+<ul>
+<li>从原料堆里随便拿出一句话。</li>
+</ul>
+</li>
+<li>
+<p><strong>[清洗] 去除杂质</strong></p>
+<ul>
+<li>把文本里没用的结束符（如 <code>&lt;|endoftext|&gt;</code>）删掉。</li>
+</ul>
+</li>
+<li>
+<p><strong>[翻译] 查字典变成数字</strong></p>
+<ul>
+<li>把“今天天气不错”变成类似 <code>[105, 234, 567, ...]</code> 这样的 ID 列表。</li>
+</ul>
+</li>
+<li>
+<p><strong>[裁剪] 砍掉多余的部分</strong></p>
+<ul>
+<li>如果句子太长，必须砍断。<strong>注意：</strong> 要预留两个位置给特殊VIP符号。</li>
+</ul>
+</li>
+<li>
+<p><strong>[打包] 加上 BERT 专属包装</strong> (<code>build_sample</code>)</p>
+<ul>
+<li><strong>加头：</strong> 在最前面加上 <code>[CLS]</code> 标记（表示句子开始）。</li>
+<li><strong>加尾：</strong> 在最后面加上 <code>[SEP]</code> 标记（表示句子结束）。</li>
+<li><strong>填单子：</strong> 生成一堆全是 0 或 -1 的辅助数组（用来告诉模型哪些是字，哪些是填充，需不需要计算损失等）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 对照代码一步一步讲</h3>
+<p>现在我们拿着上面的清单，一段一段看代码在干嘛：</p>
+<h4>第一步：准备阶段 (<code>__init__</code>)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">text_dataset</span><span class="p">,</span> <span class="n">max_seq_length</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">text_dataset</span> <span class="o">=</span> <span class="n">text_dataset</span>   <span class="c1"># 存下原料（文本）</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_length</span> <span class="o">=</span> <span class="n">max_seq_length</span> <span class="c1"># 存下最大长度限制</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">bert_tokenizer</span> <span class="o">=</span> <span class="n">get_tokenizer</span><span class="p">()</span> <span class="c1"># 拿出翻译字典</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>解释</strong>：这是类的初始化。就像你刚上班，把工具摆在桌子上。</p>
+</blockquote>
+<h4>第二步 &amp; 第三步：抽取与清洗 (<code>__getitem__</code> 开头)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="fm">__getitem__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">idx</span><span class="p">):</span>
+    <span class="c1"># Text.</span>
+    <span class="n">text_sample</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">text_dataset</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span> <span class="c1"># 根据索引 idx 拿一条数据</span>
+    <span class="n">text</span> <span class="o">=</span> <span class="n">text_sample</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">]</span>           <span class="c1"># 提取出文字内容</span>
+    <span class="n">text</span> <span class="o">=</span> <span class="n">text</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">&quot;&lt;|endoftext|&gt;&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span> <span class="c1"># 清洗：删掉没用的结束符</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>解释</strong>：<code>__getitem__</code> 是每次循环时被调用的函数。这里只是把纯文本拿出来并打扫干净。</p>
+</blockquote>
+<h4>第四步 &amp; 第五步：翻译与裁剪 (<code>__getitem__</code> 中间)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># Bert/Wordpiece tokens (+truncate).</span>
+    <span class="n">bert_token_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">bert_tokenizer</span><span class="o">.</span><span class="n">tokenize</span><span class="p">(</span><span class="n">text</span><span class="p">)</span> <span class="c1"># 翻译：文字 -&gt; 数字列表</span>
+
+    <span class="c1"># 重点：裁剪</span>
+    <span class="c1"># 为什么要减 2？因为还要给 [CLS] 和 [SEP] 留位置</span>
+    <span class="n">bert_token_ids</span> <span class="o">=</span> <span class="n">bert_token_ids</span><span class="p">[:</span><span class="bp">self</span><span class="o">.</span><span class="n">max_seq_length</span> <span class="o">-</span> <span class="mi">2</span><span class="p">]</span> 
+
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">bert_token_ids</span><span class="p">:</span> <span class="c1"># 如果句子是空的或者是乱码被删光了</span>
+        <span class="n">bert_token_ids</span> <span class="o">=</span> <span class="p">[</span> <span class="bp">self</span><span class="o">.</span><span class="n">bert_tokenizer</span><span class="o">.</span><span class="n">pad_id</span> <span class="p">]</span> <span class="c1"># 塞一个填充符进去防止报错</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>解释</strong>：这是核心逻辑。BERT 模型吃不下无限长的句子，必须切断。</p>
+</blockquote>
+<h4>第六步：打包 (<code>build_sample</code> 和 <code>__getitem__</code> 结尾)</h4>
+<p>这是最让新手头晕的地方，但其实就是<strong>拼积木</strong>。BERT 要求输入不仅有数字 ID，还要有头有尾。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">build_sample</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">tokenizer</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">):</span>
+        <span class="c1"># 这是一个小工具函数，用来生成一排全是同一个数字的数组</span>
+        <span class="n">get_constant_array</span> <span class="o">=</span> <span class="k">lambda</span> <span class="n">c</span> <span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="nb">len</span><span class="p">(</span><span class="n">token_ids</span><span class="p">)</span> <span class="o">+</span> <span class="mi">2</span><span class="p">,),</span> <span class="n">c</span><span class="p">,</span> <span class="s2">&quot;int64&quot;</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="c1"># 1. 核心数据：[CLS] + 你的句子ID + [SEP]</span>
+            <span class="s2">&quot;text&quot;</span> <span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">cls</span><span class="p">,</span> <span class="o">*</span><span class="n">token_ids</span><span class="p">,</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">sep</span> <span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">&quot;int64&quot;</span><span class="p">),</span>
+
+            <span class="c1"># 2. 类型标记：BERT用来区分句子A和句子B的。这里只有一句话，所以全是 0</span>
+            <span class="s2">&quot;types&quot;</span> <span class="p">:</span> <span class="n">get_constant_array</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+
+            <span class="c1"># 3. 标签：通常用于训练。这里设为 -1，说明我们可能只是在做特征提取，不需要计算Loss</span>
+            <span class="s2">&quot;labels&quot;</span> <span class="p">:</span> <span class="n">get_constant_array</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">),</span>
+
+            <span class="c1"># ... 其他全是 0 或 1 的辅助标记，告诉模型不要计算损失(loss_mask=0)</span>
+            <span class="s2">&quot;loss_mask&quot;</span> <span class="p">:</span> <span class="n">get_constant_array</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+            <span class="c1"># ...</span>
+        <span class="p">}</span>
+</code></pre></div>
+
+<p>最后在 <code>__getitem__</code> 里调用这个打包函数：</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># Bert sample.</span>
+    <span class="n">sample</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_sample</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">bert_tokenizer</span><span class="p">,</span> <span class="n">bert_token_ids</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">sample</span> <span class="c1"># 交货！</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这个文件的唯一目的就是：
+<strong>把 <code>“你好世界”</code> 变成 <code>{'text': [101, 872, 1962, 102], 'types': [0,0,0,0], ...}</code>。</strong></p>
+<ul>
+<li><code>101</code> 是 <code>[CLS]</code> (开始)</li>
+<li><code>872, 1962</code> 是 <code>你好世界</code> 的编码</li>
+<li><code>102</code> 是 <code>[SEP]</code> (结束)</li>
+</ul>
+<p>它就是一个标准的数据预处理脚本，为了让 Megatron 里的 BERT 模型能吃得下数据。</p>

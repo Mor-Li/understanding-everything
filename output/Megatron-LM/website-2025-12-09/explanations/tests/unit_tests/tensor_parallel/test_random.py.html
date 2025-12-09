@@ -1,0 +1,99 @@
+<h1>tests/unit_tests/tensor_parallel/test_random.py</h1>
+<p>这个文件 (<code>tests/unit_tests/tensor_parallel/test_random.py</code>) 确实比较硬核，它是 <strong>Megatron-Core</strong>（一个用于训练超大模型的库）的单元测试代码。</p>
+<p>这代码主要是在测试：<strong>在多张显卡并行训练（Tensor Parallel）时，如何精准地控制“随机数生成器”（RNG, Random Number Generator）。</strong></p>
+<p>为了让你听懂，我们不需要一行行死磕代码，而是把这当成一个<strong>学习任务清单 (To-Do List)</strong>。我们通过 <strong>5 个任务</strong>，一步步拆解它的核心逻辑。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 理解背景——为什么要管“随机数”？</h4>
+<p><strong>概念：</strong> 在深度学习里，随机数无处不在（比如 Dropout 丢弃神经元、参数初始化）。
+<strong>问题：</strong> 当你用 4 张显卡训练同一个模型时，如果显卡 A 和显卡 B 生成的随机数不一样（比如 Dropout 丢弃了不同的神经元），模型可能就乱套了，或者显存优化技术（如 Checkpointing）无法正常工作。
+<strong>目标：</strong> 我们需要一个“大管家”来管理这些随机数的状态，保证我们在需要它们“一样”的时候一样，需要“不一样”的时候不一样。</p>
+<hr />
+<h4>✅ Task 2: 拆解 <code>test_cuda_rng_states_tracker</code> (测试随机数管家)</h4>
+<p><strong>代码对应：</strong> <code>def test_cuda_rng_states_tracker(): ...</code>
+<strong>讲解：</strong>
+这个测试是在检查 <code>CudaRNGStatesTracker</code>（随机数状态追踪器/管家）能不能正常工作。你可以把它想象成游戏的“存档管理器”。</p>
+<ol>
+<li><strong>存取状态 (<code>set/get_states</code>)：</strong><ul>
+<li>测试能不能把当前的随机数状态保存下来（存档），然后再读出来。</li>
+</ul>
+</li>
+<li><strong>重置 (<code>reset</code>)：</strong><ul>
+<li>测试能不能一键清空所有存档。</li>
+</ul>
+</li>
+<li><strong>添加种子 (<code>add</code>)：</strong><ul>
+<li>给某个特定的名字（比如 "state2"）分配一个随机种子（Seed）。</li>
+<li>代码里还测试了报错机制：如果名字重复了，或者给错了参数，必须报错（<code>pytest.raises</code>）。</li>
+</ul>
+</li>
+<li><strong>分叉/切换 (<code>fork</code>)：</strong><ul>
+<li><strong>核心点：</strong> <code>rng_tracker.fork("state2")</code>。意思是：“现在的随机数生成器，请切换到 'state2' 这个存档的设置”。</li>
+<li>测试验证了：切换后生成的随机数状态，是否真的等于我们预期的那个状态。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 3: 拆解 <code>test_model_parallel_cuda_manual_seed</code> (测试并行环境下的播种)</h4>
+<p><strong>代码对应：</strong> <code>def test_model_parallel_cuda_manual_seed(): ...</code>
+<strong>讲解：</strong>
+这个测试模拟了“多卡并行”的环境。</p>
+<ol>
+<li><strong>模拟环境 (<code>Utils.initialize_model_parallel</code>)：</strong><ul>
+<li>假装我们现在有 4 张卡，模型被切分了（Tensor Parallel）。</li>
+</ul>
+</li>
+<li><strong>手动播种 (<code>model_parallel_cuda_manual_seed</code>)：</strong><ul>
+<li>这是 Megatron 的核心功能。它要保证在并行训练开始前，设置好基础的随机种子。</li>
+<li>通常，模型参数初始化时，我们希望所有卡用<strong>相同</strong>的种子（保证参数初始值一致）；但在数据处理时，可能希望用<strong>不同</strong>的种子。</li>
+</ul>
+</li>
+<li><strong>验证：</strong><ul>
+<li>检查 <code>rng_tracker</code> 里是否成功生成了一个叫 <code>'model-parallel-rng'</code> 的状态存档。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 4: 拆解 <code>test_checkpoint</code> (测试“重计算”技术)</h4>
+<p><strong>代码对应：</strong> <code>def test_checkpoint(): ...</code>
+<strong>讲解：</strong>
+这是最难理解但最重要的部分。
+<strong>背景知识（Activation Checkpointing）：</strong> 为了省显存，我们在前向传播（Forward）时不保存中间结果，而是在反向传播（Backward）时<strong>重新计算</strong>一遍。
+<strong>为什么这跟随机数有关？</strong>
+如果你在 Forward 时做了一次 Dropout（随机丢弃），在 Backward 重算时，必须<strong>丢弃完全相同</strong>的神经元。否则梯度就全错了。</p>
+<ol>
+<li><strong>普通函数测试：</strong><ul>
+<li>定义了一个简单的加法函数 <code>test_forward</code>。</li>
+<li>用 <code>checkpoint</code> 包裹它运行，看结果对不对（是不是等于直接加）。</li>
+</ul>
+</li>
+<li><strong>并行环境测试：</strong><ul>
+<li>初始化并行环境。</li>
+<li>测试 <code>checkpoint</code> 能否正确处理输入输出，并且保证在 GPU 上运行无误。</li>
+<li><strong>潜台词：</strong> 虽然代码没明写，但 <code>checkpoint</code> 内部会自动保存和恢复 RNG 状态，确保重计算时随机性一致。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 5: 拆解 <code>test_checkpoint_without_output</code> (测试更激进的省显存技巧)</h4>
+<p><strong>代码对应：</strong> <code>def test_checkpoint_without_output(): ...</code>
+<strong>讲解：</strong>
+这是一个进阶版的测试。</p>
+<ol>
+<li><strong>对比实验：</strong><ul>
+<li><strong>普通版 (<code>normal_forward</code>)：</strong> 正常的 GELU 激活函数 -&gt; 乘法。</li>
+<li><strong>省显存版 (<code>checkpoint_forward</code>)：</strong> 用了 <code>CheckpointWithoutOutput</code>。这是一种特殊的技巧，它在重计算时甚至不需要保留某些输出，通过注册回调函数来处理梯度。</li>
+</ul>
+</li>
+<li><strong>验证一致性：</strong><ul>
+<li><strong>输出一致：</strong> <code>assert torch.equal(output1, output2)</code>。普通跑和省显存跑，结果必须一样。</li>
+<li><strong>梯度一致：</strong> <code>assert torch.equal(input1.grad, input2.grad)</code>。这是最终目的！不管你怎么省显存、怎么重置随机数，最后算出来的梯度（用于更新模型参数）必须一模一样。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这个文件虽然全是代码，但它讲了一个故事：</p>
+<blockquote>
+<p>“为了在多张显卡上训练大模型并节省显存，我们需要用到<strong>重计算 (Checkpointing)</strong> 技术。而为了让重计算不出错，我们必须严格管理<strong>随机数 (RNG)</strong>。这个文件就是为了确保：<strong>不管怎么切分模型、怎么重算，随机数的状态都是可控的、精准的，算出来的梯度是正确的。</strong>”</p>
+</blockquote>

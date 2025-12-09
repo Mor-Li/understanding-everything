@@ -1,0 +1,115 @@
+<h1>recipe/spin/fsdp_workers.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到了<strong>大规模分布式训练（Distributed Training）</strong>、<strong>强化学习（RL）</strong>以及<strong>底层显存优化</strong>。</p>
+<p>简单来说，这个文件定义了两个“打工人”（Worker），它们在多张显卡上协同工作，用来运行 <strong>SPIN (Self-Play Fine-Tuning)</strong> 算法。</p>
+<p>为了让你听懂，我把阅读这份代码的任务拆解成一个 <strong>“TodoList”</strong>，我们一步一步来完成这个任务清单，每一步我都会解释它对应代码里的哪一部分以及它的作用。</p>
+<hr />
+<h3>任务清单：理解 SPIN 分布式训练代码</h3>
+<h4>✅ Task 1：搞清楚这代码是干嘛的 (High-Level Concept)</h4>
+<ul>
+<li><strong>背景</strong>：我们要训练一个大模型（类似 ChatGPT）。单张显卡放不下，所以需要用 <strong>FSDP (Fully Sharded Data Parallel)</strong> 把模型切碎了放在多张卡上。</li>
+<li><strong>算法</strong>：用的是 <strong>SPIN</strong>。你可以把它理解为一种“左右互搏”或者“自我博弈”的训练方式，通常结合 <strong>DPO (Direct Preference Optimization)</strong> 损失函数。</li>
+<li><strong>角色</strong>：代码里定义了两个主要的类（两个角色）：<ol>
+<li><strong><code>SPINRolloutRefWorker</code></strong>：主角。既是<strong>演员（Actor）</strong>也是<strong>参考系（Ref）</strong>。它负责生成文本、计算概率，并更新自己的参数。</li>
+<li><strong><code>RewardModelWorker</code></strong>：裁判。负责给生成的文本打分（Reward）。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 2：初始化主角 (<code>SPINRolloutRefWorker</code>)</h4>
+<p><strong>目标</strong>：把模型加载进显存，并配置好分布式环境。</p>
+<ul>
+<li><strong>看代码位置</strong>：<code>init_model(self)</code> 方法。</li>
+<li><strong>它做了什么</strong>：<ol>
+<li><strong>加载模型</strong>：它其实加载了<strong>两份</strong>模型。<ul>
+<li><code>self.actor</code>：当前正在训练的模型（会变）。</li>
+<li><code>self.ref_policy</code>：参考模型（不变，通常是上一轮的旧模型，用来做对比）。</li>
+</ul>
+</li>
+<li><strong>FSDP 包装</strong>：代码里有很多 <code>fsdp_config</code>。这是为了把巨大的模型切片，防止显存爆炸。</li>
+<li><strong>优化器设置</strong>：配置 <code>actor_optimizer</code>，准备用来更新 <code>actor</code> 的参数。</li>
+<li><strong>Offload 策略</strong>：如果显存实在不够，它配置了 <code>offload</code>，允许把暂时不用的参数从 GPU 搬运到 CPU。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 3：计算参考概率 (Reference Log Prob)</h4>
+<p><strong>目标</strong>：在训练前，先看看“老师傅”（参考模型）对这批数据是怎么看的。</p>
+<ul>
+<li><strong>看代码位置</strong>：<code>compute_ref_log_prob(self, data)</code>。</li>
+<li><strong>它做了什么</strong>：<ol>
+<li><strong>数据搬运</strong>：把数据搬到 GPU 上。</li>
+<li><strong>计算</strong>：调用 <code>self.ref_policy</code> 跑一次前向传播（Forward），算出 <code>ref_log_prob</code>。</li>
+<li><strong>Ulysses 优化</strong>：代码里出现了 <code>with self.ulysses_sharding_manager</code>。这是处理超长文本的一种并行技术（序列并行），防止长文本把显存撑爆。</li>
+<li><strong>清理</strong>：算完后把结果搬回 CPU，释放 GPU 资源。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 4：计算当前概率 (Actor Log Prob)</h4>
+<p><strong>目标</strong>：看看“现在的我”（Actor模型）对这批数据是怎么看的。</p>
+<ul>
+<li><strong>看代码位置</strong>：<code>compute_log_prob(self, data)</code>。</li>
+<li><strong>它做了什么</strong>：<ol>
+<li><strong>加载参数</strong>：如果之前把参数卸载（Offload）到了 CPU，这里要用 <code>load_fsdp_model_to_gpu</code> 把它拉回 GPU。</li>
+<li><strong>计算</strong>：调用 <code>self.actor</code> 跑前向传播，算出 <code>old_log_probs</code>。SPIN/DPO 算法需要对比“当前概率”和“参考概率”的差值来计算 Loss。</li>
+<li><strong>卸载参数</strong>：算完如果不用了，赶紧 <code>offload</code> 回 CPU 省显存。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 5：执行训练更新 (Update Policy)</h4>
+<p><strong>目标</strong>：这是最核心的一步，根据计算结果修改模型参数，让模型变强。</p>
+<ul>
+<li><strong>看代码位置</strong>：<code>update_actor_dpo(self, data)</code>。</li>
+<li><strong>它做了什么</strong>：<ol>
+<li><strong>准备环境</strong>：把模型参数和优化器状态都加载到 GPU。</li>
+<li><strong>计算 Loss 并更新</strong>：调用 <code>self.actor.update_policy_dpo_with_ref(data)</code>。这里面包含了 DPO 的数学公式计算和 <code>optimizer.step()</code>。</li>
+<li><strong>记录指标</strong>：计算吞吐量（Tokens/sec）、显存占用、MFU（算力利用率）等，方便在大屏幕上监控训练进度。</li>
+<li><strong>打扫战场</strong>：更新完后，再次把参数卸载回 CPU（如果配置了 Offload）。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 6：初始化裁判 (<code>RewardModelWorker</code>)</h4>
+<p><strong>目标</strong>：虽然 SPIN 主要是自我博弈，但有时候也需要一个独立的奖励模型（Reward Model）来评估生成质量。</p>
+<ul>
+<li><strong>看代码位置</strong>：<code>RewardModelWorker</code> 类及其 <code>init_model</code>。</li>
+<li><strong>它做了什么</strong>：<ol>
+<li><strong>建立 Device Mesh</strong>：规划好哪些 GPU 是一组。</li>
+<li><strong>加载 RM 模型</strong>：通常是一个分类模型（输出一个分数）。</li>
+<li><strong>特殊处理</strong>：代码里有 <code>use_remove_padding</code> 和 <code>monkey_patch</code>。这是为了加速计算，把 batch 中无用的 padding（填充符）去掉，只计算有效 token。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 7：给数据打分 (Compute Reward)</h4>
+<p><strong>目标</strong>：输入文本，输出分数。</p>
+<ul>
+<li><strong>看代码位置</strong>：<code>compute_rm_score(self, data)</code> 和 <code>_forward_micro_batch</code>。</li>
+<li><strong>它做了什么</strong>：<ol>
+<li><strong>格式转换</strong>：<code>_switch_chat_template</code>。因为奖励模型可能需要特定的对话格式（比如 <code>&lt;|user|&gt;...&lt;|assistant|&gt;...</code>），这里做格式对齐。</li>
+<li><strong>切片计算</strong>：如果数据量太大，把它切成 <code>micro_batch</code> 一小批一小批地算。</li>
+<li><strong>去填充 (Unpad) 与 序列并行 (Ulysses)</strong>：这是代码最难懂的部分。<ul>
+<li>它把所有句子的有效词拼成这一长串（Unpad）。</li>
+<li>如果开了序列并行，它会把这一长串切分到不同显卡上算 Attention，算完再拼回来。</li>
+</ul>
+</li>
+<li><strong>提取分数</strong>：只取最后一个 Token 的输出作为这句话的奖励分。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码的核心逻辑流</h3>
+<ol>
+<li><strong>准备阶段</strong>：启动 <code>SPINRolloutRefWorker</code>，把模型切分加载到多张卡上。</li>
+<li><strong>数据流转</strong>：<ul>
+<li>数据来了 -&gt; <code>compute_ref_log_prob</code> (看参考模型的反应)。</li>
+<li>数据来了 -&gt; <code>compute_log_prob</code> (看当前模型的反应)。</li>
+</ul>
+</li>
+<li><strong>训练阶段</strong>：<ul>
+<li>拿着上面两步的概率 -&gt; <code>update_actor_dpo</code> -&gt; 计算 DPO Loss -&gt; 反向传播 -&gt; 更新模型权重。</li>
+</ul>
+</li>
+<li><strong>显存管理 (贯穿全程)</strong>：<ul>
+<li>代码里到处都是 <code>load_fsdp...</code> 和 <code>offload_fsdp...</code>。这说明这个系统非常在意显存，像蚂蚁搬家一样，用的时候搬进 GPU，不用的时候搬回 CPU，以此来训练超大模型。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结</strong>：这是一个<strong>极其注重显存优化</strong>的、支持<strong>超长上下文</strong>的、用于 <strong>SPIN/DPO 算法</strong>的分布式训练执行脚本。</p>

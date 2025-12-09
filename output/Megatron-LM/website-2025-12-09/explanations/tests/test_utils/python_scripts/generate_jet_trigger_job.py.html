@@ -1,0 +1,91 @@
+<h1>tests/test_utils/python_scripts/generate_jet_trigger_job.py</h1>
+<p>完全没问题。这段代码确实涉及了很多参数和逻辑，乍一看很晕。</p>
+<p>你可以把这个脚本想象成一个<strong>“包工头”</strong>。它自己不干活（不直接跑测试），它的任务是写一份<strong>“施工计划书”</strong>（GitLab CI 的配置文件），告诉 GitLab 应该去哪里、用什么机器、跑什么测试。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>Task To-Do List（任务清单）</strong>，带你一步步看它是怎么工作的。</p>
+<hr />
+<h3>📝 脚本任务清单 (To-Do List)</h3>
+<h4>1. ✅ 接收老板的需求 (解析命令行参数)</h4>
+<p><strong>代码位置：</strong> <code>@click.command()</code> 到 <code>def main(...)</code> 这一大段。
+*   <strong>任务：</strong> 脚本启动时，用户（或者上游流水线）会传给它一堆参数。
+*   <strong>解释：</strong> 比如“要在哪个集群跑？”(<code>--cluster</code>)，“测什么模型？”(<code>--test-cases</code>)，“用哪个容器镜像？”(<code>--container-image</code>)。
+*   <strong>动作：</strong> 脚本把这些通过 <code>click</code> 库接收进来，存到变量里备用。</p>
+<h4>2. ✅ 去仓库清点货物 (加载测试用例)</h4>
+<p><strong>代码位置：</strong> <code>list_of_test_cases = [...]</code> (调用了 <code>recipe_parser.load_workloads</code>)
+*   <strong>任务：</strong> 根据刚才接收到的需求（比如“我要测所有 GPT 模型”），去查阅“食谱”（<code>recipe_parser</code>），看看具体有哪些测试需要跑。
+*   <strong>解释：</strong> 这一步会生成一个列表，里面装着所有要执行的具体测试任务（例如：<code>gpt3-126m</code>, <code>gpt3-5b</code> 等）。同时过滤掉类型为 "build" 的任务。
+*   <strong>准备标签：</strong> 定义了一组 <code>tags</code>（如 <code>arch/amd64</code>, <code>team/megatron</code>），这是为了告诉 GitLab 只有贴了这些标签的机器才能接这个活。</p>
+<h4>3. ✅ 制定施工方案 (生成 Pipeline 结构)</h4>
+<p>这里分两种情况：</p>
+<p><strong>情况 A：仓库是空的 (没有测试用例)</strong>
+<strong>代码位置：</strong> <code>if not list_of_test_cases:</code>
+*   <strong>任务：</strong> 如果第2步没找到任何需要跑的测试。
+*   <strong>动作：</strong> 创建一个“空壳”计划。
+    *   写一个叫 <code>empty-pipeline-placeholder-job</code> 的假任务。
+    *   这个任务只执行 <code>sleep 1</code>（睡1秒就结束）。
+    *   <strong>目的：</strong> 防止 GitLab 因为没有任务而报错，虽然没活干，但也得走个过场。</p>
+<p><strong>情况 B：有活干了 (存在测试用例)</strong>
+<strong>代码位置：</strong> <code>else:</code>
+*   <strong>任务：</strong> 准备正式的施工图纸。
+*   <strong>动作 1 (排序)：</strong> 把测试用例按模型名称排个序。
+*   <strong>动作 2 (定义阶段)：</strong> 设置 <code>stages</code>（阶段），通常以模型名作为阶段名。
+*   <strong>动作 3 (定义规则)：</strong> 设置 <code>workflow</code> 规则，比如代码更新了就自动取消旧任务。</p>
+<h4>4. ✅ 给每个工人派活 (循环处理每个测试用例)</h4>
+<p><strong>代码位置：</strong> <code>for test_idx, test_case in enumerate(list_of_test_cases):</code>
+这是最核心的部分，脚本开始遍历每一个测试用例，为它们生成具体的指令。</p>
+<ul>
+<li>
+<p><strong>Sub-Task 4.1: 确定工作地点</strong></p>
+<ul>
+<li>把具体的集群配置（<code>cluster/...</code>）加到标签列表里，确保任务被分发到正确的服务器集群。</li>
+</ul>
+</li>
+<li>
+<p><strong>Sub-Task 4.2: 写具体的操作指令 (Script)</strong></p>
+<ul>
+<li><strong>代码：</strong> <code>script = ["export PYTHONPATH...", "python ... launch_jet_workload.py ..."]</code></li>
+<li><strong>解释：</strong> 这里在拼接一段很长的命令。注意，这个脚本生成的任务，实际上是去运行<strong>另一个</strong> Python 脚本 (<code>launch_jet_workload.py</code>)。</li>
+<li>它把刚才收到的所有参数（环境、重复次数、时间限制、账号等）都拼接到这个命令字符串里。</li>
+</ul>
+</li>
+<li>
+<p><strong>Sub-Task 4.3: 处理特殊需求</strong></p>
+<ul>
+<li>如果有 <code>partition</code>（分区），加上参数。</li>
+<li>如果是 <code>enable-lightweight-mode</code>（轻量模式），加上参数。</li>
+<li>如果要记录到 <code>wandb</code>（可视化工具），加上参数。</li>
+</ul>
+</li>
+<li>
+<p><strong>Sub-Task 4.4: 安排排队顺序 (Warmup 预热机制)</strong></p>
+<ul>
+<li><strong>代码：</strong> <code>if enable_warmup:</code> 及其后的逻辑。</li>
+<li><strong>解释：</strong> 这是一个很有趣的优化。<ul>
+<li>如果是列表里的<strong>第一个</strong>任务 (<code>test_idx == 0</code>)，它被标记为“预热任务” (<code>warmup_job</code>)。</li>
+<li><strong>后续的任务</strong>，会添加一个 <code>needs</code> 依赖，必须等这个“预热任务”跑完才能开始。</li>
+</ul>
+</li>
+<li><strong>目的：</strong> 防止几百个任务同时启动瞬间把缓存或存储挤爆。先跑一个，把环境热一热，缓存建好，后面的再并行跑。</li>
+</ul>
+</li>
+<li>
+<p><strong>Sub-Task 4.5: 把任务加入总表</strong></p>
+<ul>
+<li><strong>代码：</strong> <code>gitlab_pipeline[test_case['spec']['test_case']] = { ... }</code></li>
+<li><strong>解释：</strong> 把上面拼好的镜像、标签、命令脚本、超时时间、重试策略等信息，打包成一个字典对象，放入总计划书中。</li>
+</ul>
+</li>
+</ul>
+<h4>5. ✅ 打印施工计划书 (输出 YAML 文件)</h4>
+<p><strong>代码位置：</strong> <code>with open(output_path, 'w') as outfile:</code>
+*   <strong>任务：</strong> 把内存里整理好的 <code>gitlab_pipeline</code> 字典，按照 YAML 格式写到硬盘上。
+*   <strong>解释：</strong> 这个生成的 <code>.yaml</code> 文件，随后会被 GitLab CI 读取，GitLab 就会照着这个文件真的去启动那些测试任务了。</p>
+<hr />
+<h3>总结一下</h3>
+<p><strong>这个脚本不是在“跑测试”，而是在“生成跑测试的配置文件”。</strong></p>
+<ol>
+<li><strong>输入：</strong> 你想测什么（范围、环境、集群）。</li>
+<li><strong>处理：</strong> 查找对应的测试用例，并为每个用例生成一段运行命令 (<code>python launch_jet_workload.py ...</code>)。</li>
+<li><strong>逻辑：</strong> 加上了排队逻辑（Warmup），确保第一个跑完后面的再跑。</li>
+<li><strong>输出：</strong> 一个 YAML 文件。</li>
+</ol>
+<p>这就好比你是包工头，你写了一张 Excel 表格（YAML），上面写着：“张三去A区搬砖，李四等张三搬完了一半再去B区砌墙”。你把这张表交给工头（GitLab），工头才会去叫人干活。</p>

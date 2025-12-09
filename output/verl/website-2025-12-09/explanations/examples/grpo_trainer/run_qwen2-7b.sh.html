@@ -1,0 +1,91 @@
+<h1>examples/grpo_trainer/run_qwen2-7b.sh</h1>
+<p>这份脚本确实包含了很多术语，因为它是在配置一个非常前沿的<strong>大模型强化学习（RLHF）训练任务</strong>。</p>
+<p>简单来说，这段代码是在指挥 8 张显卡，用一种叫 <strong>GRPO</strong> 的算法（DeepSeek-R1 背后的核心技术之一），教 <strong>Qwen2-7B</strong> 这个模型做 <strong>GSM8K</strong>（小学数学题）。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“AI 补习班培训计划”</strong> 的 Task List（任务清单），我们一步步来勾选讲解：</p>
+<hr />
+<h3>📋 Task 1: 确定培训目标与教材 (基础设置)</h3>
+<p>首先，我们要告诉程序：我们要训练谁？用什么书教？</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    data.train_files=$HOME/data/gsm8k/train.parquet  # 教材：GSM8K 数学题训练集
+    actor_rollout_ref.model.path=Qwen/Qwen2-7B-Instruct # 学生：Qwen2-7B 指令微调版
+    trainer.experiment_name='qwen2_7b_function_rm'   # 课程名：Qwen2-7B 功能型奖励模型实验</code></li>
+<li><strong>白话解释：</strong>
+    我们要把 Qwen2-7B 这个“学生”拉过来，用 GSM8K 这本“数学习题册”对他进行特训。</li>
+</ul>
+<hr />
+<h3>📋 Task 2: 确定教学方法 (核心算法 GRPO)</h3>
+<p>这是整个脚本最关键的地方。我们不用传统的 PPO，而是用 GRPO。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    python3 -m verl.trainer.main_ppo \    # 启动训练主程序
+    algorithm.adv_estimator=grpo \        # 【重点】使用 GRPO 算法，而不是普通 PPO</code></li>
+<li><strong>白话解释：</strong>
+    普通的 PPO 需要一个额外的“老师模型”（Critic）来给学生打分，这很占显存。
+    <strong>GRPO (Group Relative Policy Optimization)</strong> 是一种省钱省力的方法：它不需要额外的“老师模型”。它让学生对同一道题做多次回答，然后把这些回答放在一起比较，好的加分，差的减分。</li>
+</ul>
+<hr />
+<h3>📋 Task 3: 规定“考试”方式 (Rollout 采样)</h3>
+<p>为了配合 GRPO 算法，学生必须对每一道题通过“分身术”写出多个答案。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    actor_rollout_ref.rollout.name=vllm        # 使用 vLLM 引擎（写字速度极快）
+    actor_rollout_ref.rollout.n=5              # 【重点】每道题生成 5 个不同的答案
+    data.max_prompt_length=512                 # 题目最长 512 字
+    data.max_response_length=1024              # 答案最长 1024 字</code></li>
+<li><strong>白话解释：</strong>
+    我们用了 <strong>vLLM</strong> 这个加速工具，要求模型针对每一个数学题，一口气写出 <strong>5 个不同的解题过程</strong>。这 5 个答案稍后会被用来互相比较优劣。</li>
+</ul>
+<hr />
+<h3>📋 Task 4: 设定奖惩规则 (优化与 Loss)</h3>
+<p>学生写完答案后，我们要告诉他怎么改才能进步，同时不能让他“走火入魔”（比如为了得分乱说话）。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    actor_rollout_ref.actor.optim.lr=1e-6      # 学习率：进步的步子迈多大（很小，求稳）
+    actor_rollout_ref.actor.use_kl_loss=True   # 开启 KL 散度惩罚
+    actor_rollout_ref.actor.kl_loss_coef=0.001 # 惩罚力度</code></li>
+<li><strong>白话解释：</strong><ul>
+<li><strong>学习率 (<code>lr</code>)</strong>：设得很低，防止模型学傻了。</li>
+<li><strong>KL Loss</strong>：这是为了防止模型在训练过程中彻底改变了自己的语言习惯。比如，我们希望它学会做数学题，但不希望它突然开始讲火星语。如果它生成的答案和原始模型差别太大，就会受到惩罚。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 5: 安排教室座位 (硬件资源分配)</h3>
+<p>这是最复杂的工程部分。怎么把 70 亿参数的模型塞进显卡里跑起来？</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    trainer.n_gpus_per_node=8                  # 一个节点有 8 张显卡
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2  # 推理时，2张卡合体跑一个模型
+    actor_rollout_ref.actor.fsdp_config.param_offload=False # 训练时，参数不卸载到 CPU
+    actor_rollout_ref.ref.fsdp_config.param_offload=True    # 参考模型，参数卸载到 CPU (省显存)</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>你有 8 张显卡。</li>
+<li><strong>推理时 (Rollout)</strong>：因为要快速生成 5 个答案，脚本设置了每 2 张卡合作（Tensor Parallel）来跑模型。</li>
+<li><strong>训练时 (Actor)</strong>：使用 FSDP 技术把模型切碎了放在不同卡上训练。</li>
+<li><strong>参考模型 (Ref)</strong>：为了计算 KL Loss，需要保留一个原始模型的副本。为了省显存，脚本把这个副本的一部分数据扔到了 CPU 内存里 (<code>offload=True</code>)。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 6: 进度监控 (Logging)</h3>
+<p>最后，我们要记录训练过程。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    trainer.logger='["console","wandb"]'       # 打印在屏幕上，并发送到 WandB 网站
+    trainer.project_name='verl_grpo_example_gsm8k' # WandB 上的项目名
+    trainer.save_freq=20                       # 每 20 步存个档
+    trainer.total_epochs=15                    # 总共把书看 15 遍</code></li>
+<li><strong>白话解释：</strong>
+    这部分就是告诉程序，把训练的曲线图画在 WandB 网页上，方便人类观察模型是不是变聪明了。</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>低成本复现 DeepSeek-R1 思路</strong>的脚本。它配置了 8 张显卡，使用 <strong>GRPO 算法</strong>，让 Qwen2-7B 模型在 GSM8K 数学题上通过“自己生成 5 个答案并互相比较”的方式进行强化学习，从而提高做题准确率。</p>

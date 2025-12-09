@@ -1,0 +1,89 @@
+<h1>megatron/legacy/data/realm_dataset_utils.py</h1>
+<p>这份代码确实比较晦涩，因为它属于 <strong>Megatron-LM</strong> 项目中比较早期的（Legacy）、针对特定任务（REALM - 检索增强语言模型）的数据处理工具代码。</p>
+<p>简单来说，这个文件的核心目的是：<strong>把一大堆文档切分成固定大小的“块”（Blocks），并为这些块建立索引，以便模型可以进行“检索”或“训练”。</strong></p>
+<p>为了让你听懂，我把这个文件的逻辑拆解成一个 <strong>“为搜索引擎准备数据”</strong> 的任务清单（To-Do List）。我们将一步步完成这个任务。</p>
+<hr />
+<h3>任务清单：构建 REALM 检索数据集</h3>
+<p>我们需要完成以下 4 个步骤，才能让模型读懂数据：</p>
+<ol>
+<li><strong>定义基本单位</strong>：什么是“一个块”？（定义数据结构）</li>
+<li><strong>绘制地图</strong>：如何把海量文章切分并建立索引？（核心逻辑）</li>
+<li><strong>装载货物</strong>：如何把数据批量读入内存？（DataLoader）</li>
+<li><strong>拆解包裹</strong>：训练时如何提取具体的数据字段？（ICT 任务）</li>
+</ol>
+<hr />
+<h3>Step 1: 定义基本单位 (Class <code>BlockSampleData</code>)</h3>
+<p>在 REALM 模型中，我们不是处理一整篇文章，而是处理一个个固定的文本片段（Block）。我们需要一个结构来记录这个片段的信息。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>class BlockSampleData</code> 和 <code>class BlockSamplesMapping</code></li>
+<li><strong>通俗解释</strong>：
+    想象你有一本很厚的书（原始数据集）。你需要把它剪成无数个小纸条（Blocks）。
+    <code>BlockSampleData</code> 就是每个小纸条的“身份证”，上面写着：<ul>
+<li><code>doc_idx</code>: 我来自第几章（第几篇文档）。</li>
+<li><code>start_idx</code>: 我是从这一章的第几句话开始的。</li>
+<li><code>end_idx</code>: 我到第几句话结束。</li>
+<li><code>block_idx</code>: 我是第几个小纸条（全局唯一ID）。</li>
+</ul>
+</li>
+</ul>
+<p><code>BlockSamplesMapping</code> 只是一个包装器，用来方便地存储和读取成千上万个这样的“身份证”。</p>
+<h3>Step 2: 绘制地图 (Function <code>get_block_samples_mapping</code>)</h3>
+<p>这是文件中最长、最复杂的函数。它的任务是处理原始数据，生成上面的“身份证列表”。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>def get_block_samples_mapping(...)</code></li>
+<li><strong>流程解析</strong>：<ol>
+<li><strong>检查缓存</strong>：它首先看硬盘上有没有一个以 <code>.npy</code> 结尾的文件（indexmap）。如果有，说明之前切分过，直接读取（省时间）。</li>
+<li><strong>主节点干活 (Rank 0)</strong>：如果没有缓存，就让 0 号显卡（主进程）开始干活。<ul>
+<li>它调用底层的 C++ 辅助函数 (<code>helpers.build_blocks_mapping</code>)，按照设定的 <code>max_seq_length</code>（最大长度），把所有文档切成一块一块的。</li>
+<li><strong>关键点</strong>：它要计算每一块的起始和结束位置，确保不切断句子（尽量）。</li>
+</ul>
+</li>
+<li><strong>保存并广播</strong>：0 号显卡把切分好的地图（Mapping）存到硬盘。</li>
+<li><strong>全员同步</strong>：其他显卡（Rank &gt; 0）等待 0 号干完活，然后大家一起从硬盘读取这个文件。</li>
+</ol>
+</li>
+</ul>
+<p><strong>为什么这么麻烦？</strong> 因为处理几百 GB 的文本切分非常慢，所以只做一次，存成文件，下次直接读。</p>
+<h3>Step 3: 装载货物 (Function <code>get_one_epoch_dataloader</code>)</h3>
+<p>地图有了，现在需要把数据搬运给 GPU 进行计算。这个函数通常用于 <strong>“构建索引”</strong> 阶段（Indexing Job）。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>def get_one_epoch_dataloader(...)</code></li>
+<li><strong>通俗解释</strong>：
+    这是一个搬运工。它创建一个 PyTorch 的 <code>DataLoader</code>。<ul>
+<li>它的目标是把所有数据 <strong>不重复地</strong> 遍历一遍（One Epoch）。</li>
+<li>这通常是为了把所有切好的 Block 喂给 BERT 编码器，生成向量，存入向量数据库（FAISS）。</li>
+</ul>
+</li>
+<li><strong>注意（坑）</strong>：
+    代码里有一行 <code>assert False, 'DistributedBatchSampler deprecated...'</code>。
+    这意味着<strong>这部分代码在当前版本是废弃的/坏的</strong>。开发者留了个报错在这里，提醒使用者这个采样器已经不能用了，需要重写。</li>
+</ul>
+<h3>Step 4: 拆解包裹 (Function <code>get_ict_batch</code>)</h3>
+<p>这是为了具体的训练任务服务的。REALM 经常使用一种叫 <strong>ICT (Inverse Cloze Task)</strong> 的预训练任务。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>def get_ict_batch(data_iterator)</code></li>
+<li><strong>任务背景 (ICT)</strong>：
+    ICT 的逻辑是：给你一句话（Query），让你从一堆文本块中找到包含这句话的那一段（Block）。这用来训练模型的检索能力。</li>
+<li><strong>代码逻辑</strong>：<ol>
+<li>从数据流中取出一个 Batch。</li>
+<li><strong>广播 (Broadcast)</strong>：确保所有 GPU 拿到一样的数据。</li>
+<li><strong>拆包</strong>：把数据拆分成以下几个部分：<ul>
+<li><code>query_tokens</code>: 提问的句子（比如：“苹果是红色的”）。</li>
+<li><code>block_tokens</code>: 被检索的文本块（比如：“...水果有很多种。苹果是红色的。它很好吃...”）。</li>
+<li><code>block_data</code>: 这个块的索引信息。</li>
+</ul>
+</li>
+<li>返回这些张量（Tensor）给模型去算 Loss。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就是一个 <strong>“切肉工”</strong>：</p>
+<ol>
+<li><strong><code>BlockSampleData</code></strong>: 定义每一块肉（文本块）的标签。</li>
+<li><strong><code>get_block_samples_mapping</code></strong>: 把整头猪（整个语料库）切成标准大小的肉块，并记录每块肉原本属于哪个部位，存成档案。</li>
+<li><strong><code>get_ict_batch</code></strong>: 把肉块拿出来，分成“问题”和“答案”，喂给模型去学习。</li>
+</ol>
+<p><strong>你最需要关注的是：</strong>
+如果你不是在做 REALM 或类似的检索增强模型，这个文件基本可以忽略。如果你在调试报错，请注意 <code>get_one_epoch_dataloader</code> 里面那个显式的报错语句，说明这部分代码需要修复才能运行。</p>

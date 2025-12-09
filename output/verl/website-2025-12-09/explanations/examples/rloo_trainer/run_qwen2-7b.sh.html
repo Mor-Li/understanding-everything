@@ -1,0 +1,74 @@
+<h1>examples/rloo_trainer/run_qwen2-7b.sh</h1>
+<p>这份脚本确实看起来很吓人，因为它把<strong>模型训练、硬件配置、算法参数</strong>全部塞在一个命令里了。</p>
+<p>别担心，我们把它想象成你在<strong>指挥一个厨师团队（GPU集群）来特训一个实习生（AI模型）</strong>。</p>
+<p>为了让你看懂，我把理解这份文件拆解成 <strong>5个待办任务（Task List）</strong>，我们一步步来完成。</p>
+<hr />
+<h3>Task 1: 搞清楚我们在做什么（宏观目标）</h3>
+<p><strong>目标：</strong> 这段脚本的目的是启动一个<strong>强化学习（RL）训练流程</strong>。
+<strong>对象：</strong> 我们要训练的模型是 <strong>Qwen2-7B-Instruct</strong>。
+<strong>教材：</strong> 数据集是 <strong>GSM8K</strong>（一个经典的小学数学应用题数据集）。
+<strong>方法：</strong> 使用一种叫 <strong>RLOO</strong> 的算法（它是 PPO 算法的一种变体，更省显存）。</p>
+<blockquote>
+<p><strong>对应代码行：</strong>
+*   <code>python3 -m verl.trainer.main_ppo</code>: 启动 VeRL 库的主程序。
+*   <code>algorithm.adv_estimator=rloo</code>: 核心！指定算法为 RLOO（Reinforce Leave-One-Out），而不是普通的 PPO。
+*   <code>trainer.experiment_name='qwen2_7b_function_rm'</code>: 给这次特训起个名字。</p>
+</blockquote>
+<hr />
+<h3>Task 2: 准备训练材料（数据与模型）</h3>
+<p>在开始训练前，我们需要指定“课本”在哪里，“学生”是谁。</p>
+<p><strong>步骤说明：</strong>
+1.  <strong>指定数据</strong>：告诉程序去哪里读取训练集和测试集（parquet 格式）。
+2.  <strong>指定模型</strong>：加载 Qwen2-7B 作为基础模型。
+3.  <strong>设定长度限制</strong>：防止题目太长或回答太长爆显存。</p>
+<blockquote>
+<p><strong>对应代码行：</strong>
+*   <code>data.train_files=$HOME/data/gsm8k/train.parquet</code>: 训练数据路径。
+*   <code>actor_rollout_ref.model.path=Qwen/Qwen2-7B-Instruct</code>: 模型的路径（HuggingFace 格式）。
+*   <code>data.max_prompt_length=512</code>: 题目最长 512 token。
+*   <code>data.max_response_length=1024</code>: 回答最长 1024 token。</p>
+</blockquote>
+<hr />
+<h3>Task 3: 设定特训规则（RLOO 算法逻辑）</h3>
+<p>这是最难懂的部分。在强化学习中，我们需要模型自己生成答案（Rollout），然后给它打分，再更新模型。</p>
+<p><strong>RLOO 的核心逻辑是：</strong> 让模型对同一个问题生成 <strong>N</strong> 个不同的回答，然后把这 N 个回答互相比较，好的加分，差的减分。</p>
+<p><strong>步骤说明：</strong>
+1.  <strong>生成数量</strong>：也就是上面的 N。脚本里设为 5。
+2.  <strong>推理引擎</strong>：为了生成这 5 个回答够快，我们使用 <strong>vLLM</strong>（一个超快的推理库）。
+3.  <strong>约束学生</strong>：我们不希望模型为了刷分而开始胡言乱语，所以需要一个“参考模型（Ref）”来盯着它，计算 KL 散度（KL Penalty），确保它不要偏离原有的语言能力太远。</p>
+<blockquote>
+<p><strong>对应代码行：</strong>
+*   <code>actor_rollout_ref.rollout.n=5</code>: 关键参数！对每个问题生成 5 个回答。
+*   <code>actor_rollout_ref.rollout.name=vllm</code>: 使用 vLLM 来加速生成这 5 个回答。
+*   <code>algorithm.kl_ctrl.kl_coef=0.001</code>: KL 惩罚系数。系数越小，允许模型改动越大。</p>
+</blockquote>
+<hr />
+<h3>Task 4: 安排硬件资源（怎么把大象装进冰箱）</h3>
+<p>这是一个 7B（70亿参数）的模型，还要同时跑生成（Rollout）、训练（Actor）、参考（Ref），显存压力很大。我们需要精打细算。</p>
+<p><strong>步骤说明：</strong>
+1.  <strong>GPU 分配</strong>：脚本指定单机 8 卡（<code>n_gpus_per_node=8</code>）。
+2.  <strong>模型切分</strong>：7B 模型可能一张卡跑起来吃力，或者为了更快，我们把它切开。<code>tensor_model_parallel_size=2</code> 意味着用 2 张卡拼起来跑一个模型实例。
+3.  <strong>显存优化 (FSDP)</strong>：Fully Sharded Data Parallel。这是一种把模型参数碎尸万段存在不同显卡上的技术，为了省显存。
+    *   <code>actor...fsdp_config.param_offload=False</code>: 训练用的模型（Actor）必须在显存里，不卸载到 CPU。
+    *   <code>ref...fsdp_config.param_offload=True</code>: 参考模型（Ref）只是偶尔用来算分，平时不用，所以可以卸载到 CPU 内存里省地盘。</p>
+<hr />
+<h3>Task 5: 设定训练节奏（超参数）</h3>
+<p>最后是控制训练进度的旋钮。</p>
+<p><strong>步骤说明：</strong>
+1.  <strong>学习率 (LR)</strong>：<code>1e-6</code>。非常小，因为是在微调，不想破坏模型原有的知识。
+2.  <strong>批次大小 (Batch Size)</strong>：
+    *   <code>train_batch_size=1024</code>: 总共一次看 1024 个数据。
+    *   <code>ppo_micro_batch_size_per_gpu=80</code>: 显卡一次吃不下 1024，所以切碎成小块，每块 80 个慢慢吃。
+3.  <strong>总时长</strong>：<code>total_epochs=15</code>。整个数据集学 15 遍。</p>
+<hr />
+<h3>总结：这个脚本到底在干嘛？</h3>
+<p>把所有 Task 串起来，这个脚本在对机器说：</p>
+<blockquote>
+<p>“嘿，用 <strong>8张显卡</strong>，加载 <strong>Qwen2-7B</strong> 模型。
+给我用 <strong>GSM8K</strong> 数学题来训练它。
+训练方法是：每道题让它用 <strong>vLLM 快速生成 5 个答案</strong>，然后对比这 5 个答案的好坏（<strong>RLOO算法</strong>）。
+记得用 <strong>FSDP</strong> 技术省点显存，把不用的参考模型扔到内存里。
+学习率设低点（<strong>1e-6</strong>），别学傻了。
+一共跑 <strong>15 轮</strong>，结果记在 <strong>WandB</strong> 上。”</p>
+</blockquote>
+<p>现在再回头看那些参数，是不是稍微眼熟一点了？</p>

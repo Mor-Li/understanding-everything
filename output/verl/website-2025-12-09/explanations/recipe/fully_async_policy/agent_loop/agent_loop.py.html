@@ -1,0 +1,105 @@
+<h1>recipe/fully_async_policy/agent_loop/agent_loop.py</h1>
+<p>这份代码确实比较复杂，因为它结合了 <strong>Ray</strong>（分布式计算框架）、<strong>Asyncio</strong>（异步编程）、<strong>Hydra</strong>（配置管理）以及 <strong>LLM 推理</strong>（vLLM）。</p>
+<p>简单来说，这个文件的作用是：<strong>构建一个完全异步的系统，指挥多个“工人（Worker）”去调用 LLM 生成数据（比如对话、解题步骤），并管理这些生成过程的启动、暂停和恢复。</strong></p>
+<p>为了让你听懂，我把阅读这份代码的任务拆解成一个 <strong>Todo List</strong>，然后逐个任务给你讲解。</p>
+<hr />
+<h3>📋 阅读理解 Todo List</h3>
+<ol>
+<li><strong>任务一：搞清楚角色分工</strong> —— 谁是老板，谁是打工的，谁是大脑？</li>
+<li><strong>任务二：理解“大脑”的接口 (<code>FullyAsyncLLMServerManager</code>)</strong> —— 怎么向 LLM 发送请求？</li>
+<li><strong>任务三：理解“打工人”的日常 (<code>FullyAsyncAgentLoopWorker</code>)</strong> —— 怎么处理一批数据？怎么运行 Agent 逻辑？</li>
+<li><strong>任务四：理解“大老板”的调度 (<code>FullyAsyncAgentLoopManager</code>)</strong> —— 怎么初始化系统？怎么分配任务？</li>
+<li><strong>任务五：串联流程</strong> —— 一个请求进来，是怎么流转的？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>任务一：搞清楚角色分工</h4>
+<p>在这个文件里，有三个核心类，它们的关系如下：</p>
+<ul>
+<li><strong><code>FullyAsyncAgentLoopManager</code> (大老板)</strong>：<ul>
+<li>负责初始化整个系统。</li>
+<li>负责启动底层的 vLLM 推理服务。</li>
+<li>负责把数据分发给下面的 Worker。</li>
+</ul>
+</li>
+<li><strong><code>FullyAsyncAgentLoopWorker</code> (打工人)</strong>：<ul>
+<li>这是一个 Ray Actor（独立进程）。</li>
+<li>它负责具体执行“Agent Loop”（比如：拿到一个问题 -&gt; 思考 -&gt; 调用工具 -&gt; 再思考）。</li>
+<li>它会处理具体的每一个样本。</li>
+</ul>
+</li>
+<li><strong><code>FullyAsyncLLMServerManager</code> (连接器/传话筒)</strong>：<ul>
+<li>Worker 用它来和远程的 LLM 推理服务（vLLM）通信。</li>
+<li>它负责把 Prompt 发过去，把生成的 Token 拿回来。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>任务二：理解“大脑”的接口 (<code>FullyAsyncLLMServerManager</code>)</h4>
+<p>看代码块 <code>class FullyAsyncLLMServerManager</code>：</p>
+<ul>
+<li><strong>核心方法</strong>：<code>generate_for_partial</code></li>
+<li><strong>功能</strong>：这是一个异步函数（<code>async def</code>）。它接收 <code>prompt_ids</code>（提示词）和 <code>sampling_params</code>（温度、top_p等参数）。</li>
+<li><strong>关键点</strong>：<ul>
+<li><code>server = self._choose_server(request_id)</code>：根据请求ID选择一个推理服务器（实现会话保持，Sticky Session）。</li>
+<li><code>await server.generate_for_partial.remote(...)</code>：<strong>异步</strong>地调用远程 GPU 服务器生成文本。</li>
+<li><strong>为什么叫 Partial？</strong> 因为在强化学习或复杂的 Agent 任务中，生成过程可能会被打断（比如生成了一半需要调用计算器），或者需要分段生成。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>任务三：理解“打工人”的日常 (<code>FullyAsyncAgentLoopWorker</code>)</h4>
+<p>这是最复杂的干活部分。</p>
+<p><strong>1. <code>generate_sequences_no_post</code> (处理一批订单)</strong>
+*   <strong>输入</strong>：<code>batch</code>（一批数据，比如 10 个数学题）。
+*   <strong>逻辑</strong>：
+    *   设置采样参数（Temperature 等）。
+    *   如果是第一次运行，初始化空的 <code>partial_output_list</code>。
+    *   <strong>并发执行</strong>：使用 <code>asyncio.create_task</code> 为 Batch 中的<strong>每一条数据</strong>创建一个任务，然后用 <code>asyncio.gather</code> 同时等待它们完成。这就实现了并行处理，不用等第一题做完再做第二题。
+    *   <strong>取消检查</strong>：检查是否有任务被取消了 (<code>is_cancel</code>)。</p>
+<p><strong>2. <code>_partial_run_agent_loop</code> (处理单条数据)</strong>
+*   <strong>逻辑</strong>：
+    *   <strong>断点续传</strong>：第一行就在检查 <code>if kwargs["output"] is not None...</code>。如果这个任务之前做过一部分（并且没被取消），直接返回结果，不用重做。
+    *   <strong>动态加载 Agent</strong>：
+        <code>python
+        agent_loop = hydra.utils.instantiate(config=agent_loop_config, ...)</code>
+        这里用 Hydra 动态创建了一个 Agent（比如一个“单轮对话 Agent”或“ReAct Agent”）。
+    *   <strong>运行 Agent</strong>：<code>await agent_loop.run(...)</code>。这行代码是核心，它会去调用 LLM，执行思考过程。
+    *   <strong>传入取消事件</strong>：它把 <code>self.cancellation_event</code> 传进去了，这样老板喊停的时候，正在运行的 Agent 能立刻感知到并停止。</p>
+<hr />
+<h4>任务四：理解“大老板”的调度 (<code>FullyAsyncAgentLoopManager</code>)</h4>
+<p>这个类管理整个集群资源。</p>
+<p><strong>1. <code>_initialize_llm_servers_async</code> (招聘与基建)</strong>
+*   计算需要多少个 GPU 副本（Replica）。
+*   启动 <code>vLLM</code> 服务（<code>self.rollout_replicas</code>）。
+*   配置 Prometheus 监控（为了看 GPU 利用率等指标）。</p>
+<p><strong>2. <code>generate_single_sample_async</code> (派活)</strong>
+*   <strong>负载均衡</strong>：<code>worker = self._select_best_worker()</code>。这里用的是简单的轮询（Round-Robin），轮流把活派给不同的 Worker。
+*   <strong>异步派发</strong>：<code>worker.generate_sequences_no_post.remote(...)</code>。老板把活派出去就不管了，等着结果回来（<code>await</code>）。</p>
+<p><strong>3. <code>cancel</code>, <code>resume</code>, <code>wake_up</code>, <code>sleep</code> (行政命令)</strong>
+*   老板可以一键让所有 Worker 停手（<code>cancel</code>），或者让底层的 GPU 显存清空（<code>sleep</code>/<code>clear_kv_cache</code>）以节省资源。</p>
+<hr />
+<h4>任务五：串联流程 —— 总结</h4>
+<p>假设我们要训练一个 AI 做数学题，流程是这样的：</p>
+<ol>
+<li><strong>启动</strong>：<code>Manager</code> 启动，拉起 8 个 GPU 上的 vLLM 服务，并启动 4 个 <code>Worker</code> 进程。</li>
+<li><strong>来活了</strong>：来了一批数学题数据 <code>batch</code>。</li>
+<li><strong>分配</strong>：<code>Manager</code> 把这批题丢给 <code>Worker A</code>。</li>
+<li><strong>拆解</strong>：<code>Worker A</code> 发现有 64 道题，它同时创建 64 个异步任务 (<code>_partial_run_agent_loop</code>)。</li>
+<li><strong>执行</strong>：<ul>
+<li>每个任务实例化一个 Agent。</li>
+<li>Agent 想：“我需要调用 LLM”。</li>
+<li>Agent 调用 <code>ServerManager</code>。</li>
+<li><code>ServerManager</code> 把请求发给远程的 vLLM GPU。</li>
+</ul>
+</li>
+<li><strong>结果</strong>：LLM 返回答案，Agent 拿到答案，处理完毕。</li>
+<li><strong>汇总</strong>：<code>Worker A</code> 等齐了 64 个答案，打包返回给 <code>Manager</code>。</li>
+</ol>
+<h3>💡 核心观点总结</h3>
+<p>这个文件的核心观点（或设计哲学）是：</p>
+<ol>
+<li><strong>全异步（Fully Async）</strong>：从数据分发、Agent 逻辑执行、到 LLM 推理，全部使用 <code>asyncio</code>。这意味着 CPU 不会因为等待 GPU 生成文本而闲置，吞吐量极大。</li>
+<li><strong>状态管理（Stateful/Partial）</strong>：支持“断点续传”。生成的中间结果（<code>partial_output_list</code>）被保留。如果训练过程中断，或者 Agent 需要多步推理，系统可以基于之前的状态继续，而不是重头开始。</li>
+<li><strong>存算分离</strong>：逻辑执行（Worker）和模型推理（LLM Server）是物理分离的，通过 Ray 通信。这样可以灵活扩缩容。</li>
+</ol>

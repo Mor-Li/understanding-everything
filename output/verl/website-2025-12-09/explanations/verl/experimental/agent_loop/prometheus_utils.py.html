@@ -1,0 +1,71 @@
+<h1>verl/experimental/agent_loop/prometheus_utils.py</h1>
+<p>这份代码确实涉及了一些分布式系统（Ray）和监控（Prometheus）的概念，如果对这些背景不熟悉，看起来会比较晕。</p>
+<p>为了让你更容易理解，我们可以把这段代码想象成一个<strong>“监控系统的自动更新任务”</strong>。</p>
+<p>我们可以把你（作为程序员）的任务拆解成一个 <strong>Todo List</strong>，每一步对应代码中的一段逻辑。</p>
+<hr />
+<h3>任务清单：如何让监控系统自动发现新上线的服务器？</h3>
+<p><strong>背景故事：</strong>
+你正在管理一个巨大的 AI 训练集群。有很多台机器跑着模型推理服务（代码里叫 <code>server_addresses</code>，比如 vLLM 服务）。你想用 <strong>Prometheus</strong>（一个非常流行的监控软件）来盯着这些服务，看它们是不是挂了、速度快不快。
+但是，机器的 IP 地址是变动的。你不可能每次加机器都手动去改配置文件。</p>
+<p><strong>你的目标：</strong> 写一个脚本，自动把新的机器地址告诉 Prometheus，并让它立即生效。</p>
+<h4>✅ Task 1: 拿到最新的机器名单</h4>
+<ul>
+<li><strong>逻辑：</strong> 首先，我得知道现在有哪些机器在干活（跑模型）。</li>
+<li><strong>代码对应：</strong><ul>
+<li>函数入口 <code>update_prometheus_config(..., server_addresses)</code>。</li>
+<li>这里的 <code>server_addresses</code> 就是那份最新的“机器名单”。</li>
+<li>代码开头检查 <code>if not server_addresses</code>，如果名单是空的，那就不用干活了，直接返回。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 起草新的监控配置文件</h4>
+<ul>
+<li><strong>逻辑：</strong> Prometheus 不认识 Python 列表，它只认识 YAML 格式的配置文件。你需要把刚才的名单，填到一个标准的配置模板里。</li>
+<li><strong>代码对应：</strong><ul>
+<li>代码里定义了 <code>prometheus_config_json</code> 字典。</li>
+<li>它定义了两个任务（Jobs）：<ol>
+<li><code>job_name: "ray"</code>：监控 Ray 框架自己的状态。</li>
+<li><code>job_name: "rollout"</code>：<strong>重点在这里</strong>，它把 <code>targets</code> 设置为了 <code>server_addresses</code>。这意味着告诉 Prometheus：“去盯着这些 IP 地址！”。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 把配置文件分发到每台电脑上 (最难理解的部分)</h4>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li>你的代码可能运行在“电脑A”上，但 Prometheus 可能运行在“电脑B”上，或者集群里的所有电脑都需要这份配置。</li>
+<li>你不能只在本地写文件，你得用一种魔法，让集群里<strong>每一台</strong>活着的电脑都生成这个文件。</li>
+<li>这个“魔法”就是 <strong>Ray</strong>。</li>
+</ul>
+</li>
+<li><strong>代码对应：</strong><ul>
+<li><code>@ray.remote</code> 修饰的 <code>write_config_file</code> 函数：这是一个可以在远程电脑上执行的函数。</li>
+<li><code>nodes = ray.nodes()</code>：获取集群里所有电脑的信息。</li>
+<li><code>for node in alive_nodes...</code>: 遍历每一台活着的电脑。</li>
+<li><code>task = write_config_file.options(resources={"node:" + node_ip: ...})</code>：这句代码的意思是“指定在这个 IP 的电脑上，去运行写文件的任务”。</li>
+<li>结果就是：集群里每一台机器的指定路径下，都生成了最新的配置文件。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 踹一脚 Prometheus，让它重新加载 (Hot Reload)</h4>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li>文件虽然改了，但正在运行的软件通常不会自己去读新文件。</li>
+<li>你需要“拍一拍”Prometheus，告诉它：“配置改了，快重新读一下，别偷懒”。</li>
+<li>Prometheus 提供了一个接口（URL），只要你发个 POST 请求给它，它就会重载配置。</li>
+</ul>
+</li>
+<li><strong>代码对应：</strong><ul>
+<li><code>@ray.remote</code> 修饰的 <code>reload_prometheus</code> 函数。</li>
+<li>里面用了 <code>subprocess.run(["curl", "-X", "POST", reload_url]...)</code>。这相当于在命令行里敲 <code>curl</code> 命令，给本机发送一个“重载信号”。</li>
+<li>同样的，代码再次遍历了所有节点，在每一台机器上都尝试去执行这个“踹一脚”的操作。</li>
+<li><em>注：</em> 代码里加了 <code>try...except</code>，是因为并不是每台机器上都跑着 Prometheus，如果那台机器没跑，踹空了也没事，直接忽略错误（<code>pass</code>）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这段代码其实就干了一件事：</p>
+<p><strong>当有新的 AI 推理服务上线时，利用 Ray 的分布式能力，把这些服务的 IP 地址写进所有机器的 Prometheus 配置文件里，并强制 Prometheus 刷新配置，从而实现自动监控。</strong></p>
+<p>现在再回去看代码，是不是清晰一点了？</p>

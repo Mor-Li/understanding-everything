@@ -1,0 +1,99 @@
+<h1>verl/workers/rollout/utils.py</h1>
+<p>没问题，这段代码乍一看确实涉及很多网络编程的术语（Socket, IPv6, Uvicorn, Asyncio），如果不熟悉这块确实容易晕。</p>
+<p>简单来说，<strong>这个文件的作用就是：“在一个没人用的‘端口’上，启动一个可以在后台运行的 Web 服务器。”</strong></p>
+<p>想象你要开一家“快递收发室”（Web服务器），你需要先确定地址（IP），然后找一个没被占用的门牌号（端口），最后挂牌营业。</p>
+<p>为了让你更容易理解，我把你当作这个程序的“管家”，列一个 <strong>To-Do List (任务清单)</strong>，然后一步步告诉你代码是怎么完成这些任务的。</p>
+<hr />
+<h3>📋 管家的 To-Do List (任务清单)</h3>
+<ol>
+<li><strong>任务一：确认地址类型</strong> —— 看看老板给的地址是“老式地址 (IPv4)”还是“新式地址 (IPv6)”。</li>
+<li><strong>任务二：找一个空闲的门牌号</strong> —— 随便找一个没人用的端口 (Port)，占住它，防止跟别的程序冲突。</li>
+<li><strong>任务三：尝试启动服务器</strong> —— 用刚才找到的门牌号，把收发室（Uvicorn服务器）开起来。</li>
+<li><strong>任务四：失败重试机制</strong> —— 如果开张失败（比如门牌号突然被抢了），就在任务二和三之间反复尝试，最多试 5 次。</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<h4>1. 任务一：确认地址类型 (IPv4 vs IPv6)</h4>
+<p><strong>代码位置：</strong> <code>is_valid_ipv6_address</code> 函数</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">is_valid_ipv6_address</span><span class="p">(</span><span class="n">address</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">ipaddress</span><span class="o">.</span><span class="n">IPv6Address</span><span class="p">(</span><span class="n">address</span><span class="p">)</span> <span class="c1"># 尝试把地址当成 IPv6 解析</span>
+        <span class="k">return</span> <span class="kc">True</span>                    <span class="c1"># 成功了，说明是 IPv6</span>
+    <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">False</span>                   <span class="c1"># 报错了，说明不是</span>
+</code></pre></div>
+
+<ul>
+<li><strong>人话解释：</strong> 互联网有两种地址格式。一种是短的（IPv4，比如 192.168.1.1），一种是长的（IPv6）。这个函数就是个“安检员”，看一眼地址是不是 IPv6 格式，方便后面决定用哪种网络协议。</li>
+</ul>
+<h4>2. 任务二：找一个空闲的门牌号 (Get Free Port)</h4>
+<p><strong>代码位置：</strong> <code>get_free_port</code> 函数</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">get_free_port</span><span class="p">(</span><span class="n">address</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">]:</span>
+    <span class="c1"># ... 省略判断 IPv4/IPv6 的代码 ...</span>
+
+    <span class="c1"># 创建一个套接字（相当于准备一个电话机）</span>
+    <span class="n">sock</span> <span class="o">=</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">(</span><span class="n">family</span><span class="o">=</span><span class="n">family</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="n">socket</span><span class="o">.</span><span class="n">SOCK_STREAM</span><span class="p">)</span>
+
+    <span class="c1"># 允许地址复用（相当于告诉系统：如果我刚挂断，允许我立刻再用这个号）</span>
+    <span class="n">sock</span><span class="o">.</span><span class="n">setsockopt</span><span class="p">(</span><span class="n">socket</span><span class="o">.</span><span class="n">SOL_SOCKET</span><span class="p">,</span> <span class="n">socket</span><span class="o">.</span><span class="n">SO_REUSEADDR</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+    <span class="n">sock</span><span class="o">.</span><span class="n">setsockopt</span><span class="p">(</span><span class="n">socket</span><span class="o">.</span><span class="n">SOL_SOCKET</span><span class="p">,</span> <span class="n">socket</span><span class="o">.</span><span class="n">SO_REUSEPORT</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+
+    <span class="c1"># 关键点：绑定到端口 0</span>
+    <span class="c1"># 在计算机网络中，端口写 0 意思就是：“系统大哥，你帮我随机分一个没人用的端口吧”</span>
+    <span class="n">sock</span><span class="o">.</span><span class="n">bind</span><span class="p">((</span><span class="n">address</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>
+
+    <span class="c1"># 获取系统刚才分配给我们的端口号</span>
+    <span class="n">port</span> <span class="o">=</span> <span class="n">sock</span><span class="o">.</span><span class="n">getsockname</span><span class="p">()[</span><span class="mi">1</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">port</span><span class="p">,</span> <span class="n">sock</span>
+</code></pre></div>
+
+<ul>
+<li><strong>人话解释：</strong> 电脑上有很多程序（微信、浏览器等）都在用网络，每个程序都要占一个“端口”（类似门牌号）。</li>
+<li>如果你硬指定一个号（比如 8080），可能已经被占用了。</li>
+<li>这个函数的聪明之处在于：它申请绑定到 <strong>端口 0</strong>。这是给操作系统的暗号，意思是<strong>“给我自动分配一个空闲的”</strong>。拿到之后，它就把这个号码记下来返回去。</li>
+</ul>
+<h4>3. 任务三 &amp; 四：启动服务器与重试 (Run Server)</h4>
+<p><strong>代码位置：</strong> <code>run_unvicorn</code> 函数 (注：代码里有个拼写错误，应该是 <code>uvicorn</code>)</p>
+<p>这个函数是核心，它把上面的步骤串起来了。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">run_unvicorn</span><span class="p">(</span><span class="n">app</span><span class="p">:</span> <span class="n">FastAPI</span><span class="p">,</span> <span class="n">server_args</span><span class="p">,</span> <span class="n">server_address</span><span class="p">,</span> <span class="n">max_retries</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">Task</span><span class="p">]:</span>
+    <span class="c1"># ...</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">max_retries</span><span class="p">):</span> <span class="c1"># 这是一个循环，最多试 5 次（任务四）</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="c1"># 1. 调用刚才的任务二，拿到一个空闲端口</span>
+            <span class="n">server_port</span><span class="p">,</span> <span class="n">sock</span> <span class="o">=</span> <span class="n">get_free_port</span><span class="p">(</span><span class="n">server_address</span><span class="p">)</span>
+
+            <span class="c1"># 2. 配置 Uvicorn 服务器（Uvicorn 是一个 Python 的高性能 Web 服务器软件）</span>
+            <span class="n">config</span> <span class="o">=</span> <span class="n">uvicorn</span><span class="o">.</span><span class="n">Config</span><span class="p">(</span><span class="n">app</span><span class="p">,</span> <span class="n">host</span><span class="o">=</span><span class="n">server_address</span><span class="p">,</span> <span class="n">port</span><span class="o">=</span><span class="n">server_port</span><span class="p">,</span> <span class="n">log_level</span><span class="o">=</span><span class="s2">&quot;warning&quot;</span><span class="p">)</span>
+            <span class="n">server</span> <span class="o">=</span> <span class="n">uvicorn</span><span class="o">.</span><span class="n">Server</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+
+            <span class="c1"># 3. 启动服务器</span>
+            <span class="c1"># 这里有一些比较“黑客”的操作 (should_exit=True)，</span>
+            <span class="c1"># 它的目的是为了能拿到 server 的 task 对象，让它在后台跑，不要卡住主程序。</span>
+            <span class="n">server</span><span class="o">.</span><span class="n">should_exit</span> <span class="o">=</span> <span class="kc">True</span> 
+            <span class="k">await</span> <span class="n">server</span><span class="o">.</span><span class="n">serve</span><span class="p">()</span>
+            <span class="n">server_task</span> <span class="o">=</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">create_task</span><span class="p">(</span><span class="n">server</span><span class="o">.</span><span class="n">main_loop</span><span class="p">())</span>
+
+            <span class="c1"># 成功了！跳出循环</span>
+            <span class="k">break</span>
+        <span class="k">except</span> <span class="p">(</span><span class="ne">OSError</span><span class="p">,</span> <span class="ne">SystemExit</span><span class="p">)</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="c1"># 失败了！打印错误，准备下一次重试</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Failed... try </span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">, error: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># 如果 5 次都失败了，直接退出程序，不干了</span>
+        <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">server_port</span><span class="p">,</span> <span class="n">server_task</span>
+</code></pre></div>
+
+<ul>
+<li><strong>人话解释：</strong><ol>
+<li><strong>循环 5 次：</strong> 就像你打客服电话，打不通就重拨，最多拨 5 次。</li>
+<li><strong>获取端口：</strong> 每次重试都重新找一个新端口（以防刚才那个突然又被占了）。</li>
+<li><strong>启动 Uvicorn：</strong> <code>Uvicorn</code> 就像是快递员，专门负责把外界发来的 HTTP 请求转交给你的程序 (<code>app</code>) 处理。</li>
+<li><strong>Asyncio (异步)：</strong> 注意那个 <code>async</code> 和 <code>await</code>。这表示这个服务器启动后，会在<strong>后台</strong>默默运行，不会让整个程序卡死在这里不动。主程序可以继续往下跑。</li>
+</ol>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这文件就是一个<strong>“自动档的服务器启动器”</strong>。</p>
+<p>它不让用户操心“我该用哪个端口？会不会冲突？”，而是自己去问系统要一个空闲端口，然后在这个端口上把 Web 服务跑起来。如果启动失败，它还会自动重试几次。</p>

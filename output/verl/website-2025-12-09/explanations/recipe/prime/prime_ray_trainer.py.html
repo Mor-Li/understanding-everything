@@ -1,0 +1,85 @@
+<h1>recipe/prime/prime_ray_trainer.py</h1>
+<p>这份代码确实比较复杂，它是一个基于 <strong>Ray</strong>（分布式计算框架）和 <strong>PPO</strong>（强化学习算法）的大模型训练器。简单来说，它的作用是<strong>让大模型通过“尝试-获得反馈-学习”的过程变得更聪明</strong>。</p>
+<p>为了让你看懂，我把它想象成一个<strong>“老师教学生（模型）做题”</strong>的过程，并把代码拆解成一个 <strong>Task List (任务清单)</strong>。</p>
+<p>代码的核心逻辑都在 <code>fit()</code> 这个函数里，我们按顺序来执行这个清单：</p>
+<hr />
+<h3>📋 Task 0: 准备工作 (Setup)</h3>
+<p><strong>对应代码：</strong> <code>__init__</code>, <code>_create_dataloader</code>, <code>_load_checkpoint</code>
+*   <strong>目标</strong>：在开课前，把教室（计算资源）、课本（数据集）和之前的教案（Checkpoint）准备好。
+*   <strong>解释</strong>：
+    *   初始化 Ray 分布式环境（因为模型太大，需要多张显卡一起跑）。
+    *   加载训练数据（<code>train_dataloader</code>）和验证数据（<code>val_dataloader</code>）。
+    *   如果是中断后继续训练，从硬盘加载之前的进度（Checkpoint）。</p>
+<hr />
+<h3>🔄 Task 1: 让学生做题 (Rollout / Generation)</h3>
+<p><strong>对应代码：</strong> <code>fit()</code> 循环中的 <code>self.actor_rollout_wg.generate_sequences(...)</code>
+*   <strong>目标</strong>：给模型一些题目（Prompts），让它生成答案。
+*   <strong>关键点</strong>：
+    *   代码里有一个 <code>config.actor_rollout_ref.rollout.n</code>，意思是<strong>同一个题目，让模型生成 N 个不同的答案</strong>。
+    *   为什么要 N 个？为了对比。就像让学生对同一道题写 5 种解法，方便后面挑出最好的。</p>
+<hr />
+<h3>⚖️ Task 2: 找个参考基准 (Optional: ReMax Baseline)</h3>
+<p><strong>对应代码：</strong> <code>if self.config.algorithm.adv_estimator == "remax": ...</code>
+*   <strong>目标</strong>：如果配置了 ReMax 算法，需要先算一个“及格分”。
+*   <strong>解释</strong>：
+    *   它会用贪婪策略（不随机，只选概率最大的词）生成一个“标准答案”。
+    *   用这个标准答案的得分作为基准线（Baseline）。如果刚才生成的 N 个答案比这个好，就奖励；比这个差，就惩罚。</p>
+<hr />
+<h3>✅ Task 3: 批改作业 (Reward / Verification)</h3>
+<p><strong>对应代码：</strong> <code>self.reward_fn.verify(batch)</code> 和 <code>metrics["acc"]</code>
+*   <strong>目标</strong>：判断模型生成的答案对不对。
+*   <strong>解释</strong>：
+    *   这里调用了一个验证函数（比如做数学题，检查答案是不是等于正确数值）。
+    *   计算准确率（Accuracy）。</p>
+<hr />
+<h3>🔍 Task 4: 筛选好题 (Filter &amp; Downsample)</h3>
+<p><strong>对应代码：</strong> <code>self.filter_and_downsample(scores, batch)</code>
+*   <strong>目标</strong>：从刚才生成的那么多数据里，挑出最有价值的来训练。
+*   <strong>核心逻辑</strong>：
+    *   代码里有个 <code>oversample_factor</code>（过采样因子）。假设我们需要 100 个数据，我们可能先生成 400 个。
+    *   在这个函数里，会根据规则（比如：答案太长的不要、准确率太低或太高的不要）进行过滤。
+    *   <strong>重点</strong>：只保留那些“值得学习”的样本，扔掉垃圾样本。</p>
+<hr />
+<h3>🧮 Task 5: 回顾刚才怎么写的 (Compute Old Log Prob)</h3>
+<p><strong>对应代码：</strong> <code>self.actor_rollout_wg.compute_log_prob(batch)</code>
+*   <strong>目标</strong>：计算刚才生成的那些字，在当前模型眼里的“出现概率”是多少。
+*   <strong>解释</strong>：
+    *   这是 PPO 算法的数学要求。我们需要知道模型在生成这些词时的“自信程度”（Log Probability），并计算熵（Entropy，代表多样性）。</p>
+<hr />
+<h3>📖 Task 6: 看看“教科书”怎么说 (Reference Policy)</h3>
+<p><strong>对应代码：</strong> <code>self.ref_policy_wg.compute_ref_log_prob(batch)</code>
+*   <strong>目标</strong>：防止模型为了拿高分而“走火入魔”（乱写）。
+*   <strong>解释</strong>：
+    *   我们会保留一个原始模型（Reference Model，通常是未经过强化学习微调的模型）。
+    *   我们要计算原始模型生成这些答案的概率。
+    *   如果当前模型和原始模型差别太大（KL 散度过大），通常会给予惩罚。</p>
+<hr />
+<h3>🏆 Task 7: 算算这题做得有多好 (Compute Advantage)</h3>
+<p><strong>对应代码：</strong> <code>compute_advantage(...)</code>
+*   <strong>目标</strong>：计算“优势函数”（Advantage）。
+*   <strong>解释</strong>：
+    *   这是强化学习的核心。代码中使用了 <code>rloo</code> (Reinforce Leave-One-Out) 算法。
+    *   简单说：对于同一个问题生成的 N 个答案，在这个步骤里比较它们。
+    *   <strong>例子</strong>：如果答案 A 得 10 分，答案 B 得 5 分。那么 A 的优势就是正的（它是好答案），B 的优势是负的（它是坏答案）。</p>
+<hr />
+<h3>🧠 Task 8: 更新大脑 (Update Actor)</h3>
+<p><strong>对应代码：</strong> <code>self.actor_rollout_wg.update_actor(batch)</code>
+*   <strong>目标</strong>：根据刚才算出来的优势，修改模型的参数。
+*   <strong>解释</strong>：
+    *   <strong>好答案（优势高）</strong> -&gt; 增加生成这些词的概率。
+    *   <strong>坏答案（优势低）</strong> -&gt; 减少生成这些词的概率。
+    *   这就是模型“学习”的时刻。</p>
+<hr />
+<h3>📝 Task 9: 记账和存盘 (Logging &amp; Checkpoint)</h3>
+<p><strong>对应代码：</strong> <code>logger.log(...)</code>, <code>_save_checkpoint()</code>
+*   <strong>目标</strong>：记录训练过程，防止断电白跑。
+*   <strong>解释</strong>：
+    *   记录各种指标：平均分、回答长度、训练速度、Loss值等。
+    *   定期把模型参数保存到硬盘。</p>
+<hr />
+<h3>总结一下这段代码的独特之处：</h3>
+<ol>
+<li><strong>没有 Critic 模型</strong>：注意看 <code>self.use_critic = False</code>。标准的 PPO 通常有一个 Critic 网络来打分，但这里似乎使用了 <strong>RLOO</strong> 或 <strong>ReMax</strong> 这种不需要独立 Critic 网络的算法变体，直接通过对比多个采样（Rollout N）来计算优势。</li>
+<li><strong>数据筛选（Filtering）</strong>：它不是生成什么就练什么，而是先生成一大堆，然后通过 <code>filter_and_downsample</code> 挑出高质量的样本进行训练，这在提升大模型推理能力（如数学、代码）时非常常用。</li>
+<li><strong>Ray 分布式</strong>：所有的计算（生成、算分、更新）都是分发给不同的 Worker（可能是不同的 GPU）去做的，主进程（Driver）只负责发号施令。</li>
+</ol>

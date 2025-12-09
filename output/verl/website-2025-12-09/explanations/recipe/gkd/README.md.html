@@ -1,0 +1,62 @@
+<h1>recipe/gkd/README.md</h1>
+<p>这份文档主要介绍了一种<strong>高效的“在线知识蒸馏”（On-Policy Knowledge Distillation）训练方法</strong>。</p>
+<p>简单来说，就是让一个“学生模型”在自己生成的回答上，去模仿一个更强的“老师模型”。为了让这个过程跑得更快，作者设计了一套<strong>异步（Async）</strong>的系统，让生成数据、询问老师、更新参数这几件事并行处理，不再互相死等。</p>
+<p>为了让你更容易理解，我把你当作这个系统的开发者，列一个 <strong>“开发与理解任务清单 (To-Do List)”</strong>，一步步拆解文档中的核心观点：</p>
+<hr />
+<h3>第一阶段：理解核心逻辑 (Concept)</h3>
+<p><strong>Task 1: 搞懂我们在做什么 (What is On-Policy KD?)</strong>
+*   <strong>观点</strong>：我们要训练一个学生模型（Student），让它模仿老师模型（Teacher）。
+*   <strong>做法</strong>：
+    1.  <strong>学生自己做题</strong>：学生模型根据提示词（Prompt）生成回答（这叫 On-Policy Rollout）。
+    2.  <strong>老师打分</strong>：老师模型看一眼学生的回答，告诉学生：“在这个位置，如果是我的话，概率最高的几个词（Top-k）是什么”。
+    3.  <strong>学生修正</strong>：学生调整自己的参数，尽力去贴近老师给出的概率分布（计算 KL 散度损失）。
+*   <strong>优势</strong>：比强化学习（RL）更稳定，比离线微调（SFT）更能适应模型当前的状态。</p>
+<p><strong>Task 2: 发现痛点 (Why Async?)</strong>
+*   <strong>现状</strong>：最原始的做法是“串行”的：<code>生成数据 -&gt; 等老师打分 -&gt; 训练更新 -&gt; 也就是生成数据...</code>。
+*   <strong>问题</strong>：这太慢了！GPU 经常在空转（Pipeline bubbles）。
+*   <strong>目标</strong>：我们需要让这三个步骤重叠起来（Overlap），比如在训练第 1 批数据时，同时去生成第 2 批数据。</p>
+<hr />
+<h3>第二阶段：系统设计与优化 (System Design)</h3>
+<p><strong>Task 3: 选择“时间管理大师”策略 (Schedulers)</strong>
+文档提出了两种异步调度策略，你需要根据情况二选一：
+*   <strong>策略 A: One-Step-Off (慢一步策略)</strong>
+    *   <strong>做法</strong>：在更新当前参数时，同时生成下一批数据。
+    *   <strong>特点</strong>：比较简单，稍微有一点点延迟（用的是上一步的旧参数生成的数据），但速度快很多。
+*   <strong>策略 B: Two-Step-Off (慢两步策略)</strong>
+    *   <strong>做法</strong>：重叠得更深。当老师模型特别慢（响应时间长）的时候用这个。
+    *   <strong>代价</strong>：数据稍微更“旧”一点，但吞吐量（Throughput）最大化。</p>
+<p><strong>Task 4: 解决传输瓶颈 (Efficient Weight Sync)</strong>
+*   <strong>观点</strong>：在 Actor（训练者）和 Rollout（生成者）之间同步几个 G 的模型参数太慢了。
+*   <strong>操作</strong>：
+    *   不要一个一个张量传，要<strong>打包批量传</strong>。
+    *   不要让所有人互相广播，让一个人（Rank 0）收集好，再发给其他人。
+    *   <strong>效果</strong>：速度提升了 3-4 倍。</p>
+<hr />
+<h3>第三阶段：实操执行 (Actionable To-Do)</h3>
+<p>如果你要运行这个代码，你需要按以下步骤操作：</p>
+<p><strong>Task 5: 启动老师服务器 (Launch Teacher Server)</strong>
+*   <strong>Todo</strong>：你需要先跑起一个 vLLM 服务作为“老师”。
+*   <strong>命令</strong>：运行 <code>recipe/gkd/teacher/start_server.sh</code>。
+*   <strong>检查</strong>：用 <code>telnet localhost 15555</code> 看看通不通。</p>
+<p><strong>Task 6: 配置训练参数 (Configuration)</strong>
+*   <strong>Todo</strong>：修改 <code>on_policy_distill_trainer.yaml</code> 配置文件。
+*   <strong>关键点</strong>：
+    *   <code>teacher</code>: 填上刚才启动的老师服务器 IP 和端口。
+    *   <code>scheduler</code>: 决定用 <code>one_step_off</code> 还是 <code>two_step_off</code>。
+    *   <code>n_gpus_per_node</code>: 分配多少卡给训练（Actor），多少卡给生成（Rollout）。</p>
+<p><strong>Task 7: 开始训练 (Start Training)</strong>
+*   <strong>Todo</strong>：运行训练脚本。
+*   <strong>命令</strong>：参考文档 7.2 节的 <code>python3 -m recipe.gkd.main_gkd ...</code>。
+*   <strong>注意</strong>：确保你的数据路径 (<code>train_files</code>) 和模型路径 (<code>model.path</code>) 是对的。</p>
+<hr />
+<h3>第四阶段：监控与调试 (Monitoring)</h3>
+<p><strong>Task 8: 盯着仪表盘 (Metrics)</strong>
+训练开始后，你需要看 Log 里的这些指标：
+*   <strong><code>timing/wait_prev_teacher</code></strong>：如果这个时间很长，说明<strong>老师太慢了</strong>。
+    *   <em>解决</em>：加更多 GPU 给老师，或者减少发给老师的请求量。
+*   <strong><code>timing/wait_prev_gen</code></strong>：如果这个时间长，说明<strong>学生生成太慢了</strong>。
+    *   <em>解决</em>：分更多 GPU 给 Rollout 组。
+*   <strong><code>actor/kl_loss</code></strong>：这是蒸馏的损失函数，应该随着训练下降。</p>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这篇文档讲的就是：<strong>如何用“异步流水线”和“批量传输优化”，让“在线知识蒸馏”这种本来很慢的训练方法，在多卡多机环境下跑得飞快。</strong></p>

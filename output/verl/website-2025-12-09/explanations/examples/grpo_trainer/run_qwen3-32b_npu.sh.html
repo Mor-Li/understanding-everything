@@ -1,0 +1,135 @@
+<h1>examples/grpo_trainer/run_qwen3-32b_npu.sh</h1>
+<p>这份脚本确实看起来很复杂，因为它涉及到了<strong>大模型（LLM）的强化学习训练</strong>，而且是在<strong>多机多卡</strong>的<strong>NPU</strong>（华为昇腾芯片）环境下进行的。</p>
+<p>你可以把这个脚本看作是给一个超级庞大的“训练工厂”下达的一份<strong>生产任务书</strong>。</p>
+<p>为了让你听懂，我把这份“任务书”拆解成一个 <strong>6步走的 To-Do List（任务清单）</strong>。我们假设你就是这个工厂的厂长，现在我们要一步步配置这条生产线。</p>
+<hr />
+<h3>📋 任务清单：训练 Qwen3-32B 模型 (GRPO 算法)</h3>
+<ol>
+<li><strong>【准备工作】设定基本信息与原材料</strong><ul>
+<li>确定我们要训练哪个模型？用什么数据？</li>
+</ul>
+</li>
+<li><strong>【核心策略】确定训练算法</strong><ul>
+<li>我们用什么方法让模型变聪明？(GRPO)</li>
+</ul>
+</li>
+<li><strong>【数据流水线】配置数据输入</strong><ul>
+<li>一次喂多少数据？题目多长？</li>
+</ul>
+</li>
+<li><strong>【车间分工】配置模型的三重身份 (Actor/Rollout/Ref)</strong><ul>
+<li>这是最复杂的部分：如何让模型一边写作业，一边自我反思，一边不忘初心？</li>
+</ul>
+</li>
+<li><strong>【硬件优化】如何在 NPU 上跑得动？</strong><ul>
+<li>模型太大显存不够怎么办？(切分模型、混合精度)</li>
+</ul>
+</li>
+<li><strong>【项目管理】监控与保存</strong><ul>
+<li>多久存一次档？去哪里看进度？</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🛠️ 逐步详解 (对应脚本内容)</h3>
+<h4>✅ Task 1: 【准备工作】设定基本信息与原材料</h4>
+<p>首先，我们得告诉程序，东西都在哪。</p>
+<ul>
+<li><strong>脚本代码：</strong>
+    <code>bash
+    project_name='GRPO-Qwen3'
+    MODEL_PATH=.../Qwen3-32B  # 原始模型在哪里
+    TRAIN_FILE=.../gsm8k/train.parquet # 训练用的数学题库</code></li>
+<li><strong>解读：</strong><ul>
+<li>我们要训练的模型是 <strong>Qwen3-32B</strong>（通义千问3代，320亿参数）。</li>
+<li>我们用的教材（数据）是 <strong>GSM8K</strong>，这是一个经典的数学推理数据集。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 【核心策略】确定训练算法</h4>
+<p>我们要用一种叫 <strong>GRPO</strong> 的方法来训练它。</p>
+<ul>
+<li><strong>脚本代码：</strong>
+    <code>bash
+    algorithm.adv_estimator=grpo</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>GRPO</strong> (Group Relative Policy Optimization) 是最近很火的一种强化学习算法（DeepSeek 也是用的这种思路）。</li>
+<li>简单说：给模型一道题，让它生成好几个答案，然后对比这些答案哪个好，好的奖励，差的惩罚，不需要额外的“判卷老师模型”（Critic），这样更省显存。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 【数据流水线】配置数据输入</h4>
+<p>控制“喂饭”的速度和大小。</p>
+<ul>
+<li><strong>脚本代码：</strong>
+    <code>bash
+    data.train_batch_size=1024       # 总共一次训练1024道题
+    data.max_prompt_length=2048      # 题目最长2048个字
+    data.max_response_length=2048    # 答案最长2048个字</code></li>
+<li><strong>解读：</strong><ul>
+<li>设置了题目和答案的长度限制，防止爆显存。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 【车间分工】配置模型的三重身份 (最难懂的部分)</h4>
+<p>在强化学习中，同一个模型通常要扮演三个角色，脚本里叫 <code>actor_rollout_ref</code>。</p>
+<ol>
+<li><strong>Actor (演员/学生)：</strong> 正在被训练、参数会更新的模型。</li>
+<li><strong>Rollout (做题者)：</strong> 负责根据题目生成答案的过程（通常用 vLLM 加速）。</li>
+<li>
+<p><strong>Ref (参考/老师)：</strong> 原始模型，参数冻结不变。用来对比，防止学生学歪了（忘本）。</p>
+</li>
+<li>
+<p><strong>脚本代码解读：</strong></p>
+<ul>
+<li><strong>关于做题 (Rollout):</strong><ul>
+<li><code>actor_rollout_ref.rollout.name=vllm</code>: 使用 <strong>vLLM</strong> 这个超快的引擎来生成答案。</li>
+<li><code>actor_rollout_ref.rollout.n=4</code>: 每一道题，让模型生成 <strong>4个</strong> 不同的答案（用来给 GRPO 算法做对比）。</li>
+<li><code>actor_rollout_ref.rollout.tensor_model_parallel_size=4</code>: 生成答案时，把模型切成4份放在不同卡上跑（TP=4）。</li>
+</ul>
+</li>
+<li><strong>关于学习 (Actor):</strong><ul>
+<li><code>actor.optim.lr=1e-6</code>: <strong>学习率</strong>，学得非常小心（很慢），防止学坏。</li>
+<li><code>actor.use_kl_loss=True</code>: 开启 <strong>KL散度</strong> 惩罚。意思就是：学生写的答案不能和老师（Ref）的风格差太远，要保持语言的通顺。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 5: 【硬件优化】如何在 NPU 上跑得动？</h4>
+<p>32B 的模型很大，单张卡放不下，必须把模型“切碎”放进显存。</p>
+<ul>
+<li>
+<p><strong>脚本代码：</strong>
+    ```bash
+    # 混合精度训练，用 bf16 格式省显存且保持精度
+    +actor_rollout_ref.actor.fsdp_config.mixed_precision.param_dtype=bf16</p>
+<h1>开启 FSDP (Fully Sharded Data Parallel)</h1>
+<h1>把模型参数完全切碎分散到各个显卡上</h1>
+<p>actor_rollout_ref.actor.fsdp_config.param_offload=True </p>
+<h1>Ulysses 序列并行</h1>
+<p>actor_rollout_ref.actor.ulysses_sequence_parallel_size=4
+<code>``
+*   **解读：**
+*   **FSDP &amp; Offload:** 这是一个极端的省显存策略。把模型参数切碎，甚至在不用的时候把参数扔到 CPU 内存里（Offload），腾出 NPU 显存。
+*   **Ulysses (尤利西斯):** 这是一种针对长文本的切分技术。如果文章太长，就把文章切成4段，4个显卡各算一段。
+*   **NPU:** 脚本最后指定了</code>trainer.device=npu`，说明这是专门为华为昇腾芯片优化的代码，不是英伟达 GPU。</p>
+</li>
+</ul>
+<h4>✅ Task 6: 【项目管理】监控与保存</h4>
+<p>最后是统筹全局的设置。</p>
+<ul>
+<li><strong>脚本代码：</strong>
+    <code>bash
+    trainer.nnodes=4             # 用 4 台服务器
+    trainer.n_gpus_per_node=8    # 每台服务器 8 张卡 (共32张卡)
+    trainer.save_freq=500        # 每跑 500 步存个档
+    trainer.logger=['console','tensorboard'] # 进度打印在屏幕和图表里</code></li>
+<li><strong>解读：</strong><ul>
+<li>这是一个大规模训练，动用了 <strong>32张 NPU 卡</strong>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<p>这段代码在指挥 <strong>32张 NPU 芯片</strong>，使用 <strong>vLLM 加速推理</strong>，配合 <strong>FSDP 和 Ulysses 并行技术</strong> 节省显存，利用 <strong>GRPO 算法</strong> 和 <strong>GSM8K 数学题库</strong>，对 <strong>Qwen3-32B</strong> 模型进行强化学习训练，目的是让这个模型做数学题更厉害。</p>

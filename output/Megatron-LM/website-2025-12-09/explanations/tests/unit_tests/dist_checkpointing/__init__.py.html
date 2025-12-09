@@ -1,0 +1,85 @@
+<h1>tests/unit_tests/dist_checkpointing/<strong>init</strong>.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了<strong>分布式系统（Distributed Systems）</strong>和<strong>多进程协作</strong>的逻辑，专门用于测试环境。</p>
+<p>简单来说，这个文件的核心目的是：<strong>在多个显卡（进程）同时跑测试时，安全地创建、使用和清理临时文件夹。</strong></p>
+<p>如果不加控制，多个进程同时读写同一个文件夹会打架（比如进程A刚删了文件，进程B又要去读，程序就崩了）。</p>
+<p>我们可以把理解这份代码的过程拆解成一个 <strong>Task List（任务清单）</strong>，我带着你一步步打钩完成：</p>
+<hr />
+<h3>✅ Task 1: 理解背景——什么是“Rank 0”？</h3>
+<p>在看代码细节前，必须先懂这个概念。
+*   <strong>场景</strong>：假设你在用 8 张显卡训练模型，就有 8 个进程同时运行这份代码。
+*   <strong>Rank（排名/编号）</strong>：每个进程都有个编号，从 0 到 7。
+*   <strong>Rank 0 (主进程)</strong>：通常把 0 号进程当做“班长”或“包工头”。涉及修改文件系统（比如创建文件夹、删除文件）的操作，通常只让“班长”一个人做，其他人看着。</p>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">Utils</span><span class="o">.</span><span class="n">rank</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="k">return</span>
+<span class="c1"># 或者</span>
+<span class="k">if</span> <span class="n">Utils</span><span class="o">.</span><span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="c1"># 做删除/创建操作</span>
+</code></pre></div>
+
+<hr />
+<h3>✅ Task 2: 清理工——<code>empty_dir</code> 函数</h3>
+<p><strong>目标</strong>：理解如何安全清空一个目录。</p>
+<ul>
+<li><strong>逻辑</strong>：<ol>
+<li>首先检查你是谁？如果你不是 Rank 0（班长），直接溜了（<code>return</code>），别碰文件。</li>
+<li>如果你是 Rank 0，遍历这个路径下的所有东西。</li>
+<li>是文件夹就 <code>rmtree</code>（递归删除），是文件就 <code>unlink</code>（删除）。</li>
+</ol>
+</li>
+</ul>
+<p><strong>总结</strong>：这个函数确保了只有一个人在执行删除操作，避免混乱。</p>
+<hr />
+<h3>✅ Task 3: 核心类——<code>TempNamedDir</code> 的初始化</h3>
+<p><strong>目标</strong>：理解这个自定义的临时文件夹类是怎么创建出来的。</p>
+<p>这个类继承自 Python 自带的 <code>TemporaryDirectory</code>，但加了分布式锁。</p>
+<p><strong>步骤拆解 (<code>__init__</code> 方法)</strong>：
+1.  <strong>建房</strong>：如果是 Rank 0，负责创建文件夹 (<code>os.makedirs</code>) 并清空它 (<code>empty_dir</code>)。
+2.  <strong>集合（关键点）</strong>：
+    *   代码里有 <code>torch.distributed.barrier()</code>。
+    *   <strong>Barrier（屏障）</strong>的意思是：大家都在这里等着！
+    *   Rank 0 在建房的时候，Rank 1-7 跑到这行代码会停下来等待。直到 Rank 0 建好房了，大家再一起往下走。
+    *   <em>为什么要这样？</em> 防止 Rank 0 还没建好文件夹，Rank 1 就试图去读取，导致报错。</p>
+<hr />
+<h3>✅ Task 4: 进门与出门——<code>__enter__</code> 和 <code>__exit__</code></h3>
+<p><strong>目标</strong>：理解 <code>with</code> 语句背后的魔法。</p>
+<p>当你写 <code>with TempNamedDir(...) as tmp:</code> 时：</p>
+<ol>
+<li>
+<p><strong>进门 (<code>__enter__</code>)</strong>：</p>
+<ul>
+<li>调用父类的进门方法。</li>
+<li>再次遇到 <code>barrier()</code>（集合点）。</li>
+<li><strong>作用</strong>：确保所有进程都已经准备好进入这个上下文了，没有任何人掉队。</li>
+</ul>
+</li>
+<li>
+<p><strong>出门 (<code>__exit__</code>)</strong>：</p>
+<ul>
+<li>当 <code>with</code> 语句结束时触发。</li>
+<li>调用 <code>self.cleanup()</code> 进行打扫。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 最后的打扫——<code>cleanup</code> 方法</h3>
+<p><strong>目标</strong>：理解如何安全地“拆迁”。</p>
+<p>测试跑完了，要删掉临时文件夹。</p>
+<p><strong>逻辑</strong>：
+1.  <strong>同步等待</strong>：先调用 <code>barrier()</code>。
+    *   <em>这非常重要！</em> 必须等 Rank 1-7 全部用完这个文件夹，Rank 0 才能动手删。
+    *   如果 Rank 0 跑得快，直接删了，Rank 7 还在读文件，Rank 7 就会报错。
+2.  <strong>动手删除</strong>：确认大家都完事后，Rank 0 调用 <code>super().cleanup()</code> 把文件夹删掉。</p>
+<hr />
+<h3>🏆 总结回顾</h3>
+<p>把整个流程串起来，这份代码讲了这么一个故事：</p>
+<ol>
+<li><strong>开始</strong>：大家要用同一个临时文件夹跑测试。</li>
+<li><strong>分工</strong>：Rank 0 说：“你们等着，我去建文件夹，建好之前谁也别动。” (<code>__init__</code> + <code>barrier</code>)</li>
+<li><strong>使用</strong>：大家确认文件夹建好了，一起开始用。 (<code>__enter__</code>)</li>
+<li><strong>结束</strong>：大家跑完测试。</li>
+<li><strong>拆迁</strong>：Rank 0 问：“都用完了吗？” 大家回答：“用完了。” (<code>barrier</code>)</li>
+<li><strong>删除</strong>：Rank 0 把文件夹删了。 (<code>cleanup</code>)</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这是一个<strong>线程安全（且多进程安全）</strong>的临时目录管理器，专门为了防止在多显卡并行测试时，因为文件读写冲突而导致程序崩溃。</p>

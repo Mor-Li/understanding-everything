@@ -1,0 +1,68 @@
+<h1>recipe/flowrl/FLOWRL_SIMPLE_GUIDE.md</h1>
+<p>这份文件实际上是一份<strong>代码修改指南</strong>。它的目的是在一个叫 <code>verl</code>（一个大模型强化学习训练框架）的代码库中，把原本的 <strong>PPO 算法</strong> 替换成一种新的算法，叫做 <strong>FlowRL</strong>。</p>
+<p>为了让你更容易理解，我们可以把这个过程想象成<strong>给大模型做一次“脑部手术”</strong>。原本的大模型（PPO）需要两个大脑（Actor生成内容，Critic打分），现在 FlowRL 想把 Critic 那个大脑扔掉，只保留 Actor，并在 Actor 身上装一个小插件来实现自我调节。</p>
+<p>下面我列一个 <strong>To-Do List</strong>，一步步拆解这个手术过程和背后的逻辑：</p>
+<hr />
+<h3>任务清单：从 PPO 迁移到 FlowRL</h3>
+<h4>✅ Task 1: 安装“直觉插件” (添加 Partition Function Z)</h4>
+<p><strong>对应文件：</strong> <code>verl/workers/fsdp_workers.py</code></p>
+<ul>
+<li><strong>这是做什么？</strong>
+    在 FlowRL 理论中，有一个概念叫 $Z$ (Partition Function)。你可以把它通俗地理解为模型对当前问题（Prompt）的一个<strong>“全局难度预估”</strong>或者<strong>“及格分基准”</strong>。</li>
+<li><strong>代码动作：</strong><ol>
+<li>定义一个小型的神经网络 <code>ProjZModule</code>（就是一个简单的多层感知机 MLP）。</li>
+<li>把它“缝”到主模型（Actor）身上。</li>
+</ol>
+</li>
+<li><strong>观点解读：</strong>
+    传统的 PPO 需要一个巨大的 Critic 模型来时刻监督 Actor。FlowRL 认为不需要那么麻烦，我们在 Actor 身上挂一个小小的 MLP 层（<code>proj_z</code>），专门用来预测这个 $Z$ 值就可以了。这大大节省了显存。</li>
+</ul>
+<h4>✅ Task 2: 激活“直觉通路” (修改前向传播)</h4>
+<p><strong>对应文件：</strong> <code>verl/workers/actor/dp_actor.py</code></p>
+<ul>
+<li><strong>这是做什么？</strong>
+    仅仅装上插件（Task 1）还不够，模型在处理数据时，得真正去调用它。</li>
+<li><strong>代码动作：</strong><ol>
+<li>修改 <code>forward</code> 函数。</li>
+<li>当模型读完用户的提问（Prompt）后，提取出 Prompt 的特征（Hidden States）。</li>
+<li>把这些特征喂给 Task 1 里装的 <code>proj_z</code>，算出一个数值 <code>log_z</code>。</li>
+</ol>
+</li>
+<li><strong>观点解读：</strong>
+    这里有一个关键点：$Z$ 值是基于<strong>提问（Prompt）</strong>计算的，与模型后来回答了什么无关。它代表了模型在这个问题开始前的一种“初始状态”或“势能”。</li>
+</ul>
+<h4>✅ Task 3: 换掉“考试大纲” (替换 Loss Function)</h4>
+<p><strong>对应文件：</strong> <code>verl/workers/actor/dp_actor.py</code></p>
+<ul>
+<li><strong>这是做什么？</strong>
+    这是最核心的一步。PPO 的学习方式（Loss Function）是：“我觉得好的动作就多做，坏的少做，并且要和 Critic 的打分做对比”。FlowRL 的学习方式完全不同，它用的是 <strong>Trajectory Balance (轨迹平衡)</strong>。</li>
+<li><strong>代码动作：</strong><ol>
+<li><strong>删除</strong> 原本复杂的 PPO Loss 计算逻辑。</li>
+<li><strong>插入</strong> FlowRL 的核心公式（<code>compute_flowrl_objective</code>）。<ul>
+<li>公式的核心逻辑是：<code>log_z + log_prob ≈ Reward</code>。</li>
+<li>意思就是：我的“初始预估($Z$)”加上“我说这句话的概率($P$)”，应该等于“这句话最终得到的奖励($R$)”。如果不相等，就产生 Loss（误差），模型就要修改参数。</li>
+</ul>
+</li>
+<li>加入<strong>重要性采样 (Importance Sampling)</strong>：因为数据可能是旧模型跑出来的，需要修正一下权重。</li>
+</ol>
+</li>
+<li><strong>观点解读：</strong>
+    FlowRL 试图通过这个公式，让模型生成的概率分布直接逼近奖励分布。它不再需要 Critic 告诉它好坏，而是通过 $Z$ 值和最终奖励 $R$ 的差值来自我校正。</li>
+</ul>
+<h4>✅ Task 4: 善后处理 (修复模型加载)</h4>
+<p><strong>对应文件：</strong> <code>verl/workers/sharding_manager/fsdp_vllm.py</code></p>
+<ul>
+<li><strong>这是做什么？</strong>
+    训练完之后，我们要把模型拿去用（推理/聊天）。通常使用 <code>vLLM</code> 这样的加速引擎。</li>
+<li><strong>代码动作：</strong>
+    在加载模型权重给 <code>vLLM</code> 时，<strong>过滤掉</strong> <code>proj_z</code> 相关的参数。</li>
+<li><strong>观点解读：</strong>
+    <code>proj_z</code> 只是训练时候用的“辅助轮”或者是“教官”。当模型真正上战场（推理聊天）时，它只需要生成文本，不需要再计算 $Z$ 值了。如果不删掉这一行，<code>vLLM</code> 会因为看到不认识的层（<code>proj_z</code>）而报错。</li>
+</ul>
+<hr />
+<h3>总结：这篇文档到底讲了啥？</h3>
+<p>这篇文档在教你如何<strong>低成本地改造</strong>现有的 PPO 训练代码，使其变成 FlowRL。</p>
+<p><strong>核心观点变化：</strong>
+1.  <strong>结构简化</strong>：PPO = Actor + Critic (两个大模型) $\rightarrow$ FlowRL = Actor + 小插件 (一个大模型 + 几层MLP)。
+2.  <strong>目标改变</strong>：从“最大化奖励”变成了“让概率流平衡 (Trajectory Balance)”。</p>
+<p>如果你是开发者，按照这个 List 一步步改代码，你就能把原本跑 PPO 的流程改成跑 FlowRL 算法。</p>

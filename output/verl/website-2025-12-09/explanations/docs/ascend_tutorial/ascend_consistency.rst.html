@@ -1,0 +1,52 @@
+<h1>docs/ascend_tutorial/ascend_consistency.rst</h1>
+<p>这份文档看起来确实充满了很多技术术语（如 HCCL, LCCL, MATMUL 等），容易让人晕头转向。</p>
+<p>简单来说，这份文档的核心目的只有一个：<strong>“消除随机性”</strong>。</p>
+<p>在 AI 推理中，为了让 <code>verl</code> 和 <code>vLLM</code> 这两个框架在华为昇腾（Ascend）芯片上跑出的结果<strong>完全一模一样</strong>（这被称为“对齐”），你需要强制关掉所有可能产生随机误差的“加速开关”或“通信机制”。</p>
+<p>为了让你更容易理解，我把你通过这份文档需要做的事情整理成了一个 <strong>To-Do List（任务清单）</strong>，并一步步解释为什么要这么做。</p>
+<hr />
+<h3>任务清单：在昇腾上实现推理结果对齐</h3>
+<h4>第一步：搞清楚你的硬件场景（3选1）</h4>
+<p>首先，你需要知道你现在的运行环境是下面哪一种，因为不同的环境需要设置不同的“开关”。</p>
+<ul>
+<li><strong>场景 A：多卡 - 默认通信模式 (HCCL)</strong> -&gt; <em>这是最常见的多卡训练/推理场景。</em></li>
+<li><strong>场景 B：多卡 - 特殊通信模式 (LCCL)</strong> -&gt; <em>只有当你明确开启了 <code>HCCL_OP_EXPANSION_MODE="AIV"</code> 时才看这里，否则跳过。</em></li>
+<li><strong>场景 C：单卡</strong> -&gt; <em>你只用了一张显卡/NPU。</em></li>
+</ul>
+<h4>第二步：根据场景配置“系统环境变量”</h4>
+<p>这一步就像是在操作系统的终端里打命令，目的是<strong>关掉硬件层面的随机优化</strong>。</p>
+<p><strong>👉 如果你是【场景 A：多卡默认 (HCCL)】，请执行：</strong>
+1.  <code>export CLOSE_MATMUL_K_SHIFT=1</code>
+    *   <em>解释：</em> 关掉矩阵乘法的一种位移优化，保证计算精度完全固定。
+2.  <code>export ATB_MATMUL_SHUFFLE_K_ENABLE=0</code>
+    *   <em>解释：</em> 禁止打乱计算顺序。通常打乱顺序能加速，但会导致结果有微小差异。
+3.  <code>export HCCL_DETERMINISTIC="true"</code>
+    *   <em>解释：</em> <strong>关键点</strong>。强制多卡通信（HCCL）必须是确定性的，不能为了快而导致数据传输有微小波动。
+4.  <code>export VLLM_ENABLE_V1_MULTIPROCESSING=0</code>
+    *   <em>解释：</em> 调整 vLLM 的多进程设置，避免并行处理带来的不一致。</p>
+<p><strong>👉 如果你是【场景 B：多卡特殊 (LCCL)】，请执行：</strong>
+*   除了上面提到的 1, 2, 4 项，你需要特别设置：
+    *   <code>export LCCL_DETERMINISTIC=1</code> (让 LCCL 通信也变得确定)
+    *   <code>export ATB_LLM_LCOC_ENABLE=0</code> (关掉另一种特定的通信优化)</p>
+<p><strong>👉 如果你是【场景 C：单卡】，请执行：</strong>
+*   只需要设置最基础的计算确定性开关（即上面的 1, 2, 4 项），因为单卡没有通信，所以不需要设置 HCCL/LCCL 相关的参数。</p>
+<h4>第三步：修改代码中的随机种子 (Seed)</h4>
+<p>做完上面的步骤，硬件和通信层面的随机性已经关掉了。现在要解决<strong>软件层面</strong>的随机性。</p>
+<ul>
+<li><strong>任务：</strong> 打开你的 Python 代码，找到初始化 <code>vLLM</code> 引擎的地方。</li>
+<li><strong>操作：</strong> 在 <code>SamplingParams</code>（采样参数）里，强制加一个固定的种子数（seed）。</li>
+<li><strong>代码示例：</strong>
+    <code>python
+    sampling_params = SamplingParams(
+        n=1,
+        # ... 其他参数保持不变
+        seed=1234  # &lt;--- 必须加上这一行！
+    )</code></li>
+<li><strong>解释：</strong> AI 模型生成文本通常是“抽卡”式的（概率生成）。如果不固定 <code>seed=1234</code>，每次运行程序，代码内部的随机数生成器起点都不同，生成的文本自然就不一样。固定了种子，每次“抽卡”的结果就必定相同。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇文档就在讲一件事：</p>
+<p><strong>为了让结果可复现（对齐），请你：</strong>
+1.  <strong>在终端里</strong>：输入一堆 <code>export</code> 命令，把硬件加速带来的微小随机抖动全部关掉。
+2.  <strong>在代码里</strong>：把 <code>seed</code> 固定住，把软件生成的随机性关掉。</p>
+<p>做完这两步，你在昇腾设备上跑出的结果就能和标准结果完全一致了。</p>

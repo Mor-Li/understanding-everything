@@ -1,0 +1,92 @@
+<h1>recipe/fapo/run_fapo_32b.sh</h1>
+<p>这份脚本确实看起来参数非常多，很容易让人晕头转向。简单来说，这是一个 <strong>启动脚本（Launch Script）</strong>，它的作用是告诉计算机：“嘿，我要用 <strong>强化学习（RL）</strong> 的方法来训练一个 <strong>32B（320亿参数）</strong> 的大模型。”</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“项目经理的 ToDo List”</strong>。想象你是一个项目的负责人，要安排这次训练任务，你需要按顺序确认以下 5 件事：</p>
+<hr />
+<h3>✅ Task 1: 确定项目身份与目标 (Project Identity)</h3>
+<p><strong>“我们要干什么？给这次任务起个名。”</strong></p>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">project_name</span><span class="o">=</span><span class="s1">&#39;FAPO-Reproduce&#39;</span><span class="w">  </span><span class="c1"># 项目叫 FAPO复现</span>
+<span class="nv">exp_name</span><span class="o">=</span><span class="s1">&#39;FAPO-32B&#39;</span><span class="w">            </span><span class="c1"># 实验名叫 FAPO-32B</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这就像给文件夹命名，方便以后在 WandB（可视化面板）上找到这次训练的日志。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 选定“学生”和“老师” (Models &amp; Data)</h3>
+<p><strong>“谁来学习？谁来打分？用什么教材？”</strong></p>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">MODEL_PATH</span><span class="o">=</span>.../Qwen2.5-32B<span class="w">      </span><span class="c1"># 学生模型：Qwen 2.5 32B</span>
+<span class="nv">GRM_PATH</span><span class="o">=</span>.../FAPO-GenRM-4B<span class="w">      </span><span class="c1"># 老师模型（奖励模型）：一个4B的小模型</span>
+<span class="nv">TRAIN_FILE</span><span class="o">=</span>.../fapo-train...<span class="w">    </span><span class="c1"># 教材：训练数据 parquet 文件</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li><strong>Actor (学生)</strong>：我们要训练的主角是 Qwen2.5-32B。</li>
+<li><strong>Reward Model (老师)</strong>：这里用了一个 4B 的生成式奖励模型（GenRM）来给学生的回答打分。</li>
+<li><strong>逻辑</strong>：学生写作业 -&gt; 老师打分 -&gt; 学生根据分数改进。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 设定考试规则 (Algorithm &amp; Hyperparameters)</h3>
+<p><strong>“怎么算分？允许学生自由发挥多少？作业能写多长？”</strong></p>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">adv_estimator</span><span class="o">=</span>grpo<span class="w">             </span><span class="c1"># 核心算法：GRPO (DeepSeek-R1 同款思路)</span>
+<span class="nv">kl_coef</span><span class="o">=</span><span class="m">0</span>.0<span class="w">                    </span><span class="c1"># KL惩罚系数：0 (意味着不限制它必须像原始模型)</span>
+<span class="nv">max_response_length</span><span class="o">=</span><span class="k">$((</span><span class="m">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">20</span><span class="k">))</span><span class="w"> </span><span class="c1"># 作业长度：2万个token！</span>
+<span class="nv">n_resp_per_prompt</span><span class="o">=</span><span class="m">8</span><span class="w">            </span><span class="c1"># 每次出题，让学生写 8 个不同的答案</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li><strong>GRPO</strong>：这是最近很火的一种强化学习算法（Group Relative Policy Optimization），它不需要额外的“评论家模型”（Critic），比较省显存。</li>
+<li><strong>超长文本</strong>：<code>max_response_length</code> 设为了 20K，这说明这是在训练 <strong>推理能力（Chain-of-Thought）</strong>，允许模型进行超长的思考。</li>
+<li><strong>一题多解</strong>：同一个问题让模型生成 8 个答案，然后对比哪个好。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 安排考场与资源 (Infrastructure &amp; Parallelism)</h3>
+<p><strong>“32B的模型太大了，显存不够怎么办？需要几台机器？”</strong></p>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">sp_size</span><span class="o">=</span><span class="m">8</span><span class="w">              </span><span class="c1"># 序列并行：把长文本切成8段放在不同卡上</span>
+<span class="nv">offload</span><span class="o">=</span>True<span class="w">           </span><span class="c1"># 显存卸载：显存不够时，把参数暂存到内存里</span>
+<span class="nv">gen_tp</span><span class="o">=</span><span class="m">4</span><span class="w">               </span><span class="c1"># 生成时的张量并行</span>
+<span class="nv">NNODES</span><span class="o">=</span><span class="m">2</span><span class="w">               </span><span class="c1"># 用 2 个计算节点（假设每个节点8张卡，共16张卡）</span>
+<span class="nv">RM_NODES</span><span class="o">=</span><span class="m">2</span><span class="w">             </span><span class="c1"># 奖励模型也用 2 个节点</span>
+actor...rollout.name<span class="o">=</span>vllm<span class="w"> </span><span class="c1"># 使用 vLLM 引擎来加速生成文本</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这是最硬核的部分。<ul>
+<li>因为模型很大（32B）且文本超长（20K token），单张显卡根本塞不下。</li>
+<li><strong>sp_size=8</strong>：使用了 Ulysses 序列并行技术，把长文切分处理。</li>
+<li><strong>vLLM</strong>：用来快速让学生“写作业”（生成文本），速度比普通推理快很多。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 按下启动按钮 (Execution)</h3>
+<p><strong>“配置确认完毕，把指令发给 Ray 集群开始干活。”</strong></p>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code>ray<span class="w"> </span>job<span class="w"> </span>submit<span class="w"> </span>...<span class="w"> </span>python3<span class="w"> </span>-m<span class="w"> </span>verl.trainer.main_ppo<span class="w"> </span>...
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li>这个脚本最后的一大坨 <code>ray job submit</code> 并不是新东西，它只是把上面定义的变量（比如路径、参数、长度）全部填入到 Python 程序的启动命令中。</li>
+<li>它调用了 <code>verl</code> 框架（一个专门做大模型强化学习的库）的主程序 <code>main_ppo</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇文章的核心观点</h3>
+<p>如果把这个脚本看作一篇文章，它的“中心思想”是：</p>
+<p><strong>我们要在一个多节点的 GPU 集群上，使用 Ray 调度框架和 vLLM 加速引擎，对 Qwen2.5-32B 模型进行 GRPO 强化学习训练。训练的重点是提升模型的长文本推理能力（允许输出 20k token），并使用 FAPO-GenRM-4B 作为判卷老师。</strong></p>
+<h4>你的下一步行动建议：</h4>
+<p>如果你需要运行或修改它，请重点关注以下三个变量，因为它们最容易导致报错（OOM - 显存溢出）：
+1.  <code>train_prompt_bsz</code> (512)：总批次大小。
+2.  <code>train_prompt_mini_bsz</code> (32)：微批次大小，太大会爆显存。
+3.  <code>max_response_length</code> (20480)：生成的长度，越长越吃显存。</p>

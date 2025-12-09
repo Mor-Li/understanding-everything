@@ -1,0 +1,113 @@
+<h1>megatron/core/distributed/torch_fully_sharded_data_parallel.py</h1>
+<p>没问题，这段代码读起来确实比较晦涩，因为它处于 <strong>Megatron-Core（大模型框架）</strong> 和 <strong>PyTorch FSDP（底层分布式工具）</strong> 的交界处。</p>
+<p>你可以把这段代码看作是一个<strong>“装修工头”</strong>。它的工作是指挥 PyTorch 原生的 FSDP（Fully Sharded Data Parallel，全切片数据并行）工具，去“装修”（包装）Megatron 的大模型，以便模型能在多张显卡上省显存运行。</p>
+<p>我为你列了一个 <strong>6步走的 Task List（学习/阅读清单）</strong>，我们一步一步拆解它在干什么：</p>
+<hr />
+<h3>📋 Task 1: 理解核心目标 (The "Why")</h3>
+<p><strong>目标：</strong> 搞清楚为什么要有这个类 <code>TorchFullyShardedDataParallel</code>。</p>
+<ul>
+<li><strong>背景知识：</strong><ul>
+<li><strong>DDP (Data Parallel):</strong> 每张显卡都存一份<strong>完整</strong>的模型参数。显存消耗巨大。</li>
+<li><strong>FSDP (Fully Sharded Data Parallel):</strong> 把模型参数<strong>切碎</strong>（Shard），每张显卡只存一小部分。计算时，大家临时交换数据拼凑出完整的层，算完立刻扔掉。这能极大节省显存。</li>
+</ul>
+</li>
+<li><strong>代码作用：</strong><ul>
+<li>Megatron 是一个大模型库，它有自己的模型结构。</li>
+<li>PyTorch 2.4+ 推出了新版 FSDP2。</li>
+<li><strong>这个类的作用：</strong> 就是把 PyTorch 的 FSDP2 功能，“适配”给 Megatron 的模型使用。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 2: 检查施工环境 (Setup &amp; Checks)</h3>
+<p><strong>目标：</strong> 对应代码开头的 <code>__init__</code> 前半部分。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    assert HAVE_FSDP, '...requires PyTorch &gt;= 2.4.0...'
+    self.device_mesh = DeviceMesh.from_group(...)</code></li>
+<li><strong>白话解释：</strong><ol>
+<li><strong>查户口：</strong> 检查你的 PyTorch 版本够不够新（必须 &gt;= 2.4.0），否则直接报错。</li>
+<li><strong>建群组：</strong> <code>DeviceMesh</code> 就像是建立一个微信群，把参与计算的 GPU 拉到一个组里，告诉它们待会儿要在群里互相发数据。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 3: 保护特殊行李 (The "Hack" for Attributes)</h3>
+<p><strong>目标：</strong> 理解 <code>save_custom_attrs</code> 和 <code>restore_custom_attrs</code> 这两个奇怪的函数。</p>
+<ul>
+<li><strong>问题所在：</strong><ul>
+<li>FSDP 是一种很“暴力”的包装方式。当你用 <code>fully_shard</code> 包装模型时，它会把原本的参数（Parameter）替换成扁平化的张量。</li>
+<li>Megatron 的代码里，给很多参数贴了“便利贴”（自定义属性），比如 <code>param._fp8_attrs</code>（这是 FP8 精度训练需要的元数据）。</li>
+<li>如果直接包 FSDP，这些“便利贴”会被撕掉，导致训练出错。</li>
+</ul>
+</li>
+<li><strong>代码逻辑：</strong><ol>
+<li><strong>打包行李 (<code>save</code>)：</strong> 在装修前，先把参数上贴的属性（特别是 FP8 相关的）抄下来，存到一个字典里。</li>
+<li><strong>装修中：</strong> 运行 FSDP 包装逻辑。</li>
+<li><strong>恢复行李 (<code>restore</code>)：</strong> 装修完，再把刚才抄下来的属性，重新贴回到已经被 FSDP 处理过的参数上。</li>
+<li><em>注：这是一段典型的“胶水代码”，为了修补 PyTorch 和 Megatron 之间的兼容性问题。</em></li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 4: 制定拆分计划 (Strategy)</h3>
+<p><strong>目标：</strong> 理解 <code>sub_modules_to_wrap</code> 相关的逻辑。</p>
+<ul>
+<li><strong>核心思想：</strong> FSDP 不是把整个模型当成一块肉切碎，而是把模型里的“组件”一个个切碎。我们需要告诉它哪些组件需要切。</li>
+<li><strong>代码片段：</strong>
+    <code>python
+    sub_modules_to_wrap = { TransformerLayer, LanguageModelEmbedding, ... }</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>这里定义了一份<strong>“拆迁名单”</strong>。</li>
+<li>名单里通常包括：Transformer 的每一层（Layer）、词嵌入层（Embedding）、输出层等。</li>
+<li>意思就是：“FSDP 听令，遇到这些类型的模块，就给我在这个粒度上进行切分和通信。”</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 5: 执行拆分与优化 (Execution &amp; Optimization)</h3>
+<p><strong>目标：</strong> 理解那个 <code>for sub_module in self.module.modules()</code> 循环。这是全篇最核心的动作。</p>
+<ul>
+<li><strong>动作 1：按需包装 (Just-In-Time Wrapping)</strong><ul>
+<li><strong>代码：</strong> <code>fully_shard(sub_module, **kwargs)</code></li>
+<li><strong>解释：</strong> 遍历模型里的每一个子模块，如果在上面的“拆迁名单”里，就对它执行 <code>fully_shard</code>。这意味着在计算时，只有用到这一层，才会去把分散在各地的参数收集起来（All-Gather）。</li>
+</ul>
+</li>
+<li><strong>动作 2：调整预取策略 (Prefetch Tuning)</strong><ul>
+<li><strong>代码：</strong> <code>sub_module.set_modules_to_backward_prefetch(...)</code></li>
+<li><strong>解释：</strong> 这是一个高级优化。<ul>
+<li>正常情况下，算第 N 层梯度时，GPU 会闲着也是闲着，就提前去取第 N-1 层的参数（预取）。</li>
+<li>但是，如果开启了 <strong>Activation Recomputation（重计算，为了省显存的一种技术）</strong>，这种默认的预取顺序会被打乱，导致变慢。</li>
+<li>这段代码就是手动告诉 FSDP：“嘿，这一层的前一层是 <code>prev_module</code>，你算我的时候，去预取那个家伙，别乱跑。”</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 6: 收尾 (Finalize)</h3>
+<p><strong>目标：</strong> 对应代码最后几行。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    fully_shard(self.module, **kwargs)
+    restore_custom_attrs(self.module, attrs)
+    def load_state_dict(...): pass</code></li>
+<li><strong>白话解释：</strong><ol>
+<li><strong>封顶：</strong> 最后把整个大模型（Root Module）也包一层 FSDP，作为最外层的壳。</li>
+<li><strong>贴回便利贴：</strong> 执行 Task 3 里的恢复逻辑。</li>
+<li><strong>禁用旧加载方式：</strong> <code>load_state_dict</code> 写成 <code>pass</code>（空操作）。因为 FSDP 有自己独特的加载权重方式，不能用 PyTorch 传统的加载方法了，所以这里直接把传统方法屏蔽掉，防止误用。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p><strong>一句话概括：</strong>
+这个文件是 Megatron 为了使用 PyTorch 2.4+ 的 FSDP2 特性，专门写的一个<strong>配置器</strong>。它负责保护参数属性、指定哪些层需要切分，并针对重计算（Recomputation）做了性能微调。</p>
+<p><strong>你只需要记住这个流程：</strong>
+1.  <strong>环境准备</strong> (PyTorch 版本、通信组)
+2.  <strong>备份参数属性</strong> (防止丢失 FP8 信息)
+3.  <strong>遍历模型层</strong> -&gt; <strong>逐层包装 FSDP</strong> -&gt; <strong>设置预取顺序</strong>
+4.  <strong>恢复参数属性</strong></p>
+<p>希望这个 List 能帮你把逻辑理顺！</p>

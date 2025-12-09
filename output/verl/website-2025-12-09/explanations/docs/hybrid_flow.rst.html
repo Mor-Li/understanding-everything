@@ -1,0 +1,83 @@
+<h1>docs/hybrid_flow.rst</h1>
+<p>这份文档主要是介绍 <code>verl</code> 这个框架的设计理念（基于 HybridFlow 论文）以及如何使用它。因为它涉及强化学习（RL）、大模型（LLM）训练和分布式系统，所以术语比较多。</p>
+<p>别担心，我把它拆解成一个 <strong>“学习任务清单” (To-Do List)</strong>，分阶段、一步步用大白话给你解释清楚。</p>
+<hr />
+<h3>第一阶段：核心概念理解（为什么要这么设计？）</h3>
+<p><strong>Task 1：理解“控制流”与“计算流”的区别</strong>
+*   <strong>背景</strong>：在大模型强化学习（RLHF）中，事情比普通炼丹（训练模型）复杂。
+*   <strong>普通训练</strong>：数据进来 -&gt; 算梯度 -&gt; 更新模型。这是一条直线。
+*   <strong>RLHF (PPO)</strong>：
+    1.  先让模型写作文（Rollout）。
+    2.  算这篇作文写得好不好（Reward/Value）。
+    3.  根据分数算优势（Advantage）。
+    4.  最后才是更新模型（Update）。
+*   <strong>HybridFlow 的观点</strong>：
+    *   <strong>控制流 (Control Flow)</strong>：也就是上面的步骤逻辑（先干A，再干B，最后干C）。这部分逻辑很复杂，但计算量不大。
+    *   <strong>计算流 (Computation Flow)</strong>：具体的脏活累活（比如模型前向传播、反向传播）。这部分逻辑简单，但需要很多显卡（GPU）并行计算。</p>
+<p><strong>Task 2：理解“解耦”的设计哲学</strong>
+*   <strong>旧方法</strong>：把逻辑和计算绑死在一起。如果你想把底层计算从 FSDP 换成 Megatron，整个代码都要重写。
+*   <strong>verl 的方法</strong>：<strong>脑子和肌肉分离</strong>。
+    *   <strong>脑子 (Controller)</strong>：单进程，负责发号施令。它决定什么时候生成数据，什么时候训练。
+    *   <strong>肌肉 (Workers)</strong>：多进程/多GPU，负责干活。
+    *   <strong>好处</strong>：你的算法代码（脑子）写一次，底下的计算引擎（肌肉）随便换，互不影响。</p>
+<hr />
+<h3>第二阶段：架构角色认知（都有谁在干活？）</h3>
+<p><strong>Task 3：认识三个核心组件</strong>
+文档中提到的架构图其实就是这三个角色的互动：
+1.  <strong>Controller (主控)</strong>：
+    *   这是一个运行在 CPU 上的单进程程序。
+    *   它拿着整个 PPO 算法的流程图。
+2.  <strong>Worker Group (工人群组)</strong>：
+    *   这是运行在 GPU 上的。
+    *   <strong>ActorRolloutRef</strong>：负责生成文本（Actor）、做对比（Ref）、产出数据（Rollout）。为了效率，这三个功能通常捆绑在一起。
+    *   <strong>Critic</strong>：负责给动作打分（价值网络）。
+    *   <strong>Reward</strong>：负责给结果打分（奖励模型）。
+3.  <strong>Data (数据)</strong>：
+    *   数据在 Controller 和 Workers 之间来回传递。</p>
+<hr />
+<h3>第三阶段：代码实现逻辑（怎么写代码？）</h3>
+<p><strong>Task 4：理解“入口函数” (Entry Function)</strong>
+*   文件：<code>main_ppo.py</code>
+*   <strong>要做的事</strong>：这是一个普通的 Python 函数。它启动 Ray（分布式框架），初始化所有的 Worker Group，然后开始循环。
+*   <strong>注意</strong>：这个函数本身不占显存，它只是指挥官。</p>
+<p><strong>Task 5：理解“神奇的装饰器” (Worker Definition)</strong>
+这是文档中最“魔法”的地方。
+*   <strong>问题</strong>：Controller 只有一个，但底下的 Worker 有好几个（比如 8 张卡）。Controller 怎么把数据分给它们？
+*   <strong>解决</strong>：<code>@register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)</code>
+    *   这个装饰器就像一个<strong>自动分发器</strong>。
+    *   当你在 Controller 里调用 <code>worker_group.generate_sequences(data)</code> 时：
+        1.  系统自动把 <code>data</code> 切分成 8 份。
+        2.  分别发给 8 个 Worker。
+        3.  等它们算完，系统自动把 8 个结果拼回成一个完整的 <code>output</code> 给 Controller。
+    *   <strong>结果</strong>：你写代码时感觉像是在操作单卡，实际上是在指挥整个集群。</p>
+<hr />
+<h3>第四阶段：把流程串起来（PPO 循环）</h3>
+<p><strong>Task 6：看懂 PPO 主循环 (Main Loop)</strong>
+文档最后展示了一段伪代码，这其实就是你作为开发者主要打交道的地方。流程如下：</p>
+<ol>
+<li><strong>生成数据</strong>：
+    <code>output = actor_wg.generate(prompt)</code> -&gt; 指挥 Actor 去写作文。</li>
+<li><strong>计算概率和价值</strong>：
+    <code>old_log_prob = actor_wg.compute_prob(output)</code> -&gt; 算算刚才写的概率。
+    <code>values = critic_wg.compute_values(output)</code> -&gt; Critic 觉得写得咋样。
+    <code>rewards = reward_wg.compute_scores(output)</code> -&gt; Reward 模型打分。</li>
+<li><strong>计算优势 (在 Controller 本地做)</strong>：
+    <code>advantages = compute_advantages(...)</code> -&gt; 这就是纯数学加减法，CPU 上瞬间算完。</li>
+<li><strong>打包数据</strong>：
+    把上面所有的东西（作文、概率、分数、优势）打包成一个 Batch。</li>
+<li><strong>更新模型</strong>：
+    <code>actor_wg.update_actor(batch)</code> -&gt; 指挥所有显卡根据这些数据更新权重。
+    <code>critic_wg.update_critic(batch)</code> -&gt; 更新 Critic 权重。</li>
+</ol>
+<hr />
+<h3>总结：这篇文档到底在讲啥？</h3>
+<p>简单来说，这篇文档在告诉你：</p>
+<ol>
+<li><strong>verl 是一个让写 RLHF 代码变简单的框架。</strong></li>
+<li><strong>核心思想</strong>：把“怎么算”（多卡并行、FSDP/Megatron）封装起来，让你只关注“算什么”（算法逻辑）。</li>
+<li><strong>怎么用</strong>：你只需要写一个像单线程一样的 Python 脚本（Controller），通过调用 WorkerGroup 的方法，就能指挥成百上千张 GPU 协同工作。</li>
+</ol>
+<p><strong>建议阅读顺序：</strong>
+1.  先看 <strong>Motivation</strong> 里的图，理解 RL 流程图。
+2.  跳过中间的设计选择讨论，直接看 <strong>Codebase walkthrough</strong>。
+3.  重点看 <strong>Worker definition</strong> 里的代码块，理解那个 <code>@register</code> 是怎么把复杂的多卡通信隐藏起来的。</p>

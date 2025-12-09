@@ -1,0 +1,65 @@
+<h1>.github/workflows/e2e_transferqueue.yml</h1>
+<p>这份文件是一个 <strong>GitHub Actions 的配置文件</strong>（<code>.yml</code> 格式）。它的作用是配置一套<strong>自动化测试流程</strong>（CI/CD）。</p>
+<p>简单来说，它的目的是：<strong>每当有人修改了代码，就自动租一台带 GPU 的服务器，跑一下关于 "TransferQueue" 这个功能的测试，看看代码有没有被改坏。</strong></p>
+<p>为了让你读懂，我制定了一个 <strong>6步走的 Task List</strong>，我们一步步拆解：</p>
+<hr />
+<h3>✅ Task 1: 搞懂“这是在干什么？”（宏观视角）</h3>
+<p>首先看文件开头的注释（<code>#</code> 后面的内容）和文件名。
+*   <strong>文件名</strong>: <code>e2e_transferqueue.yml</code>。
+    *   <code>e2e</code> = End-to-End（端到端测试），意思是把整个系统跑一遍，而不是只测一个小函数。
+    *   <code>transferqueue</code> = 这是本次测试的主角，一个叫“传输队列”的功能模块。
+*   <strong>注释</strong>: 提到 <code>tests/</code> 下面有很多测试分类，这个文件属于 <code>special_e2e</code>（特殊的端到端测试）。</p>
+<p><strong>结论</strong>：这是一个为了测试 <code>TransferQueue</code> 功能是否正常而写的自动化脚本。</p>
+<hr />
+<h3>✅ Task 2: 搞懂“什么时候触发？”（触发条件）</h3>
+<p>看 <code>on:</code> 这一段。
+*   <strong><code>push</code> &amp; <code>pull_request</code></strong>: 当有人向 <code>main</code> 分支或 <code>v0.*</code> 分支提交代码（Push）或者提合并请求（PR）时触发。
+*   <strong><code>paths</code></strong>: 这里列了一堆规则。
+    *   <code>"**/*.py"</code>: 如果修改了 Python 文件，就测。
+    *   <code>"!**/*.md"</code>: 如果只改了文档（Markdown），<strong>不</strong>测（省钱省时间）。
+    *   <code>"recipe/transfer_queue/**"</code>: 重点！如果改了这个路径下的文件，必须测。
+    *   其他带 <code>!</code> 的都是排除项（比如改了别的 trainer 就不跑这个测试）。</p>
+<p><strong>结论</strong>：只有当涉及到 Python 代码修改，且不是单纯改文档或无关模块时，这个测试才会启动。</p>
+<hr />
+<h3>✅ Task 3: 搞懂“在哪跑？”（环境准备）</h3>
+<p>看 <code>jobs: setup</code> 这一段。
+*   <strong><code>runs-on: ubuntu-latest</code></strong>: 这一步是在 GitHub 的普通服务器上运行。
+*   <strong><code>steps</code> -&gt; <code>create-runner</code></strong>: 这一步很关键。它调用了一个叫 <code>volcengine/vemlp-github-runner</code> 的工具。
+    *   <strong>含义</strong>: 它去火山引擎（字节跳动的云服务）<strong>临时租了一台高性能机器</strong>。
+    *   <strong><code>mlp-image</code></strong>: 指定了这台机器要装的系统镜像（包含 vllm 等 AI 依赖）。</p>
+<p><strong>结论</strong>：因为测试 AI 模型需要 GPU，GitHub 默认的机器跑不动，所以第一步是去云端“摇人”（申请一台强力 GPU 服务器）。</p>
+<hr />
+<h3>✅ Task 4: 核心任务一（FSDP 模式测试）</h3>
+<p>看 <code>jobs: e2e_transferqueue_fsdp</code> 这一段。这是真正的测试开始。
+*   <strong><code>needs: setup</code></strong>: 等机器申请好了再跑。
+*   <strong><code>runs-on</code></strong>: 在刚才申请的那台强力机器上跑。
+*   <strong><code>env</code></strong>: 设置环境变量，比如 <code>ACTOR_STRATEGY: "fsdp"</code>。<strong>FSDP</strong> (Fully Sharded Data Parallel) 是一种训练大模型的并行策略。
+*   <strong><code>steps</code> (执行步骤)</strong>:
+    1.  <strong>Checkout</strong>: 把代码下载下来。
+    2.  <strong>Install</strong>: 安装依赖包（transformers, TransferQueue 等）。
+    3.  <strong>Prepare Data</strong>: 运行 <code>gsm8k.py</code>，准备 GSM8K 数据集（这是一个数学题数据集，常用于测大模型）。
+    4.  <strong>Run</strong>: 运行 <code>bash tests/special_e2e/run_transferqueue.sh</code>。这是真正干活的脚本。</p>
+<p><strong>结论</strong>：这一步是用 <strong>FSDP</strong> 这种并行策略，跑一遍 TransferQueue 的测试脚本，确保没报错。</p>
+<hr />
+<h3>✅ Task 5: 核心任务二（Megatron 模式测试）</h3>
+<p>看 <code>jobs: e2e_transferqueue_megatron</code> 这一段。
+*   这一段和 Task 4 几乎一模一样。
+*   <strong>唯一的区别</strong>: 环境变量变成了 <code>ACTOR_STRATEGY: "megatron"</code>。
+*   <strong>含义</strong>: <strong>Megatron</strong> 是另一种著名的大模型训练架构（由 NVIDIA 开发）。</p>
+<p><strong>结论</strong>：为了保证兼容性，代码不仅要能在 FSDP 模式下跑通，还得在 Megatron 模式下跑通。</p>
+<hr />
+<h3>✅ Task 6: 搞懂“怎么收尾？”（资源清理）</h3>
+<p>看 <code>jobs: cleanup</code> 这一段。
+*   <strong><code>if: always()</code></strong>: 无论前面的测试是成功还是失败，这一步<strong>必须</strong>执行。
+*   <strong><code>steps</code> -&gt; <code>destroy-runner</code></strong>: 把 Task 3 里租的那台机器退掉。</p>
+<p><strong>结论</strong>：测试跑完了（或者崩了），要把昂贵的 GPU 服务器关机，防止一直扣费。</p>
+<hr />
+<h3>📝 总结 (Summary)</h3>
+<p>把这个文件翻译成人话，就是告诉 GitHub：</p>
+<blockquote>
+<p>“嘿 GitHub，如果有人改了关于 <code>TransferQueue</code> 的 Python 代码：
+1.  先去火山引擎租一台带 GPU 的电脑。
+2.  在这台电脑上，用 <strong>FSDP</strong> 模式跑一遍测试脚本。
+3.  再在这台电脑上，用 <strong>Megatron</strong> 模式跑一遍测试脚本。
+4.  不管测得咋样，最后记得<strong>把电脑退了</strong>。”</p>
+</blockquote>

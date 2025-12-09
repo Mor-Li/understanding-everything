@@ -1,0 +1,105 @@
+<h1>tests/special_e2e/run_fully_async_policy.sh</h1>
+<p>这份脚本文件 (<code>run_fully_async_policy.sh</code>) 的核心目的是<strong>启动一个“完全异步（Fully Async）”的强化学习（PPO）训练任务</strong>，用于测试系统的稳定性和功能。</p>
+<p>简单来说，它的作用是指挥一群 GPU，一部分专门负责“写作业”（生成文本/Rollout），另一部分专门负责“学习”（训练模型/Training），两边同时进行，互不等待。</p>
+<p>为了让你更容易理解，我把它拆解成一个<strong>机器人的“待办事项清单 (To-Do List)”</strong>，并逐步解释每一步在做什么。</p>
+<hr />
+<h3>🤖 机器人的任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>[环境准备]</strong> 检查我有多少 GPU，今天要用什么战术（FSDP2 还是 Megatron）。</li>
+<li><strong>[模型准备]</strong> 确认我要训练哪个“大脑”（模型），以及用什么引擎来生成回复。</li>
+<li><strong>[分工部署]</strong> <strong>(核心)</strong> 把 GPU 分成两队：一队负责生成数据，一队负责训练更新。</li>
+<li><strong>[参数配置]</strong> 设定好训练的所有细节（学习率、奖励规则、数据路径等）。</li>
+<li><strong>[战术选择]</strong> 根据第1步的战术，组装最终的启动命令。</li>
+<li><strong>[正式启动]</strong> 运行 Python 程序，开始训练。</li>
+</ol>
+<hr />
+<h3>逐步详细解读</h3>
+<h4>1. [环境准备] 设定基础变量</h4>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>bash
+    NUM_GPUS=${NUM_GPUS:-8}
+    ACTOR_STRATEGY=${ACTOR_STRATEGY:-"fsdp2"}</code></li>
+<li><strong>解读：</strong><ul>
+<li>脚本首先确认显卡数量，默认是 8 张。</li>
+<li>确认分布式策略（<code>ACTOR_STRATEGY</code>）：默认使用 <code>fsdp2</code>（PyTorch 的一种显存优化技术），也可以选 <code>megatron</code>（NVIDIA 的一种大规模并行训练框架）。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [模型准备] 选定模型与引擎</h4>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>bash
+    MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}
+    rollout_name="vllm"</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>模型：</strong> 选用的是 Qwen2.5-0.5B（一个比较小的模型，适合测试）。</li>
+<li><strong>引擎：</strong> 使用 <code>vllm</code>。这是一个非常快的推理引擎，专门用来让模型快速生成文本（写作业）。</li>
+</ul>
+</li>
+</ul>
+<h4>3. [分工部署] 异步架构配置 (全篇最关键的点)</h4>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>bash
+    n_gpus_rollout=4
+    n_gpus_training=4
+    # ...
+    async_training.staleness_threshold=0.1</code></li>
+<li><strong>解读：</strong><ul>
+<li>这里体现了“<strong>Fully Async (完全异步)</strong>”的概念。</li>
+<li><strong>分工：</strong> 假设总共8张卡，脚本把它们强行拆开：<strong>4张卡专门负责 Rollout</strong>（生成数据/玩游戏/对话），<strong>4张卡专门负责 Training</strong>（计算梯度/更新参数）。</li>
+<li><strong>异步逻辑：</strong> 传统训练是“生成完一批 -&gt; 停下来训练 -&gt; 训练完 -&gt; 再生成”。这个脚本测试的是“生成组不停地生成，训练组不停地训练”，中间通过数据队列传输。<code>staleness_threshold</code> 是用来控制数据“新鲜度”的参数。</li>
+</ul>
+</li>
+</ul>
+<h4>4. [参数配置] 填写详细的训练配置单</h4>
+<ul>
+<li><strong>代码片段：</strong> <code>common_params=( ... )</code> 这一大段。</li>
+<li><strong>解读：</strong>
+    这是一个巨大的数组，里面全是传给 Python 程序的参数。主要包含：<ul>
+<li><strong>数据路径：</strong> 告诉程序去哪里读取 GSM8K 数据集（数学题）。</li>
+<li><strong>算法参数：</strong> 使用 <code>adv_estimator=grpo</code>（一种策略优化算法），设定 <code>kl_coef</code>（KL 散度系数）。</li>
+<li><strong>生成限制：</strong> 比如 <code>max_prompt_length=1024</code>（题目最长多少），<code>max_response_length=2048</code>（回答最长多少）。</li>
+<li><strong>奖励模型 (Reward Model)：</strong> 配置了 <code>dapo</code> 和关于回答长度的惩罚机制（如果模型废话太多会被惩罚）。</li>
+</ul>
+</li>
+</ul>
+<h4>5. [战术选择] FSDP2 还是 Megatron？</h4>
+<p>脚本到了这里出现了一个分岔路口 (<code>if ... elif ...</code>)：</p>
+<ul>
+<li>
+<p><strong>路径 A：FSDP2 模式</strong></p>
+<ul>
+<li><strong>代码：</strong> <code>if [ "${ACTOR_STRATEGY}" == "fsdp2" ]; then ...</code></li>
+<li><strong>特点：</strong> 适合通用的 PyTorch 分布式训练。</li>
+<li><strong>操作：</strong> 开启梯度检查点 (<code>gradient_checkpointing</code>) 省显存，设置切片大小 (<code>fsdp_size</code>)。</li>
+</ul>
+</li>
+<li>
+<p><strong>路径 B：Megatron 模式</strong></p>
+<ul>
+<li><strong>代码：</strong> <code>elif [ "${ACTOR_STRATEGY}" == "megatron" ]; then ...</code></li>
+<li><strong>特点：</strong> 适合超大模型，使用了更复杂的并行技术。</li>
+<li><strong>操作：</strong> 设置了 <code>gen_tp=2</code> (生成时的张量并行) 和 <code>train_pp=2</code> (训练时的流水线并行)。这意味着它把模型切得更碎，分布在不同显卡上。</li>
+</ul>
+</li>
+</ul>
+<h4>6. [正式启动] 运行 Python 主程序</h4>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>bash
+    python3 -m recipe.fully_async_policy.fully_async_main "${common_params[@]}" ...</code></li>
+<li><strong>解读：</strong><ul>
+<li>这是最后一步“按下发射按钮”。</li>
+<li>它调用 Python 解释器，运行 <code>recipe/fully_async_policy/fully_async_main.py</code> 这个文件。</li>
+<li>它把之前整理好的所有参数 (<code>common_params</code>) 和根据战术选择的特定参数全部喂给 Python 程序。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇文档到底在讲啥？</h3>
+<p>这篇文档是一个<strong>自动化测试脚本</strong>。</p>
+<p>它的核心观点（或者说测试目标）是：
+<strong>验证在强化学习（RLHF/PPO）过程中，能否将“数据生成（Rollout）”和“模型训练（Train）”彻底解耦到不同的 GPU 组上并行运行，以提高效率。</strong></p>
+<p>它通过设置不同的后端（FSDP2 或 Megatron）来确保这种异步机制在不同的底层技术栈上都能正常工作。</p>

@@ -1,0 +1,69 @@
+<h1>tests/unit_tests/inference/test_scheduler.py</h1>
+<p>这个文件其实是一个<strong>单元测试（Unit Test）</strong>。它的作用不是“实现功能”，而是“模拟场景”，用来验证背后的 <code>Scheduler</code>（调度器）逻辑是否正确。</p>
+<p>你可以把 <code>Scheduler</code> 想象成一个<strong>只有 4 个窗口的银行大厅经理</strong>。他的工作是安排客户（Request）去窗口办事（Active），如果窗口满了就让客户排队（Waiting），客户办完事了就送走（Completed）。</p>
+<p>我为你列了一个 <strong>Task Todo List</strong>，我们按照这个清单，一步一步模拟这位“大厅经理”的一天，你就能看懂这个文件的逻辑了。</p>
+<hr />
+<h3>任务清单：银行大厅经理的一天</h3>
+<h4>✅ Task 1: 开门营业（初始化）</h4>
+<p><strong>代码对应：</strong> <code>setup_method</code> 部分
+<strong>场景：</strong> 银行刚开门，经理就位。
+*   <strong>设定规则：</strong> 设定最大并行处理量 <code>max_batch_size = 4</code>（只有 4 个窗口）。
+*   <strong>检查状态：</strong>
+    *   正在办业务的人（Active Pool）应该是 0。
+    *   排队的人（Waiting Pool）应该是 0。
+    *   办完走的人（Completed Pool）应该是 0。
+*   <strong>观点：</strong> 调度器启动时必须是一张白纸，不能有残留数据。</p>
+<h4>✅ Task 2: 接待前 4 位客户（填满窗口）</h4>
+<p><strong>代码对应：</strong> <code>test_scheduler</code> 中的 <code>for i in range(self.max_batch_size):</code> 循环
+<strong>场景：</strong> 来了 4 个客户。
+*   <strong>动作：</strong> 经理调用 <code>add_request</code> 接收客户。
+*   <strong>检查：</strong> 每加一个人，经理都要确认一下“正在办业务的人数”是不是增加了。加到第 4 个人时，窗口正好满员。
+*   <strong>观点：</strong> 只要有空位，新来的任务应该直接进入“运行状态”（Active）。</p>
+<h4>✅ Task 3: 处理第 5 位客户（触发排队）</h4>
+<p><strong>代码对应：</strong> 循环结束后的那次 <code>self.scheduler.add_request</code>
+<strong>场景：</strong> 窗口满了（4人），这时第 5 个客户来了。
+*   <strong>动作：</strong> 经理再次 <code>add_request</code>。
+*   <strong>检查：</strong>
+    *   排队区（Waiting Pool）必须有 1 个人。
+    *   这个人的状态必须是 <code>WAITING_IN_QUEUE</code>。
+    *   系统必须显示 <code>have_requests_pending() == True</code>（确实有事没做完）。
+*   <strong>观点：</strong> 当并行量达到上限，新任务必须进入“等待队列”，不能插队，也不能丢弃。</p>
+<h4>✅ Task 4: 模拟部分客户办完业务（状态变更）</h4>
+<p><strong>代码对应：</strong> <code>if int(request_id) % 2 == 0: ... request.status = Status.COMPLETED</code>
+<strong>场景：</strong> 正在窗口办事的 4 个人里，拿偶数号牌（比如第0号、第2号）的客户事情办完了。
+*   <strong>动作：</strong> 手动把这些人的状态标记为 <code>COMPLETED</code>。
+*   <strong>注意：</strong> 这一步只是客户说“我好了”，但他们还没离开窗口，排队的人也还没进来。
+*   <strong>观点：</strong> 任务状态的改变通常是由模型推理引擎触发的，这里是在手动模拟这个结果。</p>
+<h4>✅ Task 5: 经理进行调度更新（核心逻辑）</h4>
+<p><strong>代码对应：</strong> <code>self.scheduler.update_requests_pools(active_request_dict)</code>
+<strong>场景：</strong> 经理看到有人办完了，开始指挥换人。
+*   <strong>动作：</strong> 执行 <code>update_requests_pools</code>。
+*   <strong>预期结果（这是最复杂的数学题）：</strong>
+    1.  原本 4 个人在窗口。
+    2.  走了 2 个（偶数号）。
+    3.  空出 2 个位置。
+    4.  排队的只有 1 个（第5位客户），把他叫到窗口。
+    5.  <strong>最终窗口人数：</strong> 4 - 2 + 1 = <strong>3 人</strong>。
+*   <strong>检查：</strong>
+    *   Active Pool（窗口）现在应该是 3 人。
+    *   Waiting Pool（排队）现在应该是 0 人。
+    *   Completed Pool（已走）现在应该是 2 人。
+*   <strong>观点：</strong> 调度器的核心职责是<strong>新旧交替</strong>——踢出完成的，填入排队的，最大化利用计算资源。</p>
+<h4>✅ Task 6: 所有人办完业务（清空）</h4>
+<p><strong>代码对应：</strong> 最后一段 <code>request.status = Status.COMPLETED</code> 和再次 <code>update</code>
+<strong>场景：</strong> 剩下的 3 个人（原先的奇数号 + 刚才补进来的第5位）也都办完了。
+*   <strong>动作：</strong> 全部标记为完成，经理再次刷新状态。
+*   <strong>检查：</strong>
+    *   Active Pool（窗口）变 0。
+    *   Waiting Pool（排队）变 0。
+    *   Completed Pool（已走）变 5（总共接待了5人）。
+    *   <code>have_requests_pending()</code> 应该是 <code>False</code>（下班了）。
+*   <strong>观点：</strong> 验证系统能够正确地结束所有任务，不发生死锁或残留。</p>
+<hr />
+<h3>总结：这代码想告诉你什么？</h3>
+<p>这个文件通过这 6 个步骤，验证了 Megatron-Core 推理调度器的三个核心观点：</p>
+<ol>
+<li><strong>资源限制（Capacity）：</strong> 系统有最大并行度（Batch Size），不能无限塞任务。</li>
+<li><strong>排队机制（Queueing）：</strong> 超过能力的任务必须排队，状态管理要清晰（Active vs Waiting）。</li>
+<li><strong>动态调度（Scheduling）：</strong> 必须能够动态地把“完成的任务”移出，把“等待的任务”移入，保证流水线不断。</li>
+</ol>

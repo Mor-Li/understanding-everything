@@ -1,0 +1,115 @@
+<h1>tests/unit_tests/transformer/moe/test_shared_experts.py</h1>
+<p>这份代码看起来很复杂，充满了各种参数配置，但其实它只是一个<strong>“质检清单”</strong>（Unit Test，单元测试）。</p>
+<p>它的目的是测试 <strong>Megatron-LM</strong>（一个大模型训练框架）中关于 <strong>MoE（混合专家模型）</strong> 的一个具体功能：<strong>Shared Experts（共享专家）</strong>。</p>
+<p>别担心，我们把它拆解成一个 <strong>5步的任务清单 (Todo List)</strong>，带你一步步看懂它在干什么。</p>
+<hr />
+<h3>✅ Task 1：搞懂背景 —— 什么是 MoE 和 Shared Expert？</h3>
+<p>在看代码前，先建立一个简单的心理模型：</p>
+<ul>
+<li><strong>普通模型</strong>：像一个全能医生，什么病都看。</li>
+<li><strong>MoE (Mixture of Experts)</strong>：像一家医院，有耳科、眼科、骨科等（这些叫 <strong>Experts</strong>）。病人（数据 Token）来了，会被分配到特定的科室。</li>
+<li><strong>Shared Expert (本代码的核心)</strong>：这是 DeepSeek-MoE 等模型提出的一种新机制。除了上面的专科医生，医院里设立了一个 <strong>“全科分诊台” (Shared Expert)</strong>。<ul>
+<li><strong>重点</strong>：<strong>所有</strong>病人（Token）都要先经过这个全科分诊台，然后再去特定的专科。</li>
+<li><strong>目的</strong>：让模型既有通用的知识（共享专家负责），又有专业的知识（独立专家负责）。</li>
+</ul>
+</li>
+</ul>
+<p><strong>这个文件的目的，就是测试这个“全科分诊台”能不能正常工作。</strong></p>
+<hr />
+<h3>✅ Task 2：阅读第一个测试类 <code>TestSharedExperts</code></h3>
+<p>代码分成了两部分，我们先看第一个类 <code>TestSharedExperts</code>。它的任务是测试<strong>基础功能</strong>。</p>
+<ul>
+<li>
+<p><strong>Step 2.1：初始化配置 (Config)</strong>
+    看 <code>transformer_config = TransformerConfig(...)</code> 这一大段。</p>
+<ul>
+<li>关键点是 <code>moe_shared_expert_intermediate_size=32</code>。</li>
+<li><strong>含义</strong>：这就好比告诉系统，“我要建一个全科分诊台，它的大小是32”。如果没有这行，就是普通的 MoE。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.2：检查“分诊台”是否建成</strong>
+    看这几行断言（Assert）：
+    <code>python
+    assert self.moe_layer.shared_experts is not None
+    assert self.moe_layer.shared_experts.stream is None</code></p>
+<ul>
+<li>第一行：检查共享专家（分诊台）是否存在？<strong>必须存在</strong>。</li>
+<li>第二行：检查是否开启了“并行流”（Stream）？这里是 <code>None</code>，说明<strong>没有开启加速/重叠优化</strong>（这是下一个测试的任务）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.3：检查“体重” (Parameters)</strong>
+    <code>python
+    num_weights = sum([...])
+    assert num_weights == 3480 + 1152</code></p>
+<ul>
+<li>这是在算参数量。<code>3480</code> 是普通专家的参数，<code>1152</code> 是在这个测试里新增的“共享专家”的参数。如果数字对不上，说明共享专家没加进去。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.4：试运行 (Forward Pass)</strong>
+    <code>python
+    output, _ = moe_layer(hidden_states)</code></p>
+<ul>
+<li><strong>含义</strong>：造一些假数据（<code>hidden_states</code>），扔进模型里跑一遍。</li>
+<li><strong>结果</strong>：只要不报错，且输出的形状（Shape）是对的，说明基础功能是好的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3：阅读第二个测试类 <code>TestSharedExpertsOverlap</code></h3>
+<p>这个类名字里多了个 <strong>Overlap</strong>。这是什么意思？
+*   <strong>Overlap (重叠/掩盖)</strong>：在高性能计算里，指的是<strong>“一边计算，一边传输数据”</strong>。
+*   如果不 Overlap，就是“传数据 -&gt; 等待 -&gt; 计算 -&gt; 等待 -&gt; 传数据”。
+*   这个测试是为了验证：<strong>共享专家在工作时，能不能利用这种加速技巧？</strong></p>
+<ul>
+<li>
+<p><strong>Step 3.1：查看配置变化</strong>
+    注意 Config 里多了这两行：
+    <code>python
+    moe_shared_expert_overlap=True,        # 开启重叠优化
+    moe_token_dispatcher_type="alltoall",  # 设置分发方式</code></p>
+<ul>
+<li><strong>含义</strong>：这次我们要测试“火力全开”的高性能模式。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2：关键检查</strong>
+    <code>python
+    assert self.moe_layer.shared_experts.stream is not None
+    assert self.moe_layer.token_dispatcher.shared_experts is not None</code></p>
+<ul>
+<li>还记得 Task 2 里 <code>stream</code> 是 <code>None</code> 吗？</li>
+<li>在这里，<code>stream</code> <strong>必须不是 None</strong>。这代表系统分配了独立的 CUDA 流（GPU 通道）给共享专家。</li>
+<li><strong>比喻</strong>：普通模式下，全科医生和专科医生共用一个诊室（排队）；Overlap 模式下，全科医生有自己的独立诊室（Stream），可以和专科医生同时看病。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4：总结代码逻辑流程</h3>
+<p>把你刚才看到的串起来，这个文件的逻辑就是：</p>
+<ol>
+<li><strong>准备环境</strong>：模拟 GPU 环境。</li>
+<li><strong>测试 A (基础版)</strong>：<ul>
+<li>设置参数：我要一个共享专家。</li>
+<li>检查：共享专家生成了吗？参数量对吗？</li>
+<li>运行：数据跑进去，结果能出来吗？</li>
+</ul>
+</li>
+<li><strong>测试 B (加速版)</strong>：<ul>
+<li>设置参数：我要一个共享专家，并且开启“计算通信重叠”优化。</li>
+<li>检查：优化通道 (Stream) 开启了吗？</li>
+<li>运行：数据跑进去，结果能出来吗？</li>
+</ul>
+</li>
+<li><strong>清理环境</strong>：测试结束，释放 GPU 资源。</li>
+</ol>
+<hr />
+<h3>✅ Task 5：最后结论</h3>
+<p><strong>这个文件讲了什么观点？</strong></p>
+<p>它不是在讲观点，而是在<strong>验证事实</strong>：
+1.  Megatron 框架已经支持了 <strong>Shared Expert (共享专家)</strong> 这一架构。
+2.  这个共享专家不仅能跑通，还支持 <strong>Overlap (通信计算重叠)</strong> 这种高级的并行加速技术。
+3.  通过对比两个测试类，证明了可以通过配置开关灵活控制是否使用这种加速。</p>
+<p>现在再回头看代码，是不是觉得 <code>TransformerConfig</code> 里的参数和 <code>assert</code> 语句没那么可怕了？它们只是在确认“我点的菜（功能）上齐了没有”。</p>

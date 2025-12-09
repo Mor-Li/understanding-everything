@@ -1,0 +1,92 @@
+<h1>tools/run_inference_performance_test.py</h1>
+<p>这份代码文件 <code>tools/run_inference_performance_test.py</code> 的核心目的是：<strong>对 Megatron-LM 模型（GPT 或 Mamba）进行推理（Inference）性能测试</strong>。</p>
+<p>简单来说，它不是用来训练模型的，而是用来测试模型“生成文本”的速度、显存占用和吞吐量的。</p>
+<p>为了让你更容易理解，我们可以把这个脚本看作一个<strong>“性能测试员”</strong>，他手里有一张<strong>任务清单（Todo List）</strong>。我们按照他执行任务的顺序，一步一步拆解代码：</p>
+<hr />
+<h3>📋 任务清单：性能测试员的一天</h3>
+<h4>✅ Task 1: 接收指令（解析参数）</h4>
+<p><strong>代码位置：</strong> <code>add_inference_benchmarking_args</code> 和 <code>main</code> 开头
+<strong>他在做什么：</strong>
+测试员首先要听你的指挥。他通过命令行读取你设定的参数。
+*   <strong>关键参数：</strong>
+    *   <code>--num-input-tokens</code>: 每个请求输入多少个单词（Token）。
+    *   <code>--engine-type</code>: 用哪种引擎跑？<code>static</code>（静态）还是 <code>dynamic</code>（动态，也就是 Continuous Batching）。
+    *   <code>--stream</code>: 是否像 ChatGPT 那样一个字一个字流式输出。
+    *   <code>--benchmark-profile</code>: 是否开启 CUDA 分析器（深度调试用）。</p>
+<h4>✅ Task 2: 准备大脑（加载模型）</h4>
+<p><strong>代码位置：</strong> <code>main</code> 函数中的 <code>initialize_megatron</code>, <code>get_model</code>, <code>load_checkpoint</code>
+<strong>他在做什么：</strong>
+*   初始化环境（GPU 分布式设置）。
+*   根据你是 GPT 还是 Mamba (<code>args.model_provider</code>)，把模型架构搭建起来。
+*   从硬盘加载训练好的权重 (<code>load_checkpoint</code>)。
+*   把模型设为评估模式 (<code>model.eval()</code>)，准备开始工作。</p>
+<h4>✅ Task 3: 组装引擎（选择推理后端）</h4>
+<p><strong>代码位置：</strong> <code>get_inference_engine</code> 函数
+<strong>他在做什么：</strong>
+这是最关键的一步。根据你在 Task 1 选的 <code>engine-type</code>，他会组装不同的“发动机”：
+1.  <strong>StaticInferenceEngine (静态引擎):</strong> 传统的推理方式。假设所有请求长度差不多，一批一批处理。
+2.  <strong>DynamicInferenceEngine (动态引擎):</strong> 更高级的方式（类似 vLLM）。它可以处理长短不一的请求，谁先处理完谁先走，新的请求随时插队进来（Continuous Batching）。这里涉及很多复杂的配置（如 <code>DynamicInferenceContext</code>，显存管理等）。</p>
+<h4>✅ Task 4: 准备考题（生成请求数据）</h4>
+<p><strong>代码位置：</strong> <code>main</code> 函数中 <code>requests</code> 列表的生成部分
+<strong>他在做什么：</strong>
+测试模型需要输入数据（Prompt）。这里有两种情况：
+1.  <strong>随机生成 (<code>get_random_prompt_tokens</code>):</strong> 如果你没给具体文本，他会根据词表随机凑一堆乱码单词。这是为了纯粹测试速度，不管生成的逻辑。
+2.  <strong>使用指定文本:</strong> 如果你给了 <code>--prompts</code>，他就用你给的句子。</p>
+<p>他把这些输入打包成一个个 <code>InferenceRequest</code>（推理请求）。</p>
+<h4>✅ Task 5: 热身运动（CUDA Graph Warmup）</h4>
+<p><strong>代码位置：</strong> <code>if args.cuda_graph_impl == "local": ...</code>
+<strong>他在做什么：</strong>
+如果开启了 CUDA Graph（一种 GPU 加速技术），模型需要先空跑几次（Warmup），让 GPU 记录下计算图，这样正式跑的时候会更快。</p>
+<h4>✅ Task 6: 正式考试（执行推理）— 核心环节</h4>
+<p><strong>代码位置：</strong> <code>main</code> 函数中的计时部分 <code>start_time = time.perf_counter()</code>
+<strong>他在做什么：</strong>
+他掐下秒表，开始干活。这里根据配置分了三条路：</p>
+<ol>
+<li><strong>路 A：流式传输 (<code>args.stream</code> 为 True)</strong><ul>
+<li>调用 <code>generate</code> (async 异步函数)。</li>
+<li>一边生成，一边把结果吐出来（虽然这个脚本里只是把结果收集起来，没打印到屏幕上以免影响测速）。</li>
+</ul>
+</li>
+<li><strong>路 B：静态引擎 (<code>static</code>)</strong><ul>
+<li>调用 <code>inference_engine.generate</code>。</li>
+<li>传统的批处理生成。</li>
+</ul>
+</li>
+<li><strong>路 C：动态引擎 (<code>dynamic</code>)</strong><ul>
+<li>调用 <code>generate_dynamic</code>。</li>
+<li>这是一个循环：不断把请求塞给引擎 (<code>add_request</code>)，然后不断让他走一步 (<code>step</code>)，直到所有请求都跑完。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 7: 填写成绩单（输出结果）</h4>
+<p><strong>代码位置：</strong> <code>main</code> 函数末尾
+<strong>他在做什么：</strong>
+*   按下秒表暂停 (<code>end_time</code>)，计算总耗时 (<code>latency</code>)。
+*   查看显存用了多少 (<code>torch.cuda.max_memory_allocated</code>)。
+*   <strong>打印报告：</strong>
+    *   <code>tpot</code>: Time Per Output Token（每个输出 token 耗时多久，越小越好）。
+    *   <code>latency</code>: 总延迟。
+    *   <code>memory_usage_GB</code>: 显存占用。
+    *   <code>generated_output</code>: 生成的具体文本（如果提供了 Prompt）。</p>
+<hr />
+<h3>总结一下代码逻辑流</h3>
+<ol>
+<li><strong>配置</strong> (Args) -&gt;</li>
+<li><strong>加载模型</strong> (Model) -&gt;</li>
+<li><strong>选择引擎</strong> (Static vs Dynamic) -&gt;</li>
+<li><strong>造假数据</strong> (Random Tokens) -&gt;</li>
+<li><strong>跑分</strong> (Run Inference) -&gt;</li>
+<li><strong>打印耗时与显存</strong> (Print Metrics)</li>
+</ol>
+<h3>你该如何使用它？</h3>
+<p>如果你想跑这个脚本，通常在命令行大概是这样写的（伪代码）：</p>
+<div class="codehilite"><pre><span></span><code>python<span class="w"> </span>tools/run_inference_performance_test.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tensor-model-parallel-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--pipeline-model-parallel-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num-input-tokens<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num-tokens-to-generate<span class="w"> </span><span class="m">50</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--engine-type<span class="w"> </span>dynamic<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--inference-batch-times-seqlen-threshold<span class="w"> </span><span class="m">1000</span>
+</code></pre></div>
+
+<p>这个脚本就是为了告诉你：<strong>你的 Megatron 模型在当前的硬件配置下，吞吐量到底有多大，响应有多快。</strong></p>

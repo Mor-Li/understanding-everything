@@ -1,0 +1,87 @@
+<h1>examples/tuning/70b/qwen2-70b_grpo_32_h20_fsdp_vllm.sh</h1>
+<p>这份脚本确实看着很吓人，因为它涉及到了<strong>大模型训练中最复杂、最前沿的领域</strong>：在大规模集群上进行强化学习（RLHF），而且还是针对 72B 这样巨大的模型。</p>
+<p>为了让你看懂，我们把这个脚本想象成<strong>“为一位天才学生（AI）制定的一份数学竞赛特训计划”</strong>。</p>
+<p>我们可以把这个脚本拆解成 <strong>5 个待办事项（Task List）</strong>。</p>
+<hr />
+<h3>📝 Task 1：确定“学生”和“教材”</h3>
+<p><strong>目标</strong>：选定我们要训练哪个模型，以及用什么题目来训练它。</p>
+<ul>
+<li><strong>脚本对应代码</strong>：
+    <code>bash
+    gsm8k_train_path=$HOME/data/rlhf/gsm8k/train.parquet  # 教材：GSM8K（小学数学题库）
+    model_path=Qwen/Qwen2-72B-Instruct                    # 学生：Qwen2-72B（千问720亿参数模型）</code></li>
+<li><strong>白话解释</strong>：
+    我们要训练“千问72B”这个大块头，用的教材是 GSM8K（一套经典的数学应用题数据集）。</li>
+</ul>
+<hr />
+<h3>📝 Task 2：确定“教学方法” (核心算法)</h3>
+<p><strong>目标</strong>：告诉 AI 怎么学习。这里用的不是传统的“背书”（SFT），而是“刷题总结规律”（RL）。</p>
+<ul>
+<li><strong>脚本对应代码</strong>：
+    <code>bash
+    algorithm.adv_estimator=grpo   # 核心算法：GRPO
+    actor_rollout_ref.rollout.n=5  # 每次做题生成 5 个不同的答案</code></li>
+<li><strong>白话解释</strong>：<ul>
+<li><strong>GRPO (Group Relative Policy Optimization)</strong>：这是最近很火的算法（DeepSeek-R1 背后也是类似的思路）。</li>
+<li>它的逻辑是：给 AI 一道数学题，让它<strong>生成 5 个不同的解题过程</strong>（<code>rollout.n=5</code>）。然后比较这 5 个答案，奖励好的，惩罚差的。通过这种“组内竞争”，让 AI 学会更好的推理步骤。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 Task 3：搭建“超大考场” (硬件与并行策略)</h3>
+<p><strong>目标</strong>：72B 的模型太大了，一张显卡根本装不下，甚至一台机器都装不下。我们需要把模型“切碎”放在很多显卡上跑。<strong>这是脚本里最难懂的部分。</strong></p>
+<ul>
+<li>
+<p><strong>脚本对应代码</strong>：
+    ```bash
+    trainer.nnodes=4                 # 用 4 台服务器
+    trainer.n_gpus_per_node=8        # 每台服务器 8 张卡（一共 32 张卡！）</p>
+<h1>训练时的切分策略 (FSDP)</h1>
+<p>actor_rollout_ref.actor.fsdp_config.param_offload=True # 显存不够时，把参数暂存到内存</p>
+<h1>做题(推理)时的切分策略 (Tensor Parallel + vLLM)</h1>
+<p>actor_rollout_ref.rollout.name=vllm                # 用 vLLM 这个库来加速生成答案
+actor_rollout_ref.rollout.tensor_model_parallel_size=16 # 16张卡合起来推理一次
+<code>``
+*   **白话解释**：
+*   **资源**：这个脚本动用了 **32 张高端显卡**（H20/H100/A100级别）。
+*   **分工**：
+    *   **做题时 (Rollout)**：因为要快速生成 5 个答案，所以调用了</code>vLLM<code>（一个超快的推理引擎）。并且因为模型太大，需要 **16 张卡联手** 才能跑通一次推理（TP=16）。
+    *   **学习时 (Train)**：使用</code>FSDP`（完全分片数据并行），把模型参数切得粉碎撒在所有显卡上，防止显存爆炸。</p>
+</li>
+</ul>
+<hr />
+<h3>📝 Task 4：制定“奖惩规则” (超参数)</h3>
+<p><strong>目标</strong>：防止 AI 为了拿高分而“走火入魔”（比如乱输出奇怪的字符但碰巧蒙对了答案）。</p>
+<ul>
+<li><strong>脚本对应代码</strong>：
+    <code>bash
+    actor_rollout_ref.actor.use_kl_loss=True      # 开启 KL 散度约束
+    actor_rollout_ref.actor.kl_loss_coef=0.001    # 约束力度
+    data.max_prompt_length=512                    # 题目最长多少字
+    data.max_response_length=512                  # 答案最长写多少字</code></li>
+<li><strong>白话解释</strong>：<ul>
+<li><strong>KL Loss</strong>：这是一根“绳子”。它拴着正在训练的模型，不让它偏离原始模型（Base Model）太远。如果 AI 开始胡言乱语，这个 Loss 就会变大，强行把它拉回来。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 Task 5：正式开始特训 (启动命令)</h3>
+<p><strong>目标</strong>：把上面所有配置组合起来运行。</p>
+<ul>
+<li><strong>脚本对应代码</strong>：
+    <code>bash
+    python3 -m verl.trainer.main_ppo ... # 启动 verl 库的主程序
+    trainer.project_name='verl_grpo_example_gsm8k' # 项目名字
+    trainer.total_epochs=1               # 整个题库只刷 1 遍</code></li>
+<li><strong>白话解释</strong>：
+    一切准备就绪，启动 <code>verl</code> 框架（一个专门做大模型强化学习的库），开始训练，结果记录在 'verl_grpo_example_gsm8k' 这个项目里。</li>
+</ul>
+<hr />
+<h3>总结：这个脚本到底在干嘛？</h3>
+<p>简单来说，这个脚本在做一件事：</p>
+<blockquote>
+<p><strong>动用 32 张显卡，使用 vLLM 进行加速，通过 GRPO 算法（让模型自己生成多个答案并互相对比），来微调 Qwen2-72B 这个巨型模型，目的是提高它做 GSM8K 数学题的能力。</strong></p>
+</blockquote>
+<p><strong>为什么你看不懂？</strong>
+因为它混合了 <strong>算法配置</strong>（GRPO, KL coeff）、<strong>数据配置</strong>（GSM8K）、<strong>模型配置</strong>（Qwen 72B）以及最复杂的 <strong>分布式系统工程配置</strong>（FSDP, Tensor Parallel, vLLM, Offload）。</p>
+<p>如果你是初学者，建议先忽略那些带有 <code>fsdp</code>、<code>offload</code>、<code>parallel</code> 字眼的参数，那些是为了让代码能在硬件上跑起来的“工程补丁”，关注 <code>algorithm</code> 和 <code>data</code> 部分就能理解它的核心逻辑了。</p>

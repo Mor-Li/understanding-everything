@@ -1,0 +1,79 @@
+<h1>tools/retro/sft/sft_retro_lm.sh</h1>
+<p>这份脚本确实看起来很复杂，因为它涉及到了深度学习中比较高阶的<strong>分布式训练</strong>、<strong>RETRO（检索增强）模型</strong>以及<strong>微调（SFT）</strong>。</p>
+<p>你可以把这个脚本想象成一个<strong>“烹饪食谱”</strong>。它的作用是告诉计算机：“用什么原料（数据），把火开多大（学习率），用什么锅（模型架构），煮多久（迭代次数），最后做出一道什么菜（微调后的模型）”。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>Task Todo List（任务清单）</strong>，我们按照脚本执行的逻辑一步步来看：</p>
+<hr />
+<h3>任务清单：启动 RETRO 模型微调</h3>
+<h4>Task 1: 接收“点单”信息 (读取参数)</h4>
+<p>脚本的第一步是接收外部传进来的命令。就像厨师拿到客人的点单纸。
+*   <strong>代码位置</strong>：第 4-10 行 (<code>blend_name=$1</code>, <code>model_size=$2</code> 等)
+*   <strong>含义</strong>：
+    *   <code>blend_name</code>: 数据的名字（比如 "landrover_tasb_retrieved"）。
+    *   <code>model_size</code>: 模型多大（比如 "843m"）。
+    *   <code>ckpt</code>: 预训练好的模型放在哪（作为基础，在这个基础上继续学）。
+    *   这里还定义了 <code>TASK=none</code>，表示这是一个通用的微调任务。</p>
+<h4>Task 2: 确认“厨房”位置 (定义路径)</h4>
+<p>在开始之前，必须告诉程序所有东西放在硬盘的哪里。
+*   <strong>代码位置</strong>：第 16-29 行 (<code>DATA_HOME</code>, <code>TOKENIZER_MODEL</code>, <code>RETRO_WORKDIR</code> 等)
+*   <strong>含义</strong>：
+    *   <strong>数据在哪？</strong> (<code>DATA_HOME</code>)
+    *   <strong>字典在哪？</strong> (<code>TOKENIZER_MODEL</code>，用来把文字变成数字)
+    *   <strong>检索库在哪？</strong> (<code>RETRO_WORKDIR</code>，RETRO 模型需要去这里查资料)
+    *   <strong>日志存哪？</strong> (<code>TENSORBOARD_DIR</code>，用来画训练曲线图)</p>
+<h4>Task 3: 准备“食材” (加载数据集配置)</h4>
+<ul>
+<li><strong>代码位置</strong>：第 34 行 (<code>. ./tools/retro/sft/"${blend_name}".sh</code>)</li>
+<li><strong>含义</strong>：<ul>
+<li>这行命令很关键，它去执行了另一个脚本。那个脚本里定义了具体要用哪些数据文件。这就好比“把冰箱里名为 <code>blend_name</code> 的那篮菜拿出来”。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 挑选“锅具” (定义模型架构)</h4>
+<p>根据 Task 1 中指定的模型大小，决定模型的具体参数。
+*   <strong>代码位置</strong>：第 37-50 行 (<code>if [[ $model_size == "843m" ]]; then ...</code>)
+*   <strong>含义</strong>：
+    *   如果模型大小是 "843m"（8.43亿参数），那么：
+    *   <code>layers=24</code>：模型有24层（深度）。
+    *   <code>hid_dim=1024</code>：隐藏层维度是1024（宽度）。
+    *   <code>heads=16</code>：注意力头数是16。
+    *   这步就是定义这个“大脑”长什么样。</p>
+<h4>Task 5: 设定“烹饪参数” (组装 GPT 参数)</h4>
+<p>这是最长的一段，定义了模型底层的技术细节。
+*   <strong>代码位置</strong>：第 53-80 行 (<code>GPT_ARGS="..."</code>)
+*   <strong>含义</strong>：
+    *   这里全是技术术语（如 <code>swiglu</code>, <code>rotary-position-embeddings</code>, <code>bf16</code>）。
+    *   <strong>通俗理解</strong>：这里规定了模型计算数学题的具体方法，比如“使用半精度（bf16）来省显存”、“使用旋转位置编码来处理长文本”等。</p>
+<h4>Task 6: 设定“微调”特技 (SFT &amp; RETRO 参数)</h4>
+<p>这是这个脚本的核心特色。它不是普通的训练，而是 <strong>SFT（有监督微调）</strong> 且带 <strong>RETRO（检索）</strong> 功能。
+*   <strong>代码位置</strong>：第 82-85 行 (<code>FT_ARGS</code>) 和 第 96-100 行 (<code>options</code> 中的 retro 部分)
+*   <strong>含义</strong>：
+    *   <code>--answer-loss-only</code>: <strong>关键点</strong>。在做问答训练时，只计算“答案”部分的对错，不计算“问题”部分。这叫 Instruction Tuning。
+    *   <code>--retro-add-retriever</code>: 开启外挂知识库模式。
+    *   <code>--retro-num-neighbors ${K}</code>: 遇到不懂的问题，允许去知识库里查 <code>K=2</code> 个相似的文档作为参考。</p>
+<h4>Task 7: 决定“从哪开始” (断点续训逻辑)</h4>
+<ul>
+<li><strong>代码位置</strong>：第 114-124 行 (<code>if [[ -d "$CHECKPOINT_PATH" ]]; then ...</code>)</li>
+<li><strong>含义</strong>：<ul>
+<li>程序会检查：我们之前训练过这个模型吗？</li>
+<li><strong>如果是</strong> (<code>--load $CHECKPOINT_PATH</code>)：从上次中断的地方继续练（断点续训）。</li>
+<li><strong>如果否</strong> (<code>--load $PRETRAINED_CHECKPOINT</code>)：加载最原始的预训练模型，开始新的微调，并重置优化器状态 (<code>--no-load-optim</code>)。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 8: 最终“开火” (启动分布式训练)</h4>
+<p>把上面所有的准备工作打包，扔给 Python 去执行。
+*   <strong>代码位置</strong>：第 130-149 行
+*   <strong>含义</strong>：
+    *   <code>export NCCL...</code>: 设置显卡之间通信的环境变量。
+    *   <code>python -m torch.distributed.run ...</code>: <strong>这是真正的启动按钮</strong>。
+    *   <code>--nproc_per_node 8</code>: 告诉电脑，“我要用 8 张显卡同时跑这个任务”。
+    *   <code>${run_cmd}</code>: 运行 <code>sft_retro.py</code> 这个 Python 程序，并把上面整理好的那一大串参数传进去。</p>
+<hr />
+<h3>总结：这个脚本到底在干嘛？</h3>
+<p>简单来说，这个脚本在对一个 <strong>8.43亿参数</strong> 的 <strong>RETRO（带检索功能）</strong> 模型进行 <strong>SFT（指令微调）</strong>。</p>
+<p>它告诉机器：
+1.  <strong>加载</strong> 一个基础模型。
+2.  <strong>准备</strong> 好特定的问答数据。
+3.  <strong>开启</strong> 检索功能（允许模型查阅外部文档）。
+4.  <strong>使用</strong> 8张显卡。
+5.  <strong>训练</strong> 1000步，教会模型如何根据问题回答答案。</p>

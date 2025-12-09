@@ -1,0 +1,90 @@
+<h1>tests/workers/rollout/rollout_vllm/run_fsdp_vllm.py</h1>
+<p>这份代码确实涉及了比较高阶的深度学习工程概念，主要是关于 <strong>大模型训练（FSDP）与推理（vLLM）的高效结合</strong>。</p>
+<p>简单来说，这个脚本在做一个实验：<strong>“我能不能在训练过程中（使用 FSDP 切分模型），直接把模型权重‘塞’给 vLLM 引擎去跑推理，而不需要把模型保存到硬盘再重新读取？”</strong></p>
+<p>为了帮你理解，我把这个脚本的逻辑拆解成一个 <strong>由浅入深的 7 步 Task List</strong>。</p>
+<hr />
+<h3>📝 任务清单：从零开始理解 FSDP + vLLM 混合流</h3>
+<h4>✅ Task 1: 准备工作台（初始化环境与加载模型）</h4>
+<p><strong>目标</strong>：把多显卡环境配好，并把模型下载到本地。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>main()</code> 函数开头到 <code>actor_model.to(torch.bfloat16)</code>。</li>
+<li><strong>发生了什么</strong>：<ol>
+<li>检查有没有 CUDA（显卡）。</li>
+<li>初始化分布式环境（<code>initialize_global_process_group</code>），比如你有 4 张卡，这里就建立 4 个进程通信。</li>
+<li>从 HDFS 或网络下载 Qwen2-7B 模型到本地缓存。</li>
+<li>用 Hugging Face 的原生方式加载模型 (<code>AutoModelForCausalLM</code>) 到显存里。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 2: 建立“标准答案”（Hugging Face 原生推理）</h4>
+<p><strong>目标</strong>：先用最普通、最慢的方法跑一遍生成，看看模型正常的输出是什么，作为后续对比的基准。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>preencode_prompts</code> 到 <code>print(f"hf response: ...")</code>。</li>
+<li><strong>发生了什么</strong>：<ol>
+<li>准备了几个提示词（如“美国总统是...”）。</li>
+<li>调用 <code>actor_model.generate(...)</code> 进行生成。这是 PyTorch 原生的生成方式，虽然慢，但逻辑最简单。</li>
+<li>打印出结果。<strong>记住这个结果，它是用来验证后面复杂的 vLLM 搞没搞错的。</strong></li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 3: 模拟训练状态（FSDP 模型切分）</h4>
+<p><strong>目标</strong>：把刚才那个完整的模型，变成“训练模式”下的切分状态。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>init_device_mesh</code> 到 <code>fsdp_model = FSDP(...)</code>。</li>
+<li><strong>核心观点</strong>：<ul>
+<li>在训练超大模型时，一张卡放不下，我们需要用 <strong>FSDP (Fully Sharded Data Parallel)</strong> 把模型参数切碎，分散存到不同的显卡上。</li>
+<li>这里代码创建了一个 <code>fsdp_model</code>，它模拟了模型正在被训练时的状态（参数是碎的，分布在各个卡上）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 准备“交接棒”（提取 FSDP 权重）</h4>
+<p><strong>目标</strong>：把分散在各个卡上的模型参数（权重）提取出来，准备传给 vLLM。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>FSDP.set_state_dict_type(...)</code> 和 <code>state_dict = fsdp_model.state_dict()</code>。</li>
+<li><strong>发生了什么</strong>：<ul>
+<li>设置提取模式为 <code>SHARDED_STATE_DICT</code>。这意味着我们拿到的 <code>state_dict</code> 依然是切分好的，保留了分布式特性（而不是在 CPU 上合并成一个巨大的文件，那样太慢且爆内存）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 启动加速引擎（初始化 vLLM）</h4>
+<p><strong>目标</strong>：启动 vLLM 推理引擎，但<strong>不让它加载硬盘上的模型文件</strong>。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>llm = LLM(...)</code>。</li>
+<li><strong>核心观点</strong>：<ul>
+<li>vLLM 是目前最快的大模型推理库之一。</li>
+<li>通常 vLLM 启动时会自己去读硬盘上的模型文件。</li>
+<li><strong>关键点</strong>：这里设置了 <code>load_format="dummy_dtensor"</code> 和 <code>model=None</code>。意思是告诉 vLLM：“你先启动个空壳子，别读文件，模型权重我一会儿直接通过内存传给你。”</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 核心动作 —— 内存级权重传输（Sync Weights）</h4>
+<p><strong>目标</strong>：把 Task 4 里的 FSDP 权重，直接同步给 Task 5 里的 vLLM 引擎。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>llm.sync_model_weights(actor_weights=state_dict, load_format="dtensor")</code>。</li>
+<li><strong>这是全篇最重要的一步</strong>：<ul>
+<li>它打通了 <strong>训练（FSDP）</strong> 和 <strong>推理（vLLM）</strong> 的隔阂。</li>
+<li>如果不这样做，流程通常是：训练 -&gt; 保存模型到硬盘(很慢) -&gt; vLLM 读取硬盘(很慢) -&gt; 推理。</li>
+<li>这样做之后：训练 -&gt; <strong>显存内直接拷贝(极快)</strong> -&gt; vLLM 推理。</li>
+<li>代码中还特意加了计时 (<code>start_time</code>, <code>end_time</code>) 来测试这个同步过程有多快。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 7: 极速推理与验证（vLLM Generate）</h4>
+<p><strong>目标</strong>：用装载好权重的 vLLM 跑推理，并和 Task 2 的结果对比。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>llm.generate(...)</code> 和最后的 <code>print</code> 对比。</li>
+<li><strong>发生了什么</strong>：<ol>
+<li>把输入数据处理一下（去掉 padding）。</li>
+<li>调用 <code>llm.generate</code>。</li>
+<li>如果一切正常，vLLM 的输出应该和 Task 2 的 Hugging Face 输出是一致的（或者逻辑一致）。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这篇文章（代码）到底想证明什么？</h3>
+<p>这个脚本是 <strong>Verl</strong> (一个 RLHF 强化学习框架) 的测试代码。它想证明：</p>
+<p>在 <strong>RLHF (基于人类反馈的强化学习)</strong> 流程中，我们需要频繁地在 <strong>“训练模型”</strong> 和 <strong>“用模型生成数据”</strong> 之间切换。
+*   <strong>传统做法</strong>：训练 -&gt; 存盘 -&gt; 读盘 -&gt; 生成。这在几百亿参数的模型上非常耗时。
+*   <strong>本文观点</strong>：利用 FSDP 和 vLLM 的接口，我们可以实现 <strong>In-Memory Weight Transfer（内存权重传输）</strong>。</p>
+<p><strong>一句话概括：</strong>
+这个脚本展示了如何把正在训练中的模型（FSDP状态），不经过硬盘，直接“热更新”到一个高性能推理引擎（vLLM）中去，从而极大地加速 RLHF 的训练循环。</p>

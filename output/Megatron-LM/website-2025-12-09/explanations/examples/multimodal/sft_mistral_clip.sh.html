@@ -1,0 +1,101 @@
+<h1>examples/multimodal/sft_mistral_clip.sh</h1>
+<p>这份脚本确实包含了很多参数，乍一看非常吓人。但如果把它想象成<strong>“训练一个能看懂图片的AI（多模态模型）的操作手册”</strong>，就容易理解多了。</p>
+<p>这个脚本的目标是：<strong>使用 SFT（监督微调）技术，让一个 Mistral 模型（大脑）学会理解 CLIP 模型（眼睛）看到的图片。</strong></p>
+<p>我为你整理了一个<strong>“项目经理视角的 To-Do List”</strong>，我们将代码拆解为 5 个步骤的任务清单，一步步带你看懂它在干嘛。</p>
+<hr />
+<h3>📋 任务清单：训练多模态 AI 的 5 个步骤</h3>
+<ol>
+<li><strong>【准备工作】设定工作区与基础模型</strong> (设置文件存哪里、读哪个旧模型)</li>
+<li><strong>【决策模式】决定是“调试”还是“正式训练”</strong> (设置训练强度)</li>
+<li><strong>【定义大脑】配置模型架构参数</strong> (告诉程序 Mistral 长什么样)</li>
+<li><strong>【定义课程】设置学习计划与数据</strong> (学习率、图片怎么处理、数据在哪)</li>
+<li><strong>【一键启动】开始训练</strong> (发送指令给显卡)</li>
+</ol>
+<hr />
+<h3>🛠️ 逐步详解</h3>
+<h4>任务 1：【准备工作】设定工作区与基础模型</h4>
+<p><strong>代码位置：</strong> 第 1 行 到 第 37 行
+<strong>核心逻辑：</strong> 就像做饭前要准备好锅碗瓢盆和食材。</p>
+<ul>
+<li><strong><code>export ...</code></strong>: 设置环境变量，告诉显卡如何通信（NCCL）以及是否允许某些优化。</li>
+<li><strong><code>WORKSPACE</code></strong>: 检查你有没有设置工作目录。没设置就报错退出，因为训练出来的模型得有个地方存。</li>
+<li><strong><code>OUTPUT</code></strong>: 定义输出路径，日志、模型存档（Checkpoints）都放这。</li>
+<li><strong><code>LOAD_NAME</code> / <code>CHECKPOINT_DIR</code></strong>: <strong>关键点</strong>。我们要在一个“预训练好”的模型基础上进行微调，这里指定了那个旧模型叫什么、在哪里。</li>
+<li><strong><code>TRITON_CACHE</code></strong>: 设置一些缓存路径，为了加速计算。</li>
+</ul>
+<h4>任务 2：【决策模式】决定是“调试”还是“正式训练”</h4>
+<p><strong>代码位置：</strong> 第 39 行 到 第 54 行
+<strong>核心逻辑：</strong> 你是在“随便跑跑测试代码通不通”（Debug），还是“动真格的训练”（Production）？</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">DEBUG</span><span class="o">=</span><span class="m">0</span><span class="w">  </span><span class="c1"># 这里设为0，表示正式训练。如果设为1，就是调试模式</span>
+<span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="nv">$DEBUG</span><span class="w"> </span>-eq<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nv">BZ</span><span class="o">=</span><span class="m">8</span><span class="w">   </span><span class="c1"># 调试时，一次只学8条数据 (Batch Size)</span>
+<span class="w">    </span><span class="nv">NW</span><span class="o">=</span><span class="m">1</span><span class="w">   </span><span class="c1"># 只用1个搬运工 (Workers)</span>
+<span class="k">else</span>
+<span class="w">    </span><span class="nv">BZ</span><span class="o">=</span><span class="m">128</span><span class="w"> </span><span class="c1"># 正式训练，一次学128条数据，效率高</span>
+<span class="w">    </span><span class="nv">NW</span><span class="o">=</span><span class="m">2</span><span class="w">   </span><span class="c1"># 用2个搬运工</span>
+<span class="k">fi</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：正式训练需要吞吐量大（Batch Size 大），调试只需要跑通就行。</li>
+</ul>
+<h4>任务 3：【定义大脑】配置模型架构参数</h4>
+<p><strong>代码位置：</strong> 第 56 行 到 第 87 行（<code>OPTIONS</code> 变量的上半部分）
+<strong>核心逻辑：</strong> 这里是在描述 Mistral-7B 这个模型的“身体构造”。必须和预训练时的构造一模一样，否则模型加载会报错。</p>
+<ul>
+<li><strong>并行策略</strong>：<ul>
+<li><code>--tensor-model-parallel-size 4</code>: <strong>重要</strong>。模型太大了，一张显卡装不下，把模型切成 4 份，放在 4 张卡上同时算。</li>
+</ul>
+</li>
+<li><strong>模型形状</strong>：<ul>
+<li><code>--num-layers 32</code>: 模型有 32 层。</li>
+<li><code>--hidden-size 4096</code>: 每一层的神经元宽度。</li>
+<li><code>--num-attention-heads 32</code>: 注意力头数。</li>
+</ul>
+</li>
+<li><strong>技术细节</strong>：<ul>
+<li><code>--swiglu</code>, <code>--group-query-attention</code>, <code>--rope</code>: 这些都是 Mistral 模型特有的先进技术组件（激活函数、注意力机制、位置编码）。</li>
+<li><code>--use-flash-attn</code>: 使用 Flash Attention 技术，加速训练。</li>
+</ul>
+</li>
+</ul>
+<h4>任务 4：【定义课程】设置学习计划与数据</h4>
+<p><strong>代码位置：</strong> 第 88 行 到 第 127 行（<code>OPTIONS</code> 变量的下半部分）
+<strong>核心逻辑：</strong> 怎么教它？用什么教材？</p>
+<ul>
+<li><strong>学习参数（怎么教）</strong>：<ul>
+<li><code>--lr 1e-6</code>: 学习率。SFT 通常用很小的学习率，不仅学得细，还防止把原来会的知识学傻了。</li>
+<li><code>--train-iters 20000</code>: 训练 2 万步。</li>
+<li><code>--save-interval 500</code>: 每 500 步存个档，防止断电白跑。</li>
+</ul>
+</li>
+<li><strong>多模态视觉参数（怎么看图）</strong>：<ul>
+<li><code>--freeze-ViT</code>: <strong>核心观点</strong>。冻结视觉编码器（ViT）。意思是：<strong>“眼睛（CLIP）已经很完美了，不需要再训练，我们只训练大脑（Mistral）去理解眼睛传来的信号。”</strong></li>
+<li><code>--img-h 336</code>: 图片会被缩放到 336x336 像素。</li>
+</ul>
+</li>
+<li><strong>数据源（教材）</strong>：<ul>
+<li><code>--data-path</code>: 训练数据在哪里。</li>
+<li><code>--tokenizer-model</code>: 使用 Mistral 的分词器（把文字变成数字的工具）。</li>
+</ul>
+</li>
+</ul>
+<h4>任务 5：【一键启动】开始训练</h4>
+<p><strong>代码位置：</strong> 最后一行
+<strong>核心逻辑：</strong> 组装好所有参数，点火发射。</p>
+<div class="codehilite"><pre><span></span><code>torchrun<span class="w"> </span>--nproc_per_node<span class="w"> </span><span class="m">8</span><span class="w"> </span>examples/multimodal/train.py<span class="w"> </span><span class="si">${</span><span class="nv">OPTIONS</span><span class="si">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong><code>torchrun</code></strong>: PyTorch 的启动工具。</li>
+<li><strong><code>--nproc_per_node 8</code></strong>: 这台机器上有 8 张显卡，全部用起来。</li>
+<li><strong><code>train.py</code></strong>: 实际干活的 Python 代码。</li>
+<li><strong><code>${OPTIONS}</code></strong>: 把上面那一长串配置传进去。</li>
+</ul>
+<hr />
+<h3>💡 总结文中的核心观点</h3>
+<p>这个脚本实际上在表达：
+1.  <strong>微调策略</strong>：我们不需要从头训练，而是拿一个懂语言的 <strong>Mistral-7B</strong> 和一个懂图片的 <strong>CLIP</strong> 拼在一起。
+2.  <strong>资源分配</strong>：模型很大，需要用 <strong>4 张卡并行（Tensor Parallel）</strong> 才能装下它的参数。
+3.  <strong>训练技巧</strong>：<strong>锁住视觉部分（Freeze ViT）</strong> 不动，只微调语言模型部分，让语言模型学会“看图说话”。
+4.  <strong>工程化</strong>：使用 Flash Attention 和 Transformer Engine 等技术来加速训练，节省显存。</p>

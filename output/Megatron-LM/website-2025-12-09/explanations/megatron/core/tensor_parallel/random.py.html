@@ -1,0 +1,100 @@
+<h1>megatron/core/tensor_parallel/random.py</h1>
+<p>这份代码确实比较晦涩，因为它处理的是<strong>深度学习框架底层最棘手的问题之一：分布式训练中的随机性管理（Randomness Management）</strong>。</p>
+<p>简单来说，这个文件的作用是：<strong>确保在几百张显卡上并行训练大模型时，随机数（比如 Dropout、参数初始化）既能受控制，又能在需要的时候“时光倒流”以节省显存。</strong></p>
+<p>为了让你读懂它，我为你列了一个 <strong>5步走的 To-Do List</strong>。按照这个顺序看，你会豁然开朗。</p>
+<hr />
+<h3>Task 1: 理解核心痛点（为什么需要这个文件？）</h3>
+<p>在看代码前，先明白我们在解决什么问题。</p>
+<ul>
+<li><strong>场景</strong>：你在 8 张显卡上训练一个巨型 Transformer。</li>
+<li><strong>矛盾</strong>：<ol>
+<li><strong>有些地方需要随机性一致</strong>：比如初始化模型参数时，所有卡上的参数必须一样，否则模型就裂开了。</li>
+<li><strong>有些地方需要随机性不同</strong>：比如 Dropout 层，每张卡扔掉的神经元必须不一样，否则就失去了正则化的意义。</li>
+<li><strong>显存不够怎么办</strong>：我们需要用“重计算（Activation Checkpointing）”技术。即在前向传播时算过一遍，为了省显存把中间结果扔了；反向传播时再算一遍。</li>
+<li><strong>重计算的噩梦</strong>：如果你再算一遍时，Dropout 随机扔掉的神经元和第一次不一样，那梯度就全算错了！</li>
+</ol>
+</li>
+</ul>
+<p><strong>结论</strong>：我们需要一个能够<strong>管理多个随机种子（Seed）</strong>，并且能<strong>精准恢复现场</strong>的工具。这就是这个文件的核心。</p>
+<hr />
+<h3>Task 2: 认识主角 <code>CudaRNGStatesTracker</code></h3>
+<p><strong>目标</strong>：阅读 <code>class CudaRNGStatesTracker</code> (大约第 127 行)。</p>
+<p>这是个“随机状态追踪器”。你可以把它想象成一个<strong>存档管理器</strong>。</p>
+<ul>
+<li><strong><code>states_</code> (字典)</strong>：它在内部维护了一个字典。<ul>
+<li>Key 是名字（比如 <code>'model-parallel-rng'</code>）。</li>
+<li>Value 是对应的随机数生成器状态（一串二进制数据）。</li>
+</ul>
+</li>
+<li><strong><code>add(name, seed)</code></strong>：给某个名字注册一个种子。比如告诉它：“'data-parallel' 用种子 1234，'model-parallel' 用种子 5678”。</li>
+<li><strong><code>fork(name)</code></strong>：这是最精彩的方法（使用了 <code>@contextlib.contextmanager</code>）。<ul>
+<li><strong>原理</strong>：<ol>
+<li><strong>进门时</strong>：保存当前 GPU 的随机状态 -&gt; 切换到 <code>name</code> 对应的那个随机状态。</li>
+<li><strong>干活</strong>：执行 <code>with</code> 语句块里的代码（比如跑一个 Transformer Layer）。</li>
+<li><strong>出门时</strong>：把状态切回进门前的样子。</li>
+</ol>
+</li>
+<li><strong>作用</strong>：这就像奇异博士的时间宝石，允许你在一段代码里暂时切换到另一个“平行宇宙”的随机状态，做完事后再回来，互不干扰。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 理解种子的分配策略</h3>
+<p><strong>目标</strong>：阅读 <code>model_parallel_cuda_manual_seed</code> 函数 (大约第 339 行)。</p>
+<p>这个函数决定了每一张显卡到底该用什么种子。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li><strong><code>data_parallel_seed</code></strong>：所有卡都一样（通常等于传入的 <code>seed</code>）。用于那些需要在所有卡上一致的操作。</li>
+<li><strong><code>tensor_model_parallel_seed</code></strong>：<code>seed + tp_rank</code>。这很关键！每一张负责模型切片的卡（Tensor Parallel Rank），拿到的种子是<strong>不一样</strong>的。这保证了 Dropout 在不同切片上是不一样的。</li>
+</ul>
+</li>
+<li><strong>操作</strong>：<ul>
+<li>它调用了 <code>_CUDA_RNG_STATE_TRACKER.add(...)</code> 把这两个种子分别注册进去，名字叫 <code>'data-parallel-rng'</code> 和 <code>'model-parallel-rng'</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 攻克难点“重计算” (Checkpointing)</h3>
+<p><strong>目标</strong>：阅读 <code>class CheckpointFunction</code> (大约第 388 行)。</p>
+<p>这是 Megatron 省显存的核心黑科技。</p>
+<ul>
+<li><strong><code>forward</code> (前向传播)</strong>：<ol>
+<li><code>ctx.rng_states = _get_all_rng_states()</code>：<strong>关键动作！</strong> 在干活之前，把当前所有的随机数状态（包括 CPU 和 GPU）全部<strong>截图保存</strong>下来。</li>
+<li><code>run_function(*args)</code>：执行真正的计算（比如一层 Transformer）。</li>
+<li><code>ctx.save_for_backward(...)</code>：保存输入，但通常<strong>不保存</strong>中间激活值（为了省显存）。</li>
+</ol>
+</li>
+<li><strong><code>backward</code> (反向传播)</strong>：<ol>
+<li>我们需要求梯度，但中间激活值刚才没存，需要重算。</li>
+<li><code>with _fork_rng():</code>：准备开始“时光倒流”。</li>
+<li><code>_set_all_rng_states(*ctx.rng_states)</code>：<strong>恢复现场！</strong> 把随机数生成器强行设置回 <code>forward</code> 刚开始的那一刻。</li>
+<li><code>ctx.run_function(*detached_inputs)</code>：再跑一遍前向传播。因为随机状态被完美还原了，所以这次跑出来的 Dropout 结果和第一次<strong>一模一样</strong>。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>Task 5: 扫尾与高级特性 (可跳过)</h3>
+<p><strong>目标</strong>：了解剩下的辅助代码。</p>
+<ul>
+<li><strong><code>_get_cuda_rng_state</code> / <code>_set_cuda_rng_state</code></strong>：<ul>
+<li>这是对 PyTorch 原生函数的封装。</li>
+<li>主要为了处理 <strong>CUDA Graph</strong>（一种 GPU 加速技术）。在 CUDA Graph 模式下，设置随机种子的方式不太一样，所以这里做了兼容性处理。</li>
+</ul>
+</li>
+<li><strong><code>CheckpointWithoutOutput</code></strong>：<ul>
+<li>这是 <code>CheckpointFunction</code> 的变体。普通的 Checkpoint 虽然省了中间激活，但输出（Output）还在。这个类连 Output 都在前向传播后扔掉，反向传播时再重算。这是为了极致的省显存。</li>
+</ul>
+</li>
+<li><strong><code>Transformer Engine (TE)</code></strong>：<ul>
+<li>代码里有很多 <code>if HAVE_TE:</code>。这是为了兼容 NVIDIA 的 Transformer Engine 库（用于 FP8 训练加速）。如果装了 TE，就用 TE 自带的随机追踪器，逻辑是一样的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (你的 Cheat Sheet)</h3>
+<p>如果你要给别人讲这个文件，只需要记住这三句话：</p>
+<ol>
+<li><strong>它是一个多面手</strong>：它维护了一个字典，存了多套随机种子（一套给数据并行用，一套给模型并行用）。</li>
+<li><strong>它是时光机</strong>：通过 <code>fork</code> 方法，它能让代码在执行某段逻辑时，临时切换到指定的随机种子。</li>
+<li><strong>它是后悔药</strong>：配合 Checkpoint 机制，它能在反向传播重计算时，完美复现前向传播时的随机环境，确保 Dropout 结果一致。</li>
+</ol>

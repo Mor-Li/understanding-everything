@@ -1,0 +1,97 @@
+<h1>recipe/spin/core_algos.py</h1>
+<p>这份代码是用于<strong>大模型对齐（Alignment）训练</strong>的，特别是针对 <strong>SPIN (Self-Play Fine-Tuning)</strong> 或者 <strong>Online DPO (Direct Preference Optimization)</strong> 这种算法的核心工具包。</p>
+<p>简单来说，它的目的是：<strong>让模型自己生成答案，然后根据评分判断哪个好，哪个坏，最后通过数学公式调整模型参数，让它以后多生成好的，少生成坏的。</strong></p>
+<p>为了让你听懂，我把这个代码的功能拆解成一个<strong>“训练大模型的 Todo List（任务清单）”</strong>。想象你是一个老师，正在教一个学生（模型）写作文。</p>
+<hr />
+<h3>📋 训练大模型任务清单 (Todo List)</h3>
+<ol>
+<li><strong>基础任务：算概率 (<code>get_batch_logps</code>)</strong><ul>
+<li><em>任务描述</em>：看看学生对自己写的每一个字有多大的把握（置信度）。</li>
+</ul>
+</li>
+<li><strong>核心任务 A：分出胜负 (<code>compute_onlinedpo_pref</code>)</strong><ul>
+<li><em>任务描述</em>：学生针对同一个题目写了两篇作文，你要根据评分（Reward），告诉学生哪篇是“赢家”（Chosen），哪篇是“输家”（Rejected）。</li>
+</ul>
+</li>
+<li><strong>核心任务 B：计算惩罚 (<code>compute_online_dpo_loss</code>)</strong><ul>
+<li><em>任务描述</em>：根据胜负结果，计算要怎么打手板（Loss）。如果学生给“输家”的置信度太高，或者给“赢家”的置信度太低，就要狠狠罚。</li>
+</ul>
+</li>
+<li><strong>监控任务：防止跑偏 (<code>KLController</code>)</strong><ul>
+<li><em>任务描述</em>：防止学生为了讨好老师而彻底变成另一个人（防止模型遗忘原本的知识）。我们要控制它改变的幅度。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解</h3>
+<p>下面我按照上面的清单，一步一步解释代码里的函数是干嘛的：</p>
+<h4>1. 基础任务：算概率</h4>
+<p><strong>函数名：</strong> <code>get_batch_logps</code></p>
+<ul>
+<li><strong>这是啥？</strong>
+    这是最底层的工具。大模型输出的本质是一堆数字（Logits），这个函数把这些数字转换成<strong>“这句话生成的对数概率”</strong>。</li>
+<li><strong>为什么需要？</strong>
+    因为 DPO 算法的核心就是比较概率。我们需要知道模型生成“好的回答”的概率是多少，生成“坏的回答”的概率是多少。</li>
+<li><strong>代码逻辑：</strong>
+    拿到模型的输出 -&gt; 对照实际的标签（Labels） -&gt; 算出每个字的概率 -&gt; 加起来（或取平均）得到整句话的得分。</li>
+</ul>
+<h4>2. 核心任务 A：分出胜负 (关键点!)</h4>
+<p><strong>函数名：</strong> <code>compute_onlinedpo_pref</code></p>
+<ul>
+<li><strong>这是啥？</strong>
+    这是 <strong>Online DPO / SPIN</strong> 的核心逻辑。
+    传统的 DPO 数据集是人写好的（A比B好）。但在 Online DPO 中，数据是<strong>模型实时生成</strong>的。
+    比如模型对同一个问题生成了 <code>回答1</code> 和 <code>回答2</code>。我们需要一个裁判（Reward Model）给它们打分。</li>
+<li><strong>代码逻辑：</strong><ol>
+<li>输入：一堆回答的奖励分数（<code>token_level_rewards</code>）。</li>
+<li>分组：代码假设输入是成对的（<code>[回答1, 回答2, 回答3, 回答4...]</code>）。它把 <code>回答1</code> 和 <code>回答2</code> 放在一起比。</li>
+<li><strong>比大小</strong>：如果 <code>回答1</code> 分数高，那 <code>回答1</code> 就是 Winner（Chosen），<code>回答2</code> 就是 Loser（Rejected）。</li>
+<li>输出：一个布尔值的列表（Mask），标记谁赢了。</li>
+</ol>
+</li>
+<li><strong>一句话总结：</strong> <strong>在这个函数里，我们通过分数高低，动态地决定谁是好答案，谁是坏答案。</strong></li>
+</ul>
+<h4>3. 核心任务 B：计算惩罚</h4>
+<p><strong>函数名：</strong> <code>compute_online_dpo_loss</code></p>
+<ul>
+<li><strong>这是啥？</strong>
+    这是<strong>DPO 算法的数学公式实现</strong>。</li>
+<li><strong>输入：</strong><ul>
+<li><code>policy_chosen_logps</code>: 当前模型生成“好答案”的概率。</li>
+<li><code>policy_rejected_logps</code>: 当前模型生成“坏答案”的概率。</li>
+<li><code>reference_...</code>: 原始模型（没训练前的）生成这些答案的概率（用来做参考）。</li>
+</ul>
+</li>
+<li><strong>代码逻辑：</strong>
+    它计算一个差值：<code>(好答案概率 - 坏答案概率)</code>。<ul>
+<li>如果这个差值很大（模型觉得好答案比坏答案概率大很多），Loss 就小，因为模型学对了。</li>
+<li>如果这个差值很小甚至为负（模型觉得坏答案更好），Loss 就大，模型就要被更新参数。</li>
+</ul>
+</li>
+<li><strong>一句话总结：</strong> <strong>告诉模型：“你要提高好答案的概率，降低坏答案的概率，而且要比你之前的版本（Reference）做得更好。”</strong></li>
+</ul>
+<h4>4. 监控任务：防止跑偏</h4>
+<p><strong>类名：</strong> <code>AdaptiveKLController</code> 和 <code>FixedKLController</code></p>
+<ul>
+<li><strong>这是啥？</strong>
+    <strong>KL 散度（KL Divergence）</strong> 是用来衡量两个概率分布差异的。
+    在训练中，我们希望模型变聪明，但<strong>不希望它完全变成另一个模型</strong>（导致胡言乱语或遗忘基础知识）。</li>
+<li><strong>两种模式：</strong><ol>
+<li><strong>Fixed (固定)</strong>: 就像一根长度固定的绳子拴着模型，惩罚系数永远不变。</li>
+<li><strong>Adaptive (自适应)</strong>: 就像一根弹簧。如果模型偏离原始模型太远（KL太大），我就把惩罚系数调大（拉紧一点）；如果模型改变太小，我就调小一点（放松一点）。</li>
+</ol>
+</li>
+<li><strong>代码逻辑：</strong>
+    <code>update</code> 函数会根据当前的 <code>current_kl</code> 动态调整 <code>self.value</code>（惩罚系数）。</li>
+</ul>
+<hr />
+<h3>💡 总结整个流程</h3>
+<p>如果把这个文件放在整个训练循环里，它的工作流是这样的：</p>
+<ol>
+<li>模型针对一个问题，生成了两个回答。</li>
+<li>用 <strong><code>get_batch_logps</code></strong> 算出这两个回答的概率。</li>
+<li>有一个打分模型给这两个回答打分。</li>
+<li>用 <strong><code>compute_onlinedpo_pref</code></strong> 对比分数，定下哪个是“好回答”，哪个是“坏回答”。</li>
+<li>用 <strong><code>KLController</code></strong> 看看模型是不是改得太猛了，准备好惩罚系数。</li>
+<li>最后用 <strong><code>compute_online_dpo_loss</code></strong> 算出最终的 Loss，反向传播更新模型，让它下次更聪明。</li>
+</ol>

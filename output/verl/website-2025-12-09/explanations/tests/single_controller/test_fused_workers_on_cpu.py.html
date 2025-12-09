@@ -1,0 +1,125 @@
+<h1>tests/single_controller/test_fused_workers_on_cpu.py</h1>
+<p>这段代码确实涉及了一些比较高级的并行计算概念（基于 Ray 框架），特别是<strong>如何把两个独立的角色（Worker）“融合”到同一个进程中去运行</strong>。</p>
+<p>简单来说，这段代码是在测试一个功能：<strong>省钱省力模式</strong>。
+通常在 AI 训练中，Actor（负责行动的模型）和 Critic（负责打分的模型）是分开的。但为了减少数据传输的开销，我们想把它们塞进同一个“身体”（进程）里，让它们共用资源。</p>
+<p>为了让你看懂，我制定了一个 <strong>5步走的 Task List</strong>，我们一步步来拆解这个“融合实验”。</p>
+<hr />
+<h3>Task 1: 定义原材料 (Actor 和 Critic)</h3>
+<p>首先，我们需要定义两个独立工作的工人。</p>
+<ul>
+<li>
+<p><strong>代码对应部分：</strong>
+    ```python
+    @ray.remote
+    class Actor(Worker):
+        # ...
+        def add(self, x):
+            x += self.rank  # 把输入加上自己的编号(rank)
+            return x</p>
+<p>@ray.remote
+class Critic(Worker):
+    def <strong>init</strong>(self, val) -&gt; None:
+        super().<strong>init</strong>()
+        self.val = val # 初始化时记住一个数字，比如10</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">def</span><span class="w"> </span><span class="nv">sub</span><span class="ss">(</span><span class="nv">self</span>,<span class="w"> </span><span class="nv">x</span><span class="ss">)</span>:
+<span class="w">    </span><span class="nv">x</span><span class="w"> </span><span class="o">-=</span><span class="w"> </span><span class="nv">self</span>.<span class="nv">val</span><span class="w">  </span>#<span class="w"> </span>把输入减去那个数字
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nv">x</span>
+</code></pre></div>
+
+<p>```
+*   <strong>解读：</strong>
+*   <strong>Actor</strong>: 一个简单的工人，只会做加法。
+*   <strong>Critic</strong>: 另一个工人，只会做减法。
+*   此时它们还是独立的，如果要运行，通常会分别启动在不同的进程里。</p>
+</li>
+</ul>
+<h3>Task 2: 打包并准备融合 (Preparation)</h3>
+<p>既然要融合，我们得先把这两个类（Class）和它们的初始化参数打包好，告诉系统“我要把这俩货合体”。</p>
+<ul>
+<li>
+<p><strong>代码对应部分：</strong>
+    ```python
+    actor_cls = RayClassWithInitArgs(cls=Actor)
+    critic_cls = RayClassWithInitArgs(cls=Critic, val=10) # 告诉系统Critic初始化要传参val=10
+    cls_dict = {"actor": actor_cls, "critic": critic_cls}</p>
+<h1>核心魔法：创建一个融合后的基类</h1>
+<p>FusedBaseClass = create_colocated_worker_raw_cls(cls_dict)
+<code>``
+*   **解读：**
+*   我们把</code>Actor<code>和</code>Critic<code>放进了一个字典</code>cls_dict<code>。
+*</code>create_colocated_worker_raw_cls<code>: 这是一个工厂函数。它拿到了那两个类，动态生成了一个新的**基类**（</code>FusedBaseClass`）。这个新基类拥有“同时容纳 Actor 和 Critic”的能力。</p>
+</li>
+</ul>
+<h3>Task 3: 定义“合体人” (HybridWorker)</h3>
+<p>现在我们要定义最终运行的那个“合体人”类，它继承自上面生成的基类。</p>
+<ul>
+<li><strong>代码对应部分：</strong>
+    <code>python
+    @ray.remote
+    class HybridWorker(FusedBaseClass):
+        @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+        def foo(self, x):
+            # 注意这里！它能在内部直接调用 actor 和 critic
+            return self.critic.sub(self.actor.add(x))</code></li>
+<li><strong>解读：</strong><ul>
+<li><code>HybridWorker</code> 是最终的产物。</li>
+<li><strong>关键点</strong>：<code>self.actor</code> 和 <code>self.critic</code>。因为它是融合来的，所以它体内自动有了这两个属性。</li>
+<li><code>foo</code> 函数展示了融合的好处：数据 <code>x</code> 不需要跨网络传输，直接在同一个进程内存里，先给 Actor 处理，再给 Critic 处理。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 搭建舞台并初始化 (Setup)</h3>
+<p>定义好了类，现在要正式启动测试环境，分配 CPU 资源。</p>
+<ul>
+<li><strong>代码对应部分：</strong>
+    ```python
+    def test_fused_workers():
+        ray.init(num_cpus=100) # 启动 Ray<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 1. 资源池：我们要启动2个这样的节点(process_on_nodes=[2])
+process_on_nodes = [2]
+resource_pool = RayResourcePool(process_on_nodes=process_on_nodes, use_gpu=False)
+
+<span class="gh">#</span> 2. 告诉资源池，我们要用那个 HybridWorker
+hybrid_cls_with_init = RayClassWithInitArgs(cls=HybridWorker)
+hybrid_cls_with_init.fused_worker_used = True # 标记：这是个融合怪
+
+<span class="gh">#</span> 3. 创建工作组
+fused_wg = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=hybrid_cls_with_init)
+
+<span class="gh">#</span> 4. 正式合体！实例化内部的 actor 和 critic
+fused_wg.fuse(cls_dict.keys())
+</code></pre></div>
+
+<p><code>``
+*   **解读：**
+*   这部分主要是 Ray 的样板代码，负责申请计算资源。
+*</code>fused_wg.fuse(...)<code>是最关键的一步，它会在</code>HybridWorker<code>启动后，把内部的</code>actor<code>和</code>critic` 对象真正创建出来。</p>
+</li>
+</ul>
+<h3>Task 5: 验证结果 (Verification)</h3>
+<p>最后，我们要验证这个“合体人”工作是否正常。</p>
+<ul>
+<li>
+<p><strong>代码对应部分：</strong>
+    ```python
+    # 分步调用：先让 actor 算
+    x = fused_wg.actor.add(0.1)
+    # 再让 critic 算
+    y = fused_wg.critic.sub(x)</p>
+<h1>混合调用：直接调用合体人的 foo 方法 (内部包含了上面两步)</h1>
+<p>z = fused_wg.foo(0.1)</p>
+<h1>验证：分步做的结果(y) 和 合体做的结果(z) 应该是一模一样的</h1>
+<p>for i, j in zip(y, z, strict=True):
+    assert i == j
+<code>``
+*   **解读：**
+*   **逻辑**：
+    *</code>x<code>= 0.1 + rank (假设rank是0) = 0.1
+    *</code>y<code>=</code>x<code>- 10 = -9.9
+    *</code>z<code>=</code>foo(0.1)<code>= 内部直接算 (0.1 + 0) - 10 = -9.9
+*   **结论**：如果</code>y<code>和</code>z<code>相等，说明融合成功了，逻辑没有坏掉，而且</code>foo` 函数这种内部直接调用的方式是可行的。</p>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这篇文档讲的故事是：
+<strong>“我们原本有两个分开的工人（Actor/Critic），为了提高效率，我们写了一段代码（Tests），把它们缝合进了一个叫 <code>HybridWorker</code> 的身体里。测试证明，这个合体人既可以像以前一样分别指挥手脚干活，也可以用一个新的脑子（foo函数）一次性把活干完。”</strong></p>

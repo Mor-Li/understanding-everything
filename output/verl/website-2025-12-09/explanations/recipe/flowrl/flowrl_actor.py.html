@@ -1,0 +1,101 @@
+<h1>recipe/flowrl/flowrl_actor.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到 <strong>强化学习（RL）</strong> 和 <strong>GFlowNet（生成流网络）</strong> 的结合。</p>
+<p>简单来说，这是一个 <strong>FlowRL Actor</strong> 的实现。通常我们用 PPO 算法来训练大模型，让它“得分更高”。而 FlowRL 是一种不同的训练思路，它的目标是让模型生成的概率 <strong>正比于</strong> 奖励（Reward）。</p>
+<p>为了帮你理解，我把你当作这个 AI 的“架构师”，我们需要完成一个 <strong>5步的 Task List</strong> 才能读懂并实现这个算法。</p>
+<hr />
+<h3>🟢 Task 1：理解核心目标（为什么要改代码？）</h3>
+<p><strong>背景</strong>：
+普通的 PPO 只是想让模型“尽可能拿高分”。
+FlowRL 的目标有点不同，它想让模型满足一个数学平衡公式：
+$$ \log p(生成内容) + \log Z(提示词) \approx \beta \times \text{奖励} + \log p_{ref}(生成内容) $$</p>
+<p>看不懂没关系，你只需要知道：<strong>为了实现这个公式，我们需要模型多输出一个东西，叫做 $Z$（Log Z）。</strong>
+这个 $Z$ 代表了“在这个提示词（Prompt）下，所有可能回答的总得分潜力”。</p>
+<p><strong>Todo</strong>:
+我们需要给模型加一个“小脑袋”，专门用来预测这个 $Z$ 值。</p>
+<h3>🟢 Task 2：搭建预测 Z 的小模块 (<code>ProjZModule</code>)</h3>
+<p>代码最开头定义的 <code>ProjZModule</code> 就是这个“小脑袋”。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>class ProjZModule(torch.nn.Module)</code></li>
+<li><strong>解读</strong>:<ul>
+<li>这是一个简单的<strong>多层感知机（MLP）</strong>。</li>
+<li>结构：线性层 -&gt; GELU激活 -&gt; 层归一化 -&gt; Dropout -&gt; 线性层。</li>
+<li><strong>输入</strong>: 模型的隐藏状态（Hidden State）。</li>
+<li><strong>输出</strong>: 一个数字（维度为1），这就是 <code>log_z</code>。</li>
+</ul>
+</li>
+</ul>
+<p><strong>总结</strong>：这个类就是一个打分器，给它看一眼提示词的特征，它就要猜出一个数值 $Z$。</p>
+<h3>🟢 Task 3：修改前向传播，让模型吐出 Z (<code>_forward_micro_batch</code>)</h3>
+<p>普通的 Actor 只需要输出“下一个词的概率”。现在我们需要它同时输出 $Z$。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>_forward_micro_batch</code> 方法</li>
+<li><strong>解读</strong>:<ol>
+<li><strong>正常跑模型</strong>: 代码大部分都在处理数据填充（Padding）和并行计算（Ulysses），最终调用 <code>self.actor_module(...)</code> 得到输出。</li>
+<li><strong>关键修改</strong>:
+    <code>python
+    # ==== FlowRL: use proj_z to estimate log Z ====
+    if return_log_z:
+        # 1. 拿到模型最后一层的隐藏状态
+        last_hidden = output.hidden_states[-1]...
+        # 2. 找到 Prompt (提示词) 部分的隐藏状态，取平均值
+        avg_hidden = verl_F.masked_mean(prompts_last_hidden, ...)
+        # 3. 用 Task 2 写的那个“小脑袋”预测 Z
+        log_z = self.actor_module.proj_z(avg_hidden)
+        return entropy, log_probs, log_z  # &lt;--- 把 log_z 一起返回去</code></li>
+</ol>
+</li>
+</ul>
+<p><strong>总结</strong>：每次模型推理时，不仅算词的概率，还顺便算了一下当前 Prompt 的 $Z$ 值。</p>
+<h3>🟢 Task 4：实现 FlowRL 的“平衡算式” (<code>compute_flowrl</code>)</h3>
+<p>这是整个文件的<strong>灵魂</strong>。普通的 PPO 算的是 Policy Gradient Loss，这里算的是 <strong>Trajectory Balance Loss（轨迹平衡损失）</strong>。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>compute_flowrl</code> 方法</li>
+<li>
+<p><strong>解读</strong>:
+    这个函数就是在计算 Task 1 里提到的那个公式的“误差”（如果不平衡，误差就大）。</p>
+<p>```python</p>
+<h1>1. 算平均概率和奖励</h1>
+<p>avg_log_prob = ... # 模型生成的概率
+seq_log_reward = ... # 获得的奖励 (Reward)</p>
+<h1>2. 核心公式 (Delta 就是误差)</h1>
+<h1>理想情况下 Delta 应该等于 0</h1>
+<h1>Delta = LogZ + 生成概率 - (系数 * 奖励) - 参考模型概率</h1>
+<p>delta = log_z + avg_log_prob - self.flowrl_beta_coef * seq_log_reward - avg_ref_log_prob</p>
+<h1>3. 计算重要性权重 (Importance Sampling)</h1>
+<h1>因为数据可能是旧策略生成的，需要纠正一下</h1>
+<p>log_w = ...
+imp_w = torch.clamp(...)</p>
+<h1>4. 最终 Loss：加权的误差平方</h1>
+<h1>我们希望误差(delta)越小越好</h1>
+<p>weighted_losses = imp_w * (delta**2)
+avg_loss = torch.mean(weighted_losses)
+```</p>
+</li>
+</ul>
+<p><strong>总结</strong>：这个函数告诉优化器：“嘿，你的 $Z$ 值、你的生成概率和最终的奖励必须满足这个数学关系，如果不满足，就狠狠地惩罚你（Loss变大）”。</p>
+<h3>🟢 Task 5：把所有东西串进训练循环 (<code>update_policy</code>)</h3>
+<p>最后一步，就是像搭积木一样把上面做的东西放进训练流程里。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>update_policy</code> 方法</li>
+<li><strong>解读</strong>:<ol>
+<li><strong>准备数据</strong>: 把数据切分成小批次（Mini-batch）。</li>
+<li><strong>前向计算</strong>: 调用 Task 3 的 <code>_forward_micro_batch(..., return_log_z=True)</code>，拿到 <code>log_prob</code> 和 <code>log_z</code>。</li>
+<li><strong>计算 Loss</strong>: <strong>这里不再调用 PPO 的 Loss 函数</strong>，而是调用 Task 4 的 <code>self.compute_flowrl(...)</code>。</li>
+<li><strong>反向传播</strong>: <code>loss.backward()</code> 更新模型参数。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>全文逻辑总结 (你的 Cheat Sheet)</h3>
+<p>如果你要给别人讲这段代码，可以这样列个清单：</p>
+<ol>
+<li><strong>身份</strong>：这是一个 RL Actor，但不是标准的 PPO，是 FlowRL 变体。</li>
+<li><strong>新增组件</strong>：加了一个 <code>ProjZModule</code> 神经网络层，用来预测“配分函数 Z”。</li>
+<li><strong>流程变化</strong>：<ul>
+<li><strong>Forward</strong>: 跑完大模型后，额外把 Prompt 的特征拿出来算一个数值 <code>log_z</code>。</li>
+<li><strong>Loss</strong>: 不用 PPO 的 <code>clip</code> 损失，而是用 <strong>Trajectory Balance Loss</strong>（公式：$Z + P - R = 0$ 的均方误差）。</li>
+</ul>
+</li>
+<li><strong>目的</strong>：让模型生成的概率分布更平滑地对齐奖励分布，通常用于探索能力更强的场景。</li>
+</ol>
+<p>这段代码之所以看着乱，是因为里面夹杂了很多 <code>verl</code> 框架特有的数据处理（比如 <code>ulysses</code> 并行、<code>rmpad</code> 去除填充等），<strong>你可以把那些 <code>if self.use_ulysses_sp:</code> 之类的代码全部在大脑里过滤掉</strong>，只看逻辑主干，就会清晰很多。</p>

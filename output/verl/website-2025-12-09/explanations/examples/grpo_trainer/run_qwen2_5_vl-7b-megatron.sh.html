@@ -1,0 +1,124 @@
+<h1>examples/grpo_trainer/run_qwen2_5_vl-7b-megatron.sh</h1>
+<p>这份脚本确实看起来很复杂，因为它结合了<strong>强化学习（RL）</strong>、<strong>大模型训练架构（Megatron）</strong>、<strong>多模态模型（Qwen2.5-VL）</strong>以及<strong>显存优化技术</strong>。</p>
+<p>别担心，我们把它拆解成一个“学习任务清单（Todo List）”，像剥洋葱一样，一层一层地看懂它在干什么。</p>
+<hr />
+<h3>任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>Task 1: 搞清楚“我们在干什么？”（宏观目标）</strong></li>
+<li><strong>Task 2: 准备工作（模型格式转换）</strong></li>
+<li><strong>Task 3: 显存不够怎么办？（Offload 策略）</strong></li>
+<li><strong>Task 4: 模型太大怎么塞进显卡？（Megatron 并行策略）</strong></li>
+<li><strong>Task 5: 怎么让训练更快？（动态批处理与性能调优）</strong></li>
+<li><strong>Task 6: 启动训练（关键参数解读）</strong></li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>✅ Task 1: 搞清楚“我们在干什么？”</h4>
+<p><strong>核心目标</strong>：使用 <strong>GRPO 算法</strong>（一种强化学习算法，DeepSeek-R1 背后的核心技术之一）来微调一个 <strong>视觉-语言模型 (Qwen2.5-VL-7B)</strong>。</p>
+<ul>
+<li><strong>脚本名字</strong>：<code>run_qwen2_5_vl-7b-megatron.sh</code><ul>
+<li><code>qwen2_5_vl-7b</code>: 使用的模型是 Qwen 2.5 Vision-Language 版本，70亿参数。</li>
+<li><code>megatron</code>: 使用 Megatron-Core 架构来运行，这通常是为了支持多卡并行和更高效的大规模训练。</li>
+</ul>
+</li>
+<li><strong>数据</strong>：脚本里写了 <code>geo3k</code>，这看起来是一个几何题目的数据集。</li>
+<li><strong>目的</strong>：让这个模型做几何题做得更好。</li>
+</ul>
+<h4>✅ Task 2: 准备工作（模型格式转换）</h4>
+<p>看脚本的这一部分（虽然被注释掉了，但非常重要）：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># convert HF model to meagatron format offlinely</span>
+<span class="c1"># python scripts/converter_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH</span>
+</code></pre></div>
+
+<ul>
+<li><strong>问题</strong>：我们在 HuggingFace 下载的模型（<code>HF_MODEL_PATH</code>）通常是通用格式。</li>
+<li><strong>解决</strong>：Megatron 架构需要特殊的“切分”格式。如果你要用 Megatron 的并行能力（比如把模型切开放在两张卡上），你需要先运行这个转换脚本，把模型转成 Megatron 格式（<code>DIST_CKPT_PATH</code>）。</li>
+<li><strong>现状</strong>：脚本里这行被注释了，意味着作者假设你<strong>已经转好了</strong>，或者在后续步骤中会自动处理。</li>
+</ul>
+<h4>✅ Task 3: 显存不够怎么办？（Offload 策略）</h4>
+<p>这一大段全是关于 <strong>Offload（卸载）</strong> 的设置：</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">ALL_OFFLOAD</span><span class="o">=</span><span class="si">${</span><span class="nv">ALL_OFFLOAD</span><span class="k">:-</span><span class="nv">True</span><span class="si">}</span>
+COMMON_PARAM_OFFLOAD...
+ACTOR_PARAM_OFFLOAD...
+</code></pre></div>
+
+<ul>
+<li><strong>背景</strong>：显卡显存（VRAM）非常贵且有限。</li>
+<li><strong>动作</strong>：<code>Offload = True</code> 意思是把暂时不用的数据（比如模型参数、优化器状态、梯度）从 <strong>显卡显存</strong> 搬运到 <strong>CPU 内存</strong> 里去。</li>
+<li><strong>观点</strong>：这是一种“用时间换空间”的策略。虽然搬运数据会慢一点，但原本塞不下的模型现在能训练了。脚本这里默认<strong>全部开启卸载</strong>，为了省显存。</li>
+</ul>
+<h4>✅ Task 4: 模型太大怎么塞进显卡？（Megatron 并行策略）</h4>
+<p>这是脚本最核心的“Megatron”部分：</p>
+<div class="codehilite"><pre><span></span><code>actor_rollout_ref.actor.megatron.tensor_model_parallel_size<span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+actor_rollout_ref.actor.megatron.pipeline_model_parallel_size<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+</code></pre></div>
+
+<ul>
+<li><strong>Tensor Parallel (TP) = 2</strong>：<strong>张量并行</strong>。想象把模型的每一层神经网络竖着切成两半，分别放在两张显卡上计算。<ul>
+<li><em>为什么？</em> 即使是 7B 的模型，如果上下文很长，单卡也可能吃不消。这里用了 2 张卡来扛一个模型。</li>
+</ul>
+</li>
+<li><strong>Pipeline Parallel (PP) = 1</strong>：<strong>流水线并行</strong>。这里设为 1，表示不使用流水线并行（即不把模型的层横向切分）。</li>
+</ul>
+<h4>✅ Task 5: 怎么让训练更快？（动态批处理与性能调优）</h4>
+<p>看脚本开头的注释指南（Guide）：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 2. enable dynamic batch size...</span>
+<span class="c1"># 3. set ppo_max_token_len_per_gpu...</span>
+</code></pre></div>
+
+<p>以及下面的参数：</p>
+<div class="codehilite"><pre><span></span><code>actor_rollout_ref.actor.use_dynamic_bsz<span class="o">=</span>True<span class="w"> </span><span class="se">\</span>
+</code></pre></div>
+
+<ul>
+<li><strong>Dynamic Batch Size (动态批大小)</strong>：<ul>
+<li>通常训练时，必须把所有句子补齐（Padding）到相同长度，这很浪费显存和计算力（算了一堆 0）。</li>
+<li>开启这个选项后，Megatron 会把短句子拼在一起，像俄罗斯方块一样塞满显存，<strong>极大提高训练效率（MFU）</strong>。</li>
+</ul>
+</li>
+<li><strong>Recompute (重计算)</strong>：<ul>
+<li>注释里提到的 <code>full recompute</code>。如果你显存实在不够了，可以开启这个。它不存中间结果，需要时再算一遍。脚本里没默认开，因为会慢 30%。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 启动训练（关键参数解读）</h4>
+<p>最后那个超级长的 <code>python3</code> 命令，我们挑重点看：</p>
+<ol>
+<li>
+<p><strong>算法设置</strong>:</p>
+<ul>
+<li><code>algorithm.adv_estimator=grpo</code>: 明确指定使用 <strong>GRPO</strong> 算法。GRPO 不需要额外的 Critic 模型（省了一个大模型的显存），通过一组输出结果的平均值来做基线。</li>
+</ul>
+</li>
+<li>
+<p><strong>角色分配 (Actor, Rollout, Ref)</strong>:</p>
+<ul>
+<li><strong>Actor</strong>: 正在训练的模型（Qwen2.5-VL）。</li>
+<li><strong>Ref</strong>: 参考模型（原始模型，用来防止训练跑偏，计算 KL 散度）。</li>
+<li><strong>Rollout</strong>: 负责生成答案的模型（通常和 Actor 是同一个权重）。</li>
+<li><code>rollout.name=$ENGINE</code>: 这里用了 <code>vllm</code>。vLLM 是一个推理加速引擎，意味着生成答案时非常快。</li>
+</ul>
+</li>
+<li>
+<p><strong>数据长度</strong>:</p>
+<ul>
+<li><code>data.max_prompt_length=1024</code>: 题目最长 1024 token。</li>
+<li><code>data.max_response_length=2048</code>: 答案最长 2048 token。</li>
+</ul>
+</li>
+<li>
+<p><strong>硬件资源</strong>:</p>
+<ul>
+<li><code>trainer.n_gpus_per_node=8</code>: 假设你这台机器有 8 张显卡。</li>
+</ul>
+</li>
+</ol>
+<h3>总结：这个脚本在讲什么故事？</h3>
+<blockquote>
+<p>“嘿，我要在一台 8 卡的机器上，用 <strong>GRPO 算法</strong> 训练 <strong>Qwen2.5-VL-7B</strong> 模型去解几何题。</p>
+<p>为了防止显存爆炸，我做了两手准备：
+1. 用 <strong>Megatron</strong> 把模型切成两半（TP=2），放在两张卡上跑。
+2. 把暂时不用的参数全部 <strong>卸载（Offload）</strong> 到 CPU 内存里。</p>
+<p>为了跑得快一点，我用了 <strong>vLLM</strong> 来做推理生成，并且开启了 <strong>动态批处理</strong> 来榨干显卡性能。”</p>
+</blockquote>
+<p>现在再回头看脚本，是不是清晰一些了？</p>

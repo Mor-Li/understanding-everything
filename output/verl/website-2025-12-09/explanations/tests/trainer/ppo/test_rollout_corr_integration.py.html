@@ -1,0 +1,93 @@
+<h1>tests/trainer/ppo/test_rollout_corr_integration.py</h1>
+<p>这份代码确实涉及强化学习（RL）中比较进阶的概念，主要是关于 <strong>PPO 训练中的数据修正（Rollout Correction）</strong>。</p>
+<p>简单来说，这个文件的目的是测试：<strong>当我们用来训练的数据（Rollout）和当前模型的想法不太一致时，如何通过数学方法（重要性采样 IS 和 拒绝采样 RS）来修正这些偏差，防止模型练崩了。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“理解任务清单” (Task Todo List)</strong>，我们一步步来通关。</p>
+<hr />
+<h3>任务清单：一步步理解代码逻辑</h3>
+<h4>✅ Task 1: 理解背景 —— 为什么需要“修正”？</h4>
+<ul>
+<li><strong>场景</strong>：在 PPO 训练中，我们先用一个模型（Actor）去玩游戏或生成文本，收集一堆数据（这叫 <strong>Rollout</strong>）。然后我们用这些数据来更新模型参数。</li>
+<li><strong>问题</strong>：有时候，收集数据的模型（旧模型）和正在训练的模型（新模型）之间有差异（Off-policy）。<ul>
+<li>比如：旧模型觉得“吃苹果”概率是 0.9，但新模型觉得只有 0.1。</li>
+</ul>
+</li>
+<li><strong>后果</strong>：如果直接拿这些偏差很大的数据去硬训练，模型会产生错误的梯度，导致训练崩溃。</li>
+<li><strong>本文件目标</strong>：测试一套机制，专门用来检测这些差异，并自动调整数据的权重。</li>
+</ul>
+<h4>✅ Task 2: 核心概念 A —— 重要性采样 (Rollout IS)</h4>
+<ul>
+<li><strong>概念</strong>：如果一条数据，旧模型觉得很合理，新模型觉得很离谱，那这条数据的<strong>参考价值（权重）</strong>就应该降低。</li>
+<li><strong>代码对应</strong>：<code>rollout_is</code> (Importance Sampling)。</li>
+<li><strong>逻辑</strong>：计算 <code>old_log_prob</code> (旧概率) 和 <code>rollout_log_prob</code> (数据生成时的概率) 的比值。<ul>
+<li>如果比值太夸张，就降低这条数据在计算 Loss 时的权重（Weight）。</li>
+</ul>
+</li>
+<li><strong>测试点</strong>：<code>test_policy_loss_with_rollout_is</code><ul>
+<li><strong>翻译</strong>：测试一下，如果我算出了这些修正权重，PPO 的 Loss 函数能不能正确识别并使用它们？</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 核心概念 B —— 拒绝采样 (Rollout RS)</h4>
+<ul>
+<li><strong>概念</strong>：如果一条数据实在太离谱了（差异大到无法修正），那就<strong>直接扔掉</strong>，完全不要用它来训练。</li>
+<li><strong>代码对应</strong>：<code>rollout_rs</code> (Rejection Sampling)。</li>
+<li><strong>逻辑</strong>：设定一个阈值（Threshold），超过这个线的数据，Mask（掩码）设为 0，相当于视而不见。</li>
+<li><strong>测试点</strong>：<code>test_both_bounding_modes</code><ul>
+<li><strong>翻译</strong>：测试既能“调整权重”（IS），也能“直接扔掉”（RS），这两个功能能不能同时工作？</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 安全机制 —— 一票否决 (Veto)</h4>
+<ul>
+<li><strong>概念</strong>：有时候一整句话（Sequence）大体还行，但其中<strong>某一个词（Token）</strong>的概率差异是个天文数字（Catastrophic outlier）。这时候为了安全，这整句话都不能要。</li>
+<li><strong>代码对应</strong>：<code>rollout_token_veto_threshold</code>。</li>
+<li><strong>测试点</strong>：<code>test_veto_mechanism</code><ul>
+<li><strong>翻译</strong>：我故意造一个离谱的数据（把某一个词的概率改得巨大），看看代码能不能自动把这一整条数据给“否决”（Veto）掉。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 监控指标 —— 我们偏离了多少？</h4>
+<ul>
+<li><strong>概念</strong>：我们需要知道数据和模型现在的差异到底有多大，比如困惑度（PPL）和 KL 散度。</li>
+<li><strong>代码对应</strong>：<code>compute_offpolicy_metrics</code>。</li>
+<li><strong>测试点</strong>：<code>test_offpolicy_metrics</code><ul>
+<li><strong>翻译</strong>：测试能不能算出 PPL 和 KL 这些指标，用来画图监控训练健康度。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>结合代码的具体导读</h3>
+<p>现在你再回头看代码，就能对应上了：</p>
+<ol>
+<li>
+<p><strong><code>sample_data</code> (夹具)</strong>:</p>
+<ul>
+<li>造假数据。注意它造了 <code>old_log_prob</code>（训练时的旧概率）和 <code>rollout_log_prob</code>（采样时的概率）。如果这两个相等，就是标准的 On-policy；如果不等，就需要修正。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>test_policy_loss_with_rollout_is</code> (最重要的测试)</strong>:</p>
+<ul>
+<li><strong>第一步</strong>：调用 <code>compute_rollout_correction...</code> 算出 <strong>IS Weights</strong>（修正权重）。</li>
+<li><strong>第二步</strong>：把这个权重传给 <code>compute_policy_loss_vanilla</code>（PPO 的 Loss 函数）。</li>
+<li><strong>目的</strong>：确保 Loss 函数支持加权计算，不会报错。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>test_veto_mechanism</code> (一票否决测试)</strong>:</p>
+<ul>
+<li>代码里有一行：<code>rollout_log_prob[0, 2] += 15.0</code>。</li>
+<li>这是在故意搞破坏，让第 0 条数据的第 2 个词概率差异巨大。</li>
+<li><strong>断言 (Assert)</strong>：检查 <code>veto_fraction</code> 是否大于 0，意思是“系统是否成功拦截了这个捣乱的数据”。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>test_metrics_only_mode</code></strong>:</p>
+<ul>
+<li>测试一种情况：我只想算算差异指标（看看就好），不想真的改 Loss 权重。</li>
+<li>对比了“加权重算的 Loss”和“不加权重算的 Loss”，证明它俩确实不一样。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件就是为了保证：<strong>当训练数据有点“过时”或“偏差”时，这套系统能自动通过降权（IS）、删除（RS）或一票否决（Veto）的方式，把数据修整好，再喂给 PPO Loss 函数，确保训练稳定。</strong></p>

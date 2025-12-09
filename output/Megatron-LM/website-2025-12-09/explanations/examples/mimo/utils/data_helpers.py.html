@@ -1,0 +1,74 @@
+<h1>examples/mimo/utils/data_helpers.py</h1>
+<p>这段代码确实涉及到底层分布式训练的细节，如果没接触过 Megatron-LM 或者 PyTorch 分布式训练，看懂是很困难的。</p>
+<p>简单来说，这个文件的核心功能是：<strong>在一个多显卡并行的环境中，把“主显卡”（Rank 0）手里拿着的一份复杂的、层层嵌套的数据（字典），原封不动地“复印”给其他所有显卡。</strong></p>
+<p>为了让你彻底搞懂，我制定了一个 <strong>6步走的 Task Todo List</strong>。我们把这段代码想象成一个<strong>“拆积木 -&gt; 寄快递 -&gt; 组装积木”</strong>的过程。</p>
+<hr />
+<h3>📋 学习任务清单 (Task Todo List)</h3>
+<h4>✅ Task 1: 理解背景场景 (Scenario)</h4>
+<p><strong>目标</strong>：明白为什么我们需要这段代码。
+*   <strong>场景</strong>：你在做大模型训练（Tensor Parallelism，张量并行）。
+*   <strong>问题</strong>：数据加载器（Data Loader）通常只在第 0 号显卡（Rank 0）上运行，读取硬盘数据。但是，其他显卡（Rank 1, 2, ...）也需要这份数据才能开始计算。
+*   <strong>难点</strong>：PyTorch 原生的广播（Broadcast）通常只能传简单的 Tensor（张量），很难直接传一个结构复杂的“嵌套字典”（比如 <code>{'a': tensor1, 'b': {'c': tensor2}}</code>）。
+*   <strong>代码对应</strong>：<code>broadcast_nested_data_batch</code> 函数就是为了解决这个问题。</p>
+<h4>✅ Task 2: 拆解积木 (Flatten)</h4>
+<p><strong>目标</strong>：理解 <code>flatten</code> 函数的作用。
+*   <strong>比喻</strong>：Rank 0 手里有一个拼好的乐高城堡（嵌套字典）。要想把它寄给别人，直接寄整个城堡太占地方且容易坏。最好的办法是把它<strong>拆散成一个个积木块</strong>，并记下每块积木原本的位置。
+*   <strong>动作</strong>：把树状的字典，变成一个扁平的列表。
+*   <strong>代码逻辑</strong>：
+    *   输入：<code>{'input': T1, 'mask': {'att': T2}}</code>
+    *   输出：<code>[(('input',), T1), (('mask', 'att'), T2)]</code>
+*   <strong>代码对应</strong>：
+    <code>python
+    def flatten(...):
+        # 递归地把字典里的 Tensor 找出来，并记录它的路径（key path）</code></p>
+<h4>✅ Task 3: 准备说明书 (Broadcast Schema)</h4>
+<p><strong>目标</strong>：理解 Rank 0 是如何告诉其他显卡“我即将发什么数据”。
+*   <strong>比喻</strong>：Rank 0 不能直接扔积木。它得先发一份<strong>“装箱单”</strong>给其他显卡。装箱单上写着：“我有两个积木，第一个叫 input，类型是 float32；第二个叫 mask.att，类型是 int64”。
+*   <strong>动作</strong>：Rank 0 提取数据的结构（Paths）和数据类型（Dtypes），打包发给所有人。
+*   <strong>代码对应</strong>：
+    <code>python
+    # 在 broadcast_nested_data_batch 中:
+    # 1. broadcast schema
+    meta = [paths, dtypes] 
+    torch.distributed.broadcast_object_list(obj_list, src=src, ...)
+    # 这一步之后，所有显卡都知道了数据的结构和类型，但手里还没有真正的 Tensor 数据。</code></p>
+<h4>✅ Task 4: 积木分类 (Group by Dtype)</h4>
+<p><strong>目标</strong>：理解为什么要按数据类型分组。
+*   <strong>比喻</strong>：为了寄快递省钱（提高通信效率），我们把<strong>铁做的积木</strong>放在一个箱子，<strong>木头做的积木</strong>放在另一个箱子。因为在 GPU 通信中，一次性发送同一种类型的数据通常更快。
+*   <strong>代码逻辑</strong>：创建一个字典 <code>dtype_to_keys</code>，比如 <code>{float32: ['input'], int64: ['mask.att']}</code>。
+*   <strong>代码对应</strong>：
+    <code>python
+    # 2. group tensors by dtype
+    for p, dt in zip(paths, dtypes):
+        dtype_to_keys.setdefault(dt, []).append(".".join(p))</code></p>
+<h4>✅ Task 5: 批量发货 (Broadcast Data)</h4>
+<p><strong>目标</strong>：理解真正的数据传输过程。
+*   <strong>比喻</strong>：Rank 0 开始通过高速通道（NVLink/Infiniband）把那一箱箱分类好的积木（Tensor）发给其他显卡。其他显卡根据刚才拿到的“装箱单”，把收到的数据存好。
+*   <strong>代码逻辑</strong>：调用 Megatron 的 <code>tensor_parallel.broadcast_data</code> 工具，把数据从 Rank 0 复制到其他 Rank。
+*   <strong>代码对应</strong>：
+    <code>python
+    for dt, keys in dtype_to_keys.items():
+        # 这里是真正耗时的步骤：显存之间拷贝数据
+        out = tensor_parallel.broadcast_data(keys, data_dict, dt)</code></p>
+<h4>✅ Task 6: 重新组装 (Regroup)</h4>
+<p><strong>目标</strong>：理解 <code>regroup</code> 函数的作用。
+*   <strong>比喻</strong>：现在其他显卡（Rank 1, 2...）手里有了一堆散落的积木，和一张装箱单（说明书）。他们需要按照说明书，把积木重新拼成那个“乐高城堡”。
+*   <strong>动作</strong>：把扁平的列表，还原成最初的嵌套字典结构。
+*   <strong>代码逻辑</strong>：
+    *   输入：<code>[(('input',), T1), (('mask', 'att'), T2)]</code>
+    *   输出：<code>{'input': T1, 'mask': {'att': T2}}</code>
+*   <strong>代码对应</strong>：
+    <code>python
+    def regroup(flat):
+        # 根据路径 path，一层层重建字典结构
+        cur = cur.setdefault(k, {})</code></p>
+<hr />
+<h3>🚀 总结 (Summary)</h3>
+<p>这就好比 <strong>Rank 0 是老师</strong>，其他显卡是<strong>学生</strong>：</p>
+<ol>
+<li><strong>Flatten</strong>: 老师把复杂的课本（数据）拆成一页页的纸。</li>
+<li><strong>Broadcast Meta</strong>: 老师先在大屏幕上放目录，告诉大家一共有多少页，每页是什么纸质（数据类型）。</li>
+<li><strong>Broadcast Data</strong>: 老师用复印机（GPU 通信）把这些纸批量复印给每个学生。</li>
+<li><strong>Regroup</strong>: 学生拿到一堆散乱的纸，按照目录把它们重新装订成课本。</li>
+</ol>
+<p>最终结果：<strong>所有显卡上都拥有了和 Rank 0 一模一样的那个复杂的字典对象。</strong></p>

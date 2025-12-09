@@ -1,0 +1,60 @@
+<h1>tests/unit_tests/ssm/test_mamba_block.py</h1>
+<p>这份代码确实看起来比较硬核，因为它涉及到 <strong>NVIDIA Megatron-Core</strong>（一个用于训练超大模型的底层库）和 <strong>Mamba</strong>（一种新型的模型架构）。</p>
+<p>简单来说，这个文件的作用是 <strong>“产品质检”</strong>。它是一个单元测试（Unit Test），用来确保一个叫 <code>MambaStack</code> 的组件能按预期工作。</p>
+<p>为了让你看懂，我把你当作一个“质检员”，我们制定一个 <strong>Task List（任务清单）</strong>，一步步拆解这份代码在干什么。</p>
+<hr />
+<h3>📋 任务清单：理解 Mamba Block 测试流程</h3>
+<h4>Task 1：搞清楚我们在测什么？（核心概念）</h4>
+<p>首先，你要知道被测试的主角是谁。
+*   <strong>主角</strong>：<code>MambaStack</code> (在代码第8行导入)。
+*   <strong>它的功能</strong>：它不仅仅是一个 Mamba 层，而是一个<strong>混合层堆叠（Hybrid Stack）</strong>。
+    *   现在的流行趋势是把 Mamba 架构和 Transformer（Attention/MLP）架构混合使用。
+    *   这个组件允许你像搭积木一样，自定义每一层是用 Mamba，还是用 Attention，还是用 MLP。</p>
+<h4>Task 2：准备测试环境（Setup）</h4>
+<p>在开始测试之前，代码做了一些准备工作。
+*   <strong><code>setup_method</code></strong>: 这是一个“开机”步骤。因为 Megatron 是用来跑多卡并行的，这里它模拟了一个假的并行环境（初始化 model parallel），并设置了随机种子，保证每次测试结果一致。
+*   <strong><code>get_mamba_block</code></strong>: 这是一个“生产车间”。
+    *   它接受一个 <code>hybrid_override_pattern</code>（混合模式配方）。
+    *   它配置了模型参数（比如隐藏层大小 256，头数 4）。
+    *   最后它根据你的“配方”，生产出一个 <code>MambaStack</code> 对象给你测。</p>
+<h4>Task 3：理解核心配方（Hybrid Pattern）</h4>
+<p>这是这份代码最核心的逻辑。请看 <code>test_gpu_forward</code> 和 <code>test_layer_types</code> 里的这行代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">hybrid_override_pattern</span> <span class="o">=</span> <span class="n">Symbols</span><span class="o">.</span><span class="n">MAMBA</span> <span class="o">+</span> <span class="n">Symbols</span><span class="o">.</span><span class="n">ATTENTION</span> <span class="o">+</span> <span class="n">Symbols</span><span class="o">.</span><span class="n">MLP</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点解析</strong>：这就像在点菜。你告诉程序：“我要一个 3 层的模型，第一层要是 Mamba，第二层要是 Attention，第三层要是 MLP”。</li>
+<li><strong>代码逻辑</strong>：<code>MambaStack</code> 必须能读懂这个字符串，并按顺序构建模型。</li>
+</ul>
+<h4>Task 4：执行测试一 —— 它能跑通吗？(<code>test_gpu_forward</code>)</h4>
+<p>这是最基础的测试。
+1.  <strong>造模型</strong>：按照 <code>Mamba + Attention + MLP</code> 的顺序造一个模型。
+2.  <strong>造数据</strong>：生成一些全为 1 的假数据 (<code>hidden_states</code>)，并把它放到 GPU 上。
+3.  <strong>运行</strong>：让数据流过模型 (<code>output = block(...)</code>)。
+4.  <strong>检查结果</strong>：
+    *   输出的形状对不对？（长度、Batch大小、维度是否符合预期）。
+    *   数据类型对不对？（是不是 float32）。
+*   <strong>结论</strong>：如果这个测试通过，说明这个混合模型在 GPU 上能正常进行前向传播（Forward Pass），不会报错崩掉。</p>
+<h4>Task 5：执行测试二 —— 它的结构对吗？(<code>test_layer_types</code>)</h4>
+<p>这是<strong>最关键</strong>的逻辑验证。仅仅能跑通是不够的，我们得确认它是不是真的按我们要求的顺序搭积木的。
+1.  <strong>获取层列表</strong>：拿到模型里的 <code>layers</code> 列表。
+2.  <strong>逐层检查</strong>：
+    *   <code>layers[0]</code> 必须是 <code>MambaLayer</code>。
+    *   <code>layers[1]</code> 必须是 <code>TransformerLayer</code> 且包含 <code>SelfAttention</code>。
+    *   <code>layers[2]</code> 必须是 <code>TransformerLayer</code> 且包含 <code>MLP</code>。
+*   <strong>观点解析</strong>：这证明了 <code>MambaStack</code> 确实支持<strong>混合架构</strong>，你可以随意穿插 Mamba 和 Transformer 层。</p>
+<h4>Task 6：执行测试三 —— 乱填会报错吗？(<code>test_invalid_layer_types...</code>)</h4>
+<p>一个好的系统必须能处理错误输入。
+1.  <strong>搞破坏</strong>：故意传一个非法的符号 <code>+</code> 进去（比如 <code>Mamba + Attention + MLP + "+"</code>）。
+2.  <strong>预期结果</strong>：程序应该直接报错（Raise ValueError）。
+3.  <strong>检查</strong>：代码用 <code>pytest.raises(ValueError)</code> 来确认：“如果我乱填，它确实报错了吗？”如果是，测试通过。</p>
+<hr />
+<h3>💡 总结：文中的核心观点</h3>
+<p>读完这个 List，你应该能明白这个文件的核心观点了：</p>
+<ol>
+<li><strong>混合架构支持</strong>：Megatron-Core 里的这个模块，旨在支持 Mamba 和 Transformer (Attention/MLP) 的灵活混合，而不是纯粹的 Mamba 模型。</li>
+<li><strong>配置驱动</strong>：它通过一个简单的符号序列（Pattern）来定义模型结构，而不是硬编码。</li>
+<li><strong>严格校验</strong>：它会严格检查每一层生成的类型是否与配置一致，并且拒绝非法的层类型。</li>
+</ol>
+<p><strong>一句话人话总结：</strong>
+这代码是在测试一个<strong>“模型拼装器”</strong>，验证它能不能根据用户的订单（比如“一层Mamba夹一层Attention”），正确地把模型拼出来，并且能通电运行。</p>

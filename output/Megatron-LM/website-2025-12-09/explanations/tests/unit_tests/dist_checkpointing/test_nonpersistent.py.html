@@ -1,0 +1,100 @@
+<h1>tests/unit_tests/dist_checkpointing/test_nonpersistent.py</h1>
+<p>这份代码确实涉及了很多底层框架（Megatron-LM）和测试（Pytest）的术语，看起来比较晦涩。</p>
+<p>简单来说，这是一份<strong>单元测试（Unit Test）</strong>代码。它不是用来训练模型的，而是用来<strong>验证“非持久化检查点（Non-Persistent Checkpoint）”这个功能是否正常工作</strong>。</p>
+<p>为了让你彻底搞懂，我制定了一个<strong>6步学习清单 (To-Do List)</strong>，我们一步步来拆解。</p>
+<h3>📋 学习清单 (Task List)</h3>
+<ol>
+<li><strong>搞懂核心概念</strong>：什么是“非持久化检查点”？为什么要用它？</li>
+<li><strong>看懂测试环境</strong>：代码里的 <code>setup</code> 和 <code>mock</code> 是在做什么？</li>
+<li><strong>追踪测试流程（核心）</strong>：像看电影一样，按时间线看完 <code>save</code> 和 <code>load</code> 的过程。</li>
+<li><strong>验证文件位置</strong>：检查点文件到底存哪儿了？</li>
+<li><strong>验证文件内容</strong>：存下来的数据是对的吗？</li>
+<li><strong>看懂对比测试</strong>：最后的 <code>TestLegacySaveAndLoad</code> 是干嘛的？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 搞懂核心概念</h4>
+<p>在训练超大模型（如 GPT）时，保存模型（Checkpointing）非常耗时且占硬盘。
+*   <strong>持久化检查点 (Persistent ckpt)</strong>：是你真正想保留的备份，比如每 1000 步存一次，用来以后发布模型或微调。
+*   <strong>非持久化检查点 (Non-Persistent ckpt)</strong>：是为了防止机器突然挂掉（断电、显卡故障）而频繁保存的“临时存档”。比如每 100 步存一次，但只保留最近的几个。如果训练正常，这些文件通常会被清理掉或者放在一个临时文件夹里，不污染主目录。</p>
+<p><strong>这份代码就是为了测试：Megatron-LM 能不能正确地把这种“临时存档”存到指定的子文件夹里，并且能读出来。</strong></p>
+<h4>Task 2: 看懂测试环境</h4>
+<p>在 <code>test_basic_save_load_scenarios</code> 函数开头，有一堆准备工作：</p>
+<ul>
+<li><code>Utils.initialize_model_parallel(tp, pp)</code>: 模拟了一个分布式训练环境（TP=张量并行，PP=流水线并行）。</li>
+<li><code>deterministic_empty</code>: 这是一个很有趣的技巧。通常 <code>torch.empty</code> 生成的是随机乱码数据。这里把它替换成了“全0数据”。<ul>
+<li><em>为什么？</em> 因为后面要对比文件内容是否一致。如果是随机的，每次存都不一样，就没法对比了。</li>
+</ul>
+</li>
+<li><code>TempNamedDir</code>: 创建一个临时的文件夹，测试完就删掉，不占你电脑硬盘。</li>
+</ul>
+<h4>Task 3: 追踪测试流程（核心剧情）</h4>
+<p>这是代码最长的那一段 <code>with ...</code> 里面的逻辑。我们按顺序看发生了什么：</p>
+<ol>
+<li><strong>存档 (Save) Iteration 2</strong>: 标记为 <code>non_persistent_ckpt=True</code>。<ul>
+<li><em>预期</em>：这是一个临时存档。</li>
+</ul>
+</li>
+<li><strong>存档 (Save) Iteration 3</strong>: 普通存档（默认是持久化的）。</li>
+<li><strong>存档 (Save) Iteration 4</strong>: 标记为 <code>non_persistent_ckpt=True</code>。</li>
+<li><strong>读档 (Load)</strong>:<ul>
+<li>代码：<code>load_checkpoint(...)</code></li>
+<li>断言：<code>assert iteration == 4</code></li>
+<li><em>解释</em>：系统应该能自动找到最新的存档（也就是第4步的临时存档）并恢复。</li>
+</ul>
+</li>
+<li><strong>存档 (Save) Iteration 6</strong>: 普通存档。</li>
+<li><strong>读档 (Load)</strong>:<ul>
+<li>断言：<code>assert iteration == 6</code></li>
+<li><em>解释</em>：这次恢复的是最新的普通存档。</li>
+</ul>
+</li>
+<li><strong>存档 (Save) Iteration 8</strong>: 临时存档。</li>
+<li><strong>读档 (Load)</strong>:<ul>
+<li>断言：<code>assert iteration == 8</code></li>
+</ul>
+</li>
+</ol>
+<p><strong>结论</strong>：这段逻辑证明了，无论是“临时”还是“永久”存档，系统都能正确地保存并加载最新的那个。</p>
+<h4>Task 4: 验证文件位置</h4>
+<p>代码后半部分在检查硬盘上的文件结构（<code>os.listdir</code>）：</p>
+<ul>
+<li><code>assert "iter_0000003" in os.listdir(non_persistent_ckpt_dir)</code><ul>
+<li><strong>解释</strong>：第3步是普通存档，它应该在<strong>主目录</strong>下。</li>
+</ul>
+</li>
+<li><code>assert "iter_0000004" in os.listdir(os.path.join(..., _NON_PERSISTENT_CKPT_SUBDIR))</code><ul>
+<li><strong>解释</strong>：第4步是临时存档，它<strong>不</strong>在主目录，而是在一个叫 <code>_NON_PERSISTENT_CKPT_SUBDIR</code> 的<strong>子文件夹</strong>里。</li>
+</ul>
+</li>
+<li><code>assert "iter_0000002" not in ...</code><ul>
+<li><strong>解释</strong>：第2步的临时存档不见了。这说明系统有自动清理机制（或者测试逻辑认为旧的临时存档被覆盖/删除了，虽然代码里没明写删除逻辑，但这里验证了它不在）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 验证文件内容</h4>
+<p>代码最后有一个双重循环 <code>for ckpt_a in ckpt_dirs ... filecmp.cmp(...)</code>。</p>
+<ul>
+<li>它把 Iter 3, 6 (普通) 和 Iter 4, 8 (临时) 的文件拿来进行两两对比。</li>
+<li><strong>目的</strong>：因为我们在 Task 2 里把模型参数都强制设为 0 了，所以理论上，不管你是第几步存的，也不管你是存成“临时”还是“永久”，生成的文件<strong>二进制内容应该是一模一样的</strong>。</li>
+<li><strong>结论</strong>：这证明了“临时存档”并没有偷工减料，它存的数据和普通存档一样完整，只是位置不同。</li>
+</ul>
+<h4>Task 6: 看懂对比测试</h4>
+<p>最后还有一个类 <code>TestLegacySaveAndLoad</code>。</p>
+<ul>
+<li><strong>Legacy (遗产/传统)</strong>：指的是旧版本的保存方式。</li>
+<li>它没有设置 <code>non_persistent_ckpt=True</code>。</li>
+<li><strong>目的</strong>：这是一个“回归测试”。为了保证新加了“临时存档”功能后，<strong>以前的老用法（只用普通存档）没有被改坏</strong>，依然能正常工作。</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件在讲这样一个故事：</p>
+<blockquote>
+<p>“嘿，Megatron-LM，我给你加了个新功能，让你能把临时存档扔进子文件夹里。
+我现在假装训练了几步，混着用普通存档和临时存档。
+<strong>我要检查：</strong>
+1. 你能不能每次都读到最新的进度？（能）
+2. 普通存档是不是在外面，临时存档是不是在里面？（是）
+3. 它们存的数据是不是都是对的？（是）
+4. 我以前的老用法是不是也没坏？（没坏）”</p>
+</blockquote>
+<p>只要这些测试都通过（Pass），开发者就可以放心地把代码合并进主分支了。</p>

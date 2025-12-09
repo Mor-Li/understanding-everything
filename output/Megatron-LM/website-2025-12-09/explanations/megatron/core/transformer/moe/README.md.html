@@ -1,0 +1,74 @@
+<h1>megatron/core/transformer/moe/README.md</h1>
+<p>这份文档确实非常硬核，它是 <strong>Megatron-Core (MCore)</strong> 框架中关于 <strong>MoE (Mixture of Experts，混合专家模型)</strong> 模块的技术说明书。</p>
+<p>简单来说，这份文档是写给<strong>那些想用几百张甚至几千张显卡来训练像 Mixtral 8x7B 或 DeepSeek-V3 这种超大 MoE 模型的人</strong>看的。</p>
+<p>为了让你听懂，我把这份文档拆解成一个 <strong>“MoE 训练通关任务清单” (Todo List)</strong>。我们从基础概念开始，一步步解锁高级功能。</p>
+<hr />
+<h3>✅ Task 1: 理解核心概念 —— 什么是 MoE 和 EP？</h3>
+<p><strong>目标</strong>：搞懂这东西和普通大模型有啥区别。</p>
+<ul>
+<li><strong>普通模型</strong>：像一个全能学霸，所有题目（Token）都由这一个大脑袋处理。</li>
+<li><strong>MoE 模型</strong>：像一个专家团。比如有8个专家，遇到题目时，先由一个“分发员”（Router）看一眼，觉得这题是数学题，就扔给数学专家；是语文题，就扔给语文专家。</li>
+<li><strong>EP (Expert Parallelism，专家并行)</strong>：这是文档的核心。<ul>
+<li>因为专家太多，一张显卡装不下。</li>
+<li><strong>做法</strong>：把专家分给不同的显卡（Worker）。比如显卡A负责专家1-2，显卡B负责专家3-4。</li>
+<li><strong>后果</strong>：由于数据（Token）在不同的卡之间飞来飞去（找对应的专家），所以<strong>通信（Communication）</strong>变得极其重要。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 2: 启动你的第一个 MoE —— 基础配置</h3>
+<p><strong>目标</strong>：看懂 <code>Usage</code> 和 <code>Quick Start</code> 部分，知道怎么把 MoE 开起来。</p>
+<p>你需要关注这几个开关（Arguments）：
+1.  <strong><code>--num-experts 8</code></strong>：我有8个专家。
+2.  <strong><code>--moe-router-topk 2</code></strong>：每个题目（Token）同时发给最擅长的 <strong>2个</strong> 专家处理。
+3.  <strong><code>--expert-model-parallel-size 8</code></strong>：我有8张卡专门用来分摊这些专家。
+4.  <strong><code>--moe-router-load-balancing-type aux_loss</code></strong>：
+    *   <strong>问题</strong>：如果所有题目都扔给“数学专家”，他会累死，其他专家没事干。
+    *   <strong>解决</strong>：加一个辅助损失（Aux Loss），强行让分发员把题目分配得均匀一点，别逮着一只羊薅。</p>
+<h3>✅ Task 3: 解决“堵车”问题 —— Token 分发机制</h3>
+<p><strong>目标</strong>：理解文档中的 <code>Token Dispatch Mechanism</code> 和 <code>Router</code>。</p>
+<ul>
+<li><strong>Dropless (不丢弃)</strong>：这是默认且推荐的。不管专家多忙，所有题目都要处理完。优点是效果好，缺点是如果分配不均，忙的显卡会爆显存（OOM）。</li>
+<li><strong>Token Drop (丢弃)</strong>：就像坐公交车，车（专家容量）满了，后来的乘客（Token）就被踢下车，直接跳过计算。文档里提到了 <code>Capacity Factor</code>，就是设置这辆车能装多少人。</li>
+<li><strong>DeepEP / HybridEP</strong>：<ul>
+<li>这是文档里的<strong>重头戏</strong>（特别是针对 <strong>DeepSeek</strong> 模型）。</li>
+<li>因为数据在显卡间传输太慢了，DeepSeek 开源了一套超快的通信库叫 <strong>DeepEP</strong>。</li>
+<li><strong>Todo</strong>：如果你要跑 DeepSeek-V3 这种模型，记得开启 <code>--moe-token-dispatcher-type=flex</code> 并指定 backend 为 <code>deepep</code>。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 4: 进阶架构 —— 像 DeepSeek 一样思考</h3>
+<p><strong>目标</strong>：理解 <code>What's New</code> 和 <code>Shared Experts</code> 部分。</p>
+<p>现在的先进模型（如 DeepSeek-V3）不仅仅有普通专家，还有：
+1.  <strong>Shared Experts (共享专家)</strong>：
+    *   不管题目是什么，有一些“通用专家”是必须要看的。
+    *   这些专家<strong>不进行并行切分</strong>，而是每张卡上都复制一份，随叫随到。
+2.  <strong>MLA &amp; MTP</strong>：这是 DeepSeek 特有的技术（多头潜在注意力、多Token预测），MCore 现在都支持了。</p>
+<h3>✅ Task 5: 省钱省力 —— 检查点与“旧物利用”</h3>
+<p><strong>目标</strong>：理解 <code>Checkpointing</code> 和 <code>Upcycling</code>。</p>
+<ol>
+<li><strong>Distributed Checkpointing (分布式存档)</strong>：<ul>
+<li><strong>痛点</strong>：以前存模型，如果我想从8卡变成16卡训练，存档可能就读不进去了，或者存取速度极慢。</li>
+<li><strong>新功能</strong>：存取速度快50倍，而且支持任意并行策略的切换。</li>
+</ul>
+</li>
+<li><strong>Upcycling (升级回收)</strong>：<ul>
+<li><strong>玩法</strong>：你有一个训练好的普通模型（Dense），不想从头练 MoE。</li>
+<li><strong>操作</strong>：把普通模型的脑子复制多份，作为 MoE 的初始专家，然后接着练。这能省下巨大的训练成本。</li>
+</ul>
+</li>
+</ol>
+<h3>✅ Task 6: 性能调优 —— 别让显卡闲着</h3>
+<p><strong>目标</strong>：看懂 <code>Performance Best Practice</code>。</p>
+<p>这是老手最关注的部分，怎么跑得快？
+1.  <strong>MoE Parallel Folding (并行折叠)</strong>：
+    *   这是一种高级切分技巧。简单说，注意力层（Attention）和专家层（MoE）可以用<strong>不同</strong>的切分方式。
+    *   比如：Attention 层用 TP（张量并行），MoE 层用 EP（专家并行）。这能大幅减少显存占用。
+2.  <strong>Communication Overlap (通信重叠)</strong>：
+    *   一边算数，一边传数据。不要算的时候等数据，传数据的时候显卡停转。文档里提到的 <code>Batch-Level EP-A2A hiding</code> 就是干这个的。
+3.  <strong>OOM (爆显存) 救急</strong>：
+    *   刚开始训练时，分发员（Router）很笨，容易把所有活都给一个专家，导致某张卡瞬间爆显存。
+    *   <strong>对策</strong>：刚开始设一个小一点的容量限制，或者先用 TP 代替 EP。</p>
+<hr />
+<h3>总结：这篇文档到底讲了啥？</h3>
+<p><strong>一句话总结</strong>：
+Megatron-Core 现在不仅支持<strong>基础的 MoE 训练</strong>（像 Mixtral），还全力支持了 <strong>DeepSeek-V3 等最新架构</strong>，并引入了<strong>DeepEP 通信优化</strong>、<strong>断点续训优化</strong>以及<strong>把普通模型改成 MoE (Upcycling)</strong> 的功能，目的是让你在几百张卡上既快又稳地训练超大模型。</p>

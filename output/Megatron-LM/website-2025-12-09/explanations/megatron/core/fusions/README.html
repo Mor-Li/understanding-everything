@@ -1,0 +1,56 @@
+<h1>megatron/core/fusions</h1>
+<p>这个目录 <code>megatron/core/fusions</code> 是整个 Megatron-LM 框架里的<strong>“极速改装车间”</strong>。</p>
+<p>如果把大模型训练比作赛车，普通的 PyTorch 代码就是普通家用车的引擎，稳定但不够快；而这个文件夹里的代码，就是工程师们为了让赛车（GPU）跑得更快，专门手搓的<strong>氮气加速系统（NOS）</strong>。</p>
+<p>下面我用最通俗的比喻来回答你的三个问题：</p>
+<hr />
+<h3>1. 当前这个文件夹主要负责什么功能？</h3>
+<p><strong>核心功能：把几个连贯的小动作，合并成一个大动作，减少“中间商赚差价”。</strong></p>
+<ul>
+<li><strong>比喻</strong>：
+    想象你在做菜（GPU 计算）。<ul>
+<li><strong>普通模式（无 Fusion）</strong>：你从冰箱拿葱（读显存），切好（计算），放回冰箱（写显存）；再从冰箱拿姜，切好，放回；再拿蒜……</li>
+<li><strong>Fusion 模式（当前文件夹的功能）</strong>：你一次性把葱姜蒜全拿出来（读一次显存），在案板上“啪啪啪”全切好（合并计算），然后一次性扔进锅里（写一次显存）。</li>
+</ul>
+</li>
+<li><strong>目的</strong>：
+    GPU 算得飞快，但“开关冰箱门”（显存读写）很慢。这个文件夹里的代码就是为了<strong>减少开关冰箱门的次数</strong>，从而大幅提升训练速度。</li>
+</ul>
+<hr />
+<h3>2. 这个文件夹下的各个文件/子文件夹分别是干什么的？</h3>
+<p>我们可以把这些文件分成几个<strong>“加速套餐”</strong>：</p>
+<h4>🍔 套餐 A：激活函数全家桶（加料不加价）</h4>
+<p>这些文件把“加偏置（Bias）”和“激活函数（Activation）”两步并作一步走。
+*   <strong><code>fused_bias_gelu.py</code></strong>：GPT 常用的 GELU 激活 + 偏置。
+*   <strong><code>fused_bias_geglu.py</code></strong>：更高级的 GEGLU 激活 + 偏置（Google PaLM 等用这个）。
+*   <strong><code>fused_bias_swiglu.py</code></strong>：LLaMA 系列最爱的 SwiGLU 激活 + 偏置。
+*   <strong><code>fused_weighted_squared_relu.py</code></strong>：一种带权重的平方 ReLU 激活（比较小众但在某些架构用）。</p>
+<h4>🛡️ 套餐 B：稳定器与刹车（归一化与正则）</h4>
+<ul>
+<li><strong><code>fused_layer_norm.py</code></strong>：<strong>极速版 LayerNorm</strong>。这是模型里用得最多的层，优化它收益巨大。</li>
+<li><strong><code>fused_bias_dropout.py</code></strong>：把“加偏置”、“随机丢弃（Dropout）”、“残差连接”这三步合成一步。这在 Transformer 的每一层末尾都要用到。</li>
+</ul>
+<h4>🧠 套餐 C：注意力机制加速包（大脑核心）</h4>
+<ul>
+<li><strong><code>fused_softmax.py</code></strong>：在算 Attention 分数时，把“缩放”、“遮盖（Mask）”、“Softmax”三合一。</li>
+<li><strong><code>fused_mla_yarn_rope_apply.py</code></strong>：<strong>DeepSeek 特供版</strong>。专门处理 MLA（多头潜在注意力）和 RoPE（旋转位置编码）的复杂计算，防止显存爆炸。</li>
+</ul>
+<h4>📊 套餐 D：总分统计员（损失函数）</h4>
+<ul>
+<li><strong><code>fused_cross_entropy.py</code></strong>：<strong>跨卡算分</strong>。当词表太大（比如 10 万个词），一张卡放不下时，这个文件负责在多张 GPU 之间高效地算出“这道题模型答对了多少分（Loss）”。</li>
+</ul>
+<h4>🚦 套餐 E：MoE 物流调度（混合专家模型专用）</h4>
+<p>如果你跑的是 MoE 模型（像 Mixtral 或 DeepSeek-MoE），需要把数据分发给不同的“专家”。
+*   <strong><code>fused_indices_converter.py</code></strong>：<strong>快速翻译官</strong>。把“选了哪个专家”的索引，快速转成计算机好算的格式。
+*   <strong><code>fused_pad_routing_map.py</code></strong>：<strong>强迫症补货员</strong>。GPU 喜欢整齐的数据，如果某个专家分到的任务不够整齐，这个文件负责给它“凑个整”，方便 GPU 批量处理。</p>
+<hr />
+<h3>3. 给我一个高层的认知，让我能快速理解这部分代码的作用</h3>
+<p>你可以把这个文件夹看作是一个<strong>“作弊码大全” (Cheat Codes)</strong>。</p>
+<ol>
+<li><strong>你是使用者</strong>：当你写模型代码时，不要直接用 <code>torch.nn.LayerNorm</code> 或 <code>torch.nn.GELU</code>。</li>
+<li><strong>调用这里</strong>：你要 import 这个文件夹里的 <code>FusedLayerNorm</code> 或 <code>bias_gelu</code>。</li>
+<li><strong>效果</strong>：代码逻辑完全没变（数学上是等价的），但你的模型训练速度突然变快了 30%，显存占用也变小了。</li>
+</ol>
+<p><strong>一句话总结</strong>：</p>
+<blockquote>
+<p><strong>这里面全是 NVIDIA 工程师用 C++ 和 CUDA 手写的“超频插件”，专门用来替换 PyTorch 原生那些慢吞吞的零件，是大模型训练“降本增效”的关键武器。</strong></p>
+</blockquote>

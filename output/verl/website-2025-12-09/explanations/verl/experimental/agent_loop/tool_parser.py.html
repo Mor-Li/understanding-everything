@@ -1,0 +1,90 @@
+<h1>verl/experimental/agent_loop/tool_parser.py</h1>
+<p>没问题，这个文件的代码乍一看确实有点绕，因为它涉及到了<strong>大模型（LLM）如何调用外部工具</strong>（比如计算器、搜索引擎）的底层逻辑。</p>
+<p>我们可以把阅读这份代码想象成在<strong>开发一个“翻译官”系统</strong>。</p>
+<p>大模型虽然很聪明，但它输出的终究只是一堆文字（或者说Token ID）。当模型想要使用工具时，它会吐出一些“暗号”。这个文件的作用，就是<strong>识别这些暗号，并把它们翻译成程序能读懂的指令</strong>。</p>
+<p>下面是一个 <strong>Task To-Do List</strong>，我们一步步来完成这个任务，带你看懂这段代码。</p>
+<hr />
+<h3>✅ Task 1: 定义标准格式 (标准化)</h3>
+<p><strong>目标</strong>：不管模型怎么胡言乱语，最后翻译出来的指令必须长得一样，方便后续代码执行。</p>
+<ul>
+<li><strong>对应代码</strong>：<code>class FunctionCall(BaseModel)</code></li>
+<li><strong>解读</strong>：<ul>
+<li>这是我们定义的“标准指令包”。</li>
+<li>不管模型用什么格式输出，最后都要转换成这个对象。</li>
+<li>它只存两样东西：<ol>
+<li><code>name</code>: 也就是工具的名字（比如 "search_google"）。</li>
+<li><code>arguments</code>: 参数（比如 "今天北京的天气"）。</li>
+</ol>
+</li>
+<li>这也是为什么它继承自 <code>pydantic.BaseModel</code>，是为了保证数据格式的规范。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 2: 制定翻译官的招聘标准 (抽象基类)</h3>
+<p><strong>目标</strong>：我们需要很多种不同的翻译官，但他们必须遵守同一套规则。</p>
+<ul>
+<li><strong>对应代码</strong>：<code>class ToolParser(ABC)</code></li>
+<li><strong>解读</strong>：<ul>
+<li>这是一个“抽象基类”（Abstract Base Class），相当于一份<strong>职位描述书</strong>。</li>
+<li><strong>核心要求</strong>：所有来应聘的翻译官，必须会做一个动作：<code>extract_tool_calls</code>（从一堆回答中提取出工具调用）。</li>
+<li><strong>注册机制</strong> (<code>_registry</code>, <code>register</code>, <code>get_tool_parser</code>)：这相当于一个<strong>人才库</strong>。<ul>
+<li>如果你写了一个新的翻译官，用 <code>@ToolParser.register("名字")</code> 盖个章，它就会自动存入人才库。</li>
+<li>以后只要喊名字（比如 "hermes"），系统就能自动把对应的翻译官调出来给你用。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 3: 招聘第一位翻译官 —— "Hermes" (具体实现)</h3>
+<p><strong>目标</strong>：Hermes 模型说话喜欢用 <code>&lt;tool_call&gt;</code> 这种标签，我们需要一个专门懂它的翻译官。</p>
+<ul>
+<li><strong>对应代码</strong>：<code>class HermesToolParser(ToolParser)</code></li>
+<li><strong>工作流程</strong>：<ol>
+<li><strong>解码</strong>：先把模型输出的一串数字（Token IDs）变成字符串文本。</li>
+<li><strong>找暗号</strong>：它使用正则表达式（Regex）去寻找 <code>&lt;tool_call&gt;</code> 和 <code>&lt;/tool_call&gt;</code> 中间的内容。</li>
+<li><strong>翻译</strong>：<ul>
+<li>找到的内容通常是 JSON 格式的字符串。</li>
+<li>它把 JSON 解析出来，拿到 <code>name</code> 和 <code>arguments</code>。</li>
+<li>然后打包成我们在 Task 1 里定义的 <code>FunctionCall</code> 对象。</li>
+</ul>
+</li>
+<li><strong>清理现场</strong>：把原文中的 <code>&lt;tool_call&gt;...&lt;/tool_call&gt;</code> 删掉，剩下的就是模型对人类说的普通话（<code>content</code>）。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 4: 招聘第二位翻译官 —— "GPT-OSS" (具体实现)</h3>
+<p><strong>目标</strong>：GPT-OSS 类模型说话更复杂，它喜欢把思考过程（Chain of Thought）和工具调用混在一起，而且用的是 <code>&lt;|start|&gt;</code> 这种怪异的特殊符号。</p>
+<ul>
+<li><strong>对应代码</strong>：<code>class GptOssToolParser(ToolParser)</code></li>
+<li><strong>工作流程</strong>：<ol>
+<li><strong>解码</strong>：这次解码时<strong>不能跳过特殊字符</strong>（<code>skip_special_tokens=False</code>），因为它的暗号就是特殊字符。</li>
+<li><strong>去噪</strong>：<ul>
+<li>它定义了 <code>cot_pattern</code>（思维链模式）。</li>
+<li>先把模型“自言自语”的分析过程（Analysis）删掉，因为这里面可能包含假的工具调用，如果不删会误判。</li>
+</ul>
+</li>
+<li><strong>找暗号</strong>：<ul>
+<li>使用复杂的正则表达式 <code>tool_call_pattern</code>。</li>
+<li>它在找类似 <code>&lt;|start|&gt;assistant...to=functions.xxx...</code> 这样的结构。</li>
+</ul>
+</li>
+<li><strong>翻译</strong>：提取出函数名和参数，打包成 <code>FunctionCall</code>。</li>
+<li><strong>清理现场</strong>：同样，把工具调用的乱码删掉，只留下干净的文本。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件到底在干嘛？</h3>
+<p>如果把整个系统比作一个<strong>餐厅</strong>：</p>
+<ol>
+<li><strong>顾客（大模型）</strong> 点菜时，可能会用不同的方言。<ul>
+<li>Hermes 也就是顾客 A，喜欢在菜单上画圈圈（<code>&lt;tool_call&gt;</code>）。</li>
+<li>GPT-OSS 也就是顾客 B，喜欢用特殊的暗语（<code>&lt;|start|&gt;</code>）。</li>
+</ul>
+</li>
+<li><strong>ToolParser</strong> 就是<strong>服务员经理</strong>。</li>
+<li><strong>HermesToolParser</strong> 和 <strong>GptOssToolParser</strong> 是两个懂不同方言的<strong>服务员</strong>。</li>
+<li><strong>FunctionCall</strong> 是统一的<strong>点菜小票</strong>。</li>
+</ol>
+<p><strong>整个文件的逻辑就是：</strong>
+根据当前的模型类型（Hermes 还是 GPT-OSS），派出一个懂行的服务员，把模型输出的一堆乱七八糟的文本，整理成一张干净的“点菜小票”（函数调用列表），交给后厨（代码执行环境）去处理。</p>

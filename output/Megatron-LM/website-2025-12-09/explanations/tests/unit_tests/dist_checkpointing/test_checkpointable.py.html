@@ -1,0 +1,75 @@
+<h1>tests/unit_tests/dist_checkpointing/test_checkpointable.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了<strong>分布式训练（Distributed Training）</strong>中非常底层的<strong>断点保存（Checkpointing）</strong>逻辑，而且是针对 PyTorch 2.6+ 新特性的测试。</p>
+<p>简单来说，这个文件的目的是：<strong>测试 Megatron（一个大模型训练框架）能否利用 PyTorch 原生的保存工具（DCP）来直接保存它自己切分后的张量。</strong></p>
+<p>为了让你看懂，我制定了一个 <strong>5步走的 Task List</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>Task List: 理解 <code>test_checkpointable.py</code></h3>
+<h4>✅ Task 1: 搞懂背景设定 (Context)</h4>
+<p><strong>核心问题：我们在做什么？</strong>
+*   <strong>场景</strong>：训练超大模型时，一个参数矩阵（Tensor）太大，单张显卡放不下，所以被切分（Sharded）成了很多小块，分布在不同的显卡上。
+*   <strong>痛点</strong>：保存模型时，怎么把这些散落在不同显卡上的碎片存成一个完整的文件（或者结构化的文件），以便下次读取？
+*   <strong>PyTorch 2.6 的新功能</strong>：PyTorch 引入了一套新的协议（Protocol），只要你的对象实现了特定的方法，PyTorch 的 <code>torch.distributed.checkpoint</code> 就能自动帮你把这些碎片存好，不需要你写很复杂的逻辑。
+*   <strong>本代码的目的</strong>：验证 Megatron 定义的 <code>CheckpointableShardedTensor</code> 类是否符合 PyTorch 的这套新标准。</p>
+<h4>✅ Task 2: 认识三个核心“人物” (Key Classes)</h4>
+<p>在看逻辑前，先认全这几个名词，把它们想象成容器：
+1.  <strong><code>ShardedTensor</code></strong>: <strong>原始数据碎片</strong>。比如原本是一个 <code>[100]</code> 的向量，我有两张卡，Rank 0 拿前50个，Rank 1 拿后50个。Rank 0 手里的这50个数据就是 <code>ShardedTensor</code>。
+2.  <strong><code>CheckpointableShardedTensor</code></strong>: <strong>适配器（Adapter）</strong>。这是 Megatron 写的一个包装壳。它把上面的 <code>ShardedTensor</code> 包起来，告诉 PyTorch：“嘿，我是一个可以被标准流程保存的对象”。
+3.  <strong><code>LocalShardsContainer</code></strong>: <strong>打包盒</strong>。有时候一张显卡上可能负责存同一个大矩阵的好几个碎片。这个类就是把这一堆碎片打包在一起。</p>
+<h4>✅ Task 3: 解析第一个测试 <code>test_sharded_tensor_checkpointing</code></h4>
+<p><strong>任务</strong>：测试最简单的“存一个碎片，再读回来”的流程。</p>
+<ul>
+<li><strong>Step 3.1: 准备数据 (get_sd)</strong><ul>
+<li>代码创建了一个 <code>ShardedTensor</code>。</li>
+<li><code>val=3</code>：给数据赋值。假设我是 Rank 0，我的数据就是 <code>0 + 3 = 3</code>。</li>
+<li>它被包进了 <code>CheckpointableShardedTensor</code>。</li>
+</ul>
+</li>
+<li><strong>Step 3.2: 保存 (Save)</strong><ul>
+<li><code>state_dict = get_sd(3)</code>：拿到数据（值为3）。</li>
+<li><code>torch.distributed.checkpoint.save(...)</code>：<strong>关键点</strong>。直接调用 PyTorch 原生接口保存。如果这个类没写好，这里就会报错。</li>
+</ul>
+</li>
+<li><strong>Step 3.3: 模拟加载前的状态</strong><ul>
+<li><code>loaded_state_dict = get_sd(4)</code>：初始化一个新的对象，但这次把值设为 <strong>4</strong>。</li>
+<li><code>assert ... == 4</code>：确认一下，现在的内存里确实是 4。</li>
+</ul>
+</li>
+<li><strong>Step 3.4: 加载与验证 (Load &amp; Verify)</strong><ul>
+<li><code>torch.distributed.checkpoint.load(...)</code>：从刚才存的路径加载数据。</li>
+<li><code>assert ... == 3</code>：<strong>核心验证</strong>。如果加载成功，内存里的 4 应该变回了保存时的 3。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 解析第二个测试 <code>test_multiple_local_shards</code></h4>
+<p><strong>任务</strong>：测试稍微复杂点的情况——如果我这张卡上同时存了<strong>两段</strong>数据，能不能一起存？</p>
+<ul>
+<li><strong>Step 4.1: 准备双份数据</strong><ul>
+<li>代码里定义了 <code>sh_ten_part_one</code> 和 <code>sh_ten_part_two</code>。</li>
+<li>这意味着同一个大张量的两个不同部分都在我这张卡上。</li>
+<li>使用 <code>LocalShardsContainer</code> 把这两个部分装在一个列表里。</li>
+</ul>
+</li>
+<li><strong>Step 4.2: 保存</strong><ul>
+<li>同样调用 <code>torch.distributed.checkpoint.save</code>。这里测试的是 PyTorch 能弗识别并保存这个 List 里的所有碎片。</li>
+</ul>
+</li>
+<li><strong>Step 4.3: 检查元数据 (Metadata)</strong><ul>
+<li><code>FileSystemReader(ckpt_dir).read_metadata()</code>：不读具体数据，只读“目录”。</li>
+<li><code>assert isinstance(..., TensorStorageMetadata)</code>：确认保存下来的文件确实被标记为张量数据，而不是普通的 Python 对象（Pickle）。这证明 PyTorch 正确理解了我们的意图。</li>
+</ul>
+</li>
+<li><strong>Step 4.4: 加载与验证</strong><ul>
+<li>先把内存数据设为 4。</li>
+<li>加载文件。</li>
+<li>验证两个碎片的数据都变回了 3。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 总结全篇观点 (Summary)</h4>
+<p>如果你需要向别人复述这个文件的观点，可以说：</p>
+<blockquote>
+<p>“这个文件是 Megatron-Core 的单元测试。它主要验证了在 <strong>PyTorch 2.6</strong> 及以上版本中，Megatron 自定义的分布式张量（<code>ShardedTensor</code>）可以通过包装成 <code>CheckpointableShardedTensor</code>，直接兼容 PyTorch 原生的 <strong>DCP (Distributed Checkpoint)</strong> 保存和加载流程。它测试了单卡单碎片和单卡多碎片两种情况，证明了这种新的保存方式是数据一致且有效的。”</p>
+</blockquote>
+<hr />
+<h3>💡 为什么你要关心这个？</h3>
+<p>如果你只是跑代码，不需要太关心。但如果你在做<strong>大模型架构开发</strong>或者<strong>排查保存/加载模型的 Bug</strong>，这个文件的逻辑告诉你：<strong>Megatron 现在正试图向 PyTorch 原生标准靠拢，不再完全依赖自己那一套私有的保存逻辑了。</strong></p>

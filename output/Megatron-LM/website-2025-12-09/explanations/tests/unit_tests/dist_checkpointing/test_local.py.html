@@ -1,0 +1,108 @@
+<h1>tests/unit_tests/dist_checkpointing/test_local.py</h1>
+<p>这份代码是 <strong>NVIDIA Megatron-LM</strong> 框架中的一个<strong>单元测试文件</strong>。它的核心目的是测试 <strong>“本地检查点（Local Checkpointing）”</strong> 功能。</p>
+<p><strong>什么是本地检查点？</strong>
+在大模型训练中，保存整个模型到共享存储（如 HDFS、S3）非常慢。为了快速恢复（比如训练挂了重启），Megatron 允许每个 GPU 把自己的那部分数据快速存到<strong>本地磁盘</strong>或<strong>内存（RAM Disk）</strong>中。这叫做“非持久化（Non-persistent）”检查点。</p>
+<p>为了让你读懂这个文件，我制定了一个 <strong>学习任务清单 (To-Do List)</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>📋 任务清单：一步步读懂代码</h3>
+<h4>Task 1: 理解基础概念与准备工作 (Imports &amp; Setup)</h4>
+<p><strong>目标：</strong> 知道这代码依赖什么，以及测试环境是怎么搭建的。</p>
+<ul>
+<li><strong>观察代码：</strong> 开头的 <code>import</code> 部分。</li>
+<li><strong>解读：</strong><ul>
+<li><code>pytest</code>: 这是测试框架。</li>
+<li><code>nvidia_resiliency_ext</code>: 这是一个关键的外部库，专门处理 NVIDIA 的容错功能（比如快速存取 Checkpoint）。</li>
+<li><code>megatron.core.dist_checkpointing</code>: Megatron 的分布式检查点核心逻辑。</li>
+<li><code>Utils.initialize_model_parallel(tp, pp)</code>: 这是一个测试工具，用来模拟多 GPU 环境（TP=张量并行，PP=流水线并行）。</li>
+</ul>
+</li>
+<li><strong>结论：</strong> 这个文件不是在真的训练大模型，而是用模拟的小环境测试“存”和“取”这两个动作。</li>
+</ul>
+<h4>Task 2: 热身测试 - 文件名逻辑 (<code>TestLocalCheckpointingReplication</code>)</h4>
+<p><strong>目标：</strong> 理解保存的文件名是怎么生成的。</p>
+<ul>
+<li><strong>观察代码：</strong> <code>test_filename_to_id</code> 函数。</li>
+<li><strong>逻辑：</strong><ul>
+<li>输入：iteration="0000123", rank="4"。</li>
+<li>操作：调用管理器生成文件名，再反向解析。</li>
+<li>断言（Assert）：解析出来的必须是 <code>(123, 4)</code>。</li>
+</ul>
+</li>
+<li><strong>观点：</strong> 系统必须能通过文件名准确知道这是“第几次迭代”以及“属于哪个 GPU”。</li>
+</ul>
+<h4>Task 3: 核心测试 - 数据切片处理 (<code>test_sharded_tensors</code>)</h4>
+<p><strong>目标：</strong> 验证分布式张量（Sharded Tensor）能否正确转换成可保存的格式。</p>
+<ul>
+<li><strong>背景：</strong> 在大模型中，一个巨大的参数矩阵是切碎了放在不同 GPU 上的。保存时，不能直接存，需要处理元数据。</li>
+<li><strong>步骤解读：</strong><ol>
+<li><code>setup_model_and_optimizer</code>: 建立一个假模型。</li>
+<li><code>generate_state_dict</code>: 生成模型当前的状态字典（包含参数）。</li>
+<li><code>MCoreTensorAwareStateDict.from_state_dict</code>: <strong>关键步骤</strong>。把原始状态转换成“保存态”。</li>
+<li><strong>检查点 1：</strong> 确认转换后的张量 <code>data</code> 是 <code>None</code>（为了节省内存，只存元数据结构，不重复存数据）。</li>
+<li><strong>检查点 2：</strong> 模拟加载 (<code>load_local</code>)，对比加载回来的结构和原始结构是否一致 (<code>diff</code>)。</li>
+</ol>
+</li>
+<li><strong>观点：</strong> 确保模型参数在“切碎”和“还原”的过程中，结构信息没有丢失。</li>
+</ul>
+<h4>Task 4: 完整流程测试 - 存、取、备份与清理 (<code>test_basic_save_load_scenarios</code>)</h4>
+<p><strong>目标：</strong> 模拟真实训练中的保存和加载流程。这是全文件最重要且最复杂的测试。</p>
+<ul>
+<li><strong>参数含义：</strong><ul>
+<li><code>tp, pp</code>: 并行度配置。</li>
+<li><code>use_ramdisk</code>: 是否存到内存里（<code>/dev/shm</code>），模拟极速保存。</li>
+<li><code>async_save</code>: <strong>异步保存</strong>。主训练进程不等待，后台线程去写盘。</li>
+</ul>
+</li>
+<li><strong>步骤解读：</strong><ol>
+<li><strong>第一次保存 (Iter 1):</strong> 调用 <code>save_checkpoint</code>。如果是异步，调用 <code>maybe_finalize_async_save</code> 确保写完。</li>
+<li><strong>第一次加载:</strong> 调用 <code>load_checkpoint</code>，断言 <code>iteration == 1</code>。成功！</li>
+<li><strong>搞破坏 (模拟):</strong><ul>
+<li>把刚存的文件重命名为 <code>backup_...</code>。</li>
+<li>再次尝试加载。因为找不到原名文件，断言 <code>iteration == 0</code>（回退到初始状态）。</li>
+</ul>
+</li>
+<li><strong>验证一致性:</strong><ul>
+<li>再次保存 Iter 1。</li>
+<li>对比新存的文件和刚才备份的 <code>backup_</code> 文件。<strong>观点：</strong> 只要模型状态没变，生成的二进制文件必须完全由一样（Deterministic）。</li>
+</ul>
+</li>
+<li><strong>自动清理 (Iter 2):</strong><ul>
+<li>保存 Iter 2。</li>
+<li>检查 Iter 1 的文件是否被删除了。</li>
+<li><strong>观点：</strong> 本地检查点通常只保留最新的，旧的要自动删掉以省空间。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 5: 故障测试 - 模拟保存失败 (<code>test_failed_save</code>)</h4>
+<p><strong>目标：</strong> 测试如果保存过程中出错了，系统会不会乱套。</p>
+<ul>
+<li><strong>场景：</strong> 假设有两个 GPU（Rank 0 和 Rank 1）。</li>
+<li><strong>手段：</strong> 使用 <code>mock.patch</code> 篡改 <code>_save</code> 函数。<ul>
+<li>定义 <code>exception</code> 函数：如果是 Rank 1，直接抛出异常 <code>Exception("TEST")</code>；Rank 0 正常工作。</li>
+</ul>
+</li>
+<li><strong>步骤解读：</strong><ol>
+<li>尝试 <code>save_checkpoint</code>。</li>
+<li><strong>断言：</strong> 必须抛出 <code>CheckpointingException</code>。</li>
+<li><strong>验证清理（原子性）：</strong><ul>
+<li>检查保存目录。</li>
+<li><strong>观点：</strong> 目录必须是空的！不能因为 Rank 0 存成功了就留着文件，而 Rank 1 失败了。要么全成功，要么全回滚（删除脏数据）。</li>
+</ul>
+</li>
+<li><strong>日志检查：</strong> Rank 1 的日志里不应该有“保存成功”的记录。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑其实就是要把大模型训练中 <strong>“存盘”</strong> 这个动作的各种极端情况都测一遍：</p>
+<ol>
+<li><strong>能不能存？</strong> (Task 3)</li>
+<li><strong>能不能取？</strong> (Task 4)</li>
+<li><strong>存的时候不卡顿行不行？</strong> (Task 4 中的 <code>async_save</code>)</li>
+<li><strong>存完了旧的会不会删？</strong> (Task 4 结尾)</li>
+<li><strong>存了一半报错了，会不会留下一堆垃圾文件？</strong> (Task 5)</li>
+</ol>
+<p>现在你再回头看代码，关注 <code>save_checkpoint</code> 和 <code>load_checkpoint</code> 这两个核心函数的调用位置，应该就能看懂了。</p>

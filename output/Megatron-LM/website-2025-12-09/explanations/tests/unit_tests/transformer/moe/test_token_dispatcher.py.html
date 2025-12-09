@@ -1,0 +1,72 @@
+<h1>tests/unit_tests/transformer/moe/test_token_dispatcher.py</h1>
+<p>这份代码文件 <code>test_token_dispatcher.py</code> 是 <strong>NVIDIA Megatron-LM</strong> 项目中的一个 <strong>单元测试（Unit Test）</strong> 文件。</p>
+<p>简单来说，它的作用是：<strong>检查“混合专家模型（MoE）”中的“物流系统（Token Dispatcher）”是否工作正常。</strong></p>
+<p>在 MoE 模型中，不同的 Token（单词/数据片段）会被分配给不同的“专家（Expert，即神经网络的一小部分）”去处理。这个“分配过去”再“收集回来”的过程，就是 <strong>Token Dispatcher</strong> 要做的事。</p>
+<p>为了让你看懂，我把你当成这个代码的“质检员”，列一个 <strong>Task To-Do List</strong>，这也是代码作者写这个文件的思路：</p>
+<hr />
+<h3>✅ 任务清单：MoE 物流系统质检流程</h3>
+<h4>1. 第一步：搭建模拟环境 (Setup)</h4>
+<p><strong>代码对应：</strong> <code>class MoEModelTestContainer</code>
+*   <strong>目标：</strong> 在测试电脑上模拟出一个拥有多个 GPU、多个专家的复杂环境。
+*   <strong>解释：</strong> 真正的 MoE 训练可能需要几百张显卡。但在单元测试里，我们需要假装我们有这些显卡（Mocking）。
+*   <strong>动作：</strong> 这个类初始化了并行状态（TP, EP, PP），配置了 Transformer 的参数，并创建了一个 <code>MoELayer</code>（我们要测的核心对象）。</p>
+<h4>2. 第二步：定义核心动作——“发货”与“收货”</h4>
+<p><strong>代码对应：</strong> <code>token_permutation</code> 和 <code>token_unpermutation</code> 函数
+*   <strong>目标：</strong> 定义数据流动的标准动作。
+*   <strong>动作 A (Permutation/发货)：</strong>
+    *   输入：原始的一堆 Token。
+    *   过程：根据路由（Router）的指示，把 Token 重新排序，打包发给对应的专家。
+    *   输出：排列好、准备喂给专家的 Token。
+*   <strong>动作 B (Unpermutation/收货)：</strong>
+    *   输入：专家处理完的 Token。
+    *   过程：把这些 Token 恢复成原来的顺序（因为神经网络的下一层需要原始顺序）。
+    *   输出：恢复顺序后的 Token。</p>
+<h4>3. 第三步：测试任务 A —— 完美往返测试 (Dropless Test)</h4>
+<p><strong>代码对应：</strong> <code>dispatcher_dropless_test</code>
+*   <strong>场景：</strong> 假设没有任何数据丢失，也没有容量限制。
+*   <strong>ToDo：</strong>
+    1.  造一些随机数据（Hidden states）。
+    2.  执行“发货”（Permute）。
+    3.  执行“收货”（Unpermute）。
+    4.  <strong>核心检查点：</strong> 收回来的数据，必须和发出去的数据<strong>一模一样</strong>（除了数值计算的微小误差）。
+    5.  <strong>梯度检查：</strong> 还要检查反向传播（Backpropagation）的梯度是否正确，确保训练时能正常更新参数。</p>
+<h4>4. 第三步：测试任务 B —— 容量限制测试 (Capacity Test)</h4>
+<p><strong>代码对应：</strong> <code>dispatcher_capacity_test</code>
+*   <strong>场景：</strong> 每个专家能处理的 Token 数量是有限的（Capacity）。
+*   <strong>ToDo：</strong>
+    1.  设定一个容量上限（比如每个专家只能处理 10 个 Token）。
+    2.  执行“发货”。
+    3.  <strong>核心检查点：</strong> 检查发给每个专家的 Token 数量，<strong>绝对不能超过</strong>设定的上限。
+    4.  检查数据还原后是否符合预期的逻辑。</p>
+<h4>5. 第三步：测试任务 C —— 丢弃与填充测试 (Drop and Pad Test)</h4>
+<p><strong>代码对应：</strong> <code>dispatcher_drop_and_pad_test</code>
+*   <strong>场景：</strong>
+    *   情况 1：Token 太多，专家处理不过来 -&gt; <strong>丢弃 (Drop)</strong>。
+    *   情况 2：Token 太少，为了矩阵计算方便 -&gt; <strong>填充 (Pad)</strong> 0 值凑数。
+*   <strong>ToDo：</strong>
+    1.  运行两次测试：一次不填充，一次强制填充到容量上限。
+    2.  <strong>核心检查点：</strong> 无论是否填充，对于那些“有效”的 Token，计算结果应该是一致的。填充的 0 值不应该影响有效数据的计算。</p>
+<h4>6. 第三步：测试任务 D —— FP8 量化对齐测试 (FP8 Padding Test)</h4>
+<p><strong>代码对应：</strong> <code>dispatcher_router_padding_for_fp8_test</code>
+*   <strong>场景：</strong> 使用 FP8（8位浮点数）加速训练时，数据长度通常要是 16 的倍数才能跑得快。
+*   <strong>ToDo：</strong>
+    1.  开启 FP8 模式。
+    2.  执行“发货”。
+    3.  <strong>核心检查点：</strong> 检查发给专家的 Token 数量，是否<strong>是 16 的倍数</strong>。如果不是，系统应该自动补齐了。</p>
+<h4>7. 第四步：正式执行测试 (Runner)</h4>
+<p><strong>代码对应：</strong> <code>class TestAllgatherDispatcher</code> 和 <code>class TestFlexDispatcher</code>
+*   <strong>目标：</strong> 针对不同的“物流公司”运行上述所有测试。
+*   <strong>解释：</strong> Megatron 支持两种分发方式：
+    1.  <strong>AllGather Dispatcher:</strong> 传统的通信方式，适用于大部分情况。
+    2.  <strong>Flex Dispatcher (DeepEP/HybridEP):</strong> 针对 MoE 优化的高级通信库（通常更快，但需要特定硬件环境）。
+*   <strong>动作：</strong> 使用 <code>pytest</code> 框架，组合不同的并行度（TP大小, EP大小），反复运行上面的 <code>dispatcher_dropless_test</code> 等函数，确保在各种配置下都不报错。</p>
+<hr />
+<h3>总结一下文中观点的逻辑流：</h3>
+<ol>
+<li><strong>工具准备</strong> (<code>token_permutation</code>): 我得先有把数据打乱和复原的能力。</li>
+<li><strong>基准测试</strong> (<code>dropless</code>): 最理想情况下，数据发出去再收回来，必须毫发无损。</li>
+<li><strong>边界测试</strong> (<code>capacity</code>): 专家吃不消了怎么办？必须截断，不能撑死。</li>
+<li><strong>功能测试</strong> (<code>pad</code>, <code>fp8</code>): 为了性能凑整（Padding）或者为了低精度训练（FP8），系统能不能自动处理好数据格式？</li>
+<li><strong>兼容测试</strong> (<code>Allgather</code> vs <code>Flex</code>): 不管底层用什么通信算法，上述功能都得是正常的。</li>
+</ol>
+<p>这就是这个文件在做的事情：<strong>确保 MoE 模型里的数据搬运工既快又准，还不丢包。</strong></p>

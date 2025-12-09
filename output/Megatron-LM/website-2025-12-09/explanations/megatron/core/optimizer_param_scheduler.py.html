@@ -1,0 +1,93 @@
+<h1>megatron/core/optimizer_param_scheduler.py</h1>
+<p>这份代码文件 <code>optimizer_param_scheduler.py</code> 的核心作用只有一个：<strong>控制模型训练过程中的“节奏”</strong>。</p>
+<p>具体来说，它负责管理两个关键参数随时间（训练步数）的变化：
+1.  <strong>学习率 (Learning Rate, LR)</strong>：模型学得有多快。
+2.  <strong>权重衰减 (Weight Decay, WD)</strong>：模型为了防止过拟合，对参数做的惩罚力度。</p>
+<p>为了让你更容易理解，我把这个脚本想象成一个<strong>“赛车教练”</strong>，他手里拿着一张任务清单（Todo List），坐在副驾驶上指导正在开车的优化器（Optimizer）。</p>
+<p>下面是这位“教练”的任务清单，我们一步步来看：</p>
+<hr />
+<h3>🏁 教练的任务清单 (Todo List)</h3>
+<h4>Task 1: 准备工作 (初始化配置)</h4>
+<p><strong>目标</strong>：在比赛（训练）开始前，设定好规则。
+<strong>代码对应</strong>：<code>__init__</code> 函数</p>
+<ul>
+<li><strong>教练说</strong>：“我们要跑多少圈（<code>lr_decay_steps</code>）？起步最高速度是多少（<code>max_lr</code>）？最后停车速度是多少（<code>min_lr</code>）？起步要预热多久（<code>lr_warmup_steps</code>）？”</li>
+<li><strong>动作</strong>：<ul>
+<li>记录下所有的最大值、最小值、总步数。</li>
+<li>确定“减速策略”（<code>lr_decay_style</code>），是匀速减速（Linear），还是像余弦波浪一样减速（Cosine），或者是最近很火的 WSD（先稳住再减速）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 每日打卡 (更新步数)</h4>
+<p><strong>目标</strong>：每跑一步，都要记录当前进度。
+<strong>代码对应</strong>：<code>step(increment)</code> 函数</p>
+<ul>
+<li><strong>教练说</strong>：“好，我们又跑了一个 Batch，现在的总里程数（<code>self.num_steps</code>）加 1。”</li>
+<li><strong>动作</strong>：<ul>
+<li>更新内部计数器 <code>self.num_steps</code>。</li>
+<li><strong>立刻执行 Task 3 和 Task 4</strong>，计算出这一步该用什么速度和力度，然后强行修改优化器里的参数。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 控制油门 (计算学习率 LR)</h4>
+<p><strong>目标</strong>：根据当前跑了多少步，决定踩多深油门。
+<strong>代码对应</strong>：<code>get_lr(param_group)</code> 函数</p>
+<p>这是一个分阶段的逻辑：</p>
+<ul>
+<li><strong>阶段 A：热身 (Warmup)</strong><ul>
+<li><strong>情况</strong>：刚起步 (<code>num_steps &lt;= lr_warmup_steps</code>)。</li>
+<li><strong>动作</strong>：油门从 0 慢慢踩到最大 (<code>max_lr</code>)。这叫“线性预热”，防止车子（模型）刚起步就冲出跑道（梯度爆炸）。</li>
+</ul>
+</li>
+<li><strong>阶段 B：巡航与减速 (Decay)</strong><ul>
+<li><strong>情况</strong>：热身结束，进入长跑阶段。</li>
+<li><strong>动作</strong>：根据初始化时定的策略 (<code>lr_decay_style</code>) 开始松油门。<ul>
+<li><strong>Constant</strong>：一直踩死油门不放（不推荐）。</li>
+<li><strong>Linear</strong>：匀速松油门，直到降到最低速度 (<code>min_lr</code>)。</li>
+<li><strong>Cosine</strong>：按余弦曲线松油门（刚开始松得慢，中间快，最后又慢）。</li>
+<li><strong>WSD (Warmup-Stable-Decay)</strong>：这是一种新策略。热身完先维持最高速度跑很久（Stable），直到最后阶段才快速减速。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>阶段 C：结束</strong><ul>
+<li><strong>情况</strong>：步数超过了设定的总步数。</li>
+<li><strong>动作</strong>：维持最低速度 (<code>min_lr</code>) 慢慢挪，或者直接停。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 控制刹车/方向盘阻力 (计算权重衰减 WD)</h4>
+<p><strong>目标</strong>：随着训练进行，逐渐增加或调整“约束力”，防止模型学偏（过拟合）。
+<strong>代码对应</strong>：<code>get_wd(param_group)</code> 函数</p>
+<ul>
+<li><strong>教练说</strong>：“刚开始让车子灵活点（低 WD），后面车速快了，要把方向盘调重一点（高 WD），免得翻车。”</li>
+<li><strong>动作</strong>：<ul>
+<li>查看当前步数。</li>
+<li>按照设定的策略（<code>wd_incr_style</code>，通常是常数或线性增加），计算当前的权重衰减值。</li>
+<li>通常是从 <code>start_wd</code> 逐渐增加到 <code>end_wd</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 写日记与读取记忆 (Checkpointing)</h4>
+<p><strong>目标</strong>：如果训练中断了（比如停电），下次能接着跑，而不是从头开始。
+<strong>代码对应</strong>：<code>state_dict()</code> 和 <code>load_state_dict()</code></p>
+<ul>
+<li><strong>教练说</strong>：“把现在的步数、现在的最大/最小学习率都记在小本本上。”</li>
+<li><strong>动作</strong>：<ul>
+<li><strong>保存 (<code>state_dict</code>)</strong>：把 <code>num_steps</code>, <code>max_lr</code> 等存入字典。</li>
+<li><strong>读取 (<code>load_state_dict</code>)</strong>：如果从断点恢复，会检查：“上次是不是设定跑 1000 步？现在是不是跑到第 500 步了？”</li>
+<li><strong>冲突检查 (<code>_check_and_set</code>)</strong>：如果我手动修改了配置（比如想多跑几步），代码里有一个逻辑判断是“听保存记录的”还是“听新配置的”（<code>override_opt_param_scheduler</code>）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<p>简单来说，这段代码<strong>不是</strong>在训练模型（那是 Optimizer 的工作），它是在<strong>指挥 Optimizer</strong>。</p>
+<p>每一轮训练（step），它都会做这道数学题：
+$$ \text{当前学习率} = f(\text{当前步数}, \text{总步数}, \text{策略}) $$</p>
+<p>然后把算出来的这个数字，硬塞给 Optimizer，告诉它：“这一步，你用这个学习率去更新模型参数。”</p>
+<p><strong>核心观点提取：</strong>
+1.  <strong>预热 (Warmup) 很重要</strong>：代码专门处理了前几步学习率从低到高的过程。
+2.  <strong>花式减速 (Decay Styles)</strong>：支持多种学习率下降曲线，特别是为了大模型训练支持了 WSD 策略。
+3.  <strong>权重衰减也是动态的</strong>：不仅学习率在变，Weight Decay 也可以随时间增加。
+4.  <strong>断点续训保护</strong>：非常严谨地校验 Checkpoint 里的参数和当前配置是否冲突，确保恢复训练时节奏不错乱。</p>

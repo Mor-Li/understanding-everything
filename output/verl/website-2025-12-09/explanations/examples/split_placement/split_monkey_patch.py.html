@@ -1,0 +1,81 @@
+<h1>examples/split_placement/split_monkey_patch.py</h1>
+<p>这份代码其实是一个 <strong>强化学习（RLHF，即基于人类反馈的强化学习）训练流程的核心控制脚本</strong>。</p>
+<p>具体来说，它实现了一个 <strong>PPO（Proximal Policy Optimization）算法</strong> 的主循环（<code>fit</code> 函数）。</p>
+<p>之所以叫 <code>split_monkey_patch.py</code>，是因为在大型模型训练中，我们经常要把不同的模型（Actor写文章的、Critic打分的、Reward Model奖励模型）放在不同的 GPU 或机器上（Split Placement）。这个脚本通过“Monkey Patch”（代码运行时动态替换）的方式，替换了原本的训练循环，来适应这种分布式的部署。</p>
+<p>把它想象成一个 <strong>“总指挥”</strong> 的工作清单。总指挥不亲自干活（不亲自做矩阵乘法），而是指挥底下的 <strong>Worker Groups (wg)</strong> 干活。</p>
+<p>下面我为你列一个 <strong>Task Todo List</strong>，对应代码的执行逻辑，一步步带你看懂它在干嘛：</p>
+<hr />
+<h3>📋 强化学习训练流程 Todo List</h3>
+<h4>第一阶段：准备工作 (初始化)</h4>
+<ol>
+<li><strong>启动日记本 (Logger)</strong>:<ul>
+<li>代码：<code>logger = Tracking(...)</code></li>
+<li>解释：准备好记录训练过程中的各种数据（Loss, Reward 等）。</li>
+</ul>
+</li>
+<li><strong>加载存档 (Checkpoint)</strong>:<ul>
+<li>代码：<code>self._load_checkpoint()</code></li>
+<li>解释：如果之前训过，从上次断开的地方继续；如果是新的，就加载预训练模型。</li>
+</ul>
+</li>
+<li><strong>考前摸底 (Initial Validation)</strong>:<ul>
+<li>代码：<code>val_metrics = self._validate()</code></li>
+<li>解释：在还没开始学之前，先测试一下模型现在的水平，留个底。</li>
+</ul>
+</li>
+</ol>
+<h4>第二阶段：开始特训 (训练主循环)</h4>
+<p><em>这是代码最长的部分，包含在一个大循环里 (<code>for epoch... for batch...</code>)。</em></p>
+<p><strong>Task 1: 拿到题目 (Get Data)</strong>
+*   代码：<code>batch = DataProto.from_single_dict(batch_dict)</code>
+*   解释：从数据加载器里拿出一批 Prompt（提示词/问题）。</p>
+<p><strong>Task 2: 学生做题 (Generation / Rollout)</strong>
+*   代码：<code>self.actor_rollout_wg.generate_sequences(gen_batch)</code>
+*   解释：指挥 <strong>Actor模型</strong> 根据提示词生成回复。这是“探索”的过程。
+    *   <em>注：中间有一大段 <code>if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:</code> 是针对一种叫 REMAX 的特殊算法变体的，如果你只关心标准 PPO，可以先忽略这一块。</em></p>
+<p><strong>Task 3: 整理试卷 (Batch Processing)</strong>
+*   代码：<code>batch.non_tensor_batch["uid"] = ...</code> 和 <code>self._balance_batch(...)</code>
+*   解释：给每条数据打上唯一ID，并把数据在不同的计算节点间平衡一下，防止有的卡累死，有的卡闲死。</p>
+<p><strong>Task 4: 回顾与对比 (Compute Log Probs)</strong>
+*   代码：
+    *   <code>self.actor_rollout_wg.compute_log_prob(batch)</code> (旧策略概率)
+    *   <code>self.ref_policy_wg.compute_ref_log_prob(batch)</code> (参考模型概率)
+*   解释：
+    *   <strong>Actor回顾</strong>：计算一下刚才生成的那些字，在当前模型参数下的概率是多少。
+    *   <strong>Ref对比</strong>：计算一下如果让原始模型（Reference Model，不参与训练，只做基准）来写，概率是多少。这用于防止模型学偏了（KL Divergence）。</p>
+<p><strong>Task 5: 老师预估分数 (Critic Values)</strong>
+*   代码：<code>self.critic_wg.compute_values(batch)</code>
+*   解释：指挥 <strong>Critic模型</strong> 对当前的回复进行价值预估（我觉得这句写得好不好，大概能得多少分）。</p>
+<p><strong>Task 6: 正式打分 (Compute Rewards)</strong>
+*   代码：
+    *   <code>self.rm_wg.compute_rm_score(batch)</code> (奖励模型打分)
+    *   <code>compute_reward(...)</code> (结合规则打分)
+*   解释：
+    *   让 <strong>Reward Model</strong> 给生成的回复打分。
+    *   如果有规则约束（比如格式不对扣分），也在这里算。
+    *   最后算上 KL 散度惩罚（如果模型写得太飞，偏离原意太远，要扣分）。</p>
+<p><strong>Task 7: 算算这步走得咋样 (Compute Advantage)</strong>
+*   代码：<code>compute_advantage(...)</code>
+*   解释：这是 PPO 的核心。结合“实际得分”和“Critic的预估”，计算<strong>优势函数 (Advantage)</strong>。
+    *   如果实际得分 &gt; 预估，说明这步走得好，要鼓励（增加概率）。
+    *   如果实际得分 &lt; 预估，说明这步走得差，要惩罚（降低概率）。</p>
+<p><strong>Task 8: 修正模型 (Update Parameters)</strong>
+*   代码：
+    *   <code>self.actor_rollout_wg.update_actor(batch)</code> (更新写文章的模型)
+    *   <code>self.critic_wg.update_critic(batch)</code> (更新打分的模型)
+*   解释：根据刚才算的优势和损失，正式修改模型的参数（反向传播）。
+    *   <em>注：这里用了 <code>critic_warmup</code>，意思是刚开始几步可能只训 Critic，不训 Actor，等 Critic 准了再一起训。</em></p>
+<h4>第三阶段：收尾与记录 (Housekeeping)</h4>
+<p><strong>Task 9: 阶段性测试 (Validation)</strong>
+*   代码：<code>if ... self._validate()</code>
+*   解释：每隔几步，用验证集测一下，看看模型是不是变强了。</p>
+<p><strong>Task 10: 存档 (Save Checkpoint)</strong>
+*   代码：<code>self._save_checkpoint()</code>
+*   解释：每隔几步保存一下模型文件，防止断电白训。</p>
+<p><strong>Task 11: 写日记 (Logging)</strong>
+*   代码：<code>logger.log(...)</code>
+*   解释：把这一步消耗的时间、得到的平均分、Loss值都记下来，画成图表。</p>
+<hr />
+<h3>总结</h3>
+<p>这代码就是 <strong>“出题 -&gt; 做题 -&gt; 估分 -&gt; 实际打分 -&gt; 算差距 -&gt; 改错 -&gt; 存档”</strong> 这样一个不断循环的过程。</p>
+<p>因为涉及很多个模型（Actor, Critic, Ref, RM），代码里大量使用了 <code>self.xxx_wg.func()</code>，这说明它在远程调用其他 GPU 上的模型来完成计算，自己只负责串联流程。</p>

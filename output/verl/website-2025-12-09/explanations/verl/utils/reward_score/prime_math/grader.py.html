@@ -1,0 +1,94 @@
+<h1>verl/utils/reward_score/prime_math/grader.py</h1>
+<p>这份代码 <code>grader.py</code> 的核心作用就是<strong>“阅卷老师”</strong>。</p>
+<p>在训练大模型做数学题时，模型输出的答案（Prediction）格式千奇百怪，而标准答案（Reference）通常只有一个。判断这两个答案是否“数学上相等”是一件非常复杂的事情（比如 <code>1/2</code> 和 <code>0.5</code> 和 <code>50%</code> 是一样的）。</p>
+<p>这份代码就在尽一切努力去判断：<strong>虽然长得不一样，但它们是不是同一个数？</strong></p>
+<p>下面我为你列一个<strong>阅卷流程的 To-Do List</strong>，然后逐步讲解它是如何实现的。</p>
+<hr />
+<h3>📝 阅卷流程 To-Do List (逻辑清单)</h3>
+<p>当这个程序拿到模型答案（Pred）和标准答案（Ref）时，它会按顺序执行以下任务，只要有一步成功，就判定为“正确（True）”：</p>
+<ol>
+<li><strong>[预处理]</strong>：把两个答案里的“杂质”去掉（去掉美元符号 <code>$</code>，去掉百分号 <code>%</code>，把 <code>\pi</code> 换成数字）。</li>
+<li><strong>[字面比对]</strong>：看两个字符串是不是完全一模一样（忽略大小写和空格）。</li>
+<li><strong>[数值比对]</strong>：如果都能转成数字，算一下它们的差值是否在一个极小的误差范围内（比如 0.0001）。<ul>
+<li><em>特例处理</em>：顺便检查一下是不是差了100倍（处理百分数问题）。</li>
+</ul>
+</li>
+<li><strong>[结构比对]</strong>：如果答案是列表、元组、区间或者矩阵，把它们拆开，一个元素一个元素地比对。</li>
+<li><strong>[代数/符号比对]</strong>：(大招) 动用专业的数学库 <code>SymPy</code>。<ul>
+<li>尝试化简 <code>(答案A - 答案B)</code>，看结果是不是 0。</li>
+<li>尝试把复杂的公式算出数值解，再比对数值。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解</h3>
+<p>下面我们结合代码，一步一步看它是怎么完成上面这个 List 的。</p>
+<h4>第一步：预处理 (Normalize)</h4>
+<p><strong>观点：</strong> 答案的格式不重要，重要的是内容。
+<strong>代码对应：</strong> <code>normalize</code>, <code>handle_base</code>, <code>handle_pi</code></p>
+<ul>
+<li><strong>去格式化</strong>：有些答案带着 LaTeX 的数学符号（如 <code>$100$</code>），代码会把 <code>$</code> 去掉。</li>
+<li><strong>处理百分号</strong>：如果答案是 <code>50%</code>，它会把 <code>%</code> 去掉变成 <code>50</code>，留给后面数值比对去处理倍率。</li>
+<li><strong>处理特殊常数</strong>：把 <code>\pi</code> 替换成具体的数字 <code>3.14159...</code>。</li>
+<li><strong>处理进制</strong>：如果出现 <code>10_2</code> (二进制的10)，尝试把它转成十进制。</li>
+</ul>
+<h4>第二步：字面与简单数值比对</h4>
+<p><strong>观点：</strong> 最简单的相等就是字面相等，或者简单的数字相等。
+<strong>代码对应：</strong> <code>math_equal</code> 函数的前半部分</p>
+<ul>
+<li>
+<p><strong>字符串秒杀</strong>：
+    <code>python
+    if prediction.strip().lower() == reference.strip().lower(): return True</code>
+    如果去掉了空格和大小写后一模一样，直接通过。</p>
+</li>
+<li>
+<p><strong>转数字 (Float)</strong>：
+    代码尝试把两个字符串都转成 Python 的 <code>float</code> 类型。</p>
+<ul>
+<li><strong>容错 (Tolerance)</strong>：计算机的小数是不精确的，所以它不判断 <code>a == b</code>，而是判断 <code>abs(a - b) &lt; 1e-4</code> (即 <code>isclose</code>)。</li>
+<li><strong>百分比特判</strong>：标准答案是 <code>0.5</code>，模型输出了 <code>50</code>（因为它去掉了%）。代码会尝试把标准答案 <code>*100</code> 或 <code>/100</code> 后再比一次。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：复杂结构拆解 (Structural Matching)</h4>
+<p><strong>观点：</strong> 很多数学题的答案不是一个数，而是一组数（区间、坐标、矩阵）。
+<strong>代码对应：</strong> <code>math_equal</code> 中间处理 <code>[]</code>, <code>()</code>, <code>Matrix</code> 的部分</p>
+<ul>
+<li><strong>区间与集合</strong>：
+    比如答案是 <code>[1, 5)</code>。代码会识别方括号和圆括号，把里面的 <code>1</code> 和 <code>5</code> 拆出来，分别去和标准答案里的对应位置比对。<ul>
+<li><code>format_intervals</code> 函数专门处理 Python 生成的奇怪对象格式（如 <code>Interval.Ropen</code>）转成标准的数学写法。</li>
+</ul>
+</li>
+<li><strong>列表与元组</strong>：
+    如果答案是 <code>1, 2, 3</code>，它会按逗号分割，确保 Pred 的第一个数等于 Ref 的第一个数，以此类推。</li>
+<li><strong>矩阵</strong>：
+    识别 LaTeX 的矩阵格式 <code>\begin{pmatrix}</code>，将其拆解为一个个元素进行比对。</li>
+</ul>
+<h4>第四步：终极手段——符号计算 (Symbolic Equal)</h4>
+<p><strong>观点：</strong> 有些数学表达式长得完全不一样，但数学上是相等的。比如 <code>1/sqrt(2)</code> 和 <code>sqrt(2)/2</code>。字符串比对和普通浮点数比对搞不定这个。
+<strong>代码对应：</strong> <code>symbolic_equal</code> 函数</p>
+<p>这是最消耗计算资源的一步，使用了 <code>SymPy</code> 库（一个强大的 Python 符号计算库）。</p>
+<ol>
+<li><strong>解析 (Parse)</strong>：先把字符串（可能是 LaTeX 格式）解析成数学表达式对象。</li>
+<li><strong>化简相减 (Simplify Subtraction)</strong>：<ul>
+<li>计算 <code>simplify(Prediction - Reference)</code>。</li>
+<li>如果数学库能把它化简为 <code>0</code>，说明两者相等。</li>
+</ul>
+</li>
+<li><strong>数值求值 (Numerical Evaluation)</strong>：<ul>
+<li>如果化简失败（有时候数学库也推导不出来），就用 <code>N()</code> 函数求出它们的具体数值解，再比对一次数值。</li>
+</ul>
+</li>
+<li><strong>超时保护 (Timeout)</strong>：<ul>
+<li>因为符号计算可能陷入死循环或耗时极长，代码加了 <code>timeout_limit</code>。如果 <code>SymPy</code> 算了 10 秒还没结果，就强制停止并算作不匹配，防止程序卡死。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件的核心逻辑是<strong>“由简入繁，层层递进”</strong>：
+1.  先看是不是<strong>字符串</strong>一样（最快）。
+2.  再看是不是<strong>数字</strong>一样（很快）。
+3.  再看是不是<strong>结构</strong>里的每个元素都一样。
+4.  最后实在不行，请出<strong>数学库</strong>做代数证明（最慢但最强）。</p>
+<p>这是一种非常鲁棒（Robust）的评分机制，专门为了应对大模型输出数学答案时格式不稳定的问题。</p>

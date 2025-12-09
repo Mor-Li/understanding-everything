@@ -1,0 +1,117 @@
+<h1>megatron/core/parallel_state.py</h1>
+<p>这份代码 <code>parallel_state.py</code> 是 NVIDIA Megatron-LM（以及许多基于它的的大模型框架）中<strong>最核心的基础设施</strong>。</p>
+<p>简单来说，它的作用是<strong>“给 GPU 分组”</strong>。</p>
+<p>想象一下，你有一屋子 100 个 GPU（就像 100 个工人）。如果让他们一起训练一个巨大的模型，不能乱哄哄地一起干，必须分工。比如：
+*   <strong>A组</strong>负责模型的第一层，<strong>B组</strong>负责第二层（流水线并行 PP）。
+*   在A组内部，<strong>工人1</strong>负责矩阵的上半部分，<strong>工人2</strong>负责下半部分（张量并行 TP）。
+*   同时，为了加快速度，同样的模型复制了好几份，大家并行算不同的数据（数据并行 DP）。</p>
+<p>这个文件的任务就是：<strong>告诉每一个 GPU，它属于哪个组，它的队友是谁，它该跟谁通信。</strong></p>
+<p>为了让你读懂，我把这个文件要做的事情拆解成一个 <strong>Project Todo List</strong>，一步步带你看。</p>
+<hr />
+<h3>📋 Task List：理解 Megatron 并行状态管理</h3>
+<h4>Phase 1: 准备工作 (定义全局变量)</h4>
+<p>在代码的最开头（第 27 行起），你会看到一大堆 <code>None</code> 变量。</p>
+<ul>
+<li><strong>任务目标</strong>：准备好空的“花名册”，用来存放之后建立好的通信组。</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    _TENSOR_MODEL_PARALLEL_GROUP = None  # 存放切分张量的队友
+    _PIPELINE_MODEL_PARALLEL_GROUP = None # 存放流水线上下游的队友
+    _DATA_PARALLEL_GROUP = None           # 存放算梯度平均的队友
+    # ... 以及很多其他的组</code></li>
+<li><strong>通俗解释</strong>：就像公司刚成立，先在白板上写好部门名称（技术部、市场部...），但还没填人名。</li>
+</ul>
+<h4>Phase 2: 核心入口 (初始化)</h4>
+<p>跳到第 428 行 <code>initialize_model_parallel</code> 函数。这是整个文件的<strong>大脑</strong>。</p>
+<ul>
+<li><strong>任务目标</strong>：接收用户配置的并行度参数（TP大小、PP大小、DP大小），开始计算分组。</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    def initialize_model_parallel(
+        tensor_model_parallel_size: int = 1,
+        pipeline_model_parallel_size: int = 1,
+        ...
+    ):</code></li>
+<li><strong>关键步骤</strong>：<ol>
+<li><strong>检查人数</strong>：确认 GPU 总数（<code>world_size</code>）能不能被你设定的并行度整除。</li>
+<li><strong>建立计算器</strong>：创建一个 <code>RankGenerator</code>（第 615 行）。这是个数学工具，用来算“第 5 号 GPU 在 TP 组里排老几，在 PP 组里排老几”。</li>
+</ol>
+</li>
+</ul>
+<h4>Phase 3: 建立“数据并行”组 (Data Parallel - DP)</h4>
+<p>这是最基础的一组，用于多副本训练时同步梯度。</p>
+<ul>
+<li><strong>任务目标</strong>：把负责处理不同数据但模型权重相同的 GPU 拉到一个群里。</li>
+<li><strong>代码位置</strong>：大约第 729 行 <code>for ranks in decoder_rank_generator.get_ranks('dp'):</code></li>
+<li><strong>动作</strong>：<ol>
+<li><code>RankGenerator</code> 算出哪些 GPU ID 属于同一个 DP 组。</li>
+<li>调用 <code>create_group</code>（调用 PyTorch 底层的 NCCL 通信）建立通信群。</li>
+<li>将群组句柄赋值给全局变量 <code>_DATA_PARALLEL_GROUP</code>。</li>
+</ol>
+</li>
+<li><strong>通俗解释</strong>：所有负责“同样的活儿”（模型权重完全一样）的工人在这个群里，每算完一步，大家要在群里对一下答案（AllReduce 梯度）。</li>
+</ul>
+<h4>Phase 4: 建立“模型并行”组 (Model Parallel - TP &amp; PP)</h4>
+<p>这里是把大模型切碎的地方。</p>
+<ul>
+<li>
+<p><strong>任务 4.1：流水线并行 (PP)</strong></p>
+<ul>
+<li><strong>代码位置</strong>：大约第 873 行 <code>get_ranks('pp')</code>。</li>
+<li><strong>动作</strong>：建立 <code>_PIPELINE_MODEL_PARALLEL_GROUP</code>。</li>
+<li><strong>用途</strong>：同一个 PP 组里的 GPU 负责把这一层的输出（Activation）传给下一层所在的 GPU。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 4.2：张量并行 (TP)</strong></p>
+<ul>
+<li><strong>代码位置</strong>：大约第 813 行 <code>get_ranks('tp')</code>。</li>
+<li><strong>动作</strong>：建立 <code>_TENSOR_MODEL_PARALLEL_GROUP</code>。</li>
+<li><strong>用途</strong>：这是 Megatron 最核心的黑科技。同一个 TP 组的 GPU 共同存储一个巨大的矩阵（比如 <code>4096 x 12288</code>），每个 GPU 只存一部分。做矩阵乘法时，它们必须在群里疯狂通信（AllReduce）来合并结果。</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 5: 建立“混合”组 (用于特殊功能)</h4>
+<p>有些操作需要跨维度通信，所以需要建立一些组合群。</p>
+<ul>
+<li><strong>任务目标</strong>：建立跨维度的快捷通道。</li>
+<li><strong>代码位置</strong>：大约第 915 行 <code>get_ranks('tp-dp')</code> 等。</li>
+<li><strong>例子</strong>：<ul>
+<li><code>_EMBEDDING_GROUP</code>：只包含拥有 Embedding 层（通常是第一层和最后一层）的 GPU。</li>
+<li><code>_TENSOR_AND_DATA_PARALLEL_GROUP</code>：用于 FP8 训练等特殊场景。</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 6: 专家并行 (MoE) 专用组 (Expert Parallel - EP)</h4>
+<p>如果你的模型是 Mixture-of-Experts (MoE)，逻辑会更复杂。</p>
+<ul>
+<li><strong>任务目标</strong>：MoE 模型中，Expert 层和其他层的切分方式不一样，所以需要一套独立的通信组。</li>
+<li><strong>代码位置</strong>：第 948 行起 <code>### Expert-related parallel groups initialization</code>。</li>
+<li><strong>动作</strong>：重复上面的过程，但是专门为 Expert 层建立 <code>_EXPERT_MODEL_PARALLEL_GROUP</code> 等。</li>
+</ul>
+<h4>Phase 7: 对外提供查询接口 (Getters)</h4>
+<p>初始化完毕后，其他文件（比如 <code>layers.py</code> 或 <code>transformer.py</code>）需要知道自己该跟谁通信。</p>
+<ul>
+<li><strong>任务目标</strong>：提供只读接口，返回当前的通信组。</li>
+<li><strong>代码对应</strong>：文件后半部分（第 1120 行起）的一大堆 <code>get_...</code> 函数。
+    <code>python
+    def get_tensor_model_parallel_group(check_initialized=True):
+        # 返回当前 GPU 所在的 TP 组
+        return _TENSOR_MODEL_PARALLEL_GROUP</code></li>
+<li><strong>场景</strong>：<ul>
+<li>当代码执行到 <code>RowParallelLinear</code>（行并行线性层）时，它会调用 <code>get_tensor_model_parallel_group()</code>，拿到通信组句柄，然后执行 <code>torch.distributed.all_reduce(..., group=group)</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：如何看懂这个文件</h3>
+<p>不要试图去读每一行代码（特别是那个 <code>generate_masked_orthogonal_rank_groups</code> 数学计算函数，那是纯数学逻辑，不用深究）。</p>
+<p><strong>你只需要抓住这根主线：</strong></p>
+<ol>
+<li><strong>它是“分班主任”</strong>：程序启动时，所有 GPU 都是散兵游勇。</li>
+<li><strong><code>initialize_model_parallel</code> 是分班大会</strong>：它根据你设定的 <code>TP=4, PP=2</code> 等参数，算出每个 GPU 应该进哪些班级。</li>
+<li><strong>全局变量是“班级花名册”</strong>：存下了分班的结果。</li>
+<li><strong>Get 函数是“查询窗口”</strong>：后续的模型代码通过这些函数来获取通信句柄，进行真正的数据传输。</li>
+</ol>
+<p><strong>核心观点：</strong>
+这个文件证明了在大模型训练中，<strong>通信拓扑结构（Topology）</strong> 是最重要的状态。模型怎么切，决定了通信组怎么建，进而决定了数据怎么流转。</p>

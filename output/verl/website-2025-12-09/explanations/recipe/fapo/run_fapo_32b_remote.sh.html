@@ -1,0 +1,69 @@
+<h1>recipe/fapo/run_fapo_32b_remote.sh</h1>
+<p>这份脚本确实包含了很多技术细节，如果不是专门做大模型强化学习（RLHF）的工程师，看起来会非常头大。</p>
+<p>为了让你听懂，我们可以把这个脚本想象成是一个 <strong>“给超级厨师（AI模型）下达的一张详细的做菜（训练）任务单”</strong>。</p>
+<p>这张单子告诉计算机：用什么食材（数据）、用什么厨具（显卡/服务器）、用什么烹饪手法（算法），最后要做成什么口味（奖励机制）。</p>
+<p>下面我按照你的要求，先列一个 <strong>Task Todo List</strong>，然后<strong>逐步拆解</strong>其中的含义。</p>
+<hr />
+<h3>第一部分：Task Todo List (脚本执行流程)</h3>
+<p>这个脚本运行起来后，实际上是在按顺序执行以下任务：</p>
+<ol>
+<li><strong>[起名与定调]</strong>：给这次训练任务起个名字（FAPO-32B），确定核心算法策略（GRPO）。</li>
+<li><strong>[设定红线]</strong>：规定模型说话不能太啰嗦（长度限制），以及学习时的“奖惩力度”（KL系数）。</li>
+<li><strong>[准备环境]</strong>：确认“厨房”在哪（Ray集群地址），确认“食材”在哪（数据路径），确认“初始厨师”是谁（Qwen2.5-32B 模型）。</li>
+<li><strong>[配置算力]</strong>：因为模型太大（320亿参数），单张显卡装不下，需要规划如何把模型切碎了放在多张显卡上跑（并行策略）。</li>
+<li><strong>[一键启动]</strong>：把上面所有罗里吧嗦的配置，打包成一条超长的命令，发送给 <code>Ray</code>（分布式计算管理系统），开始跑 Python 代码进行训练。</li>
+</ol>
+<hr />
+<h3>第二部分：逐步讲解（Step-by-Step）</h3>
+<p>我们把文件内容拆成几块来讲：</p>
+<h4>Step 1: 基础设置 (给任务贴标签)</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">project_name</span><span class="o">=</span><span class="s1">&#39;FAPO-Reproduce&#39;</span><span class="w">  </span><span class="c1"># 项目叫“复现FAPO”</span>
+<span class="nv">exp_name</span><span class="o">=</span><span class="s1">&#39;FAPO-32B&#39;</span><span class="w">            </span><span class="c1"># 这次实验叫“FAPO算法-32B模型”</span>
+<span class="nv">adv_estimator</span><span class="o">=</span>grpo<span class="w">             </span><span class="c1"># 核心重点：使用的算法是 GRPO (DeepSeek-R1 同款思路)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这里定义了身份。最重要的是 <code>grpo</code>，这是一种比传统 PPO 更适合做“推理能力”训练的算法，它不需要一个巨大的“老批评家模型”（Value Model），省显存且效果好。</li>
+</ul>
+<h4>Step 2: 奖惩与长度控制 (制定家规)</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">kl_coef</span><span class="o">=</span><span class="m">0</span>.0<span class="w">                    </span><span class="c1"># KL散度系数设为0（让模型放飞自我，不要太拘泥于原始模型）</span>
+<span class="nv">max_prompt_length</span><span class="o">=</span><span class="k">$((</span><span class="m">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">2</span><span class="k">))</span><span class="w">   </span><span class="c1"># 提问最多 2048 个字</span>
+<span class="nv">max_response_length</span><span class="o">=</span><span class="k">$((</span><span class="m">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">20</span><span class="k">))</span><span class="w"> </span><span class="c1"># 回答最多 20480 个字！</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：注意看 <code>max_response_length</code> 非常长（20k token）。这说明这是在训练<strong>长思维链（Chain-of-Thought）</strong>模型，允许模型在输出最终答案前进行大量的思考（类似 DeepSeek 的思考过程）。</li>
+</ul>
+<h4>Step 3: 基础设施 (找厨房和食材)</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">RAY_ADDRESS</span><span class="o">=</span>...<span class="w">                </span><span class="c1"># 连接到 Ray 集群（多台服务器组成的超级电脑）</span>
+<span class="nv">MODEL_PATH</span><span class="o">=</span>.../Qwen2.5-32B<span class="w">     </span><span class="c1"># 用的底座模型是通义千问 32B</span>
+<span class="nv">TRAIN_FILE</span><span class="o">=</span>.../fapo-train...<span class="w">   </span><span class="c1"># 训练题目（数学题或代码题）</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这是物理路径配置。它告诉脚本去哪里读取那个几百GB的模型文件，以及去哪里拿训练数据。</li>
+</ul>
+<h4>Step 4: 性能与并行 (切分模型)</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">sp_size</span><span class="o">=</span><span class="m">8</span><span class="w">      </span><span class="c1"># 序列并行：因为句子太长，把一句话切成8段给不同显卡处理</span>
+<span class="nv">gen_tp</span><span class="o">=</span><span class="m">4</span><span class="w">       </span><span class="c1"># 张量并行：把模型切成4份</span>
+<span class="nv">fsdp_size</span><span class="o">=</span><span class="m">32</span><span class="w">   </span><span class="c1"># FSDP：一种显存优化技术</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这是最硬核的部分。32B的模型非常大，加上20k的上下文长度，单张显卡绝对爆显存。这里设置了复杂的切分策略（TP, SP, FSDP），目的是为了让这庞然大物能在 4个节点（共32张显卡）上跑起来而不死机。</li>
+</ul>
+<h4>Step 5: 最终发射 (Ray Job Submit)</h4>
+<p>脚本最后那一大段 <code>ray job submit ...</code> 是真正的执行动作。它把上面定义的所有变量（<code>$变量名</code>）填入 Python 程序的参数中。</p>
+<p>我挑几个关键的参数翻译一下：</p>
+<ul>
+<li><code>actor_rollout_ref.rollout.n=8</code>: 每一个问题，让模型生成 <strong>8个</strong> 不同的回答（以此来对比哪个好）。</li>
+<li><code>reward_model.reward_manager=dapo</code>: 奖励管理器。</li>
+<li><code>custom_reward_function.path=...</code>: <strong>自定义奖励函数</strong>。这是训练的灵魂，它决定了模型答对了题给多少分，格式对不对给多少分。</li>
+<li><code>trainer.nnodes=4</code>: 使用 4 台服务器。</li>
+<li><code>trainer.total_training_steps=600</code>: 训练 600 步就停。</li>
+</ul>
+<hr />
+<h3>总结：这个脚本到底是干啥的？</h3>
+<p>用一句话说：
+<strong>这是一个在大规模服务器集群上（4台机器），利用 Ray 框架，使用 GRPO 算法，对 Qwen2.5-32B 模型进行“长思维链”强化学习训练的启动脚本。</strong></p>
+<p><strong>它的核心目标是：</strong> 让模型通过不断的“做题 -&gt; 生成8个答案 -&gt; 评分 -&gt; 优化”，学会如何进行长篇大论的逻辑推理（因为设置了极长的响应长度 20k）。</p>

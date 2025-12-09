@@ -1,0 +1,104 @@
+<h1>tests/unit_tests/a2a_overlap/test_schedule_layer_1f1b.py</h1>
+<p>这份代码确实涉及了很多高性能计算（HPC）和深度学习框架底层的概念，如果不是专门做大模型系统优化的，看着确实会像天书。</p>
+<p>别慌，这个文件的核心目的其实非常简单：<strong>它在做一个“找不同”的游戏，用来验证一种加速技术是否正确。</strong></p>
+<p>为了让你看懂，我为你制定了一个 <strong>5步走的 Task List</strong>。我们一步步来拆解：</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂核心背景 (为什么写这个代码？)</strong></li>
+<li><strong>Task 2: 理解测试的“黄金法则” (怎么测？)</strong></li>
+<li><strong>Task 3: 读懂“笨办法” (Reference 函数)</strong></li>
+<li><strong>Task 4: 读懂“聪明办法” (Overlap/1F1B 函数)</strong></li>
+<li><strong>Task 5: 串联测试流程 (Test 类)</strong></li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1: 搞懂核心背景</h4>
+<p>首先，你要知道这代码属于 <strong>Megatron-Core</strong>，这是 NVIDIA 用来训练超大模型（比如 GPT-4 级别）的库。</p>
+<ul>
+<li><strong>MoE (Mixture of Experts)</strong>: 混合专家模型。这种模型在计算时，需要把数据在不同 GPU 之间发来发去（All-to-All 通信）。</li>
+<li><strong>痛点</strong>: 通信很慢，计算很快。如果 GPU 等着数据传完再计算，效率就低。</li>
+<li><strong>A2A Overlap (All-to-All Overlap)</strong>: 这是一种优化技术。意思是“一边计算，一边在后台传输数据”。</li>
+<li><strong>1F1B (One-Forward-One-Backward)</strong>: 这是一种流水线调度策略。以前是“先把所有数据的前向传播（Forward）做完，再做反向传播（Backward）”。1F1B 是“做一部分前向，紧接着做一部分反向”，这样可以省显存并掩盖通信延迟。</li>
+</ul>
+<p><strong>结论</strong>: 这个文件的目的是<strong>测试“一边通信一边计算的 1F1B 调度策略”算出来的结果，和“老老实实串行计算”的结果是否一模一样。</strong> 如果不一样，说明优化把模型搞坏了。</p>
+<hr />
+<h4>✅ Task 2: 理解测试的“黄金法则”</h4>
+<p>在单元测试里，验证复杂优化的逻辑通常是：
+1.  <strong>Reference (基准)</strong>: 用最简单、最慢、但绝对正确的方法跑一遍，记下结果（Output）和梯度（Grad）。
+2.  <strong>Target (目标)</strong>: 用复杂的优化方法（这里是 A2A Overlap + 1F1B）跑一遍。
+3.  <strong>Compare (对比)</strong>: 比较两者的结果和梯度。如果误差极小（接近 0），测试通过。</p>
+<p>代码中的 <code>compare_captures</code> 函数就是做这个对比的。</p>
+<hr />
+<h4>✅ Task 3: 读懂“笨办法” (Reference 函数)</h4>
+<p>请看代码中的 <code>run_transformer_layer_ref_with_capture</code> 函数。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">run_transformer_layer_ref_with_capture</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 这里的 iterations 就是微批次 (Microbatches) 的数量</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">iterations</span><span class="p">):</span>
+        <span class="c1"># 1. 前向传播 (Forward)</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="n">transformer_layer</span><span class="p">(</span><span class="n">input_tensors</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">())[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">output_tensors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">output</span><span class="p">)</span>
+        <span class="c1"># 2. 立即进行反向传播 (Backward)</span>
+        <span class="n">output</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">ones_like</span><span class="p">(</span><span class="n">output</span><span class="p">))</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>: 这是一个非常直观的串行循环。来一个数据包 -&gt; 算前向 -&gt; 算反向 -&gt; 结束。</li>
+<li><strong>作用</strong>: 生成“标准答案”。</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 读懂“聪明办法” (Overlap/1F1B 函数)</h4>
+<p>这是最难懂的部分，请看 <code>run_transformer_layer_a2a_overlap_with_capture</code>。</p>
+<p>这里用到了 <code>TransformerLayerSchedulePlan</code>，你可以把它想象成一个<strong>指挥官</strong>，它负责安排什么时候计算，什么时候通信。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">run_transformer_layer_a2a_overlap_with_capture</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 初始化指挥官列表 ...</span>
+
+    <span class="c1"># 阶段 1: 启动引擎 (Warmup)</span>
+    <span class="c1"># 先只做一个前向传播 (Forward)，不立刻做反向。</span>
+    <span class="c1"># 因为反向传播需要依赖后续的梯度，刚开始没法做。</span>
+    <span class="n">output</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">TransformerLayerSchedulePlan</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+        <span class="n">layers</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="kc">None</span><span class="p">,</span> <span class="n">f_input</span><span class="o">=</span><span class="n">input_tensors</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">b_grad</span><span class="o">=</span><span class="kc">None</span>
+    <span class="p">)</span>
+
+    <span class="c1"># 阶段 2: 1F1B 循环 (核心!)</span>
+    <span class="c1"># 从第2个微批次开始循环</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">microbatches</span><span class="p">):</span>
+        <span class="c1"># 这里的 run 同时干两件事：</span>
+        <span class="c1"># 1. 帮当前的 i 做 Forward (f_input)</span>
+        <span class="c1"># 2. 帮上一个 i-1 做 Backward (b_grad)</span>
+        <span class="c1"># 这就是 &quot;One Forward, One Backward&quot; (1F1B)</span>
+        <span class="n">f_input</span><span class="p">,</span> <span class="n">b_grad</span> <span class="o">=</span> <span class="n">TransformerLayerSchedulePlan</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+            <span class="n">layers</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">layers</span><span class="p">[</span><span class="n">i</span> <span class="o">-</span> <span class="mi">1</span><span class="p">],</span> <span class="n">f_input</span><span class="o">=</span><span class="n">input_tensors</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">b_grad</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">ones_like</span><span class="p">(</span><span class="n">output</span><span class="p">)</span>
+        <span class="p">)</span>
+        <span class="c1"># 这里的 torch.cuda.synchronize() 模拟了流的同步</span>
+
+    <span class="c1"># 阶段 3: 收尾 (Cooldown)</span>
+    <span class="c1"># 最后一个微批次的前向做完了，但它的反向还没做。</span>
+    <span class="c1"># 这里只补上最后一个 Backward。</span>
+    <span class="n">TransformerLayerSchedulePlan</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">layers</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="n">f_input</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">b_grad</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">ones_like</span><span class="p">(</span><span class="n">output</span><span class="p">))</span>
+
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>: 就像流水线工人。左手接新零件（Forward），右手把刚才处理完的零件送走（Backward）。这种交错执行可以让 GPU 的计算单元和通信单元同时忙碌起来。</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 串联测试流程 (Test 类)</h4>
+<p>最后看 <code>TestA2AOverlap</code> 类，它把上面串起来了。以 <code>test_transformer_layer_overlap</code> 为例：</p>
+<ol>
+<li><strong>Setup</strong>: 初始化一个 GPT 模型。</li>
+<li><strong>Step A</strong>: 运行 Reference 函数 (<code>capture_ref = run_..._ref...</code>)。</li>
+<li><strong>Reset</strong>: 把模型参数重置回初始状态（这一步很重要，否则第二次跑的时候参数已经被第一次跑的梯度更新了，结果就不准了）。</li>
+<li><strong>Step B</strong>: 运行 Overlap 函数 (<code>capture_a2a_overlap = run_..._overlap...</code>)。</li>
+<li><strong>Assert</strong>: <code>compare_captures(...)</code>，如果不相等就报错。</li>
+</ol>
+<p><strong>关于 <code>test_mtp_layer_overlap</code></strong>:
+逻辑完全一样，只是测试的对象从普通的 Transformer 层变为了 <strong>MTP (Multi-Token Prediction)</strong> 层。MTP 是现在的热门技术，一次预测多个 Token，结构更复杂，但测试原理不变。</p>
+<h3>总结</h3>
+<p>这篇代码在说：</p>
+<blockquote>
+<p>"嘿，我写了一个超酷的调度器 (<code>TransformerLayerSchedulePlan</code>)，能让 MoE 模型一边通信一边计算 (1F1B)。为了证明我没算错，我用这个调度器跑一次，再用普通方法跑一次，结果是一样的！"</p>
+</blockquote>

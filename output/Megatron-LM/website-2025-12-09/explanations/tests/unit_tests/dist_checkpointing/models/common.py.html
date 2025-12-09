@@ -1,0 +1,100 @@
+<h1>tests/unit_tests/dist_checkpointing/models/common.py</h1>
+<p>这份代码文件 <code>tests/unit_tests/dist_checkpointing/models/common.py</code> 其实不是核心功能的实现，而是一个<strong>测试工具箱</strong>。</p>
+<p>它属于 <strong>Megatron-LM</strong>（NVIDIA 开发的一个超大模型训练框架），专门用来测试<strong>“分布式检查点（Distributed Checkpointing）”</strong>功能的。</p>
+<p>简单来说，它的作用是：<strong>验证在不同的 GPU 数量（TP/PP 并行度）之间，模型的保存（Save）和加载（Load）是否正确。</strong></p>
+<p>为了让你听懂，我把这个文件要做的事情想象成一个<strong>“模型搬家公司”的验收清单（To-Do List）</strong>。我们不仅要确保东西搬到了，还要确保如果你从一个小房子（比如 2 张显卡）搬到一个大房子（比如 4 张显卡），家具（模型参数）能自动适应并摆放正确。</p>
+<p>下面是这个文件里包含的 4 个主要测试任务（对应代码里的 4 个函数）：</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<h4>✅ 任务 1：最基础的存取测试 (Sanity Check)</h4>
+<p><strong>对应函数：</strong> <code>common_test_simple_sharded_state_dict_save_load</code>
+<strong>目标：</strong> 只是试一下“保存”和“加载”能不能跑通，不报错就行，不进行复杂的数值比对。</p>
+<ol>
+<li><strong>搭建环境</strong>：设置好 Tensor Parallel (TP)=2, Pipeline Parallel (PP)=4 的环境。</li>
+<li><strong>创建模型 A</strong>：初始化一个 GPT 模型。</li>
+<li><strong>执行保存</strong>：调用 <code>save</code> 函数，把模型 A 保存到临时文件夹。</li>
+<li><strong>创建模型 B</strong>：初始化另一个结构相同的模型。</li>
+<li><strong>执行加载</strong>：从文件夹读取数据，加载进模型 B。</li>
+<li><strong>检查报错</strong>：<ul>
+<li>允许有一些 <code>_extra_state</code>（额外状态）不匹配，这是正常的。</li>
+<li>只要程序没崩，就算通过。</li>
+</ul>
+</li>
+<li><strong>清理现场</strong>：销毁并行环境。</li>
+</ol>
+<hr />
+<h4>✅ 任务 2：变形搬家测试 (Reconfiguration E2E) —— <strong>这是最重要的测试</strong></h4>
+<p><strong>对应函数：</strong> <code>common_test_parallel_reconfiguration_e2e</code>
+<strong>目标：</strong> 测试<strong>“改变并行度”</strong>后，模型还能不能完美恢复。比如，我原本用 2 张卡训练，现在想用 4 张卡接着训，参数能不能自动切分好？</p>
+<ol>
+<li><strong>准备阶段</strong>：设定源环境（比如 TP=1, PP=1）和目标环境（比如 TP=2, PP=2）。</li>
+<li><strong>第一步：保存原始模型</strong><ul>
+<li>在源环境下初始化模型 A。</li>
+<li>(可选) 使用全并行策略 (FPSL) 进行保存。</li>
+<li>把模型 A 保存到文件夹 <code>ckpt_dir_A</code>。</li>
+<li>记录下模型 A 的参数数值（放在内存里备查）。</li>
+<li>销毁源环境。</li>
+</ul>
+</li>
+<li><strong>第二步：在不同环境下加载</strong><ul>
+<li>在<strong>目标环境</strong>（不同的 GPU 数量）下初始化模型 B。</li>
+<li>从 <code>ckpt_dir_A</code> 读取存档。<strong>关键点：</strong> 系统必须自动处理参数的切分或合并（Resharding）。</li>
+<li>把参数加载进模型 B。</li>
+<li>把模型 B 再次保存到文件夹 <code>ckpt_dir_B</code>。</li>
+<li>销毁目标环境。</li>
+</ul>
+</li>
+<li><strong>第三步：终极比对 (Diff)</strong><ul>
+<li>把环境重置为单卡模式（方便读取所有数据）。</li>
+<li>直接从磁盘读取 <code>ckpt_dir_A</code> 和 <code>ckpt_dir_B</code> 的原始张量数据。</li>
+<li><strong>比对 1</strong>：文件 A 和 文件 B 的数据必须完全一致（证明经过一次“变形加载”后，数据没丢也没错）。</li>
+<li><strong>比对 2</strong>：内存里记录的模型 A 和模型 B 的参数必须一致。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ 任务 3：比对工具自身的测试</h4>
+<p><strong>对应函数：</strong> <code>common_test_state_dict_comparison</code>
+<strong>目标：</strong> 验证我们用来找不同的工具（<code>diff</code> 函数）是不是准的。</p>
+<ol>
+<li><strong>制造数据</strong>：<ul>
+<li>创建模型 A 并保存。</li>
+<li>创建模型 B（参数是随机初始化的，肯定和 A 不一样）并保存。</li>
+</ul>
+</li>
+<li><strong>读取数据</strong>：把 A 和 B 的数据都读成普通 Tensor。</li>
+<li><strong>自我测试</strong>：比对 A 和 A，结果必须是“完全一致”。</li>
+<li><strong>差异测试</strong>：比对 A 和 B。<ul>
+<li>结果必须是“键名（Keys）一致”（结构一样）。</li>
+<li>但是“数值不一致”（内容不同）。</li>
+<li>如果工具报告 A 和 B 一样，那说明测试工具坏了。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ 任务 4：词表(Vocab)填充测试</h4>
+<p><strong>对应函数：</strong> <code>common_test_vocab_size_padding_change</code>
+<strong>目标：</strong> 处理一个边缘情况——词表大小必须能被 GPU 数量整除。</p>
+<p><em>背景知识：在 Tensor Parallel 中，如果词表大小是 100，你有 8 张卡，100 除以 8 除不尽。Megatron 会自动把词表“填充(Padding)”到 104（举例），以便每张卡分到的任务一样多。</em></p>
+<ol>
+<li><strong>计算填充</strong>：根据 GPU 数量计算词表需要被填充到多大。</li>
+<li><strong>保存模型 A</strong>：在源并行度下（比如 TP=1）保存模型，此时词表可能不需要填充。</li>
+<li><strong>加载模型 B</strong>：在目标并行度下（比如 TP=8）加载。<ul>
+<li>此时系统会自动把词表变大（填充 0 或其他值）。</li>
+<li>保存模型 B。</li>
+</ul>
+</li>
+<li><strong>比对有效数据</strong>：<ul>
+<li>读取 A 和 B 的文件。</li>
+<li><strong>关键点</strong>：只比对前 <code>vocab_size_base</code> 个数据（真实单词）。</li>
+<li>忽略后面自动填充的部分。</li>
+<li>如果真实单词部分的权重完全一致，测试通过。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件就是为了回答一个问题：</p>
+<blockquote>
+<p><strong>“不管我怎么折腾 GPU 的数量（从 1 张变 8 张，再变 4 张），Megatron 的存档系统能不能保证我的模型参数一个数字都不错？”</strong></p>
+</blockquote>
+<p>如果这些测试都跑通了（Assert Success），开发者就可以放心地进行分布式训练的断点续训（Resume Training）了。</p>

@@ -1,0 +1,104 @@
+<h1>megatron/core/models/mimo/model/base.py</h1>
+<p>这份代码其实定义了一个<strong>多模态大模型（Multimodal Model）的主架构</strong>。</p>
+<p>简单来说，它的核心任务就是：<strong>把文字、图片、音频等不同类型的数据，全部变成机器能懂的“数字向量”，然后像拼图一样按顺序拼好，最后喂给大语言模型（LLM）去处理。</strong></p>
+<p>为了让你看懂，我把这个模型的工作流程拆解成一个 <strong>Task Todo List（任务清单）</strong>。每一步对应代码中的一段逻辑。</p>
+<hr />
+<h3>📋 MimoModel 工作任务清单 (Todo List)</h3>
+<ol>
+<li>
+<p><strong>准备阶段 (Initialization):</strong></p>
+<ul>
+<li>[ ] 搭建“大脑”：初始化语言模型（LLM）。</li>
+<li>[ ] 搭建“眼睛/耳朵”：初始化处理图片、音频的子模型（Submodules）。</li>
+<li>[ ] 约定暗号：记下代表图片或音频的特殊占位符（Special Tokens，比如 <code>&lt;image&gt;</code>）。</li>
+</ul>
+</li>
+<li>
+<p><strong>处理阶段 (Processing - <code>forward</code>):</strong></p>
+<ul>
+<li>[ ] <strong>任务 A：处理非文本输入</strong>。把图片/音频喂给对应的子模型，变成向量。</li>
+<li>[ ] <strong>任务 B：处理文本输入</strong>。把文字变成向量。</li>
+<li>[ ] <strong>任务 C：拼图（核心）</strong>。根据输入句子的顺序，把文字向量和图片/音频向量“缝合”在一起。</li>
+<li>[ ] <strong>任务 D：思考</strong>。把缝合好的整体向量喂给 LLM，输出结果。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步代码解析</h3>
+<p>现在我们按照上面的清单，一步步看代码是怎么实现的。</p>
+<h4>1. 准备阶段：<code>__init__</code> 和 <code>_initialize_submodules</code></h4>
+<p><strong>观点：</strong> 模型启动时，不仅要加载 LLM，还要根据配置加载其他的编码器（比如处理图片的 Vision Transformer）。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>self._initialize_language_model()</code>: 建立 LLM 主体。</li>
+<li><code>self._initialize_submodules()</code>: 遍历配置，建立图片或音频的编码器（存在 <code>self.modality_submodules</code> 里）。</li>
+<li><code>self.special_token_ids</code>: 记录比如 <code>&lt;image&gt;</code> 对应的 ID 是多少，方便后面在句子里找位置。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 任务 A：处理非文本输入 (在 <code>forward</code> 函数中)</h4>
+<p><strong>观点：</strong> 计算机看不懂图片，得先用专门的编码器把图片变成一串数字（Embedding）。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>python
+    # 遍历所有的模态（比如 image, audio）
+    for modality_name, submodule in self.modality_submodules.items():
+        # 如果输入里有这个模态的数据
+        if modality_inputs and ...:
+            # 喂给子模型，得到 embeddings (一堆向量)
+            embeddings = submodule.forward(...)
+            modality_embeddings[modality_name] = embeddings</code><ul>
+<li><strong>结果：</strong> <code>modality_embeddings</code> 字典里现在存好了图片或音频转化成的向量。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 任务 B：处理文本输入 (<code>get_text_embeddings</code>)</h4>
+<p><strong>观点：</strong> 输入的句子（<code>input_ids</code>）里既有文字，也有代表图片的占位符。这一步只提取纯文字的向量。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>text_mask</code>: 创建一个掩码，把 <code>&lt;image&gt;</code> 之类的特殊 token 盖住，只看文字。</li>
+<li><code>self.language_model.embedding(...)</code>: 调用 LLM 的词嵌入层，把文字 ID 变成向量。</li>
+<li><strong>结果：</strong> 得到了纯文本的向量。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 任务 C：拼图/对齐 (<code>align_embeddings_by_token_positions</code>) <strong>(全篇最难懂也是最核心的地方)</strong></h4>
+<p><strong>观点：</strong> 你现在的输入可能是这样一句话：<code>"这是一只猫：&lt;image&gt;，很可爱。"</code>
+你手里有两堆向量：
+1.  “这是一只猫：，很可爱。” 的文本向量。
+2.  那张猫图的图片向量。</p>
+<p>你需要把它们按顺序拼成一个完整的长条向量序列，喂给 LLM。</p>
+<ul>
+<li><strong>代码逻辑解析：</strong><ol>
+<li><strong>创建画布：</strong> <code>combined_embeddings = torch.zeros(...)</code>，创建一个全零的大张量，形状和输入句子一样长。</li>
+<li><strong>填空：</strong><ul>
+<li>先找到所有是 <strong>文字</strong> 的位置，把 <strong>任务 B</strong> 得到的文本向量填进去。</li>
+<li>再找到所有是 <strong><code>&lt;image&gt;</code></strong> 的位置，把 <strong>任务 A</strong> 得到的图片向量填进去。</li>
+</ul>
+</li>
+<li><strong>代码片段：</strong>
+    <code>python
+    # 这里的 mask 就是用来找位置的
+    combined_embeddings.masked_scatter_(expanded_mask, modality_emb.flatten())</code></li>
+<li><strong>结果：</strong> 一个融合了多模态信息的完整向量序列。</li>
+</ol>
+</li>
+</ul>
+<h4>5. 任务 D：思考 (<code>forward</code> 的最后部分)</h4>
+<p><strong>观点：</strong> 万事俱备，把拼好的混合向量喂给大模型，让它进行推理。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>python
+    lm_output = self.language_model(
+        input_ids=None, # 不需要传 ID 了，因为下面直接传了向量
+        decoder_input=combined_embeddings, # 这里传入刚才拼好的混合向量
+        ...
+    )</code></li>
+</ul>
+<h3>总结</h3>
+<p>这个文件 <code>base.py</code> 实际上就是一个<strong>组装工厂</strong>。</p>
+<p>它不负责具体的“看图”或“写字”逻辑（那些在 submodule 和 language_model 里），它的工作是<strong>调度</strong>：
+1.  让眼睛去看图。
+2.  让大脑去理解字。
+3.  把图的信息插到字句中间正确的位置。
+4.  最后让大脑统一处理这一串混合信息。</p>

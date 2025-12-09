@@ -1,0 +1,123 @@
+<h1>megatron/legacy/data/ict_dataset.py</h1>
+<p>这份代码确实涉及一些比较学术的预训练概念。为了让你彻底看懂，我们首先要明白这个文件是干什么的。</p>
+<p><strong>核心概念：什么是 ICT (Inverse Cloze Task)？</strong></p>
+<p>通常的“完形填空 (Cloze Task)”是给你一段话，挖掉一个词，让你填这个词。
+而 <strong>“逆向完形填空 (Inverse Cloze Task, ICT)”</strong> 是：
+1.  给你一篇文章中的<strong>一句话</strong>（我们叫它 Query/提问）。
+2.  让你从一堆文章片段中，找到<strong>包含这句话的那一段上下文</strong>（我们叫它 Context/上下文）。</p>
+<p><strong>目的：</strong> 这是为了训练<strong>检索模型（Retriever）</strong>。比如训练一个 AI，让它看到问题时，能去知识库里找到包含答案的段落。</p>
+<hr />
+<h3>任务清单 (Todo List)</h3>
+<p>为了实现这个训练目标，这个 Python 文件（作为一个数据加载器 <code>Dataset</code>）每次被调用时，都在执行以下这套流水线：</p>
+<ol>
+<li><strong>【准备原材料】</strong>：拿到一段完整的文本块（Block）和它的标题（Title）。</li>
+<li><strong>【制造问题 (Query)】</strong>：从这段文本块里，随机挑出一句话作为“查询语句”。</li>
+<li><strong>【制造答案 (Context)】</strong>：把剩下的句子（或者保留原句）加上标题，组合成“上下文”。</li>
+<li><strong>【标准化加工】</strong>：给 Query 和 Context 加上特殊的标记符（如 <code>[CLS]</code>, <code>[SEP]</code>），并裁剪或填充到固定长度。</li>
+<li><strong>【生成辅助信息】</strong>：生成掩码（Mask），告诉模型哪些是真字，哪些是填充的空白。</li>
+<li><strong>【打包出厂】</strong>：把处理好的 Query 和 Context 打包成字典返回。</li>
+</ol>
+<hr />
+<h3>逐步代码详解</h3>
+<p>下面我按照上面的 Todo List，带你一步步看代码是如何实现的。</p>
+<h4>第一步：准备原材料 (<code>__init__</code> 和 <code>__getitem__</code> 开头)</h4>
+<p>首先，类初始化时加载了所有数据。当训练程序请求第 <code>idx</code> 个数据时：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 在 __getitem__ 方法中</span>
+<span class="n">sample_data</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">samples_mapping</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span>
+<span class="c1"># 获取这块数据在总数据集中的 起始下标、结束下标、文档ID</span>
+<span class="n">start_idx</span><span class="p">,</span> <span class="n">end_idx</span><span class="p">,</span> <span class="n">doc_idx</span><span class="p">,</span> <span class="n">block_idx</span> <span class="o">=</span> <span class="n">sample_data</span><span class="o">.</span><span class="n">as_tuple</span><span class="p">()</span>
+
+<span class="c1"># 获取标题 (Title)</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_titles</span><span class="p">:</span>
+    <span class="n">title</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">title_dataset</span><span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">doc_idx</span><span class="p">)]</span>
+    <span class="c1"># ...</span>
+
+<span class="c1"># 获取文本块 (Block)，这里面包含多句话</span>
+<span class="n">block</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">block_dataset</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">start_idx</span><span class="p">,</span> <span class="n">end_idx</span><span class="p">)]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这里就像是从图书馆的书架上取下来一页书（Block）和书名（Title）。<code>block</code> 是一个列表，里面每一项是一句话。</li>
+</ul>
+<h4>第二步：制造问题 (<code>rand_sent_idx</code>)</h4>
+<p>ICT 的核心就是“随机抽取一句话”。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 随机生成一个索引，决定挑哪一句话当 Query</span>
+<span class="n">rand_sent_idx</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rng</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">block</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>第三步：制造答案 (Query vs Context 分离)</h4>
+<p>这是逻辑最关键的地方。我们需要决定：刚才挑出来的那句话，要不要从原文里删掉？</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># query_in_block_prob 是一个概率值（比如 0.1 或 0.9）</span>
+<span class="c1"># 逻辑：即使我把这句话提出来当问题了，原文里要不要保留这句话？</span>
+
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">rng</span><span class="o">.</span><span class="n">random</span><span class="p">()</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">query_in_block_prob</span><span class="p">:</span>
+    <span class="c1"># 情况A：保留。Query 是这句话，Context 里也包含这句话。</span>
+    <span class="c1"># 这通常用于模拟“精确匹配”。</span>
+    <span class="n">query</span> <span class="o">=</span> <span class="n">block</span><span class="p">[</span><span class="n">rand_sent_idx</span><span class="p">]</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="c1"># 情况B：移除。Query 是这句话，Context 是把这句话挖走后剩下的部分。</span>
+    <span class="c1"># 这是标准的 ICT，强迫模型通过上下文语义去匹配，而不是通过字面复制匹配。</span>
+    <span class="n">query</span> <span class="o">=</span> <span class="n">block</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">rand_sent_idx</span><span class="p">)</span> 
+</code></pre></div>
+
+<h4>第四步：标准化加工 (Tokenization &amp; Padding)</h4>
+<p>现在的 <code>query</code> 和 <code>block</code> (context) 还是原始的句子列表，模型看不懂。需要加上 <code>[CLS]</code> (开始)、<code>[SEP]</code> (分隔) 并统一长度。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 裁剪长度，防止超长</span>
+<span class="n">query</span> <span class="o">=</span> <span class="n">query</span><span class="p">[:</span><span class="bp">self</span><span class="o">.</span><span class="n">max_seq_length</span> <span class="o">-</span> <span class="mi">2</span><span class="p">]</span> 
+<span class="c1"># 把 block 里的句子拼成一长串，并裁剪</span>
+<span class="n">block</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">itertools</span><span class="o">.</span><span class="n">chain</span><span class="p">(</span><span class="o">*</span><span class="n">block</span><span class="p">))[:</span><span class="bp">self</span><span class="o">.</span><span class="n">max_seq_length</span> <span class="o">-</span> <span class="n">title_pad_offset</span><span class="p">]</span>
+
+<span class="c1"># 2. 调用辅助函数 concat_and_pad_tokens 进行包装</span>
+<span class="c1"># 处理 Query</span>
+<span class="n">query_tokens</span><span class="p">,</span> <span class="n">query_pad_mask</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">concat_and_pad_tokens</span><span class="p">(</span><span class="n">query</span><span class="p">)</span>
+<span class="c1"># 处理 Context (把 Title 和 Block 拼在一起)</span>
+<span class="n">context_tokens</span><span class="p">,</span> <span class="n">context_pad_mask</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">concat_and_pad_tokens</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">title</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>看看 <code>concat_and_pad_tokens</code> 里发生了什么：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">concat_and_pad_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">title</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="c1"># 如果有标题：[CLS] + 标题 + [SEP] + 正文 + [SEP]</span>
+    <span class="k">if</span> <span class="n">title</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">tokens</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">cls_id</span><span class="p">]</span> <span class="o">+</span> <span class="n">title</span> <span class="o">+</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">sep_id</span><span class="p">]</span> <span class="o">+</span> <span class="n">tokens</span> <span class="o">+</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">sep_id</span><span class="p">]</span>
+    <span class="c1"># 如果没标题：[CLS] + 正文 + [SEP]</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">tokens</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">cls_id</span><span class="p">]</span> <span class="o">+</span> <span class="n">tokens</span> <span class="o">+</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">sep_id</span><span class="p">]</span>
+
+    <span class="c1"># 填充 (Padding) 到最大长度</span>
+    <span class="n">num_pad</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_length</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">tokens</span><span class="p">)</span>
+    <span class="n">tokens</span> <span class="o">+=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">pad_id</span><span class="p">]</span> <span class="o">*</span> <span class="n">num_pad</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<h4>第五步：生成辅助信息 (Masks)</h4>
+<p>Transformer 模型需要 Attention Mask 来知道它能看哪里。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 生成 Attention Mask矩阵</span>
+<span class="c1"># 这里的 make_attention_mask 主要是生成一个方阵，标记哪些位置是有效的，哪些是填充的(Pad)</span>
+<span class="n">query_mask</span> <span class="o">=</span> <span class="n">make_attention_mask</span><span class="p">(</span><span class="n">query_tokens</span><span class="p">,</span> <span class="n">query_tokens</span><span class="p">)</span>
+<span class="n">context_mask</span> <span class="o">=</span> <span class="n">make_attention_mask</span><span class="p">(</span><span class="n">context_tokens</span><span class="p">,</span> <span class="n">context_tokens</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>第六步：打包出厂 (<code>return sample</code>)</h4>
+<p>最后把所有准备好的张量（Tensor）放进字典返回给 PyTorch 的 DataLoader。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">sample</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s1">&#39;query_tokens&#39;</span><span class="p">:</span> <span class="n">query_tokens</span><span class="p">,</span>      <span class="c1"># 提问的 token ID</span>
+    <span class="s1">&#39;query_mask&#39;</span><span class="p">:</span> <span class="n">query_mask</span><span class="p">,</span>          <span class="c1"># 提问的注意力掩码</span>
+    <span class="s1">&#39;query_pad_mask&#39;</span><span class="p">:</span> <span class="n">query_pad_mask</span><span class="p">,</span>  <span class="c1"># 提问的填充掩码</span>
+    <span class="s1">&#39;context_tokens&#39;</span><span class="p">:</span> <span class="n">context_tokens</span><span class="p">,</span>  <span class="c1"># 上下文的 token ID</span>
+    <span class="s1">&#39;context_mask&#39;</span><span class="p">:</span> <span class="n">context_mask</span><span class="p">,</span>      <span class="c1"># 上下文的注意力掩码</span>
+    <span class="s1">&#39;context_pad_mask&#39;</span><span class="p">:</span> <span class="n">context_pad_mask</span><span class="p">,</span> 
+    <span class="s1">&#39;block_data&#39;</span><span class="p">:</span> <span class="n">block_data</span><span class="p">,</span>
+<span class="p">}</span>
+<span class="k">return</span> <span class="n">sample</span>
+</code></pre></div>
+
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心观点和作用是：</p>
+<ol>
+<li><strong>它不负责训练</strong>，它只负责<strong>造数据</strong>。</li>
+<li>它实现了一种<strong>自监督学习 (Self-supervised Learning)</strong> 的数据构造方法。</li>
+<li><strong>核心逻辑</strong>：把一篇文章拆成“一句话”和“其余部分”，强迫模型学习这两者之间的<strong>语义关联</strong>。</li>
+</ol>
+<p><strong>用大白话讲：</strong>
+这个脚本就像一个出题老师，拿着课本，不停地随机选一句话抄下来当题目，然后把这段课文（有的删掉这句话，有的保留）当成答案解析，打包好喂给 AI 去学习。</p>

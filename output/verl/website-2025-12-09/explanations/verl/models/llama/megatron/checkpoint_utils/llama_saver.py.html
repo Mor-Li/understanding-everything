@@ -1,0 +1,150 @@
+<h1>verl/models/llama/megatron/checkpoint_utils/llama_saver.py</h1>
+<p>这份代码确实涉及了很多分布式训练（Distributed Training）的底层概念，如果对 Megatron-LM 或大模型并行训练不熟悉，读起来会非常晦涩。</p>
+<p>简单来说，这个文件的<strong>核心任务</strong>是：<strong>“拼图”</strong>。</p>
+<p><strong>背景：</strong>
+当你用 Megatron 框架训练 Llama 大模型时，模型太大了，一张显卡放不下。于是模型被切碎了：
+1.  <strong>横着切（TP, Tensor Parallel）</strong>：一个巨大的矩阵运算被拆分到多个显卡上同时算。
+2.  <strong>竖着切（PP, Pipeline Parallel）</strong>：模型有80层，显卡A负责前10层，显卡B负责后10层，以此类推。</p>
+<p><strong>目标：</strong>
+当你想要保存模型（Checkpoint）时，你不能保存一堆碎得乱七八糟的文件。你需要把这些分散在不同显卡（Rank）上的参数<strong>收集（Collect）</strong>起来，<strong>拼接（Merge）</strong>成一个完整的、标准的模型文件（比如 Hugging Face 格式），这样以后才能方便加载。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<p>为了完成“拼图”这个大任务，代码执行了以下子任务：</p>
+<ol>
+<li><strong>[准备阶段] 搞清楚“谁拿着哪一块拼图”</strong><ul>
+<li>计算每个显卡的身份（Rank）。</li>
+<li>建立一个地图（Map），记录第几层网络在第几个显卡上。</li>
+</ul>
+</li>
+<li><strong>[工具制造] 定义“收集工具”</strong><ul>
+<li>定义如何从别的显卡拿普通参数（直接复制）。</li>
+<li>定义如何从别的显卡拿被切碎的参数（拿过来后要拼起来）。</li>
+<li><em>特殊处理</em>：Llama 的 QKV（注意力机制）和 MLP（前馈网络）有特殊的拼接逻辑。</li>
+</ul>
+</li>
+<li><strong>[开始拼图 - 头部] 收集词嵌入层 (Embeddings)</strong><ul>
+<li>找到负责模型“入口”的显卡，把词表拿回来。</li>
+</ul>
+</li>
+<li><strong>[开始拼图 - 身体] 逐层收集 Transformer 层</strong><ul>
+<li>循环遍历每一层（Layer 0 到 Layer N）。</li>
+<li>定位这一层在哪个显卡上。</li>
+<li>收集 Attention 模块（Q, K, V, Output）。</li>
+<li>收集 MLP 模块（Gate, Up, Down）。</li>
+<li>收集各种 Normalization 层。</li>
+</ul>
+</li>
+<li><strong>[开始拼图 - 尾部] 收集输出层</strong><ul>
+<li>找到负责模型“出口”的显卡，把最终的 Norm 和 LM Head 拿回来。</li>
+</ul>
+</li>
+<li><strong>[收尾] 格式转换与打包</strong><ul>
+<li>统一数据类型（float16/bfloat16），打包成字典返回。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细解读</h3>
+<p>下面我按照上面的 List，结合代码给你讲讲。</p>
+<h4>1. 准备阶段：搞清楚“谁拿着哪一块拼图”</h4>
+<p>代码开头的一堆 <code>mpu.get_...</code> 和 <code>_megatron_calc_layer_map</code> 就是在做这件事。</p>
+<ul>
+<li><strong>PP (Pipeline Parallel)</strong>：假设模型有 4 层，分给 2 个 GPU。GPU_0 拿 Layer 0-1，GPU_1 拿 Layer 2-3。</li>
+<li><strong>TP (Tensor Parallel)</strong>：假设每一层的矩阵很大，被拆成了 2 份，分给不同的 GPU 组。</li>
+</ul>
+<p>函数 <code>_megatron_calc_layer_map(config)</code> 就像是一个<strong>索引目录</strong>。它告诉主程序（Rank 0）：</p>
+<blockquote>
+<p>“如果你想要第 5 层的参数，你应该去问 PP_Rank=1 的那个显卡要。”</p>
+</blockquote>
+<h4>2. 工具制造：定义“收集工具”</h4>
+<p>在 <code>merge_megatron_ckpt_llama</code> 函数内部，定义了几个以 <code>_broadcast</code> 开头的内部函数。这些是“抓取手”：</p>
+<ul>
+<li><strong><code>_broadcast_tensor</code> (简单抓取)</strong>：<ul>
+<li>用于没有被切碎的参数（比如 LayerNorm 的参数）。</li>
+<li>逻辑：直接从源显卡广播（复制）给主显卡。</li>
+</ul>
+</li>
+<li><strong><code>_broadcast_tp_shard_tensor</code> (拼接抓取)</strong>：<ul>
+<li>用于被 TP 切碎的参数（比如 Linear 层的权重）。</li>
+<li>逻辑：主显卡不仅要拿自己的那份，还要让其他 TP 组的显卡把它们那份发过来。收到所有碎片后，用 <code>torch.concat</code> 把它们粘在一起，还原成大矩阵。</li>
+</ul>
+</li>
+<li><strong><code>_broadcast_tp_shard_tensor_qkv</code> (最麻烦的 QKV)</strong>：<ul>
+<li><strong>难点</strong>：Llama 的 Attention 层包含 Query(Q), Key(K), Value(V)。Megatron 为了加速，把它们拼在一起存。但是拼接的顺序和 Hugging Face 标准格式不一样。</li>
+<li><strong>逻辑</strong>：先把碎片拿回来拼成一个大块，然后要把这个大块像切蛋糕一样切开，把 Q、K、V 分离出来，再按照正确的顺序重新拼好。</li>
+</ul>
+</li>
+<li><strong><code>_broadcast_tp_shard_tensor_gate_up</code> (麻烦的 MLP)</strong>：<ul>
+<li><strong>难点</strong>：Llama 的 MLP 层有两个投影层 <code>gate_proj</code> 和 <code>up_proj</code>，Megatron 也是把它们拼在一起算的。</li>
+<li><strong>逻辑</strong>：同样，拿回来拼好后，要切开分成 <code>gate</code> 和 <code>up</code> 两部分存入字典。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 开始拼图 - 头部：Embeddings</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="k">if</span> <span class="n">dp_rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="c1"># ...</span>
+        <span class="n">_broadcast_tp_shard_tensor</span><span class="p">(</span>
+            <span class="n">gpt_model_module</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">embed_tokens</span><span class="o">.</span><span class="n">weight</span> <span class="k">if</span> <span class="n">pp_rank</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="s2">&quot;model.embed_tokens.weight&quot;</span><span class="p">,</span>
+            <span class="n">src_pp_rank</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="c1"># 只有流水线并行的第0个显卡有这个</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：模型的词嵌入层（输入层）肯定在流水线的第一个阶段（<code>pp_rank=0</code>）。主程序指挥说：“PP Rank 0 的兄弟，把 <code>embed_tokens</code> 发给我，其他人闭嘴。”</li>
+</ul>
+<h4>4. 开始拼图 - 身体：逐层收集</h4>
+<p>这是一个大的 <code>for</code> 循环：</p>
+<div class="codehilite"><pre><span></span><code>        <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">):</span>
+            <span class="c1"># 查地图，看这一层归谁管</span>
+            <span class="n">src_pp_rank</span><span class="p">,</span> <span class="n">src_virtual_pp_rank</span><span class="p">,</span> <span class="n">src_layer_idx</span> <span class="o">=</span> <span class="n">layer_map</span><span class="p">[</span><span class="n">layer</span><span class="p">]</span>
+
+            <span class="c1"># 1. 拿 Input LayerNorm (没切碎，直接拿)</span>
+            <span class="n">_broadcast_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">layer_name</span><span class="si">}</span><span class="s2">.input_layernorm.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 2. 拿 Attention 的 Q, K, V (切碎了且乱序，用特殊工具拿)</span>
+            <span class="n">_broadcast_tp_shard_tensor_qkv</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">layer_name</span><span class="si">}</span><span class="s2">.self_attn.q_proj.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 3. 拿 Attention 的 Output (切碎了，普通拼接)</span>
+            <span class="n">_broadcast_tp_shard_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">layer_name</span><span class="si">}</span><span class="s2">.self_attn.o_proj.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 4. 拿 Post Attention Norm</span>
+            <span class="n">_broadcast_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 5. 拿 MLP 的 Gate 和 Up (切碎了且合并了，用特殊工具拿)</span>
+            <span class="n">_broadcast_tp_shard_tensor_gate_up</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 6. 拿 MLP 的 Down (切碎了，普通拼接)</span>
+            <span class="n">_broadcast_tp_shard_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这就好比组装车身。主程序按照图纸，一层一层地问：“Layer 0 在谁那？好，把你那层的零件都传给我。Layer 1 在谁那？...”</li>
+</ul>
+<h4>5. 开始拼图 - 尾部：收集输出层</h4>
+<div class="codehilite"><pre><span></span><code>        <span class="c1"># 拿最后的 LayerNorm</span>
+        <span class="n">_broadcast_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="s2">&quot;model.norm.weight&quot;</span><span class="p">,</span> <span class="n">src_pp_rank</span><span class="o">=</span><span class="n">pp_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+
+        <span class="c1"># 拿最后的 LM Head (预测下一个词的分类头)</span>
+        <span class="n">_broadcast_tp_shard_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="s2">&quot;lm_head.weight&quot;</span><span class="p">,</span> <span class="n">src_pp_rank</span><span class="o">=</span><span class="n">pp_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：模型的尾巴肯定在流水线的最后一个阶段（<code>pp_size - 1</code>）。主程序找最后那个显卡要这些零件。</li>
+</ul>
+<h4>6. 收尾</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">get_rank</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="c1"># 统一转换数据格式，比如转成 float16</span>
+        <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">state_dict</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">dtype</span> <span class="o">!=</span> <span class="n">v</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
+                <span class="n">state_dict</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">state_dict</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：现在 Rank 0 手里已经有了一个完整的 <code>state_dict</code>（模型参数字典）。最后检查一下数据类型是否符合要求，然后就可以返回给调用者去保存成文件了。</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本就像一个<strong>“收纳师”</strong>。
+在训练时，为了速度，把模型拆得七零八落扔在不同的房间（GPU）里。
+在保存时，这个脚本拿着清单，跑遍所有房间，把零件捡回来，用胶水（Concat）粘好，最后整理成一个完美的包裹。</p>

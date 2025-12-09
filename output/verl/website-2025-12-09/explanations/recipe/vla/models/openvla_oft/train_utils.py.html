@@ -1,0 +1,76 @@
+<h1>recipe/vla/models/openvla_oft/train_utils.py</h1>
+<p>这份代码确实初看有点抽象，因为它处于<strong>“语言模型（LLM）”</strong>和<strong>“机器人控制（Robotics）”</strong>的交叉领域（即 VLA, Vision-Language-Action 模型）。</p>
+<p>简单来说，这段代码的任务是：<strong>在一个由数字组成的序列里，找到代表“机器人动作”的那几个数字，并算出模型预测得准不准。</strong></p>
+<p>为了让你听懂，我们把阅读这段代码想象成一个<strong>“机器人动作阅卷老师”</strong>的工作流程。下面是你的 <strong>To-Do List</strong>：</p>
+<hr />
+<h3>✅ Task 1：理解“试卷”格式（基础概念）</h3>
+<p><strong>目标</strong>：搞懂代码里的 <code>token_ids</code> 是什么。</p>
+<ul>
+<li><strong>背景</strong>：在 OpenVLA 这类模型里，机器人的动作（比如手臂往前移动 10cm）不是直接用小数表示的，而是被“翻译”成了整数（Token）。</li>
+<li><strong>设定</strong>：<ul>
+<li>假设机器人做一个动作需要 7 个数字（比如 x,y,z 坐标 + 旋转角度 + 夹爪开合），那么 <code>ACTION_DIM</code> (动作维度) 就是 7。</li>
+<li>这段代码里的输入 <code>token_ids</code> 就是一长串数字，里面混杂了填充符号（<code>IGNORE_INDEX</code>）和实际的动作指令。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2：圈出“当前动作”在哪里</h3>
+<p><strong>对应函数</strong>：<code>get_current_action_mask(token_ids)</code>
+<strong>目标</strong>：在一堆数字中，把代表<strong>“当下这一步动作”</strong>的那几个数字挑出来。</p>
+<ul>
+<li><strong>步骤讲解</strong>：<ol>
+<li><strong>排除废话</strong>：代码首先看哪些位置不是 <code>IGNORE_INDEX</code>（忽略填充位）。</li>
+<li><strong>计数（Cumsum）</strong>：它用 <code>torch.cumsum</code> 累加计数。比如：第1个有效数字、第2个有效数字...</li>
+<li><strong>划重点</strong>：它设定了一个范围 <code>1 &lt;= cumsum &lt;= ACTION_DIM</code>。意思是：我要找的是<strong>前 N 个</strong>有效数字（例如前 7 个）。这 7 个数字组成了“当前的动作”。</li>
+<li><strong>双重确认</strong>：最后它还检查这些数字是不是大于 <code>ACTION_TOKEN_BEGIN_IDX</code>（确保这些数字真的是动作Token，而不是普通的文字Token）。</li>
+</ol>
+</li>
+<li><strong>结论</strong>：这个函数返回一个 <code>mask</code>（掩码），告诉你：“嘿，这几个位置是我们要考核的当前动作。”</li>
+</ul>
+<hr />
+<h3>✅ Task 3：圈出“未来动作”在哪里</h3>
+<p><strong>对应函数</strong>：<code>get_next_actions_mask(token_ids)</code>
+<strong>目标</strong>：如果有的话，把<strong>“做完这一步之后要做的动作”</strong>挑出来。</p>
+<ul>
+<li><strong>步骤讲解</strong>：<ol>
+<li>逻辑和 Task 2 几乎一样。</li>
+<li><strong>区别在于</strong>：它的判断条件是 <code>cumsum &gt; ACTION_DIM</code>。</li>
+<li><strong>含义</strong>：它不关心前 7 个数字，它关心的是第 8 个及以后的所有有效数字。</li>
+</ol>
+</li>
+<li><strong>结论</strong>：这个函数用于找出序列中预测的后续步骤（用于规划或多步预测）。</li>
+</ul>
+<hr />
+<h3>✅ Task 4：批改“填空题”分数（计算准确率）</h3>
+<p><strong>对应函数</strong>：<code>compute_token_accuracy(...)</code>
+<strong>目标</strong>：看模型猜出的<strong>数字ID</strong>对不对。</p>
+<ul>
+<li><strong>步骤讲解</strong>：<ol>
+<li><strong>对比</strong>：拿模型预测的 ID (<code>predicted</code>) 和标准答案 (<code>ground_truth</code>) 进行对比。</li>
+<li><strong>过滤</strong>：只看 <code>mask</code> 标记为 True 的地方（也就是只看 Task 2 或 Task 3 圈出来的地方，不管别的）。</li>
+<li><strong>算分</strong>：(猜对的数量) 除以 (总数量)。</li>
+</ol>
+</li>
+<li><strong>观点</strong>：这是<strong>“字面上的准确率”</strong>。比如标准答案是 Token <code>100</code>，模型预测 <code>100</code> 才是对的，预测 <code>99</code> 也是错的。</li>
+</ul>
+<hr />
+<h3>✅ Task 5：批改“应用题”误差（计算物理误差）</h3>
+<p><strong>对应函数</strong>：<code>compute_actions_l1_loss(...)</code>
+<strong>目标</strong>：看模型预测的动作在<strong>物理世界</strong>里偏离了多少。</p>
+<ul>
+<li><strong>为什么需要这一步？</strong><ul>
+<li>在 Task 4 里，预测 <code>99</code> 和 <code>100</code> 都是错。但在机器人控制里，Token <code>99</code> 可能代表移动 9.9cm，Token <code>100</code> 代表移动 10.0cm。它俩其实非常接近！光看 Token 准确率是不够的。</li>
+</ul>
+</li>
+<li><strong>步骤讲解</strong>：<ol>
+<li><strong>翻译（Decode）</strong>：调用 <code>action_tokenizer</code> 把整数 ID 翻译回连续的小数（Continuous Actions）。比如把 ID <code>100</code> 变回 <code>0.5</code> (米)。</li>
+<li><strong>对比物理量</strong>：拿预测的物理量（比如 0.49米）和真实的物理量（0.5米）做减法。</li>
+<li><strong>L1 Loss</strong>：计算绝对误差。</li>
+</ol>
+</li>
+<li><strong>观点</strong>：这是<strong>“实际效果的误差”</strong>。这个指标越低，说明机器人的动作越精准、越平滑。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这段代码其实就在干这一件事：
+<strong>因为机器人动作被变成了像文字一样的 Token，所以我们需要先用 Mask（掩码）把这些动作 Token 从序列里抠出来，然后分别计算它“猜对了没有（准确率）”和“偏离了多远（L1 Loss）”。</strong></p>

@@ -1,0 +1,54 @@
+<h1>megatron/legacy/model/fused_softmax.py</h1>
+<p>这份代码看起来很复杂，但核心思想其实非常简单：<strong>它是为了加速 Transformer 模型中“注意力机制（Attention）”计算的一个核心步骤。</strong></p>
+<p>在 Transformer 中，计算 Attention Score 后，通常需要做三件事：
+1.  <strong>Scale（缩放）</strong>：除以根号 d。
+2.  <strong>Mask（掩码）</strong>：把不需要看到的词（比如未来的词或填充符）遮住。
+3.  <strong>Softmax（归一化）</strong>：把分数变成概率。</p>
+<p>通常在 PyTorch 里这是三步操作，意味着 GPU 要读写内存三次。这份代码通过<strong>融合（Fused）</strong>技术，写了专门的 C++/CUDA 代码，把这三步合并成一步做完，从而大大提升速度。</p>
+<p>下面我按照你要求的 <strong>Task To-Do List</strong> 模式，一步步带你拆解这个文件的逻辑：</p>
+<hr />
+<h3>任务清单：如何处理 Attention 的 Softmax？</h3>
+<p>这份代码的主要入口是最后的 <code>FusedScaleMaskSoftmax</code> 类。想象它是一个调度员，它的工作流程如下：</p>
+<h4>Task 1: 初始化与配置 (对应 <code>__init__</code>)</h4>
+<p><strong>目标</strong>：记下用户的设置，准备干活。
+*   <strong>ToDo 1.1</strong>: 确认数据格式。是 FP16 还是 BF16？（这两种是低精度格式，训练大模型必备）。
+*   <strong>ToDo 1.2</strong>: 确认 Mask 类型。是 <code>causal</code>（像 GPT 那样只能看前面，不能看后面）还是普通的 padding mask？
+*   <strong>ToDo 1.3</strong>: 确认是否开启“融合加速”功能 (<code>scaled_masked_softmax_fusion</code>)。
+*   <strong>ToDo 1.4</strong>: 设定缩放因子 <code>scale</code>。</p>
+<h4>Task 2: 接收输入并决策 (对应 <code>forward</code>)</h4>
+<p><strong>目标</strong>：数据来了，决定走“快速通道”还是“普通通道”。
+*   <strong>ToDo 2.1</strong>: 检查输入张量的维度，必须是 4 维 <code>[batch, heads, seq_len, seq_len]</code>。
+*   <strong>ToDo 2.2 (关键决策)</strong>: 调用 <code>is_kernel_available</code> 函数进行检查。
+    *   <em>检查内容</em>：显卡支持吗？数据长度符合 CUDA 核函数的限制吗（比如长度在 16 到 16384 之间）？内存对齐了吗（能否被 4 整除）？
+    *   <strong>结果 A</strong>：如果条件都满足 -&gt; <strong>走 Task 3 (快速通道)</strong>。
+    *   <strong>结果 B</strong>：如果条件不满足 -&gt; <strong>走 Task 4 (兜底通道)</strong>。</p>
+<h4>Task 3: 快速通道 - 调用融合算子 (对应 <code>forward_fused_softmax</code>)</h4>
+<p><strong>目标</strong>：使用 NVIDIA 写的底层 C++ 代码，一步到位。
+*   <strong>场景 A (GPT类模型)</strong>：如果是 <code>causal</code> 掩码（上三角掩码）。
+    *   <strong>Action</strong>: 调用 <code>ScaledUpperTriangMaskedSoftmax</code>。
+    *   <em>解释</em>：这个算子会在计算 Softmax 时，自动把右上角的矩阵数值设为负无穷（即遮住未来的词），同时完成缩放和 Softmax。
+*   <strong>场景 B (BERT类模型)</strong>：如果有其他类型的掩码。
+    *   <strong>Action</strong>: 调用 <code>ScaledMaskedSoftmax</code>。
+    *   <em>解释</em>：传入一个 Mask 矩阵，算子会根据这个矩阵遮盖位置，同时完成缩放和 Softmax。
+*   <strong>场景 C (无掩码)</strong>：
+    *   <strong>Action</strong>: 调用 <code>ScaledSoftmax</code>。
+    *   <em>解释</em>：只做缩放和 Softmax。</p>
+<blockquote>
+<p><strong>注意</strong>：这三个类（代码前三个 Class）里面都写着 <code>import ..._cuda</code>，说明它们实际上是去调用底层编译好的 CUDA 核心，而不是跑 Python 代码。</p>
+</blockquote>
+<h4>Task 4: 普通通道 - 使用原生 PyTorch (对应 <code>forward_torch_softmax</code>)</h4>
+<p><strong>目标</strong>：如果硬件不支持或形状奇怪，用标准的 PyTorch 慢速跑，保证程序不报错。
+*   <strong>ToDo 4.1</strong>: 如果需要，把数据转成 FP32（为了精度）。
+*   <strong>ToDo 4.2</strong>: 执行 <strong>Scale</strong>：<code>input = input * self.scale</code>。
+*   <strong>ToDo 4.3</strong>: 执行 <strong>Mask</strong>：调用 <code>self.mask_func</code> 把需要遮住的地方填上负无穷。
+*   <strong>ToDo 4.4</strong>: 执行 <strong>Softmax</strong>：<code>torch.nn.Softmax</code>。
+*   <strong>ToDo 4.5</strong>: 如果之前转了 FP32，现在转回 FP16/BF16。</p>
+<hr />
+<h3>总结文中的核心观点</h3>
+<ol>
+<li><strong>性能至上</strong>：在大模型训练中，Attention 里的 Softmax 是非常高频的操作。把 <code>Scale + Mask + Softmax</code> 三个操作融合（Fuse）成一个 CUDA Kernel，可以显著减少显存读写次数（Memory Bound），提升训练速度。</li>
+<li><strong>鲁棒性（兜底机制）</strong>：虽然融合算子很快，但它对 Tensor 的形状（Shape）有严格要求（必须能被 4 整除，长度不能太长等）。所以代码必须包含一个 <code>is_kernel_available</code> 的判断逻辑：能用快的就用快的，不能用就退化回 PyTorch 原生实现，确保模型在任何情况下都能跑通。</li>
+<li><strong>特定优化</strong>：专门为 GPT 类模型（Causal Mask）设计了 <code>ScaledUpperTriangMaskedSoftmax</code>，因为这种掩码是固定的（三角形），不需要从内存读取巨大的 Mask 矩阵，直接在计算时生成逻辑即可，这比通用的 Mask 更省显存。</li>
+</ol>
+<p><strong>简单一句话：</strong>
+这个文件就是一个<strong>智能开关</strong>，它尽量帮你去调用 NVIDIA 底层加速的 Softmax 连招；如果条件不允许，就老老实实按标准动作一步步做。</p>

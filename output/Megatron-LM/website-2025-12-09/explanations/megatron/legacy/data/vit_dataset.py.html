@@ -1,0 +1,108 @@
+<h1>megatron/legacy/data/vit_dataset.py</h1>
+<p>这份代码是 Megatron-LM 库中用于处理 <strong>Vision Transformer (ViT)</strong> 模型数据的核心文件。简单来说，它的作用是：<strong>把图片读进来，进行各种各样的“变形”（数据增强），然后转换成模型能看懂的数字格式。</strong></p>
+<p>为了让你彻底看懂，我们把阅读这份代码当做一个项目，列一个 <strong>To-Do List</strong>，分 5 个任务一步步拆解：</p>
+<hr />
+<h3>✅ Task 1: 理解基础工具（两个小特效）</h3>
+<p>在处理图片前，代码定义了两个“特效”工具类。这就像 Photoshop 里的滤镜。</p>
+<ol>
+<li>
+<p><strong><code>GaussianBlur</code> (高斯模糊)</strong>:</p>
+<ul>
+<li><strong>作用</strong>：让图片变模糊。</li>
+<li><strong>代码逻辑</strong>：有一个概率 <code>p</code>（比如 50%）。如果中奖了，就随机选一个模糊半径，把图片弄模糊；没中奖就原样返回。</li>
+<li><strong>目的</strong>：防止模型死记硬背图片的细节纹理，强迫它看大轮廓。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>Solarization</code> (过度曝光/日晒效果)</strong>:</p>
+<ul>
+<li><strong>作用</strong>：把图片中像素值超过阈值的部分反转（类似底片效果）。</li>
+<li><strong>代码逻辑</strong>：同样看概率 <code>p</code>，中了就调用 <code>ImageOps.solarize</code>。</li>
+<li><strong>目的</strong>：改变图片的颜色分布，让模型对颜色不那么敏感，更关注结构。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 2: 理解第一种训练模式 —— “分类任务”</h3>
+<p>这是最经典的模式：给一张图，问它是猫还是狗。
+对应类：<strong><code>ClassificationTransform</code></strong></p>
+<ul>
+<li><strong>场景</strong>：做有监督训练（Supervised Learning）。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><strong>如果是训练 (<code>train=True</code>)</strong>：<ol>
+<li><code>RandomResizedCrop</code>: 随机切一块下来并缩放（比如只看猫头）。</li>
+<li><code>RandomHorizontalFlip</code>: 随机左右翻转（猫头朝左朝右都是猫）。</li>
+<li><code>ColorJitter</code>: 随机改亮度、对比度、颜色。</li>
+<li><code>ImageNetPolicy</code>: 一套标准的增强策略。</li>
+<li><code>ToTensor</code> &amp; <code>Normalize</code>: 转成数字张量并标准化。</li>
+</ol>
+</li>
+<li><strong>如果是验证/测试 (<code>train=False</code>)</strong>：<ol>
+<li><code>Resize</code> &amp; <code>CenterCrop</code>: 规规矩矩地把图片缩放，切出正中心。不做乱七八糟的变形，保证测试公平。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 理解第二种训练模式 —— “修图任务” (Inpainting)</h3>
+<p>这是比较新的玩法（类似 MAE 或 BEiT 模型）：把图片挖掉几块，让模型去猜挖掉的是什么。
+对应类：<strong><code>InpaintingTransform</code></strong></p>
+<ul>
+<li><strong>场景</strong>：掩码图像建模（Masked Image Modeling）。</li>
+<li><strong>核心逻辑</strong>：<ol>
+<li><strong>变形</strong>：先把图片做基础处理（裁剪、翻转等）。</li>
+<li><strong>挖洞 (<code>gen_mask</code> 函数)</strong>：这是核心。<ul>
+<li>它生成一个全是 0 的矩阵。</li>
+<li><code>mask_type == 'random'</code>：像贪吃蛇一样随机游走，把路过的方块标记为 1（挖掉）。</li>
+<li><code>mask_type == 'row'</code>：按行把图片挖掉。</li>
+</ul>
+</li>
+<li><strong>返回</strong>：不仅返回处理后的<strong>图片</strong>，还返回一张<strong>Mask（掩码图）</strong>，告诉模型哪里被挖掉了。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 理解第三种训练模式 —— “找不同任务” (DINO)</h3>
+<p>这是最复杂的自监督学习（Self-Supervised Learning）。
+对应类：<strong><code>DinoTransform</code></strong></p>
+<ul>
+<li><strong>场景</strong>：DINO (Self-distillation with no labels)。</li>
+<li><strong>核心思想</strong>：把同一张图切成“大图”和“小图”。模型要学会：看局部（小图）能认出这是整体（大图）的一部分。</li>
+<li><strong>代码逻辑</strong>：<ol>
+<li><strong>Global Crops (大图)</strong>：切两张大图（覆盖原图大面积），加上模糊、日晒等强力特效。</li>
+<li><strong>Local Crops (小图)</strong>：切好几张（<code>local_crops_number</code>）很小的局部图。</li>
+<li><strong>返回</strong>：一个列表 <code>crops</code>，里面装着大概 8-10 张同一张图的不同切片（有大有小）。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 总指挥 —— 组装数据</h3>
+<p>最后看文件底部的函数：<strong><code>build_train_valid_datasets</code></strong>。
+它是对外的接口，负责把上面所有的东西串起来。</p>
+<ul>
+<li><strong>逻辑流程</strong>：<ol>
+<li><strong>读取配置 (<code>args</code>)</strong>：看用户想跑什么任务？<ul>
+<li>如果是 <code>classify</code> -&gt; 用 <code>ClassificationTransform</code>。</li>
+<li>如果是 <code>inpaint</code> -&gt; 用 <code>InpaintingTransform</code>。</li>
+<li>如果是 <code>dino</code> -&gt; 用 <code>DinoTransform</code>。</li>
+</ul>
+</li>
+<li><strong>加载数据 (<code>ImageFolder</code>)</strong>：<ul>
+<li>告诉它图片文件夹路径 <code>data_path</code>。</li>
+<li>把刚才选好的 <code>transform</code> 塞进去。</li>
+</ul>
+</li>
+<li><strong>返回</strong>：打包好的 <code>train_data</code> 和 <code>val_data</code> 给训练器使用。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<p>这个文件看似复杂，其实就是根据不同的 AI 学习方式，把图片“揉圆搓扁”：</p>
+<ol>
+<li><strong>分类任务</strong>：为了让模型在各种光照角度下都能认出物体。</li>
+<li><strong>Inpainting</strong>：为了把图片挖几个洞，训练模型“脑补”的能力。</li>
+<li><strong>DINO</strong>：为了把图片切碎，训练模型通过局部推断整体的能力。</li>
+</ol>
+<p>你看懂这个逻辑，代码里的细节（比如怎么做归一化、怎么转 fp16）就只是具体的实现手段了。</p>

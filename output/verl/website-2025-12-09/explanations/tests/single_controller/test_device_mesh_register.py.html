@@ -1,0 +1,98 @@
+<h1>tests/single_controller/test_device_mesh_register.py</h1>
+<p>这份代码其实是在测试一个<strong>分布式训练框架（Verl）的核心功能</strong>：如何在一个复杂的 GPU 集群拓扑（Device Mesh）中，自动地把数据分发（Dispatch）给正确的 GPU，并把结果收集（Collect）回来。</p>
+<p>简单来说，它的目的是验证：<strong>“当我有一批数据输入时，系统能不能根据我设定的并行策略（DP/TP/PP），自动把数据切片，发给该处理它的 GPU，最后还能把结果拼回来？”</strong></p>
+<p>为了让你听懂，我把这份代码的逻辑拆解成一个 <strong>“项目经理的任务清单 (Task List)”</strong>，我们一步步来看它是怎么实现的。</p>
+<hr />
+<h3>任务清单 (Task To-Do List)</h3>
+<h4>Task 1: 组建团队与分配工位 (初始化 Worker 和 Device Mesh)</h4>
+<p><strong>目标</strong>：模拟一个有 8 个 GPU 的集群，并给它们安排两种不同的“座位表”（并行策略）。
+*   <strong>代码对应</strong>：<code>TestActor</code> 类的 <code>__init__</code> 方法。
+*   <strong>解释</strong>：
+    *   我们启动了 8 个 Worker（代表 8 张显卡）。
+    *   <strong>座位表 A (推理模式 <code>infer</code>)</strong>：<code>mesh_shape=[2, 4]</code>。意思是把 8 张卡分成 2 组，每组 4 张。
+        *   <code>dp</code> (Data Parallel, 数据并行) = 2。意味着数据会被切成 2 份。
+        *   <code>tp</code> (Tensor Parallel, 张量并行) = 4。意味着模型被切成 4 份。
+    *   <strong>座位表 B (训练模式 <code>train</code>)</strong>：<code>mesh_shape=[2, 2, 2]</code>。意思是 3D 并行。
+        *   <code>pp</code> (Pipeline Parallel) = 2, <code>dp</code> = 2, <code>tp</code> = 2。</p>
+<h4>Task 2: 告诉经理谁负责接单 (注册 Dispatch 信息)</h4>
+<p><strong>目标</strong>：每个 Worker 需要告诉中央控制器（Controller），自己在“座位表”里的编号是多少，以及自己是否负责“收发快递”。
+*   <strong>代码对应</strong>：<code>_register_dispatch_collect_info</code>。
+*   <strong>解释</strong>：
+    *   这是最关键的一步。
+    *   <strong>对于推理 (<code>infer</code>)</strong>：Worker 报告自己的 <code>dp_rank</code>。控制器就知道，<code>dp_rank=0</code> 的 Worker 负责处理第一半数据，<code>dp_rank=1</code> 的负责第二半。
+    *   <strong>谁来交作业 (<code>is_collect</code>)</strong>：通常只有 Tensor Parallel 的第 0 号卡负责返回数据，其他的卡只是默默计算。</p>
+<h4>Task 3: 定义工作内容 (定义计算函数)</h4>
+<p><strong>目标</strong>：定义当数据传过来时，Worker 具体要做什么数学运算。
+*   <strong>代码对应</strong>：<code>generate_data_proto</code>, <code>train_data_proto</code> 等被 <code>@register</code> 装饰的函数。
+*   <strong>解释</strong>：
+    *   这些函数模拟了模型的前向传播。
+    *   代码里没有跑真的大模型，而是做了一个简单的加法数学题：<code>input + (rank信息)</code>。
+    *   <strong>为什么这么做？</strong> 为了验证数据真的到了具体的某张卡上。如果计算结果符合预期，说明数据走对了路。</p>
+<h4>Task 4: 实战演练 (主测试函数)</h4>
+<p><strong>目标</strong>：真正发一批数据，看系统会不会乱套。
+*   <strong>代码对应</strong>：<code>test_dist_global_info_wg</code> 函数。</p>
+<hr />
+<h3>逐步讲解：文中的观点与流程</h3>
+<p>现在我们按照 <code>test_dist_global_info_wg</code> 函数的执行流程，一步步看发生了什么：</p>
+<h4>第一步：启动集群</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 启动 8 个 Worker</span>
+<span class="n">resource_pool</span> <span class="o">=</span> <span class="n">RayResourcePool</span><span class="p">(</span><span class="n">process_on_nodes</span><span class="o">=</span><span class="p">[</span><span class="mi">8</span><span class="p">])</span>
+<span class="n">wg</span> <span class="o">=</span> <span class="n">RayWorkerGroup</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这就好比你雇佣了 8 个工人，他们每个人都按照 Task 1 初始化好了，每个人都知道自己在不同模式下的座位号（Rank）。</p>
+<h4>第二步：测试“推理模式”的数据分发</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 准备数据：只有两个数 [1, 2]</span>
+<span class="n">infer_input_data_proto</span> <span class="o">=</span> <span class="n">DataProto</span><span class="o">.</span><span class="n">from_single_dict</span><span class="p">(</span><span class="n">data</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;a&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">])})</span>
+<span class="c1"># 调用推理函数</span>
+<span class="n">infer_output_data_proto</span> <span class="o">=</span> <span class="n">wg</span><span class="o">.</span><span class="n">generate_data_proto</span><span class="p">(</span><span class="n">infer_input_data_proto</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>发生了什么？</strong>
+1.  <strong>分发 (Dispatch)</strong>：
+    *   系统看到 <code>infer</code> 模式下 <code>dp=2</code>（有 2 个数据并行组）。
+    *   输入数据有两个元素 <code>[1, 2]</code>。
+    *   系统自动把 <code>1</code> 发给 <code>dp_rank=0</code> 的那组 GPU。
+    *   系统自动把 <code>2</code> 发给 <code>dp_rank=1</code> 的那组 GPU。
+2.  <strong>计算 (Worker 内部)</strong>：
+    *   代码逻辑是：<code>data + (tp_rank + 1) * dp_rank</code>。
+    *   <strong>对于 <code>dp_rank=0</code> 的组</strong>：收到数据 <code>1</code>。计算 <code>1 + (... * 0)</code> = <strong>1</strong>。
+    *   <strong>对于 <code>dp_rank=1</code> 的组</strong>：收到数据 <code>2</code>。计算 <code>2 + (0 + 1) * 1</code> = <strong>3</strong> (假设 tp_rank=0 负责回报)。
+3.  <strong>收集 (Collect)</strong>：
+    *   系统把两组的结果拼起来：<code>[1, 3]</code>。
+4.  <strong>验证</strong>：
+    *   <code>assert ... torch.tensor([1, 3])</code>。测试通过！说明数据切分正确，发给了对的人。</p>
+<h4>第三步：测试“训练模式”的数据分发</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 准备数据：[3, 4]</span>
+<span class="n">train_input_data_proto</span> <span class="o">=</span> <span class="n">DataProto</span><span class="o">.</span><span class="n">from_single_dict</span><span class="p">(</span><span class="n">data</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;a&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">])})</span>
+<span class="c1"># 调用训练函数</span>
+<span class="n">train_output_data_proto</span> <span class="o">=</span> <span class="n">wg</span><span class="o">.</span><span class="n">train_data_proto</span><span class="p">(</span><span class="n">train_input_data_proto</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>发生了什么？</strong>
+1.  <strong>分发</strong>：同样是 <code>dp=2</code>，数据 <code>3</code> 发给 <code>dp=0</code> 组，数据 <code>4</code> 发给 <code>dp=1</code> 组。
+2.  <strong>计算</strong>：
+    *   这次公式复杂点：<code>data + (tp+1)*(dp+2)*(pp+3)</code>。
+    *   <strong>dp=0 组</strong> (拿到数据 3): <code>3 + (1)*(0+2)*(1+3)</code> = <code>3 + 8</code> = <strong>11</strong>。
+    *   <strong>dp=1 组</strong> (拿到数据 4): <code>4 + (1)*(1+2)*(1+3)</code> = <code>4 + 12</code> = <strong>16</strong>。
+    *   <em>(注：这里假设由 tp=0, pp=1 的卡负责输出)</em>
+3.  <strong>验证</strong>：
+    *   <code>assert ... torch.tensor([11, 16])</code>。测试通过！</p>
+<h4>第四步：测试复杂数据结构 (Nested Tensor)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 准备了一堆长短不一的数据 (Jagged Layout)</span>
+<span class="n">input_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nested</span><span class="o">.</span><span class="n">as_nested_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># ...</span>
+<span class="n">output</span> <span class="o">=</span> <span class="n">wg</span><span class="o">.</span><span class="n">generate_nested_tensor</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>观点</strong>：
+*   在真实的大模型训练中，每个样本的长度可能不一样（比如一句话 5 个字，另一句 100 个字）。
+*   这一步是为了验证：即使数据长短不一，系统也能正确地把它们切开，分给不同的 GPU 处理，最后再原封不动地拼回来，顺序不能乱。</p>
+<h3>总结：这个文件在讲什么？</h3>
+<p>这个文件在讲 <strong>“分布式系统中的红绿灯和调度员”</strong>。</p>
+<ol>
+<li><strong>观点 1</strong>：在分布式训练中，用户不应该手动去写 code 把数据切片发给 GPU 0 和 GPU 1。</li>
+<li><strong>观点 2</strong>：用户只需要定义好“Device Mesh”（我有多少卡，怎么分组），系统应该自动处理数据的 Dispatch（分发）和 Collect（收集）。</li>
+<li><strong>观点 3</strong>：无论数据是简单的 Tensor 还是复杂的 Nested Tensor，无论是在做推理（2D并行）还是训练（3D并行），这个调度机制都必须准确无误。</li>
+</ol>
+<p>如果你能理解<strong>“把一叠考卷（Batch Data）按学号（Rank）分给不同的组（DP Group）去写，最后收上来还是一叠完整的考卷”</strong>，你就看懂了这个代码的核心逻辑。</p>

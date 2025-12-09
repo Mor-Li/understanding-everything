@@ -1,0 +1,85 @@
+<h1>docs/advance/fully_async.md</h1>
+<p>这份文档确实比较硬核，涉及大规模模型训练的系统架构优化。简单来说，它介绍了一种<strong>让大模型训练速度提升 2 倍以上</strong>的技术方案，叫做“全异步策略训练器”（Fully Async Policy Trainer）。</p>
+<p>为了让你读懂，我们可以把这个系统想象成一家<strong>“高效率餐厅”</strong>。</p>
+<ul>
+<li><strong>旧模式（Colocate/Sync）</strong>：厨师（Trainer）和备菜员（Rollouter）是同一个人，或者共用一个灶台。切完菜才能炒菜，炒完菜才能切下一份。中间有很多时间灶台是空的，效率很低。</li>
+<li><strong>新模式（Fully Async）</strong>：厨师只管炒菜，备菜员只管切菜。两人在不同的房间（GPU资源隔离），中间有个传菜口（队列）。备菜员不停地切，厨师不停地炒，互不等待。</li>
+</ul>
+<p>下面我按照<strong>“理解与实施这个系统”</strong>的逻辑，为你列一个 <strong>Task To-Do List</strong>，一步步拆解文中的观点：</p>
+<hr />
+<h3>✅ Task 1: 搞清楚为什么要改？（背景与痛点）</h3>
+<ul>
+<li><strong>现状</strong>：目前的强化学习（如 PPO）训练是“同步”的。<ul>
+<li>先让模型生成一堆数据（Rollout，耗时且长短不一）。</li>
+<li>再用这些数据训练模型（Train，速度快）。</li>
+<li><strong>痛点</strong>：生成数据时，训练用的卡在闲置；训练时，生成的卡在闲置。而且，因为有的数据生成很长（长尾效应），整个系统都要等最慢的那条数据生成完，非常浪费时间。</li>
+</ul>
+</li>
+<li><strong>目标</strong>：把“生成”和“训练”彻底分开，让它们同时跑，谁也别等谁。</li>
+</ul>
+<h3>✅ Task 2: 重新分配资源（架构设计）</h3>
+<ul>
+<li><strong>核心动作</strong>：<strong>资源隔离（Resource Isolation）</strong>。<ul>
+<li>以前大家混着用 GPU。</li>
+<li>现在，你需要把 GPU 分成两队：<ul>
+<li><strong>A队（Rollouter）</strong>：专职负责生成数据（写作业）。</li>
+<li><strong>B队（Trainer）</strong>：专职负责更新模型参数（改作业）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>核心组件</strong>：<ul>
+<li><strong>MessageQueue（传菜口）</strong>：A队生成好的数据，丢进这个队列；B队从这里拿数据去训练。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 3: 理解“流式”工作流（Streaming）</h3>
+<ul>
+<li><strong>核心动作</strong>：<strong>并行生成与训练</strong>。<ul>
+<li>Rollouter 不停地生成，生成一条就往队列里塞一条（Sample by sample），而不是等攒够一大批才发货。</li>
+<li>Trainer 只要队列里有足够一个小批次（mini-batch）的数据，就开始训练。</li>
+</ul>
+</li>
+<li><strong>好处</strong>：流水线动起来了，消除了大部分等待时间。</li>
+</ul>
+<h3>✅ Task 4: 解决“数据过期”问题（异步核心难点）</h3>
+<p>这里有个逻辑漏洞：Trainer 更新模型很快，Rollouter 生成数据较慢。如果不加控制，Rollouter 用的模型参数可能已经是“前朝版本”了。</p>
+<ul>
+<li><strong>核心概念</strong>：<strong>Staleness（陈旧度/新鲜度）</strong>。<ul>
+<li>如果 Rollouter 还在用 V1 版本的参数生成数据，Trainer 已经进化到 V10 版本了，那这些 V1 的数据还能用吗？</li>
+<li><strong>文档观点</strong>：可以用，但要控制比例。</li>
+</ul>
+</li>
+<li><strong>配置项</strong>：<code>staleness_threshold</code>（陈旧度阈值）。<ul>
+<li>设为 0：必须同步，不能用旧的（这就退化成慢速模式了）。</li>
+<li>设为 &gt; 0：允许一定比例的“旧数据”混进来训练。这样 Rollouter 不用频繁停下来等最新参数同步，速度飞快。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 5: 优化“参数同步”的卡顿（Partial Rollout）</h3>
+<p>即使允许异步，Rollouter 终究还是要定期从 Trainer 那里同步最新的参数。</p>
+<ul>
+<li><strong>痛点</strong>：当需要同步参数时，Rollouter 手里可能正好有生成了一半的数据。以前的做法是：等这半截数据生成完，再同步。这又要等！</li>
+<li><strong>新招数</strong>：<strong>Partial Rollout（部分生成中断）</strong>。<ul>
+<li><strong>动作</strong>：要同步参数了？Rollouter 立刻暂停手里的活，保存当前状态（Snapshot），立刻同步新参数，然后<strong>恢复</strong>刚才的状态继续生成。</li>
+<li><strong>效果</strong>：几乎没有等待时间，进一步榨干 GPU 性能。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 6: 验收成果（实验数据）</h3>
+<ul>
+<li><strong>配置建议</strong>：<ul>
+<li>对于大模型（7B/30B），推荐开启 <code>async stream pipeline with partial rollout</code> 模式。</li>
+<li>参数 <code>staleness_threshold</code> 设为 0.5 左右（允许一半是旧数据）。</li>
+</ul>
+</li>
+<li><strong>最终效果</strong>：<ul>
+<li>在 128 张 GPU 卡上训练 Qwen2.5-7B。</li>
+<li>速度提升了 <strong>2.35倍 到 2.67倍</strong>。</li>
+<li>模型效果（准确率）基本没掉，甚至因为训练得快，同样时间能跑更多步数，效果更好。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：一句话说明白</h3>
+<p>这个文档讲的是：<strong>通过把“做题（生成）”和“改题（训练）”拆分到不同的 GPU 上，利用队列传输，允许使用稍微过期的题目，并支持做题做到一半暂停去更新课本，从而让大模型强化学习的训练速度翻倍。</strong></p>

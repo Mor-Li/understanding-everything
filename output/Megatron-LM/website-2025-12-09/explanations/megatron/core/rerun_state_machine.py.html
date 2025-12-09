@@ -1,0 +1,118 @@
+<h1>megatron/core/rerun_state_machine.py</h1>
+<p>这份代码 <code>megatron/core/rerun_state_machine.py</code> 是 Megatron-LM（一个用于训练超大模型的框架）中的一个<strong>实验性功能</strong>。</p>
+<p>简单来说，它的作用是一个<strong>“自动化的故障侦探”</strong>。</p>
+<p>在大模型训练中，有时候 Loss 会突然变成 NaN（非数值）或者突然飙升。这通常有两个原因：
+1.  <strong>软原因</strong>：数据有问题、超参数没设好、或者代码逻辑有 Bug。
+2.  <strong>硬原因</strong>：GPU 硬件出故障了（比如宇宙射线翻转了比特位，或者显存坏了）。</p>
+<p>这个文件的目的就是通过<strong>“重跑（Rerun）”</strong>这一步，来自动分辨到底是“软原因”还是“硬原因”。</p>
+<p>为了让你看懂，我把这个代码的逻辑拆解成一个<strong>“执行清单 (Task Todo List)”</strong>。想象你就是这个程序，这是你在训练每一步时要执行的任务列表：</p>
+<hr />
+<h3>第一阶段：准备工作 (Setup)</h3>
+<p>在训练开始前，你需要做以下准备：</p>
+<ul>
+<li>[ ] <strong>Task 1: 包装数据迭代器 (<code>RerunDataIterator</code>)</strong><ul>
+<li><strong>目的</strong>：为了能够“重跑”某一步，我必须能把刚刚喂给 GPU 的数据再喂一遍。</li>
+<li><strong>动作</strong>：给普通的数据加载器套一层壳。如果需要重跑，我就把数据“倒带 (Rewind)”回这一步的开头。</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 2: 初始化状态机 (<code>RerunStateMachine</code>)</strong><ul>
+<li><strong>目的</strong>：准备好记录当前处于什么状态（是第一次跑？还是正在重跑？）。</li>
+<li><strong>初始状态</strong>：<code>NOT_RUNNING_YET</code> (还没开始)。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第二阶段：训练循环中的每一步 (Forward/Backward Loop)</h3>
+<p>这是代码中最核心的 <code>should_run_forward_backward</code> 和 <code>validate_result</code> 方法的逻辑。</p>
+<h4>1. 第一次尝试 (Initial Run)</h4>
+<ul>
+<li>[ ] <strong>Task 3: 保存现场 (<code>_save_state</code>)</strong><ul>
+<li><strong>动作</strong>：在跑模型之前，先记下当前的随机种子 (RNG State)。</li>
+<li><strong>原因</strong>：如果要重跑，必须保证随机数生成也是一模一样的，这样才有可比性。</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 4: 正常前向/后向传播</strong><ul>
+<li><strong>状态</strong>：<code>INITIAL_RUN</code></li>
+<li><strong>动作</strong>：算 Loss，算梯度。</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 5: 检查结果 (<code>validate_result</code>)</strong><ul>
+<li><strong>动作</strong>：拿着算出来的 Loss 问：“这数对劲吗？” (比如是不是 NaN)。</li>
+<li><strong>分支 A</strong>：结果正常 -&gt; 本步结束，进入下一轮迭代。</li>
+<li><strong>分支 B</strong>：结果异常（比如 Loss 是 NaN） -&gt; <strong>触发警报！请求重跑 (<code>rerun_requested = True</code>)</strong>。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 第一次重跑：原地复现 (First Rerun - In Place)</h4>
+<p>如果 Task 5 发现了异常，程序不会继续下一轮，而是进入这个分支：</p>
+<ul>
+<li>[ ] <strong>Task 6: 恢复现场 (<code>_restore_state</code>)</strong><ul>
+<li><strong>动作</strong>：把随机种子恢复成 Task 3 记录的样子，把数据倒带。</li>
+<li><strong>状态</strong>：<code>RERUNNING_IN_PLACE</code></li>
+</ul>
+</li>
+<li>[ ] <strong>Task 7: 在同一张显卡上再跑一次</strong><ul>
+<li><strong>动作</strong>：重新计算一遍 Loss。</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 8: 对比两次结果</strong><ul>
+<li><strong>情况 A (结果变了)</strong>：第一次是 NaN，第二次正常了。<ul>
+<li><strong>结论</strong>：<strong>瞬态错误 (Transient Error)</strong>。可能是刚才运气不好，硬件发生了随机波动（如比特翻转）。</li>
+<li><strong>后续</strong>：记录日志，忽略第一次的错误，继续训练。</li>
+</ul>
+</li>
+<li><strong>情况 B (结果没变)</strong>：两次算出来都是 NaN。<ul>
+<li><strong>结论</strong>：这个错误是“可复现”的。说明要么是这张卡彻底坏了（硬故障），要么是输入数据/代码本身就会导致 NaN（软故障）。</li>
+<li><strong>后续</strong>：我们需要换张卡试试。<strong>请求保存断点 (<code>checkpoint_requested = True</code>)</strong>。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>3. 第二次重跑：换卡复现 (Second Rerun - From Checkpoint)</h4>
+<p>如果 Task 8 发现错误在同一张卡上能复现，我们需要排除是不是这张卡特有的问题。</p>
+<ul>
+<li>[ ] <strong>Task 9: 保存断点并退出 (<code>should_checkpoint_and_exit</code>)</strong><ul>
+<li><strong>动作</strong>：保存当前的训练状态到硬盘，然后<strong>故意让程序崩溃退出</strong>（返回退出码 16）。</li>
+<li><strong>目的</strong>：让调度系统（如 Slurm/K8s）重启任务。重启时，任务很可能会被分配到集群里的<strong>另一组 GPU</strong> 上。</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 10: 重启后恢复状态</strong><ul>
+<li><strong>状态</strong>：<code>RERUNNING_FROM_CHECKPOINT</code></li>
+<li><strong>检查</strong>：检查一下当前所在的机器节点 (<code>os.uname</code>) 和 GPU 编号。如果还是原来那张坏卡，那就再报错重启一次，直到换了卡为止。</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 11: 在新显卡上再跑一次</strong><ul>
+<li><strong>动作</strong>：恢复随机种子和数据，计算 Loss。</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 12: 最终判决</strong><ul>
+<li><strong>情况 A (结果变了)</strong>：在新卡上跑是正常的，在老卡上是 NaN。<ul>
+<li><strong>结论</strong>：<strong>持久性硬件错误 (Persistent Error)</strong>。实锤了，老的那张显卡坏了，建议报修。</li>
+</ul>
+</li>
+<li><strong>情况 B (结果没变)</strong>：换了卡算出来还是 NaN。<ul>
+<li><strong>结论</strong>：<strong>正确的结果 (Correct Result)</strong>。意思是“程序没算错，你的模型/数据本来就会算出一个 NaN”。</li>
+<li><strong>后续</strong>：这就是算法工程师的问题了（比如学习率太大了，数据脏了），不是硬件的锅。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件在干嘛？</h3>
+<p>它其实就是实现了一个<strong>“故障排除流程图”</strong>的代码化：</p>
+<ol>
+<li><strong>出错了？</strong> -&gt; 原地重试。</li>
+<li><strong>原地重试好了？</strong> -&gt; 偶发硬件故障（不管它，继续）。</li>
+<li><strong>原地重试还是错？</strong> -&gt; 存盘，重启，换台机器重试。</li>
+<li><strong>换机器好了？</strong> -&gt; 原来那台机器硬件坏了（运维去修）。</li>
+<li><strong>换机器还是错？</strong> -&gt; 你的代码/数据有问题（算法去修）。</li>
+</ol>
+<h3>关键代码对应</h3>
+<ul>
+<li><code>RerunState</code> (枚举类): 定义了上面提到的状态（<code>INITIAL_RUN</code>, <code>RERUNNING_IN_PLACE</code> 等）。</li>
+<li><code>validate_result</code>: 负责比较数值，决定要不要触发重跑。</li>
+<li><code>should_run_forward_backward</code>: 控制 <code>while</code> 循环，决定是继续训练还是停下来重跑。</li>
+<li><code>EXIT_CODE_RESUME_TO_DISAMBIGUATE</code> (退出码 16): 告诉外部调度系统“我需要换个节点重启来排查问题”。</li>
+</ul>

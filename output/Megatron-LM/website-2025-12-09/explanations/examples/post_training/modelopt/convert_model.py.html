@@ -1,0 +1,54 @@
+<h1>examples/post_training/modelopt/convert_model.py</h1>
+<p>这个脚本 <code>convert_model.py</code> 的核心作用是<strong>“模型格式转换与改造”</strong>。</p>
+<p>简单来说，它的任务是将一个基础的大语言模型（比如从 HuggingFace 下载的，或者已经训练好的 Megatron 模型），<strong>转换</strong>成 NVIDIA Megatron-Core (MCore) 格式，并且可以选择性地<strong>植入</strong>“投机采样（Speculative Decoding）”的模块（如 Eagle 或 Medusa 算法），最后保存为一个新的、可以直接用于推理加速的 Checkpoint。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>Task TODO List</strong>，模拟程序执行的每一步逻辑：</p>
+<hr />
+<h3>📝 任务清单：模型转换五步走</h3>
+<h4>✅ Task 1: 准备工作台 (定义参数与环境)</h4>
+<p><strong>目标</strong>：告诉程序我们要处理哪个模型，用什么算法，存到哪里。
+*   <strong>代码对应</strong>：<code>add_convert_args</code> 函数和 <code>initialize_megatron</code>。
+*   <strong>具体动作</strong>：
+    *   接收用户输入的参数，比如：
+        *   <code>--pretrained-model-path</code>: 原始 HuggingFace 模型在哪里？
+        *   <code>--algorithm</code>: 要不要加加速算法？(选 <code>eagle1</code>, <code>eagle3</code>, <code>medusa</code> 还是 <code>None</code>)
+        *   <code>--extra-model-path</code>: 如果用 Eagle 算法，额外的小模型权重在哪里？
+    *   初始化分布式环境（虽然是转换，但 Megatron 依赖分布式环境）。</p>
+<h4>✅ Task 2: 搭建模型“空壳” (初始化模型结构)</h4>
+<p><strong>目标</strong>：在内存中创建一个没有权重的模型骨架，准备接收数据。
+*   <strong>代码对应</strong>：<code>get_model</code> 函数。
+*   <strong>具体动作</strong>：
+    *   根据配置构建 GPT 或 Mamba 模型的网络结构。
+    *   <strong>省显存技巧</strong>：代码中提到了 <code>init_model_with_meta_device</code>。这意味着先在“Meta设备”（虚拟设备）上创建模型，不占用真实显存，防止模型太大直接 OOM（内存溢出）。</p>
+<h4>✅ Task 3: 注入“灵魂” (加载基础权重)</h4>
+<p><strong>目标</strong>：把实际的参数填入刚才搭建的空壳里。
+*   <strong>代码对应</strong>：<code>if args.pretrained_model_path is not None:</code> ... <code>elif args.load is not None:</code>
+*   <strong>具体动作</strong>：这里有两条路：
+    1.  <strong>路径 A (从 HF 导入)</strong>：如果你给的是 HuggingFace 格式的模型，调用 <code>import_mcore_gpt_from_hf</code> 把 HF 权重转成 Megatron 格式填进去。
+    2.  <strong>路径 B (加载 Megatron)</strong>：如果你给的是已经是 Megatron 格式的 Checkpoint，直接加载。</p>
+<h4>✅ Task 4: 进行“手术”改造 (应用投机采样算法)</h4>
+<p><strong>目标</strong>：如果用户选择了加速算法（Eagle 或 Medusa），修改模型结构并加载额外的“草稿模型”权重。这是这个脚本最独特的地方。
+*   <strong>代码对应</strong>：<code>if args.algorithm in ("eagle1", "eagle3"):</code> 或 <code>elif args.algorithm == "medusa":</code>
+*   <strong>具体动作</strong>：
+    *   <strong>如果是 Eagle 算法</strong>：
+        1.  读取 Eagle 的配置（<code>ALGO_TO_CONFIG</code>）。
+        2.  根据基础模型更新配置（比如 Hidden Size 和 Vocab Size 必须匹配）。
+        3.  调用 <code>mtsp.convert</code> 修改模型结构（ModelOpt 库的功能）。
+        4.  <strong>加载外挂</strong>：如果有 <code>extra-model-path</code>，加载 Eagle 专用的额外层（Eagle Head）的权重。
+    *   <strong>如果是 Medusa 算法</strong>：
+        1.  设置 Medusa 头部的数量。
+        2.  调用 <code>mtsp.convert</code> 修改模型结构，增加 Medusa 头。</p>
+<h4>✅ Task 5: 打包封箱 (保存新模型)</h4>
+<p><strong>目标</strong>：把转换好、改造好的模型保存到硬盘，供后续推理使用。
+*   <strong>代码对应</strong>：最后的 <code>save_checkpoint</code>。
+*   <strong>具体动作</strong>：
+    *   打印一下最终的模型结构给用户看 (<code>print_rank_0</code>).
+    *   调用 Megatron 的保存功能，生成标准的 Checkpoint 文件。
+    *   清理现场 (<code>destroy_model_parallel</code>)。</p>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>加工厂</strong>：
+1.  <strong>进货</strong>：拿来原始模型（HF 或 Megatron）。
+2.  <strong>加工</strong>：
+    *   转格式。
+    *   （可选）加装 Eagle/Medusa 加速套件。
+3.  <strong>出货</strong>：保存为 ModelOpt 优化后的 Megatron Checkpoint，以后跑推理（Generation）的时候直接加载这个新文件，速度会更快。</p>

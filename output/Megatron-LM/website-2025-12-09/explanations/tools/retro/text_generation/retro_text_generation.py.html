@@ -1,0 +1,65 @@
+<h1>tools/retro/text_generation/retro_text_generation.py</h1>
+<p>这份代码是 <strong>Megatron-LM</strong> 框架下，专门用于 <strong>RETRO (Retrieval-Enhanced Transformer)</strong> 模型进行 <strong>文本生成（推理/Inference）</strong> 的脚本。</p>
+<p>简单来说，它的作用是：<strong>读取一个包含问题的文件 -&gt; 利用检索到的外部知识（Neighbours） -&gt; 让模型生成答案 -&gt; 保存到文件。</strong></p>
+<p>为了让你更容易理解，我把整个脚本的逻辑拆解成一个 <strong>“待办事项清单 (To-Do List)”</strong>，按照程序运行的先后顺序一步步讲解：</p>
+<hr />
+<h3>✅ Task 1: 准备工作 (Initialization)</h3>
+<p><strong>代码位置：</strong> <code>main()</code> 函数开头, <code>add_text_generate_args()</code>
+*   <strong>做什么：</strong> 程序刚启动，需要先“对齐所有人的手表”并“阅读说明书”。
+*   <strong>细节：</strong>
+    *   调用 <code>initialize_megatron</code> 初始化分布式环境（因为大模型通常跑在多张显卡上）。
+    *   调用 <code>add_text_generate_args</code> 解析命令行参数。比如：你要生成多长的文本？温度（Temperature）是多少？输入文件在哪里？是否使用检索到的邻居（Neighbours）？</p>
+<h3>✅ Task 2: 搭建模型 (Build Model)</h3>
+<p><strong>代码位置：</strong> <code>main()</code> -&gt; <code>get_model(model_provider)</code> -&gt; <code>model_provider()</code>
+*   <strong>做什么：</strong> 根据配置图纸，把 GPT 模型搭建起来。
+*   <strong>细节：</strong>
+    *   <code>model_provider</code> 函数负责创建一个 <code>GPTModel</code>。
+    *   注意这里有一个断言 <code>assert args.use_legacy_models</code>，说明目前这个脚本只支持旧版（Legacy）的模型架构。
+    *   如果是推理模式，还会加载之前训练好的权重 (<code>load_checkpoint</code>)。</p>
+<h3>✅ Task 3: 读取输入数据 (Load Data)</h3>
+<p><strong>代码位置：</strong> <code>generate_samples_conditional()</code> 开头部分
+*   <strong>做什么：</strong> 只有主进程（Rank 0，通常是第0号显卡）负责读取用户的问题文件。
+*   <strong>细节：</strong>
+    *   调用 <code>preprocess(args.sample_input_file)</code> 读取文件。
+    *   如果是 RETRO 模型，输入数据不仅仅是问题（Query），还包含了检索到的外部文本块（Neighbours/Retrieval chunks）。</p>
+<h3>✅ Task 4: 循环处理每一批数据 (Batch Loop)</h3>
+<p><strong>代码位置：</strong> <code>generate_samples_conditional()</code> 中的 <code>while True</code> 循环
+*   <strong>做什么：</strong> 因为数据可能很多，不能一次算完，需要一批一批地处理。
+*   <strong>细节：</strong>
+    *   主进程（Rank 0）从数据列表中取出一批数据（Batch）。
+    *   其他进程（显卡）会在这里等待主进程分发任务或同步状态。</p>
+<h3>✅ Task 5: 核心加工——处理检索邻居 (Process Neighbours)</h3>
+<p><strong>代码位置：</strong> <code>pad_neighbours_for_query_only()</code>
+*   <strong>做什么：</strong> 这是 <strong>RETRO 模型最独特</strong> 的一步。它把检索到的外部知识整理好，喂给模型。
+*   <strong>细节：</strong>
+    *   模型需要固定长度的输入。这个函数会检查检索到的文本（Neighbours）。
+    *   如果文本太长，就切断；如果太短，就补齐（Padding）。
+    *   最终生成一个 <code>neighbours_array</code>，形状规整，准备喂给神经网络。</p>
+<h3>✅ Task 6: 拼装提示词 (Format Prompt)</h3>
+<p><strong>代码位置：</strong> <code>reformat_prompt()</code> 或 <code>reformat_prompt_short()</code>
+*   <strong>做什么：</strong> 把“用户的问题”和“检索到的知识”按照特定的模板拼在一起。
+*   <strong>细节：</strong>
+    *   类似于做 Prompt Engineering。比如把输入变成：“参考知识：[xxxx]... 问题：[yyyy]... 回答：”。
+    *   这一步把原始文本变成了模型能看懂的 Token ID 列表。</p>
+<h3>✅ Task 7: 模型生成 (Generation)</h3>
+<p><strong>代码位置：</strong> <code>retro_generate_and_post_process()</code>
+*   <strong>做什么：</strong> 把准备好的 Prompt 和 Neighbours 塞进模型，让模型吐出结果。
+*   <strong>细节：</strong>
+    *   这是一个核心调用（在 <code>retro_api.py</code> 里）。
+    *   它会控制模型根据概率（Top-k, Top-p, Temperature）一个字一个字地往后生成文本。
+    *   <strong>关键点</strong>：它会同时利用当前的上下文 <strong>和</strong> 之前处理好的检索邻居信息来生成更高质量的回答。</p>
+<h3>✅ Task 8: 清洗与保存结果 (Post-process &amp; Save)</h3>
+<p><strong>代码位置：</strong> <code>generate_and_write_samples_conditional()</code> 和 循环底部的 <code>yield</code>
+*   <strong>做什么：</strong> 把模型生成的乱七八糟的符号清理干净，存入硬盘。
+*   <strong>细节：</strong>
+    *   去除结束符（如 <code>&lt;|endoftext|&gt;</code>）。
+    *   去除多余的换行符。
+    *   主进程（Rank 0）打开输出文件（<code>.out</code>），把清洗后的文本写入一行。</p>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>流水线工人</strong>：
+1.  <strong>接单</strong>（读取输入文件）。
+2.  <strong>备料</strong>（整理检索到的外部知识）。
+3.  <strong>组装</strong>（把问题和知识拼成 Prompt）。
+4.  <strong>加工</strong>（扔进 RETRO GPT 模型计算）。
+5.  <strong>发货</strong>（写入输出文件）。</p>

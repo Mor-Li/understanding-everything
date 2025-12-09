@@ -1,0 +1,127 @@
+<h1>examples/data_preprocess/hellaswag.py</h1>
+<p>没问题。这份代码其实就是一个<strong>“数据加工厂”</strong>。它的核心任务是把原始的 HellaSwag 数据集（一个常识推理问答数据集），转换成 <code>verl</code> 这个训练框架（Bytedance 开发的）能读懂的标准格式。</p>
+<p>你可以把这个脚本看作是在执行一个 <strong>“清洗 -&gt; 格式化 -&gt; 打包”</strong> 的流程。</p>
+<p>为了让你更容易理解，我把这个脚本的工作拆解成 <strong>6 个具体的 Task（任务）</strong>，我们一步步来看：</p>
+<hr />
+<h3>📋 任务清单 (Task List)</h3>
+<ol>
+<li><strong>准备工具与配置 (Setup)</strong>：确定输入文件在哪里，输出文件存哪里。</li>
+<li><strong>进货 (Load Data)</strong>：从网上下或者本地加载原始的 HellaSwag 数据。</li>
+<li><strong>制定清洗规则 (Define Cleaning)</strong>：定义如何把脏文本变干净。</li>
+<li><strong>制定组装规则 (Define Formatting)</strong>：这是最核心的一步，把原始数据拼装成模型训练需要的“提示词(Prompt)”和“答案(Label)”格式。</li>
+<li><strong>批量生产 (Execute)</strong>：过滤掉坏数据，并对所有数据执行组装规则。</li>
+<li><strong>打包发货 (Save)</strong>：把处理好的数据保存为 <code>.parquet</code> 文件，方便后续读取。</li>
+</ol>
+<hr />
+<h3>逐步详解</h3>
+<h4>Task 1: 准备工具与配置 (Setup)</h4>
+<p><strong>代码位置：</strong> <code>if __name__ == "__main__":</code> 下面的 <code>argparse</code> 部分。</p>
+<ul>
+<li><strong>观点</strong>：程序不能瞎跑，得先告诉它路径。</li>
+<li><strong>解释</strong>：<ul>
+<li><code>local_dataset_path</code>: 如果你已经下载了数据，告诉它在哪。</li>
+<li><code>local_save_dir</code>: 处理完的数据要存到哪里（默认是 <code>~/data/hellaswag</code>）。</li>
+<li><code>hdfs_dir</code>: 这是字节跳动/企业级环境常用的，如果需要上传到云端存储（HDFS），就填这个。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 进货 (Load Data)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">local_dataset_path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">dataset</span> <span class="o">=</span> <span class="n">datasets</span><span class="o">.</span><span class="n">load_dataset</span><span class="p">(</span><span class="n">local_dataset_path</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">dataset</span> <span class="o">=</span> <span class="n">datasets</span><span class="o">.</span><span class="n">load_dataset</span><span class="p">(</span><span class="n">data_source</span><span class="p">,</span> <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：不管是本地还是云端，先把原材料拿进来。</li>
+<li><strong>解释</strong>：使用 Hugging Face 的 <code>datasets</code> 库加载 HellaSwag 数据集。HellaSwag 是一个“补全句子”的任务，给你半句话，让你从4个选项里选出最符合常识的结尾。</li>
+</ul>
+<h4>Task 3: 制定清洗规则 (Define Cleaning)</h4>
+<p><strong>代码位置：</strong> <code>def preprocess(text):</code> 函数。
+*   <strong>观点</strong>：原始数据里有很多为了人类阅读方便但对机器没用的符号，要去掉。
+*   <strong>解释</strong>：
+    *   <code>text.replace(" [title]", ". ")</code>：把特定的标签换成句号。
+    *   <code>re.sub("\\[.*?\\]", "", text)</code>：用正则去掉所有中括号里的内容（比如 <code>[header]</code> 之类的噪声）。
+    *   这个函数就像是一个“过滤器”，任何文本进来都要先过这一关。</p>
+<h4>Task 4: 制定组装规则 (Define Formatting) 【核心❗️】</h4>
+<p><strong>代码位置：</strong> <code>def make_map_fn(split):</code> 及其内部的 <code>process_fn</code>。</p>
+<ul>
+<li><strong>观点</strong>：这是脚本的灵魂。原始数据是散乱的（上下文A、上下文B、选项列表），我们需要把它组装成 <strong>User（用户提问）</strong> 和 <strong>Reward（奖励信号）</strong> 的结构。</li>
+<li><strong>逻辑拆解</strong>：<ol>
+<li><strong>拼凑问题 (<code>query</code>)</strong>：<ul>
+<li>它把 <code>activity_label</code>（活动标签）、<code>ctx_a</code>（上文A）、<code>ctx_b</code>（上文B）拼在一起，变成一整段话。</li>
+<li>例如：“做饭：先把水烧开，然后放入面条。”</li>
+</ul>
+</li>
+<li><strong>处理选项 (<code>choices</code>)</strong>：<ul>
+<li>把 4 个备选的结尾都清洗一遍。</li>
+</ul>
+</li>
+<li><strong>构建数据字典 (<code>data</code>)</strong>：<ul>
+<li><code>"prompt"</code>: 模拟用户对模型说的话。格式是 <code>[{"role": "user", "content": query}]</code>。</li>
+<li><code>"reward_model"</code>: <strong>这是给强化学习(RL)或者评估用的</strong>。<ul>
+<li><code>"style": "model"</code></li>
+<li><code>"eval": "multiple_choice"</code>: 告诉框架这是一个做选择题的任务。</li>
+<li><code>"ground_truth": gold</code>: 告诉框架哪个选项是正确答案（0, 1, 2 或 3）。</li>
+<li><code>"choices"</code>: 所有的选项内容。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 5: 批量生产 (Execute)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">train_dataset</span> <span class="o">=</span> <span class="n">train_dataset</span><span class="o">.</span><span class="n">filter</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">train_dataset</span> <span class="o">=</span> <span class="n">train_dataset</span><span class="o">.</span><span class="n">map</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：规则定好了，现在开始流水线作业。</li>
+<li><strong>解释</strong>：<ol>
+<li><strong>Filter (过滤)</strong>：<code>lambda x: len(x["label"]) &gt; 0</code>。如果有数据的标签是空的（坏数据），直接丢掉，防止报错。</li>
+<li><strong>Map (映射)</strong>：把上面定义的 <code>process_fn</code> 应用到每一条数据上。这一步之后，数据就从“原始形态”变成了“Verl框架需要的形态”。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 6: 打包发货 (Save)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">train_dataset</span><span class="o">.</span><span class="n">to_parquet</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># ...</span>
+<span class="k">if</span> <span class="n">hdfs_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span> <span class="n">copy</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：处理完了，保存成高效的格式，方便以后快速读取。</li>
+<li><strong>解释</strong>：<ul>
+<li><code>to_parquet</code>: 保存为 Parquet 格式。这种格式读写速度极快，适合大数据。</li>
+<li><code>copy(..., dst=hdfs_dir)</code>: 如果配置了云端路径，就顺便把处理好的文件上传到云端。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<p>简单来说，HellaSwag 原始数据长这样（简化版）：</p>
+<blockquote>
+<ul>
+<li>Context: "男人在跑步"</li>
+<li>Ending 1: "他飞上了天"</li>
+<li>Ending 2: "他停下来喝水" (正确)</li>
+<li>Label: 2</li>
+</ul>
+</blockquote>
+<p>这段代码把它转换成了 <code>Verl</code> 训练需要的样子：</p>
+<blockquote>
+<ul>
+<li><strong>Prompt</strong>: "用户: 男人在跑步，请补全句子。"</li>
+<li><strong>Reward Info</strong>:<ul>
+<li>这是个选择题。</li>
+<li>选项是 ["他飞上了天", "他停下来喝水"...]</li>
+<li>正确答案是第 2 个。</li>
+</ul>
+</li>
+</ul>
+</blockquote>
+<p><strong>一句话概括：</strong> 这是一个<strong>数据适配器</strong>，把公开的 HellaSwag 数据集清洗并重新包装，以便用于训练或评估字节跳动的 AI 模型。</p>

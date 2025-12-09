@@ -1,0 +1,109 @@
+<h1>examples/inference/gpt/gpt_dynamic_inference_with_coordinator.py</h1>
+<p>这份代码确实比较复杂，因为它不仅仅是跑一个模型，而是模拟了一个<strong>“客户端-服务器”（Client-Server）</strong>架构的推理系统。</p>
+<p>简单来说，这个脚本在做两件事：
+1.  <strong>作为服务器（Worker）：</strong> 启动 GPU 引擎，等待接收推理请求。
+2.  <strong>作为客户端（Client）：</strong> 模拟用户发送一堆 Prompt（提示词），并接收生成结果。</p>
+<p>我把它拆解成一个 <strong>Task Todo List</strong>，按照代码执行的时间顺序，一步步带你过一遍：</p>
+<hr />
+<h3>🚀 阶段一：厨房准备 (初始化与环境搭建)</h3>
+<p><strong>代码位置：</strong> <code>if __name__ == "__main__":</code> 块内</p>
+<ul>
+<li><strong>Task 1: 初始化 Megatron 环境</strong><ul>
+<li><code>initialize_megatron(...)</code>: 就像开机自检。设置分布式环境（因为大模型通常需要多张显卡一起跑），初始化并行状态。</li>
+</ul>
+</li>
+<li><strong>Task 2: 准备“菜单” (Prompt)</strong><ul>
+<li><code>args = get_args()</code>: 获取命令行参数。</li>
+<li><code>tokenizer = get_tokenizer()</code>: 加载分词器。</li>
+<li><code>build_requests(...)</code>: 如果是主进程（Rank 0），读取你准备好的输入文本（Prompt），把它们打包成请求列表。</li>
+</ul>
+</li>
+<li><strong>Task 3: 聘请“大厨” (加载模型)</strong><ul>
+<li><code>model = get_model()</code>: 把 GPT 模型加载到显存里。</li>
+<li><code>DynamicInferenceEngine(...)</code>: 创建推理引擎。这是核心组件，它负责管理显存、调度任务、执行生成。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📡 阶段二：餐厅开业 (启动协调器)</h3>
+<p><strong>代码位置：</strong> 进入 <code>asyncio.run(main(...))</code> -&gt; <code>main</code> 函数开头</p>
+<ul>
+<li><strong>Task 4: 启动接单系统 (Coordinator)</strong><ul>
+<li><code>await engine.start_listening_to_data_parallel_coordinator(...)</code>:<ul>
+<li>这是关键一步。所有的 GPU Worker（除了充当 Client 的那个）会在这里挂起，进入“监听模式”。</li>
+<li>它们打开一个网络端口（Port），等待有人把数据发过来。</li>
+<li><strong>理解点：</strong> 此时，后台的 GPU 已经准备好干活了，就像厨师站在灶台前等单子。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🙋 阶段三：模拟顾客点单 (客户端逻辑)</h3>
+<p><strong>代码位置：</strong> <code>main</code> 函数中的 <code>if dist.get_rank() == 0:</code> 块内
+<em>(注意：只有 Rank 0 进程会执行这部分，其他进程都在后台乖乖等任务)</em></p>
+<ul>
+<li><strong>Task 5: 顾客进店 (启动 Client)</strong><ul>
+<li><code>client = InferenceClient(port)</code>: 创建一个客户端对象，连接到上面 Task 4 开启的端口。</li>
+<li><code>await client.start()</code>: 建立连接通道。</li>
+</ul>
+</li>
+<li><strong>Task 6: 陆续下单 (发送请求)</strong><ul>
+<li>代码进入一个 <code>while True</code> 循环，模拟真实世界中请求随时间陆续到达的情况。</li>
+<li><code>client.add_request(...)</code>: 把 Prompt 发送给 Coordinator。</li>
+<li><strong>关键点</strong>：这是一个异步操作。客户端把单子扔进去就不管了，拿到一个 <code>future</code>（类似一张取餐小票），稍后再来取结果。</li>
+</ul>
+</li>
+<li><strong>Task 7: (可选) 压力测试 (Suspend/Resume)</strong><ul>
+<li>代码里有 <code>client.suspend_engines()</code> 和 <code>client.resume_engines()</code>。</li>
+<li>这是为了测试系统稳不稳定：模拟突然让厨师停手（Suspend），过一会又让他继续（Resume），看看会不会出错。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🍳 阶段四：后台烹饪 (引擎处理)</h3>
+<p><strong>代码位置：</strong> 这是一个隐形的并行过程</p>
+<ul>
+<li><strong>Task 8: 动态批处理 (Dynamic Batching)</strong><ul>
+<li>虽然代码里没直接写（封装在 <code>engine</code> 里了），但当 Client 发送请求后，Coordinator 会把这些请求收集起来。</li>
+<li>它会把多个请求拼成一个 Batch（批次），利用 GPU 并行计算生成 Token。</li>
+<li>如果有的请求生成完了，它会踢出去；如果有新的请求来了，它会插进来（这就是所谓的 Dynamic Inference）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📦 阶段五：上菜与结账 (获取结果与输出)</h3>
+<p><strong>代码位置：</strong> <code>main</code> 函数的后半部分</p>
+<ul>
+<li><strong>Task 9: 等待出餐 (Gather Results)</strong><ul>
+<li><code>results = await asyncio.gather(*futures)</code>:<ul>
+<li>Client 手里攥着一堆“取餐小票”（futures）。</li>
+<li>这里会一直等待，直到所有的请求都生成完毕，拿回结果。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>Task 10: 打印或保存账单 (输出结果)</strong><ul>
+<li>如果设置了 <code>output_path</code>，就把生成的文本、延迟（Latency）、吞吐量（Throughput）写到 JSON 文件里。</li>
+<li>如果没有设置路径，就直接在终端 Print 出来生成的文本。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🛑 阶段六：打烊 (清理)</h3>
+<p><strong>代码位置：</strong> <code>main</code> 函数末尾</p>
+<ul>
+<li><strong>Task 11: 关店</strong><ul>
+<li><code>client.stop_engines()</code>: Client 发送一个特殊的指令，告诉所有 GPU Worker：“下班了”。</li>
+<li><code>client.stop()</code>: 关闭客户端连接。</li>
+<li><code>await asyncio.gather(engine.engine_loop_task)</code>: 确保后台引擎彻底停止运行，释放资源。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本其实是一个 <strong>Full-Stack 的模拟器</strong>：
+1.  它<strong>既是服务器</strong>（在后台跑 <code>DynamicInferenceEngine</code>）。
+2.  它<strong>也是客户端</strong>（在 Rank 0 跑 <code>InferenceClient</code>）。
+3.  它通过网络端口（Socket）通信，模拟了真实的生产环境推理流程。</p>
+<p>你看不懂是因为它把“发请求”和“处理请求”写在了一个文件里，而且用了大量的异步编程 (<code>asyncio</code>) 来处理并发。</p>

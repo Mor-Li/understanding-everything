@@ -1,0 +1,118 @@
+<h1>tests/single_controller/test_worker_group_torch.py</h1>
+<p>这份代码确实涉及了很多分布式计算的概念，如果直接看代码很容易晕。它本质上是一个<strong>测试文件</strong>，用来测试一个叫 <code>verl</code> 的库能不能正确地管理多个 GPU 协同工作。</p>
+<p>为了帮你理解，我制定了一个 <strong>“学习任务清单 (Todo List)”</strong>。我们将把这个大文件拆解成 5 个小任务，一步步通关。</p>
+<hr />
+<h3>📋 任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心目标</strong> —— 我们到底想干什么？（弄懂 <code>AllGather</code>）</li>
+<li><strong>Task 2: 认识“工人”</strong> —— 谁在干活？（看懂 <code>TestAllGatherActor</code>）</li>
+<li><strong>Task 3: 认识“工头”</strong> —— 谁在指挥？（看懂 <code>RayWorkerGroup</code>）</li>
+<li><strong>Task 4: 模拟现场 (Case 1)</strong> —— 第一种工作方式流程演示。</li>
+<li><strong>Task 5: 模拟现场 (Case 2)</strong> —— 第二种工作方式有什么不同？</li>
+</ol>
+<hr />
+<h3>✅ Task 1: 理解核心目标 —— 什么是 <code>AllGather</code>？</h3>
+<p>在看代码前，先得懂这个测试的核心逻辑：<strong><code>AllGather</code>（全收集/全汇总）</strong>。</p>
+<p>想象有 4 个学生（GPU），每人手里拿着一张写着自己学号的纸条（Tensor）：
+*   学生 0 拿的是 <code>[0, 0]</code>
+*   学生 1 拿的是 <code>[1, 1]</code>
+*   学生 2 拿的是 <code>[2, 2]</code>
+*   学生 3 拿的是 <code>[3, 3]</code></p>
+<p><strong><code>AllGather</code> 的目标是：</strong> 让这 4 个学生互相交换信息。交换结束后，<strong>每一个学生</strong>手里都有一张完整的长纸条，上面写着所有人的信息：
+*   结果：<code>[0, 0, 1, 1, 2, 2, 3, 3]</code></p>
+<p><strong>代码中的体现：</strong>
+这就是 <code>test_all_gather_torch</code> 函数最后断言（assert）的内容：验证大家手里的数据是不是拼完整了。</p>
+<hr />
+<h3>✅ Task 2: 认识“工人” —— <code>TestAllGatherActor</code></h3>
+<p>代码里定义了两个类 <code>TestAllGatherActor</code> 和 <code>TestAllGatherActorV2</code>。它们就是上面的“学生”。</p>
+<p>我们看 <code>TestAllGatherActor</code> 这个类做了什么：</p>
+<ol>
+<li><strong>身份定义 (<code>Worker</code>)</strong>: 它是 <code>verl</code> 库里的一个 Worker，可以理解为一个在 GPU 上运行的进程。</li>
+<li><strong>准备数据 (<code>init</code> 方法)</strong>:
+    <code>python
+    def init(self):
+        # 1. 建立通讯录，让大家知道彼此的存在
+        torch.distributed.init_process_group()
+        # 2. 创建自己的那张小纸条
+        # self.size 是 2，self.rank 是自己的编号(0,1,2,3)
+        # 如果我是 2 号，我就创建 [0, 0] + 2 = [2, 2]
+        self.tensor = torch.zeros(size=(self.size,), ...)
+        self.tensor += self.rank</code></li>
+<li><strong>执行交换 (<code>all_gather</code> 方法)</strong>:
+    <code>python
+    def all_gather(self):
+        # 1. 准备一张长纸条 (output)，用来接收所有人的数据
+        output = torch.zeros(...)
+        # 2. 施展魔法：把自己的 tensor 发给别人，把别人的收进来填到 output 里
+        torch.distributed.all_gather_into_tensor(output, self.tensor, async_op=False)
+        return output</code></li>
+</ol>
+<hr />
+<h3>✅ Task 3: 认识“工头” —— <code>RayWorkerGroup</code></h3>
+<p>有了工人，还得有人把他们组织起来。这就是 <code>test_all_gather_torch</code> 函数里的这几行代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 招聘需求：我要 4 个工人，每个人都要配 GPU</span>
+<span class="n">resource_pool</span> <span class="o">=</span> <span class="n">RayResourcePool</span><span class="p">([</span><span class="mi">4</span><span class="p">],</span> <span class="n">use_gpu</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+<span class="c1"># 2. 岗位描述：工人要用 TestAllGatherActor 这个类，每人的数据大小(size)是 2</span>
+<span class="n">class_with_args</span> <span class="o">=</span> <span class="n">RayClassWithInitArgs</span><span class="p">(</span><span class="bp">cls</span><span class="o">=</span><span class="n">TestAllGatherActor</span><span class="p">,</span> <span class="n">size</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+
+<span class="c1"># 3. 组建团队：把上面两条合起来，成立一个叫 &quot;worker_group_torch&quot; 的项目组</span>
+<span class="n">worker_group</span> <span class="o">=</span> <span class="n">RayWorkerGroup</span><span class="p">(</span><span class="n">resource_pool</span><span class="p">,</span> <span class="n">class_with_args</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong><code>RayWorkerGroup</code> 的作用：</strong> 它是一个控制器。当你对它下令时，它会帮你在后台同时向那 4 个工人发号施令。</p>
+<hr />
+<h3>✅ Task 4: 模拟现场 (Case 1) —— <code>test_all_gather_torch</code></h3>
+<p>现在我们把整个流程串起来，看看第一个测试函数 <code>test_all_gather_torch</code> 是怎么跑的：</p>
+<ol>
+<li><strong>启动 Ray</strong>: <code>ray.init()</code> (启动分布式系统)。</li>
+<li><strong>组建团队</strong>: 创建 <code>worker_group</code> (包含 4 个工人)。</li>
+<li><strong>下令初始化</strong>:
+    <code>python
+    # 工头喊话："所有人，执行 init()！"
+    worker_group.execute_all_sync("init")</code>
+    这时，4 个 GPU 开始建立连接，各自生成自己的 <code>[0,0]</code>, <code>[1,1]</code> 等数据。</li>
+<li><strong>下令交换数据</strong>:
+    <code>python
+    # 工头喊话："所有人，执行 all_gather()！"
+    output = worker_group.execute_all_sync("all_gather")</code>
+    这时，GPU 之间开始疯狂传输数据。<code>output</code> 是一个列表，包含了 4 个工人返回的结果。</li>
+<li>
+<p><strong>检查作业</strong>:
+    ```python
+    # 检查是不是每个工人的结果都一样
+    for i in range(1, len(output)):
+        assert torch.all(output[i] == output[0])</p>
+<h1>检查结果是不是 [0, 0, 1, 1, 2, 2, 3, 3]</h1>
+<p>assert torch.all(output == torch.tensor([0, 0, 1, 1, 2, 2, 3, 3]...))
+```</p>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 模拟现场 (Case 2) —— V2 版本有啥不同？</h3>
+<p>代码里还有一个 <code>TestAllGatherActorV2</code> 和 <code>test_all_gather_torch_v2</code>。</p>
+<p><strong>区别非常小，在于“什么时候初始化”：</strong></p>
+<ul>
+<li>
+<p><strong>V1 (TestAllGatherActor):</strong></p>
+<ul>
+<li><code>__init__</code>: 只存了个 <code>size</code> 参数。</li>
+<li><code>init()</code>: <strong>手动调用时</strong>才初始化 PyTorch 分布式连接 (<code>torch.distributed.init_process_group</code>) 和创建 Tensor。</li>
+<li><strong>流程:</strong> 创建对象 -&gt; 手动调用 <code>init</code> -&gt; 手动调用 <code>all_gather</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>V2 (TestAllGatherActorV2):</strong></p>
+<ul>
+<li><code>__init__</code>: <strong>一出生就</strong>初始化 PyTorch 连接并创建 Tensor。</li>
+<li><strong>流程:</strong> 创建对象 (自动完成了 init) -&gt; 手动调用 <code>all_gather</code>。</li>
+</ul>
+</li>
+</ul>
+<p><strong>为什么要有这两个版本？</strong>
+这是为了测试 <code>RayWorkerGroup</code> 的灵活性。有时候我们希望工人在创建时就准备好（V2），有时候我们需要先创建工人，等资源到位了再手动命令他们初始化（V1）。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的作用就是验证：
+<strong>“我能否使用 <code>RayWorkerGroup</code> 轻松地管理 4 个 GPU，让它们成功地建立 PyTorch 通讯组，并正确地完成一次数据全交换（AllGather）。”</strong></p>
+<p>如果这个测试跑通了，说明这个框架的分布式管理功能是正常的。</p>

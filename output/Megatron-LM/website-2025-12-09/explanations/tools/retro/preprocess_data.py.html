@@ -1,0 +1,116 @@
+<h1>tools/retro/preprocess_data.py</h1>
+<p>这份代码 <code>preprocess_data.py</code> 是 <strong>NVIDIA Megatron-LM</strong> 框架中用于 <strong>Retro (Retrieval-Enhanced Transformer)</strong> 模型的 <strong>数据预处理</strong> 脚本。</p>
+<p>简单来说，Retro 模型之所以强大，是因为它在写东西时可以“作弊”——去翻阅一个巨大的外部数据库。这份代码的作用就是<strong>建立这个数据库</strong>，并帮模型提前把“小抄”准备好。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>项目经理的 To-Do List（任务清单）</strong>，然后一步步解释它是怎么执行的。</p>
+<hr />
+<h3>核心任务清单 (Project To-Do List)</h3>
+<p>这份脚本的核心逻辑在 <code>__main__</code> 函数的最后部分。整个流程就是按顺序完成以下 4 个大任务：</p>
+<ol>
+<li><strong>[准备工作] 初始化环境与配置</strong><ul>
+<li>加载配置、分词器（Tokenizers）、数据集路径。</li>
+</ul>
+</li>
+<li><strong>[Task 1: db-build] 建立切片数据库 (Build Chunk Database)</strong><ul>
+<li>把海量的文本切成一小块一小块的（Chunk），存起来。</li>
+</ul>
+</li>
+<li><strong>[Task 2: index-train] 训练检索索引 (Train Index)</strong><ul>
+<li>教搜索引擎（FAISS）如何快速在这些切片中查找相似内容。</li>
+</ul>
+</li>
+<li><strong>[Task 3: index-add] 填充索引 (Add to Index)</strong><ul>
+<li>把所有切片的数据真正塞进搜索引擎里。</li>
+</ul>
+</li>
+<li><strong>[Task 4: query-neighbors] 查询邻居/预取数据 (Query Neighbors)</strong><ul>
+<li>对于训练集里的每一句话，提前查好它最相似的参考资料，存下来供训练时直接使用。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解 (Step-by-Step Walkthrough)</h3>
+<p>下面根据代码的执行逻辑，逐步拆解其中的观点和操作：</p>
+<h4>第一步：初始化与资源准备 (Initialization)</h4>
+<p><strong>代码位置：</strong> <code>initialize_megatron_retro</code>, <code>get_retro_preprocessing_config</code></p>
+<ul>
+<li><strong>观点/逻辑：</strong> Retro 模型比较特殊，它需要两套理解系统。<ul>
+<li><strong>GPT Tokenizer:</strong> 负责生成文本（模型主要干的事）。</li>
+<li><strong>BERT Tokenizer &amp; Embedder:</strong> 负责理解语义，用于检索（搜索主要干的事）。</li>
+</ul>
+</li>
+<li><strong>代码做了啥：</strong><ul>
+<li><code>get_tokenizers(config)</code>: 同时加载了 GPT 和 BERT 的分词器。</li>
+<li><code>get_bert_embedders(config)</code>: 准备好 BERT 模型，用来把文本变成向量（数学表示），方便计算相似度。</li>
+<li><code>get_gpt_chunk_datasets(config)</code>: 读取你的原始文本数据（train/valid/test），并把它们处理成适合 Retro 的格式。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：任务分发 (Task Dispatching)</h4>
+<p><strong>代码位置：</strong> <code>if __name__ == "__main__":</code> 下方的 <code>task_remap</code></p>
+<ul>
+<li><strong>观点/逻辑：</strong> 用户可能只想跑某一步，或者想用一个命令跑完所有步。</li>
+<li><strong>代码做了啥：</strong><ul>
+<li>定义了一个字典 <code>task_remap</code>。</li>
+<li>如果你输入参数 <code>--retro-tasks build</code>，它会自动展开成一个列表：<code>['db-build', 'index-train', 'index-add', 'query-neighbors']</code>。这意味着“全套服务”。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：执行 Task 1 - 建立数据库 (db-build)</h4>
+<p><strong>代码位置：</strong> <code>if task == "db-build": build_db(config)</code></p>
+<ul>
+<li><strong>观点/逻辑：</strong> 要想检索，首先得把长文章切碎。</li>
+<li><strong>操作：</strong><ul>
+<li>脚本会遍历所有的 GPT 训练数据。</li>
+<li>把长文本切成固定长度的 <strong>Chunks</strong>（例如每 64 个 token 一块）。</li>
+<li>把这些 Chunks 保存到一个键值数据库（Key-Value DB）中，给每个 Chunk 一个唯一的 ID。</li>
+<li><strong>目的：</strong> 这是原始资料库，以后查到了 ID，就来这里取具体的文字。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：执行 Task 2 - 训练索引 (index-train)</h4>
+<p><strong>代码位置：</strong> <code>elif task == "index-train": train_index(config)</code></p>
+<ul>
+<li><strong>观点/逻辑：</strong> 数据量太大了，不能暴力搜索。我们需要一个高效的向量搜索引擎（通常使用 FAISS）。但在把数据放进去之前，需要根据数据的分布“训练”一下索引结构，让它查得更快。</li>
+<li><strong>操作：</strong><ul>
+<li>从刚才建立的数据库中随机抽取一部分 Chunks。</li>
+<li>用 BERT 把它们变成向量。</li>
+<li>训练索引（计算聚类中心等）。</li>
+</ul>
+</li>
+</ul>
+<h4>第四步：执行 Task 3 - 填充索引 (index-add)</h4>
+<p><strong>代码位置：</strong> <code>elif task == "index-add": add_to_index(config)</code></p>
+<ul>
+<li><strong>观点/逻辑：</strong> 索引结构搭好了，现在要把所有数据都塞进去。</li>
+<li><strong>操作：</strong><ul>
+<li>把数据库里<strong>所有</strong>的 Chunks 都拿出来。</li>
+<li>通过 BERT 转换成向量。</li>
+<li>添加到刚才训练好的索引中。</li>
+<li><strong>目的：</strong> 完成这一步后，你就有了一个可以实时搜索的“超级检索引擎”。</li>
+</ul>
+</li>
+</ul>
+<h4>第五步：执行 Task 4 - 预查询 (query-neighbors)</h4>
+<p><strong>代码位置：</strong> <code>elif task == "query-neighbors": query_neighbors(config)</code></p>
+<ul>
+<li><strong>观点/逻辑：</strong> <strong>这是最关键的一步。</strong> 在训练 Retro 模型时，如果每读一句话都去实时搜索数据库，训练速度会慢得像蜗牛。</li>
+<li><strong>解决方案：</strong> 我们在训练<strong>之前</strong>，先把训练集里每一句话对应的“参考资料（Neighbors）”都查好，存在硬盘上。</li>
+<li><strong>操作：</strong><ul>
+<li>遍历训练集、验证集、测试集。</li>
+<li>拿着当前的句子去索引里搜（Query）。</li>
+<li>找到最相似的几个 Chunk 的 ID。</li>
+<li>把这些 ID 保存下来。</li>
+<li><strong>目的：</strong> 真正训练模型时，模型只需要读取这些预先存好的 ID，就能瞬间获得外部知识，无需实时计算搜索。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这个脚本其实就是一个<strong>流水线工人</strong>，它的工作是：</p>
+<ol>
+<li><strong>切菜</strong>（把文本切成 Chunk，存入 DB）。</li>
+<li><strong>整理书架</strong>（训练索引，让查找更高效）。</li>
+<li><strong>上架</strong>（把 Chunk 向量化放入索引）。</li>
+<li><strong>写小抄</strong>（为每一条训练数据提前查好关联资料，供以后考试/训练时使用）。</li>
+</ol>
+<p>你看懂这个流程，就看懂了 Retro 预处理的核心思想。</p>

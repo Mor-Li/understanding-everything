@@ -1,0 +1,90 @@
+<h1>tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py</h1>
+<p>这段代码实际上是一个<strong>自动化阅卷脚本</strong>。</p>
+<p>想象一下：你刚刚修改了人工智能模型的代码，你需要确保改动后：
+1.  模型没有变笨（生成的答案是对的）。
+2.  模型没有变慢（运行速度正常）。</p>
+<p>这个脚本就是用来做这件事的。它把<strong>当前跑出来的结果</strong>（Test Values）和<strong>以前存好的标准答案</strong>（Golden Values）进行比对。</p>
+<p>为了让你更容易理解，我把它拆解成一个<strong>Task Todo List（任务清单）</strong>，计算机会按照这个清单一步步执行：</p>
+<hr />
+<h3>📋 Task Todo List (任务清单)</h3>
+<ol>
+<li><strong>准备阶段</strong>：打开两份文件（标准答案 vs 当前考卷）。</li>
+<li><strong>格式清洗</strong>：把文件内容转换成能读懂的格式（JSON）。</li>
+<li><strong>试卷核对</strong>：检查当前考卷的题目（ID）是否和标准答案对得上。</li>
+<li><strong>速度测试 (Throughput)</strong>：检查模型答题速度是不是太慢或太快。</li>
+<li><strong>内容阅卷 (Loop)</strong>：逐题检查答案内容：<ul>
+<li><em>检查点 A</em>：生成的 Token（词元）代码是否完全一致？</li>
+<li><em>检查点 B</em>：生成的概率数值（Logprobs）是否误差极小？</li>
+<li><em>检查点 C</em>：生成的最终文本是否一致？</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步详细讲解</h3>
+<p>下面我按照上面的清单，给你逐步讲解代码里的观点和逻辑：</p>
+<h4>1. 准备阶段 &amp; 2. 格式清洗</h4>
+<p><strong>代码位置：</strong> 开头到 <code>output_current = json.loads(...)</code> 部分。</p>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li>它读取两个路径：<code>golden_values_path</code>（标准答案/金标准）和 <code>test_values_path</code>（刚才跑出来的结果）。</li>
+<li><strong>观点：</strong> 数据有时会因为日志格式问题变成“字符串套字符串”，所以代码里加了 <code>if isinstance(..., str)</code> 的判断。如果是字符串，就再解析一次，确保变成真正的字典数据。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 试卷核对 (ID Check)</h4>
+<p><strong>代码位置：</strong> <code>assert set(output_groundtruth.keys()).issuperset(...)</code></p>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li>它对比两边的 <code>keys</code>（通常是请求的 ID）。</li>
+<li><strong>观点：</strong> 必须确保<strong>标准答案里有的题，你这次测试都跑了</strong>。如果ID对不上，程序会报警或者只测试能对得上的部分。如果完全没数据，直接报错（<code>No test performed</code>）。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 速度测试 (Throughput Check) —— 这是一个重点</h4>
+<p><strong>代码位置：</strong> <code>if "throughput" in output_groundtruth.keys():</code></p>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li><strong>去掉热身数据</strong>：代码里写了 <code>[1:]</code>，意思是去掉第一次迭代的数据。</li>
+<li><strong>观点 1（不能太慢）</strong>：<ul>
+<li><code>assert throughput_sampled &gt;= 0.9 * throughput_golden</code></li>
+<li>意思：现在的速度至少要是标准速度的 <strong>90%</strong>。如果慢了超过 10%，测试失败（说明代码改坏了，性能退化）。</li>
+</ul>
+</li>
+<li><strong>观点 2（不能太快）</strong>：<ul>
+<li><code>assert throughput_sampled &lt; throughput_golden * 1.2</code></li>
+<li>意思：现在的速度不能超过标准速度的 <strong>120%</strong>。</li>
+<li><strong>为什么？</strong> 如果突然快了很多，说明性能大幅提升了，这时候旧的“标准答案”已经过时了。代码提示你：“请去更新标准值（Golden Values）”，不要用旧标准来衡量新引擎。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>5. 内容阅卷 (详细比对)</h4>
+<p><strong>代码位置：</strong> <code>for request_id, groundtruth_results in output_groundtruth.items():</code></p>
+<p>这里进入了一个循环，针对每一个请求（每一道题）进行比对：</p>
+<ul>
+<li>
+<p><strong>检查点 A：Token (词元) 比对</strong></p>
+<ul>
+<li><code>assert tokens_groundtruth == tokens_current</code></li>
+<li><strong>观点：</strong> 这是最严格的检查。模型生成的 Token ID 序列必须<strong>一模一样</strong>。只要错一个数，测试就挂。</li>
+</ul>
+</li>
+<li>
+<p><strong>检查点 B：Logprobs (概率数值) 比对</strong></p>
+<ul>
+<li><code>math.isclose(lp1, lp2, abs_tol=0.001)</code></li>
+<li><strong>观点：</strong> 计算机处理浮点数（小数）时总会有微小的误差。所以不能用 <code>==</code>（完全相等），而是用 <code>isclose</code>（非常接近）。只要误差在 <strong>0.001</strong> 以内，就算通过。</li>
+</ul>
+</li>
+<li>
+<p><strong>检查点 C：Generated Text (文本) 比对</strong></p>
+<ul>
+<li><code>assert generated_text_groundtruth[:min_len] == ...</code></li>
+<li><strong>观点：</strong> 比对最终生成的文字。代码取了两个字符串中较短的那个长度进行截断比对。这意味着它主要关心<strong>已生成部分的前缀匹配</strong>。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本的核心观点是：<strong>回归测试 (Regression Testing)</strong>。
+它不关心模型“为什么”输出这个结果，它只关心：<strong>“今天的输出”和“以前确认正确的输出”是否一致</strong>。如果一致且速度正常，测试通过；否则，报错让人工来检查。</p>

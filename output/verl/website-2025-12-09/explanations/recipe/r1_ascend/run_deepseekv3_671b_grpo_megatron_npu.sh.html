@@ -1,0 +1,98 @@
+<h1>recipe/r1_ascend/run_deepseekv3_671b_grpo_megatron_npu.sh</h1>
+<p>这份脚本（Shell Script）乍一看确实非常复杂，因为它涉及到了<strong>当前AI领域最硬核的工程挑战</strong>：在国产硬件（华为昇腾 NPU）上，训练一个超大规模的模型（DeepSeek V3 671B），并且使用的是强化学习（GRPO算法）。</p>
+<p>为了让你看懂，我把这个脚本想象成<strong>一位总工程师正在给整个计算集群下达的“任务清单” (Todo List)</strong>。</p>
+<p>我们将这个脚本拆解为 <strong>5个阶段的任务</strong>，一步步来看它到底想干什么：</p>
+<hr />
+<h3>📋 任务清单：训练 DeepSeek V3 的“作战计划”</h3>
+<h4>✅ 第一阶段：盘点家底与资源 (Resource Allocation)</h4>
+<p><strong>“我们要动用多少算力来干这件事？”</strong></p>
+<ol>
+<li><strong>确认计算节点</strong>：<ul>
+<li><code>NNODES=16</code>：我们需要 16 台服务器。</li>
+<li><code>NPUS_PER_NODE=16</code>：每台服务器有 16 张 NPU 卡（华为的AI芯片）。</li>
+<li><strong>总计</strong>：这是一个动用 <strong>256 张 NPU</strong> 的大规模集群任务。</li>
+</ul>
+</li>
+<li><strong>确认身份</strong>：<ul>
+<li><code>project_name='GRPO'</code>：我们的项目代号是 GRPO（这是 DeepSeek-R1 背后的核心算法）。</li>
+<li><code>device="npu"</code>：明确告诉程序，我们要用 NPU 跑，不是英伟达的 GPU。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ 第二阶段：确定训练目标与教材 (Data &amp; Model Setup)</h4>
+<p><strong>“我们要训练谁？用什么书教它？”</strong></p>
+<ol>
+<li><strong>指定模型 (Model)</strong>：<ul>
+<li><code>MODEL_PATH</code>：DeepSeek-V3-hf。我们要训练的是那个 6710 亿参数的巨无霸模型。</li>
+<li><code>CKPTS_DIR</code>：如果有断点（Checkpoint），从这里加载，防止从头白练。</li>
+</ul>
+</li>
+<li><strong>指定教材 (Data)</strong>：<ul>
+<li><code>TRAIN_FILE</code>：<code>deepscaler/train.parquet</code>。这是训练数据，看起来是关于数学或推理能力的（DeepScaler）。</li>
+<li><code>custom_reward_function</code>：<code>deepscaler.py</code>。这是“判卷老师”，用来给模型生成的答案打分。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ 第三阶段：制定考试规则 (Hyperparameters)</h4>
+<p><strong>“模型怎么答题？怎么算分？”</strong></p>
+<ol>
+<li><strong>答题限制</strong>：<ul>
+<li><code>max_prompt_length=1024</code>：题目最长 1024 个词。</li>
+<li><code>max_response_length=2048</code>：答案最长 2048 个词。</li>
+</ul>
+</li>
+<li><strong>强化学习策略 (GRPO)</strong>：<ul>
+<li><code>n_resp_per_prompt=16</code>：对于每一道题，让模型生成 16 个不同的答案。</li>
+<li><code>adv_estimator=grpo</code>：使用 GRPO 算法来分析这 16 个答案的好坏，算出优势（Advantage），然后告诉模型怎么改。</li>
+<li><code>kl_coef=0.0</code>：这里似乎暂时关掉了 KL 散度惩罚（通常用于防止模型改动过大，偏离原始模型太远），或者由其他参数控制。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ 第四阶段：解决“脑容量”不够的问题 (Distributed Strategy)</h4>
+<p><strong>“模型太大装不下怎么办？切开装！”</strong>
+<em>这是脚本里最复杂、最核心的部分（Megatron配置）。</em></p>
+<ol>
+<li><strong>切分模型 (Parallelism)</strong>：<ul>
+<li><code>pipeline_model_parallel_size=8</code> (PP)：把模型像切香肠一样切成 8 段，不同的卡负责不同的层。</li>
+<li><code>expert_model_parallel_size=32</code> (EP)：DeepSeek V3 是 MoE（混合专家）模型。这里把“专家”分摊到 32 个不同的组里去计算。</li>
+</ul>
+</li>
+<li><strong>内存优化 (Offloading)</strong>：<ul>
+<li><code>offload=True</code>：显存（NPU内存）不够用，把一部分参数和梯度卸载到 CPU 内存里去。</li>
+<li><code>recompute_granularity=full</code>：为了省内存，有些计算结果不存，需要的时候重算（以时间换空间）。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ 第五阶段：分工合作 (Actor-Rollout Architecture)</h4>
+<p><strong>“谁负责做题？谁负责学习？”</strong>
+这个脚本采用了 <strong>Verl</strong> 框架（Ray Data Home 里的那个 verl），它把任务分成了两拨人：</p>
+<ol>
+<li><strong>Rollout (做题组 - vLLM)</strong>：<ul>
+<li><code>actor_rollout_ref.rollout.name=vllm</code>：使用 vLLM 这个超快的引擎来生成答案。</li>
+<li><code>tensor_model_parallel_size=2</code>：做题的时候，用 2 张卡合作生成一个答案。</li>
+</ul>
+</li>
+<li><strong>Actor (学习组 - Megatron)</strong>：<ul>
+<li><code>actor_rollout_ref.actor...</code>：这是负责根据分数修改模型参数的部分，使用 Megatron 框架，因为它更适合训练。</li>
+<li>这里配置了复杂的学习率 <code>lr=1e-6</code> 和优化器设置。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 总结：这个脚本在讲什么故事？</h3>
+<p>想象你在经营一个拥有 <strong>256 名顶级数学家（NPU）</strong> 的补习班。</p>
+<ol>
+<li><strong>目标</strong>：你要训练一个叫 <strong>DeepSeek V3</strong> 的超级天才学生。</li>
+<li><strong>方法</strong>：<ul>
+<li>你把这 256 名数学家分成不同的小组。</li>
+<li><strong>做题组 (vLLM)</strong>：负责让学生针对一道题狂写 16 种解法。</li>
+<li><strong>判卷组 (Reward Function)</strong>：给这 16 种解法打分。</li>
+<li><strong>教研组 (Megatron)</strong>：根据分数，告诉学生哪种思路是对的，哪种是错的，并更新学生的大脑（权重）。</li>
+</ul>
+</li>
+<li><strong>困难</strong>：学生的大脑太大（671B参数），一个人的脑子装不下。<ul>
+<li><strong>解决方案</strong>：你把学生的大脑切成了很多块（PP=8, EP=32），分给不同的数学家分别保管和计算。如果实在记不住，就记在草稿纸上（Offload to CPU）。</li>
+</ul>
+</li>
+</ol>
+<p>这个脚本就是这一整套复杂流程的<strong>启动指令</strong>。如果不写这个脚本，就需要人工在 256 台机器上敲几千行命令来同步这些操作。</p>

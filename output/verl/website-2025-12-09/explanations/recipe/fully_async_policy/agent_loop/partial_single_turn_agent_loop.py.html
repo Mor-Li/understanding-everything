@@ -1,0 +1,82 @@
+<h1>recipe/fully_async_policy/agent_loop/partial_single_turn_agent_loop.py</h1>
+<p>这份代码确实看起来有点绕，因为它不仅仅是简单的“输入对话 -&gt; 输出回答”，它还涉及到了<strong>“断点续传”</strong>（Partial Generation）的逻辑。这通常用于异步强化学习（Async RL）训练中，为了提高效率，可能会把生成过程切分成几段。</p>
+<p>为了让你更容易理解，我们可以把这段代码想象成一个<strong>“文章续写任务的管理员”</strong>。</p>
+<p>下面是一个<strong>Task Todo List</strong>，对应代码执行的每一步。你可以把这个类（<code>PartialSingleTurnAgentLoop</code>）看作是执行这个清单的打工仔。</p>
+<hr />
+<h3>📋 任务清单：文章续写管理员的工作流程</h3>
+<h4><strong>Task 1: 检查任务类型（是新任务还是没写完的旧任务？）</strong></h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>async def run(...)</code> 开始 到 <code>if not output:</code> 之前
+*   <strong>说明</strong>：管理员拿到一个任务包（<code>kwargs</code>）。
+*   <strong>动作</strong>：
+    *   看看手里有没有之前剩下的半成品（<code>output</code> 参数）。
+    *   如果有半成品，说明这是“续写”任务。
+    *   如果没有，说明这是“从零开始”的新任务。</p>
+</blockquote>
+<h4><strong>Task 2: 准备“上文”（Prompt 处理）</strong></h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>if not output:</code> ... <code>else:</code> ...
+*   <strong>分支 A：如果是新任务（<code>if not output:</code>）</strong>
+    *   <strong>动作</strong>：把人类给的对话文字（<code>messages</code>）翻译成模型能看懂的数字编号（<code>prompt_ids</code>）。
+    *   <em>注</em>：代码里有个 TODO 注释，说本来应该用更高级的处理器，但因为有 Bug，暂时先用普通的 Tokenizer 来翻译。
+*   <strong>分支 B：如果是续写任务（<code>else:</code>）</strong>
+    *   <strong>动作</strong>：检查之前的任务是不是被“暂停/取消”了（<code>is_cancel</code>）。
+    *   如果是被暂停的：把<strong>原来的提示词</strong> + <strong>之前已经写出来的部分</strong> 拼在一起，作为新的“上文”（<code>prompt_ids = output.prompt_ids + output.response_ids</code>）。
+    *   如果之前的任务其实已经结束了：那就直接交卷，不用干活了（<code>return output</code>）。</p>
+</blockquote>
+<h4><strong>Task 3: 让模型动笔写（生成核心）</strong></h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>with simple_timer...</code> 内部的 <code>await self.server_manager.generate_for_partial(...)</code>
+*   <strong>说明</strong>：这是最关键的一步。管理员把准备好的“上文”扔给模型服务器。
+*   <strong>动作</strong>：调用 <code>generate_for_partial</code>（部分生成）。
+*   <strong>关键点</strong>：模型写了一会儿可能会停下来。它会返回三样东西：
+    1.  <code>response_ids</code>: 这次新写出来的内容。
+    2.  <code>response_logprobs</code>: 写这些内容时的自信程度（概率）。
+    3.  <code>is_cancel</code>: 一个标记。<strong>True</strong> 表示“还没写完，但我先歇会儿（被截断了）”；<strong>False</strong> 表示“写完了”。</p>
+</blockquote>
+<h4><strong>Task 4: 整理这次写的内容（拼接结果）</strong></h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>if not output:</code> ... <code>else:</code> （在生成代码之后）
+*   <strong>分支 A：如果是新任务</strong>
+    *   <strong>动作</strong>：这次写的就是全部成果。设置好这就行。
+*   <strong>分支 B：如果是续写任务</strong>
+    *   <strong>动作</strong>：把<strong>旧的成果</strong>和<strong>这次新写的成果</strong>拼起来。
+    *   <code>response_ids = 旧的 + 新的</code>
+    *   <code>response_logprobs = 旧的 + 新的</code></p>
+</blockquote>
+<h4><strong>Task 5: 检查是否被迫完结（长度限制）</strong></h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>if len(response_ids) &gt;= self.response_length:</code>
+*   <strong>动作</strong>：管理员量一下总共写了多长。如果超过了规定的最大长度（<code>response_length</code>），不管模型想不想停，都强制标记为“已完成”（<code>is_cancel = False</code>）。</p>
+</blockquote>
+<h4><strong>Task 6: 打包交卷（Return）</strong></h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>return AgentLoopOutput(...)</code>
+*   <strong>动作</strong>：把所有东西打包成一个标准格式的盒子（<code>AgentLoopOutput</code>）。
+*   <strong>盒子里装了</strong>：
+    *   完整的提示词（Prompt）。
+    *   完整的回答（Response）。
+    *   是否还需要继续写（<code>is_cancel</code>）。
+    *   其他统计数据（Metrics）。</p>
+</blockquote>
+<hr />
+<h3>💡 核心观点总结（讲人话版）</h3>
+<p>这个文件的核心观点是实现一个<strong>支持“暂停”和“继续”的单轮对话代理</strong>。</p>
+<ol>
+<li>
+<p><strong>为什么需要这个？</strong>
+    在超大规模的模型训练中，生成文本（Rollout）非常耗时。有时候系统为了资源调度或者同步参数，需要让生成过程“停一下”，先把已经生成的部分拿去算一算，或者等参数更新了再继续生成。这就是 <code>partial</code>（部分）和 <code>async</code>（异步）的含义。</p>
+</li>
+<li>
+<p><strong>它做了什么？</strong>
+    它维护了对话的状态。它能识别出：“哦，这个请求是上次没写完的，我得把上次写的一半拼在后面，让模型继续写”，而不是傻乎乎地每次都重头开始写。</p>
+</li>
+<li>
+<p><strong>难点在哪？</strong>
+    就在 <code>prompt_ids</code> 的拼接上。</p>
+<ul>
+<li>普通模式：提示词 -&gt; 模型 -&gt; 回答。</li>
+<li>本代码模式：提示词 -&gt; 模型 -&gt; 回答(第一段) -&gt; <strong>暂停</strong> -&gt; (提示词+回答第一段) -&gt; 模型 -&gt; 回答(第二段) -&gt; <strong>完成</strong>。</li>
+</ul>
+</li>
+</ol>

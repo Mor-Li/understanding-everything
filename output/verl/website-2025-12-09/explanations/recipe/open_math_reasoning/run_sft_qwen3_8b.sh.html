@@ -1,0 +1,104 @@
+<h1>recipe/open_math_reasoning/run_sft_qwen3_8b.sh</h1>
+<p>这个脚本确实包含了很多术语，对于不熟悉大模型训练（LLM Training）的人来说，就像天书一样。</p>
+<p>其实，你可以把这个脚本看作是一个<strong>“训练大模型的各种配置清单”</strong>。它的核心目的只有一个：<strong>启动一个叫 Qwen3-8B 的模型的微调（SFT）任务。</strong></p>
+<p>为了让你听懂，我把阅读这个脚本的过程拆解成一个 <strong>Task Todo List</strong>，我们一步一步来完成这个“理解任务”。</p>
+<hr />
+<h3>📋 Task 1：搞清楚“我们要干什么” (基础设置)</h3>
+<p>首先，脚本的前几行是在定义这次任务的“主角”和“素材”。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>bash
+    ENTRYPOINT=${ENTRYPOINT:-"-m verl.trainer.sft_trainer"}
+    TRAIN_FILES=${TRAIN_FILES:-/path/to/cot_dataset.parquet}
+    MODEL_ID=${MODEL_ID:-Qwen/Qwen3-8B-Base}</code></li>
+<li><strong>解读</strong>：<ul>
+<li><strong>我们要运行哪个程序？</strong> <code>ENTRYPOINT</code> 告诉我们，要运行 <code>verl.trainer.sft_trainer</code>。简单说，这就是一个专门用来做 SFT（有监督微调，即“老师带着做题”）的 Python 程序。</li>
+<li><strong>教材在哪里？</strong> <code>TRAIN_FILES</code> 指定了数据文件路径（<code>.parquet</code> 格式）。</li>
+<li><strong>学生是谁？</strong> <code>MODEL_ID</code> 指定了我们要训练的模型是 <code>Qwen/Qwen3-8B-Base</code>（通义千问3代，80亿参数的基础模型）。</li>
+</ul>
+</li>
+</ul>
+<h3>📋 Task 2：选择“干活的工具” (后端 Backend)</h3>
+<p>大模型太大了，一张显卡装不下，需要多张显卡配合。怎么配合？这就需要选择“后端引擎”。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>bash
+    backend=${BACKEND:-fsdp}
+    # ...
+    if [ "$backend" = "fsdp" ]; then ... else ... fi</code></li>
+<li><strong>解读</strong>：<ul>
+<li>脚本支持两种干活模式（Backend）：<ol>
+<li><strong>FSDP</strong> (Fully Sharded Data Parallel)：这是 PyTorch 自带的一种把模型切碎了分给不同显卡的技术，比较通用。</li>
+<li><strong>Megatron</strong>：这是 NVIDIA 搞的一种超大规模并行技术，非常强力但配置复杂。</li>
+</ol>
+</li>
+<li>默认情况下，脚本选择了 <code>fsdp</code>。</li>
+</ul>
+</li>
+</ul>
+<h3>📋 Task 3：决定“怎么分工” (并行策略)</h3>
+<p>既然选定了工具，接下来要具体分配每张显卡干什么。这部分全是缩写，是全篇最难懂的地方。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>bash
+    SP_SIZE=${SP_SIZE:-8}       # 序列并行
+    FSDP_SIZE=${FSDP_SIZE:-16}  # FSDP并行大小
+    TP_SIZE=${TP_SIZE:-8}       # 张量并行
+    PP_SIZE=${PP_SIZE:-2}       # 流水线并行</code></li>
+<li>
+<p><strong>解读</strong>：
+    这就好比有 8 个人一起抄写一本几万页的书，怎么分工？</p>
+<ul>
+<li><strong>TP (Tensor Parallel)</strong>：把<strong>每一行字</strong>拆开，你写前半句，我写后半句。（横向切分模型层）</li>
+<li><strong>PP (Pipeline Parallel)</strong>：把<strong>书的章节</strong>拆开，你写第1-5章，我写第6-10章。（纵向切分模型层）</li>
+<li><strong>SP (Sequence Parallel)</strong>：如果一句话特别长（比如 3万字），把这句话拆成几段，大家分着读。（处理超长文本用）</li>
+<li><strong>FSDP</strong>：把这书的<strong>词典（参数）</strong>撕碎了，每个人手里只拿一部分，用的时候再凑。</li>
+</ul>
+<p><strong>文中的观点</strong>：根据你选的后端（FSDP 还是 Megatron），脚本会启用不同的分工参数。</p>
+</li>
+</ul>
+<h3>📋 Task 4：制定“学习计划” (超参数配置)</h3>
+<p>这一步是告诉模型“怎么学”。学得太快容易忘，学得太慢浪费时间。</p>
+<ul>
+<li><strong>代码片段</strong> (在 <code>FSDP_ENGINE_CONFIG</code> 里)：
+    <code>bash
+    optim.lr=2e-5                  # 学习率
+    optim.lr_warmup_steps_ratio=0.01 # 热身比例
+    optim.weight_decay=0.1         # 权重衰减
+    optim.warmup_style=cosine      # 热身方式</code></li>
+<li><strong>解读</strong>：<ul>
+<li><strong>学习率 (lr=2e-5)</strong>：这是步子迈多大。<code>2e-5</code> 是个很小的值，说明是微调，小心翼翼地改，不要把原来的知识改坏了。</li>
+<li><strong>热身 (Warmup)</strong>：刚开始学的时候（前1%的时间），步子要从小慢慢变大，防止一开始就走火入魔。</li>
+<li><strong>Cosine</strong>：学习率的变化曲线像余弦波一样，先慢后快再慢，这是一种很经典的训练策略。</li>
+</ul>
+</li>
+</ul>
+<h3>📋 Task 5：最后的一声令下 (启动命令)</h3>
+<p>前面所有的变量定义，都是为了最后这一条超级长的命令服务的。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>bash
+    torchrun --standalone ... ${ENTRYPOINT} \
+        data.train_batch_size=96 \
+        data.max_length=32768 \
+        trainer.save_freq=4000 \
+        ...</code></li>
+<li><strong>解读</strong>：<ul>
+<li><strong><code>torchrun</code></strong>：这是 PyTorch 的启动器，负责拉起多个显卡进程。</li>
+<li><strong><code>data.max_length=32768</code></strong>：这次训练支持很长的文本（32k tokens），说明这个任务可能涉及长篇大论的数学推理。</li>
+<li><strong><code>trainer.save_freq=4000</code></strong>：每训练 4000 步，就保存一下进度（存档），免得机器挂了白干。</li>
+<li><strong><code>trainer.logger=['console','wandb']</code></strong>：把训练过程打印在屏幕上，同时发给 <code>wandb</code>（一个画图表监控训练过程的网站）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个脚本讲了什么观点？</h3>
+<p>如果你把这个脚本看作一篇文章，它其实表达了以下几个<strong>技术观点（决策）</strong>：</p>
+<ol>
+<li><strong>任务定位</strong>：这是一个针对 <strong>Qwen3-8B</strong> 模型的 <strong>Open Math Reasoning（开放数学推理）</strong> 微调任务。</li>
+<li><strong>长文本优先</strong>：显式设置了 <code>max_length=32768</code> 甚至 <code>65536</code>，说明这个数学推理任务需要处理非常长的上下文（可能是复杂的解题步骤）。</li>
+<li><strong>兼容性设计</strong>：脚本作者非常纠结，既想用 PyTorch 原生的 <strong>FSDP</strong>，又想用 NVIDIA 的 <strong>Megatron</strong>，所以写了一大堆 <code>if...else</code> 来兼容这两种架构。</li>
+<li><strong>去填充 (Remove Padding)</strong>：脚本里反复出现 <code>no_padding</code> 和 <code>use_remove_padding=True</code>。这是一个优化观点：在训练长文本时，去掉无意义的填充符（Padding）可以极大地提升计算效率。</li>
+</ol>
+<p><strong>一句话总结：</strong>
+这是一个<strong>双模（FSDP/Megatron）兼容</strong>的启动脚本，专门为了在一个<strong>多显卡集群</strong>上，用<strong>超长上下文</strong>来训练一个<strong>擅长数学推理</strong>的 Qwen3 AI 模型。</p>

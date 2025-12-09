@@ -1,0 +1,121 @@
+<h1>recipe/fully_async_policy/fully_async_rollouter.py</h1>
+<p>这份代码确实比较硬核，它涉及了<strong>强化学习（RL）</strong>、<strong>分布式计算（Ray）</strong>和<strong>异步编程（Asyncio）</strong>。</p>
+<p>简单来说，这个文件定义了一个<strong>“不知疲倦的数据生产工人”</strong>。在强化学习（PPO算法）中，我们需要一边玩游戏（或者生成文本），一边学习。传统的做法是“玩一步，学一步，停下来等一等”。</p>
+<p>而这个 <code>FullyAsyncRollouter</code>（全异步采样器）的观点是：<strong>“我不管你学得怎么样，我只管疯狂地玩（生成数据），把生成好的数据扔进一个大池子（MessageQueue）里，你自己按需去取。”</strong></p>
+<p>为了让你听懂，我把这个类的运行逻辑拆解成一个 <strong>Task Todo List（任务清单）</strong>，模拟这个“工人”上班后的一步步操作：</p>
+<hr />
+<h3>📝 Task Todo List：全异步采样工人的工作日志</h3>
+<h4>Task 1: 上班打卡与准备工具 (Initialization)</h4>
+<ul>
+<li><strong>代码对应</strong>: <code>__init__</code>, <code>_init_async_objects</code>, <code>init_workers</code></li>
+<li><strong>任务描述</strong>:<ol>
+<li>启动 Ray（分布式计算框架），连接到 GPU 资源。</li>
+<li>准备好 tokenizer（用于把文字转成数字）。</li>
+<li>建立一个 <code>pending_queue</code>（待办事项篮子），用来放还没处理的题目。</li>
+<li>建立一个 <code>cancel_queue</code>（作废篮子），处理失败的任务。</li>
+<li><strong>关键点</strong>: 此时还没有开始干活，只是把环境搭好。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 2: 设定生产目标与规则 (Configuration)</h4>
+<ul>
+<li><strong>代码对应</strong>: <code>set_max_required_samples</code>, <code>set_message_queue_client</code></li>
+<li><strong>任务描述</strong>:<ol>
+<li>连接到 <code>MessageQueue</code>（传送带）：这是我和“训练员（Trainer）”沟通的唯一渠道。我生成的数据都往这里扔。</li>
+<li>计算 <code>max_queue_size</code>（仓库最大容量）：如果传送带堆满了，我就得暂停，不能把仓库撑爆。</li>
+<li>设定 <code>staleness_threshold</code>（保质期）：<strong>这是一个核心观点</strong>。如果我生成的数据是基于“很久以前的模型版本”生成的，那就是过期食品，不能给训练员吃，得扔掉。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 3: 启动流水线 (Start Streaming)</h4>
+<ul>
+<li><strong>代码对应</strong>: <code>fit</code>, <code>_streaming_generation_main</code></li>
+<li><strong>任务描述</strong>:<ul>
+<li>一旦调用 <code>fit()</code>，我就开启两个并行的线程（分身），同时干活：<ul>
+<li><strong>分身 A (供料员)</strong>：负责 <code>_feed_samples</code>。</li>
+<li><strong>分身 B (加工员)</strong>：负责 <code>_processor_worker</code>。</li>
+</ul>
+</li>
+<li>同时还有一个 <strong>监控员</strong> (<code>_async_monitor_loop</code>) 盯着系统状态。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 供料员的工作 (Feed Samples)</h4>
+<ul>
+<li><strong>代码对应</strong>: <code>_feed_samples</code></li>
+<li><strong>任务描述</strong>:<ol>
+<li>从硬盘里的数据集读取题目（Prompt）。</li>
+<li>给每个题目打上标签（Sample ID）。</li>
+<li>把这些题目源源不断地塞进 <code>pending_queue</code>（待办篮子）。</li>
+<li><strong>观点</strong>: 只要篮子没满，我就一直塞，不等待后续处理结果。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 5: 加工员的工作 (Processor Worker - 核心逻辑)</h4>
+<ul>
+<li><strong>代码对应</strong>: <code>_processor_worker</code>, <code>_process_single_sample_streaming</code></li>
+<li><strong>任务描述</strong>:<ol>
+<li><strong>检查是否暂停</strong>: 看看“监控员”有没有亮红灯（比如仓库满了）。如果是红灯，就睡觉等待。</li>
+<li><strong>取件</strong>: 从 <code>pending_queue</code> 拿出一个题目。</li>
+<li><strong>外包计算</strong>: 把题目扔给 GPU（<code>async_rollout_manager</code>），让 GPU 去做推理（生成文本/玩游戏）。注意，这里是 <strong>Async（异步）</strong> 的，我扔过去就不管了，立刻去拿下一个题目，不傻等 GPU 算完。</li>
+<li><strong>收货与发货</strong>:<ul>
+<li>当 GPU 算完后，我拿到结果。</li>
+<li><strong>盖戳</strong>: 标记这条数据是基于哪个版本的参数（<code>param_version</code>）生成的。</li>
+<li><strong>发货</strong>: 调用 <code>message_queue_client.put_sample</code> 把数据扔到传送带上给训练员。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 6: 监控与流控 (Flow Control)</h4>
+<ul>
+<li><strong>代码对应</strong>: <code>_should_pause_generation</code>, <code>pause</code>, <code>resume</code></li>
+<li><strong>任务描述</strong>:<ul>
+<li><strong>防爆仓</strong>: 每次干活前，检查传送带（MessageQueue）是不是满了。如果满了，或者我生成的数据太旧了（滞后太多），我就调用 <code>pause()</code> 暂停整个流水线，避免浪费算力。</li>
+<li><strong>恢复</strong>: 等训练员把数据取走了，仓库空了，我再 <code>resume()</code> 继续干活。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 7: 接收新图纸 (Update Parameters)</h4>
+<ul>
+<li><strong>代码对应</strong>: <code>update_param_version</code></li>
+<li><strong>任务描述</strong>:<ul>
+<li>训练员（Trainer）更新了模型参数后，会通知我：“嘿，版本升级了，现在是 Version 5 了！”</li>
+<li>我立刻更新本地的版本号。</li>
+<li><strong>关键</strong>: 之后我生成的数据都会标记为 Version 5。之前那些 Version 3 的数据如果还在排队，可能会因为“过期”被扔掉。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 文中的核心观点总结</h3>
+<p>这个文件的代码其实就在践行以下几个 <strong>System Design（系统设计）</strong> 观点：</p>
+<ol>
+<li>
+<p><strong>解耦（Decoupling）</strong>:</p>
+<ul>
+<li><strong>生成（Rollout）</strong>和<strong>训练（Train）</strong>是完全分开的。</li>
+<li>以前是：生成 -&gt; 等待 -&gt; 训练 -&gt; 等待 -&gt; 生成。</li>
+<li>现在是：生成器一直跑，训练器一直跑，中间通过一个 <strong>Queue（队列）</strong> 缓冲。</li>
+</ul>
+</li>
+<li>
+<p><strong>吞吐量优先（Throughput First）</strong>:</p>
+<ul>
+<li>利用 <code>asyncio</code> 和 Ray，最大化 GPU 的利用率。绝不让 GPU 闲着，哪怕生成的数据可能用不上，也要先生成着再说。</li>
+</ul>
+</li>
+<li>
+<p><strong>容忍陈旧数据（Staleness Tolerance）</strong>:</p>
+<ul>
+<li>在异步训练中，生成数据时用的模型参数，往往比当前训练时的参数旧。</li>
+<li>代码里通过 <code>staleness_threshold</code> 控制：允许数据稍微旧一点，但太旧的（比如落后好几个版本）就丢弃。这是一种在<strong>速度</strong>和<strong>准确性</strong>之间的权衡。</li>
+</ul>
+</li>
+<li>
+<p><strong>流式处理（Streaming）</strong>:</p>
+<ul>
+<li>不是攒够一批（Batch）再发货，而是做完一个（Sample）就发一个。这样能让下游的训练器更平滑地获取数据。</li>
+</ul>
+</li>
+</ol>
+<p>希望这个 List 能帮你把这些复杂的代码逻辑串起来！</p>

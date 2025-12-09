@@ -1,0 +1,139 @@
+<h1>megatron/core/fusions/fused_weighted_squared_relu.py</h1>
+<p>这份代码乍一看充满了PyTorch的底层操作和数学计算，确实容易让人晕头转向。</p>
+<p>简单来说，这个文件的目的是<strong>为了让大模型跑得更快、更省显存</strong>，专门手写了一个<strong>“加权的平方ReLU激活函数”</strong>。</p>
+<p>为了让你彻底搞懂，我为你列了一个<strong>6步走的“学习清单” (To-Do List)</strong>。我们将从最基础的数学公式开始，一步步拆解到代码实现。</p>
+<hr />
+<h3>📋 学习清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解数学原理 (这是做什么运算？)</strong></li>
+<li><strong>Task 2: 理解“Fusion/熔合” (为什么要这么写？)</strong></li>
+<li><strong>Task 3: 拆解“前向传播” (Forward)</strong></li>
+<li><strong>Task 4: 拆解“反向传播” (Backward - 最难点)</strong></li>
+<li><strong>Task 5: 理解 PyTorch 的管道 (Autograd Function)</strong></li>
+<li><strong>Task 6: 理解最终接口 (Shape 处理)</strong></li>
+</ol>
+<hr />
+<h3>🟢 Task 1: 理解数学原理</h3>
+<p>抛开代码，先看数学公式。这个函数叫 <code>Weighted Squared ReLU</code>。</p>
+<ul>
+<li><strong>ReLU</strong>: 大家都很熟悉，小于0变0，大于0保持原样。</li>
+<li><strong>Squared ReLU</strong>: 就是把 ReLU 的结果再平方一下。<ul>
+<li>公式：$(\text{ReLU}(x))^2$</li>
+<li><em>为什么要平方？</em> 相比普通ReLU，它的曲线更平滑，有时候能让模型训练更稳定。</li>
+</ul>
+</li>
+<li><strong>Weighted (加权)</strong>: 给这个结果乘上一个权重 $w$。</li>
+</ul>
+<p><strong>最终公式：</strong>
+$$ Output = (\text{ReLU}(x))^2 \times \text{weights} $$</p>
+<hr />
+<h3>🟢 Task 2: 理解“Fusion/熔合”</h3>
+<p>你会看到代码里到处都是 <code>@jit_fuser</code>。这是 NVIDIA Megatron 的核心优化手段。</p>
+<ul>
+<li><strong>普通写法</strong>：<ol>
+<li>计算 ReLU -&gt; 存入显存</li>
+<li>读取显存 -&gt; 计算平方 -&gt; 存入显存</li>
+<li>读取显存 -&gt; 乘权重 -&gt; 存入显存
+<em>缺点</em>：频繁读写显存，速度慢。</li>
+</ol>
+</li>
+<li><strong>Fused (熔合) 写法</strong>：<ul>
+<li>把 ReLU、平方、乘权重这三步，编译成<strong>一个</strong> CUDA 核函数 (Kernel)。</li>
+<li>数据读进来一次，一口气算完，直接写出结果。</li>
+<li><em>优点</em>：极大减少显存读写，速度飞快。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 3: 拆解“前向传播” (Forward)</h3>
+<p>看代码段 <code>weighted_squared_relu</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@jit_fuser</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">weighted_squared_relu</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">weights</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 核心逻辑就这一行：</span>
+    <span class="n">res</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="n">F</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="mi">2</span><span class="p">)</span> <span class="o">*</span> <span class="n">weights</span>
+    <span class="k">return</span> <span class="n">res</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">out_dtype</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这就是 Task 1 里的数学公式直接翻译。</li>
+<li><strong>关于 weights 的形状</strong>：代码注释提到 <code>(B, 1)</code>。这意味着对于一个 Token（词），它的所有隐藏层维度（Hidden Size）共享同一个权重。PyTorch 会自动把 <code>(B, 1)</code> 广播 (Broadcast) 到 <code>(B, Hidden_Size)</code> 进行乘法。</li>
+</ul>
+<hr />
+<h3>🟢 Task 4: 拆解“反向传播” (Backward)</h3>
+<p>这是代码里最复杂的部分。训练神经网络需要计算梯度（求导）。我们需要算两个东西的导数：<strong>输入 $x$ 的梯度</strong> 和 <strong>权重 $w$ 的梯度</strong>。</p>
+<p>看代码段 <code>weighted_squared_relu_back</code>：</p>
+<p><strong>1. 输入 $x$ 的梯度 (<code>input_grad</code>)</strong>
+根据链式法则：
+*   函数是：$y = w \cdot (\text{ReLU}(x))^2$
+*   对 $x$ 求导：$w \cdot 2 \cdot \text{ReLU}(x)$
+*   再乘上上游传来的梯度 $g$。</p>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># _squared_relu_back 函数里写着： g * 2 * F.relu(x)</span>
+<span class="c1"># 这里传入的 g 实际上是 (g * weights)，因为 weights 是常数系数</span>
+<span class="n">input_grad</span> <span class="o">=</span> <span class="n">_squared_relu_back</span><span class="p">(</span><span class="n">g</span> <span class="o">*</span> <span class="n">weights</span><span class="p">,</span> <span class="n">x</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>2. 权重 $w$ 的梯度 (<code>weights_grad</code>)</strong>
+*   函数是：$y = w \cdot \text{Val}$ （假设 $\text{Val} = \text{ReLU}(x)^2$）
+*   对 $w$ 求导：就是 $\text{Val}$ 本身。
+*   再乘上上游梯度 $g$。</p>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">weights_grad</span> <span class="o">=</span> <span class="n">squared_relu</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="o">*</span> <span class="n">g</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">w_dtype</span><span class="p">)</span>
+<span class="c1"># 关键点：求和</span>
+<span class="n">weights_grad</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">weights_grad</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>为什么要 sum (求和)？</strong><ul>
+<li>还记得 Task 3 说的吗？<code>weights</code> 的形状是 <code>(B, 1)</code>，它是广播到整个 Hidden Size 的。</li>
+<li>这意味着一个权重值影响了 Hidden Size 个神经元。</li>
+<li>所以在反向传播时，要把这 Hidden Size 个神经元回传的梯度<strong>加起来</strong>，还给这一个权重。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 5: 理解 PyTorch 的管道 (Autograd Function)</h3>
+<p>看代码段 <code>class WeightedSquaredReLUFunction(torch.autograd.Function)</code>。</p>
+<p>这是 PyTorch 的标准插件写法，用来告诉 PyTorch：“别管我内部怎么算的，反正前向传播走这里，反向传播走那里”。</p>
+<ul>
+<li><strong><code>forward</code></strong>:<ul>
+<li><code>ctx.save_for_backward(input, weights)</code>: 把输入存起来，因为算梯度的时候要用（看 Task 4 的公式，求导需要用到 $x$）。</li>
+<li>调用 Task 3 的函数。</li>
+</ul>
+</li>
+<li><strong><code>backward</code></strong>:<ul>
+<li>取出存好的 <code>input</code> 和 <code>weights</code>。</li>
+<li>接收上游梯度 <code>grad_output</code>。</li>
+<li>调用 Task 4 的函数算出 <code>inp_grad</code> 和 <code>w_grad</code> 并返回。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 6: 理解最终接口 (Shape 处理)</h3>
+<p>看最后那个函数 <code>weighted_squared_relu_impl</code>。这是给外部（也就是其他的层）调用的接口。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">weighted_squared_relu_impl</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 把输入变成 2D 矩阵： (Batch * Sequence_Length, Hidden_Size)</span>
+    <span class="nb">input</span> <span class="o">=</span> <span class="nb">input</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">ori_shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+
+    <span class="c1"># 调用上面那个 Autograd Function</span>
+    <span class="n">output</span> <span class="o">=</span> <span class="n">WeightedSquaredReLUFunction</span><span class="o">.</span><span class="n">apply</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">)</span>
+
+    <span class="c1"># 把形状还原回去 (比如还原成 3D: Batch, Seq, Hidden)</span>
+    <span class="k">return</span> <span class="n">output</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>目的</strong>：为了通用性。无论输入是 2D (Batch, Hidden) 还是 3D (Batch, Seq, Hidden)，先压扁成 2D 扔进去算，算完再复原。</li>
+</ul>
+<hr />
+<h3>📝 总结 (Summary)</h3>
+<p>这篇代码其实就在做一件事：</p>
+<blockquote>
+<p><strong>高效地计算 $y = w \cdot \text{ReLU}(x)^2$ 及其反向传播梯度。</strong></p>
+</blockquote>
+<ul>
+<li><strong>难点</strong>在于为了速度用了 JIT 编译（<code>@jit_fuser</code>）。</li>
+<li><strong>细节</strong>在于反向传播时，因为权重是广播的，所以计算权重的梯度时需要对最后一维求和 (<code>sum</code>)。</li>
+</ul>

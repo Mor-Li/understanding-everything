@@ -1,0 +1,125 @@
+<h1>tests/models/test_engine.py</h1>
+<p>这份代码文件 <code>tests/models/test_engine.py</code> 是一个<strong>测试脚本</strong>。它的主要目的是为了验证在一个叫 <code>verl</code> 的强化学习（RLHF）框架中，<strong>Actor（生成模型）</strong>和 <strong>Critic（评论模型）</strong> 能否在不同的<strong>分布式策略</strong>（如 FSDP, Megatron）下正常工作。</p>
+<p>简单来说，它在做<strong>“正确性校验”</strong>：确保当你把模型切分到多个 GPU 上跑的时候，算出来的结果和在单个 GPU 上跑标准模型的结果是一模一样的，并且能正常进行训练更新。</p>
+<p>为了让你更容易理解，我把你当作这个测试的<strong>质检员</strong>，给你列一个 <strong>Task Todo List（任务清单）</strong>，我们一步步把这个文件“拆解”开来看。</p>
+<hr />
+<h3>📋 质检员的任务清单 (Task Todo List)</h3>
+<p>你需要完成以下三个大任务，每个任务对应代码中的一个主要测试函数：</p>
+<ol>
+<li><strong>任务一：测试“演员” (Actor) 引擎是否正常</strong><ul>
+<li><em>对应代码：<code>test_actor_engine</code></em></li>
+<li>目标：验证生成模型（如 Qwen）在分布式环境下，能否算出正确的 Token 概率，并能执行 PPO 训练更新。</li>
+</ul>
+</li>
+<li><strong>任务二：测试“评论家” (Critic) 引擎是否正常</strong><ul>
+<li><em>对应代码：<code>test_critic_engine</code></em></li>
+<li>目标：验证评分模型在分布式环境下，能否给生成的句子打出正确的分数（Value），并能执行训练更新。</li>
+</ul>
+</li>
+<li><strong>任务三：测试模型参数加载是否准确</strong><ul>
+<li><em>对应代码：<code>test_per_tensor_generator</code></em></li>
+<li>目标：验证把一个标准模型切碎加载到分布式引擎（如 Megatron/FSDP）里时，每一层的权重参数（Weights）是不是都没丢、没乱。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步详解 (Step-by-Step Guide)</h3>
+<p>下面我们按照上面的清单，深入到代码细节里讲讲它是怎么做的。</p>
+<h4>🟢 任务一：测试 Actor 引擎 (<code>test_actor_engine</code>)</h4>
+<p><strong>情景</strong>：你要训练一个大模型（Actor）来写诗。因为模型太大，你需要用多个 GPU 并行跑。</p>
+<ol>
+<li><strong>初始化环境 (Setup)</strong>:<ul>
+<li>代码开头调用 <code>ray.init()</code>。这是启动分布式控制中心，因为这个框架是用 Ray 来管理多个 GPU Worker 的。</li>
+</ul>
+</li>
+<li><strong>选择分布式策略 (Strategy Selection)</strong>:<ul>
+<li>代码里有一个 <code>if strategy == "megatron": ... elif strategy == "fsdp": ...</code>。</li>
+<li>这就像在决定怎么切蛋糕：是按层切（Pipeline Parallel），还是把每一层切碎（Tensor Parallel/FSDP）。它配置了 <code>ActorConfig</code> 和 <code>EngineConfig</code>。</li>
+</ul>
+</li>
+<li><strong>启动 Worker (Init Worker)</strong>:<ul>
+<li><code>RayWorkerGroup(...)</code> 和 <code>wg.init_model()</code>。</li>
+<li>这步是真的在 GPU 上把模型加载起来了。</li>
+</ul>
+</li>
+<li><strong>造假数据 (Fake Data)</strong>:<ul>
+<li><code>input_ids = torch.randint(...)</code>。</li>
+<li>为了测试，不需要真去读莎士比亚，直接随机生成一些数字代表文字（Input IDs）和掩码（Masks）。</li>
+</ul>
+</li>
+<li><strong>核心步骤：运行分布式推理 (Distributed Inference)</strong>:<ul>
+<li><code>output = wg.compute_log_prob(data)</code>。</li>
+<li>让分布式的 Actor 算一下：给定这些输入，每个 Token 的概率（Log Probability）是多少？</li>
+</ul>
+</li>
+<li><strong>核心步骤：对比标准答案 (Verification)</strong>:<ul>
+<li>这是测试的灵魂！代码加载了一个标准的 HuggingFace 模型 (<code>hf_model</code>)。</li>
+<li>它让 HF 模型跑一样的数据，得到 <code>hf_logprobs</code>。</li>
+<li><strong>断言 (Assert)</strong>: <code>torch.testing.assert_close(hf_logprobs_mean, mcore_logprobs_mean)</code>。</li>
+<li><strong>逻辑</strong>：如果分布式引擎算出来的概率均值，和标准 HF 模型算出来的差距很小（atol=1e-3），说明分布式引擎没写具体的 Bug，算得是对的。</li>
+</ul>
+</li>
+<li><strong>测试训练更新 (Training Step)</strong>:<ul>
+<li><code>wg.update_actor(data)</code>。</li>
+<li>给它一些假的奖励信号（Advantages），看能不能跑通一次 PPO 的反向传播（Backpropagation），没报错就是成功。</li>
+</ul>
+</li>
+</ol>
+<h4>🟢 任务二：测试 Critic 引擎 (<code>test_critic_engine</code>)</h4>
+<p><strong>情景</strong>：你要训练另一个模型（Critic）来给 Actor 写出的诗打分。</p>
+<ul>
+<li>
+<p><em>流程和任务一几乎一样，区别在于模型的目标不同。</em></p>
+</li>
+<li>
+<p><strong>配置与启动</strong>:</p>
+<ul>
+<li>这次配置的是 <code>CriticConfig</code> 和 <code>CriticWorker</code>。</li>
+<li>Critic 模型通常是一个 Token Classification 模型（输出是一个分数，而不是下一个词）。</li>
+</ul>
+</li>
+<li><strong>对比标准答案</strong>:<ul>
+<li>分布式引擎跑 <code>wg.compute_values(data)</code>，得到评分 <code>values</code>。</li>
+<li>加载标准的 HuggingFace 模型，也算一次评分。</li>
+<li><strong>断言</strong>: 对比两者的评分均值是否一致。</li>
+</ul>
+</li>
+<li><strong>测试训练更新</strong>:<ul>
+<li><code>wg.update_critic(data)</code>。</li>
+<li>给它假的真实回报（Returns），看能不能更新 Critic 的参数以减少误差。</li>
+</ul>
+</li>
+</ul>
+<h4>🟢 任务三：测试参数加载 (<code>test_per_tensor_generator</code>)</h4>
+<p><strong>情景</strong>：你有一个训练好的模型文件，现在要把它加载到复杂的分布式系统里，你怕加载过程中张量（Tensor）切分错了，比如把左半边脸贴到了右半边。</p>
+<ol>
+<li><strong>创建多进程 (Spawn Processes)</strong>:<ul>
+<li><code>mp.spawn(...)</code>。因为要模拟多卡环境，这里手动起了多个进程。</li>
+</ul>
+</li>
+<li><strong>加载模型</strong>:<ul>
+<li><code>BaseEngine</code> 初始化，根据策略（Megatron 或 FSDP）构建分布式模型。</li>
+</ul>
+</li>
+<li><strong>获取切分后的参数</strong>:<ul>
+<li><code>engine.get_per_tensor_param()</code>。</li>
+<li>获取当前 GPU 上实际上持有的那一部分参数。</li>
+</ul>
+</li>
+<li><strong>对比原始参数</strong>:<ul>
+<li>代码加载了原始的 <code>ref_model</code>（标准模型）。</li>
+<li><strong>循环检查</strong>: <code>for key, value in per_tensor_params:</code></li>
+<li>它检查每一个参数的名字（key）是否存在，更重要的是检查 <strong>Shape（形状）</strong> 是否对得上。</li>
+<li><em>注：这里主要检查形状和存在性，确保切分逻辑是对的。</em></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件的核心逻辑就是：<strong>“信任但要验证” (Trust, but verify)</strong>。</p>
+<ol>
+<li>它<strong>不信任</strong>复杂的分布式引擎（Megatron/FSDP）第一次就能跑对。</li>
+<li>它用最简单的<strong>单卡 HuggingFace 模型</strong>作为“标准答案”（Ground Truth）。</li>
+<li>它让两者跑相同的数据，如果结果一致，说明复杂的分布式实现是正确的。</li>
+<li>最后它还要确保能跑通训练流程（update），不报错。</li>
+</ol>

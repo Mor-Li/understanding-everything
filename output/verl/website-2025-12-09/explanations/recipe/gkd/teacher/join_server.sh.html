@@ -1,0 +1,70 @@
+<h1>recipe/gkd/teacher/join_server.sh</h1>
+<p>没问题，我们把代码抛在一边，先想象一下这是一个<strong>大型公司的入职流程</strong>。</p>
+<p>这个脚本（<code>join_server.sh</code>）的目的是启动一个<strong>“老师模型”（Teacher Model）的服务节点</strong>，并把它连接到一个<strong>“中介代理”（Proxy）</strong>上。</p>
+<p>为了让你看懂，我把这个脚本做的事情拆解成了一个 <strong>4步走的 To-Do List</strong>：</p>
+<h3>📝 脚本任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>准备阶段</strong>：设定好联络暗号（端口）和办公地点（IP、模型路径）。</li>
+<li><strong>清场阶段</strong>：把之前还没下班的、卡死的旧员工（旧进程）全部踢掉。</li>
+<li><strong>等待阶段</strong>：一直盯着“中介大厅”的大门，直到中介（Proxy）开门营业。</li>
+<li><strong>开工阶段</strong>：正式启动“打工人”（Worker），加载模型，并向中介报到。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解</h3>
+<p>现在我们对照着代码，一步步看它是怎么完成上面这 4 个任务的：</p>
+<h4>1. 准备阶段：设定参数</h4>
+<p>代码的最开头几行是在定义“配置信息”。</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">PROXY_FRONTEND_PORT</span><span class="o">=</span><span class="m">15555</span><span class="w">  </span><span class="c1"># 对外服务的门口</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">PROXY_BACKEND_PORT</span><span class="o">=</span><span class="m">15556</span><span class="w">   </span><span class="c1"># 内部员工报到的门口</span>
+
+<span class="nv">PROXY_IP</span><span class="o">=</span><span class="s2">&quot;127.0.0.1&quot;</span><span class="w">              </span><span class="c1"># 中介就在本地</span>
+<span class="nv">BACKEND</span><span class="o">=</span>vllm<span class="w">                      </span><span class="c1"># 使用 vllm 这个引擎来推理</span>
+<span class="nv">CKPT_PATH</span><span class="o">=</span><span class="s2">&quot;/path/to/TEACHER_MODEL/&quot;</span><span class="w"> </span><span class="c1"># 老师模型的“脑子”（权重文件）放在哪</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这里就像是在填入职表格，告诉程序：中介在哪（IP）、走哪个门进去（端口 15556）、我们要用什么工具干活（vllm）、以及我们要加载哪个模型文件。</li>
+</ul>
+<h4>2. 清场阶段：清理旧进程</h4>
+<p>脚本中间有一行看起来很复杂的命令：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 翻译：找到所有名叫 &quot;python worker.py&quot; 的进程，强制杀掉(kill -9)</span>
+ps<span class="w"> </span>-ef<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span><span class="s2">&quot;python worker.py&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-v<span class="w"> </span>grep<span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span>-F<span class="w"> </span><span class="s1">&#39; &#39;</span><span class="w"> </span><span class="s1">&#39;{print $2}&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>xargs<span class="w"> </span>-r<span class="w"> </span><span class="nb">kill</span><span class="w"> </span>-9
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这是为了防止冲突。如果上次运行的程序还在后台卡着，或者没关干净，这行命令会把它们统统强制关闭。确保这次启动是在一个干净的环境里。</li>
+</ul>
+<h4>3. 等待阶段：等待中介（Proxy）就绪</h4>
+<p>这部分通过一个函数 <code>wait_server_ready</code> 来实现：</p>
+<div class="codehilite"><pre><span></span><code>wait_server_ready<span class="w"> </span>proxy<span class="w"> </span><span class="nv">$PROXY_IP</span><span class="w"> </span><span class="nv">$PROXY_BACKEND_PORT</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li>这个脚本假设有一个叫 <code>proxy</code> 的服务应该已经在运行了（通常由另一个脚本启动）。</li>
+<li>它会<strong>死循环</strong>（一直转圈圈），每秒钟敲一次门（<code>telnet</code>），问：“端口 15556 开了吗？”</li>
+<li><strong>如果没开</strong>：它就睡 1 秒，然后再问。</li>
+<li><strong>如果开了</strong>：它就跳出循环，继续往下执行。</li>
+<li><strong>目的</strong>：确保“打工人”启动的时候，“工头”已经在那等着了，否则打工人启动了也没法干活。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 开工阶段：启动 Worker</h4>
+<p>这是脚本最核心的一句话：</p>
+<div class="codehilite"><pre><span></span><code>nohup<span class="w"> </span>python<span class="w"> </span>worker.py<span class="w"> </span>--backend<span class="w"> </span><span class="nv">$BACKEND</span><span class="w"> </span>--proxy-addr<span class="w"> </span><span class="nv">$PROXY_IP</span>:<span class="nv">$PROXY_BACKEND_PORT</span><span class="w"> </span>--tp-size<span class="w"> </span><span class="m">8</span><span class="w"> </span>--n-logprobs<span class="w"> </span><span class="m">256</span><span class="w"> </span>--ckpt-path<span class="w"> </span><span class="nv">$CKPT_PATH</span><span class="w"> </span><span class="p">&amp;</span>&gt;<span class="w"> </span>worker.log<span class="w"> </span><span class="p">&amp;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li><code>python worker.py</code>：正式运行干活的 Python 程序。</li>
+<li><code>--backend vllm</code>：告诉程序用 vllm 引擎。</li>
+<li><code>--proxy-addr ...</code>：告诉程序去连接刚才等待的那个端口（找工头报到）。</li>
+<li><code>--tp-size 8</code>：<strong>重点</strong>，这表示模型很大，需要 <strong>8 张显卡</strong>（Tensor Parallel size）一起来跑。</li>
+<li><code>--ckpt-path ...</code>：去哪里读取模型文件。</li>
+<li><code>nohup ... &amp;&gt; worker.log &amp;</code>：这表示“在后台静默运行”，不要因为我关掉终端就停止，并且把所有运行日志写到 <code>worker.log</code> 文件里（就像写工作日记）。</li>
+</ul>
+</li>
+</ul>
+<h3>💡 总结</h3>
+<p>这个脚本是一个<strong>启动脚本</strong>。</p>
+<p>它的作用是：<strong>在确保环境干净、且管理节点（Proxy）已经启动的前提下，利用 8 张显卡启动一个强大的 AI 模型服务（Worker），并将其接入到系统中。</strong></p>

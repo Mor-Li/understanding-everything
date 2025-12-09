@@ -1,0 +1,100 @@
+<h1>megatron/core/dist_checkpointing/strategies/async_utils.py</h1>
+<p>这份代码 <code>async_utils.py</code> 的核心目的是为了解决大模型训练中的一个痛点：<strong>存盘（Checkpointing）太慢，会阻塞训练</strong>。</p>
+<p>为了不让显卡（GPU）在存盘时闲等着，Megatron 想把“把数据写入硬盘”这个耗时的操作，扔到后台进程（CPU）去慢慢做，让主进程继续训练。</p>
+<p>你可以把这个文件看作是一个 <strong>“后台任务管理系统”</strong>。我把它的逻辑拆解成一个 <strong>Task Todo List</strong>，让你一步步看懂它是怎么运作的。</p>
+<hr />
+<h3>Todo List 1: 定义任务包 (打包要干的活)</h3>
+<p><strong>对应代码类：</strong> <code>class AsyncRequest</code></p>
+<p>在后台干活之前，主进程首先得把活儿打包好。这就像写一张“工单”。</p>
+<ul>
+<li><strong>要做什么 (<code>async_fn</code>)</strong>: 比如“把这些张量写入磁盘”。</li>
+<li><strong>用什么做 (<code>async_fn_args</code>)</strong>: 比如“这是模型权重的张量数据”。</li>
+<li><strong>准备工作 (<code>preload_fn</code>)</strong>: 因为后台进程主要用 CPU，而数据在 GPU 上。这个函数负责先把数据从 GPU 搬运到 CPU（或者共享内存），方便后台进程读取。</li>
+<li><strong>收尾工作 (<code>finalize_fns</code>)</strong>: 等后台存完了，主进程需要干点啥？比如打印个日志“保存成功”。</li>
+</ul>
+<p><strong>核心逻辑：</strong> 这是一个数据容器（NamedTuple），用来封装一次异步保存的所有信息。</p>
+<hr />
+<h3>Todo List 2: 招聘工人 (选择后台执行方式)</h3>
+<p><strong>对应代码类：</strong> <code>class AsyncCaller</code> (基类), <code>TemporalAsyncCaller</code>, <code>PersistentAsyncCaller</code></p>
+<p>有了工单，得找人干活。这里有两种“招聘”模式：</p>
+<ul>
+<li>
+<p><strong>模式 A：临时工 (<code>TemporalAsyncCaller</code>)</strong></p>
+<ul>
+<li><strong>逻辑</strong>：每次要存盘时，现抓一个进程（<code>mp.Process</code>），干完活这个进程就销毁。</li>
+<li><strong>优点</strong>：逻辑简单，用完即走。</li>
+<li><strong>缺点</strong>：频繁创建/销毁进程开销大。</li>
+<li><strong>代码特征</strong>：使用 <code>fork</code> 模式创建进程，用 <code>process.join()</code> 等待结束。</li>
+</ul>
+</li>
+<li>
+<p><strong>模式 B：全职员工 (<code>PersistentAsyncCaller</code>)</strong></p>
+<ul>
+<li><strong>逻辑</strong>：程序一开始就启动一个后台进程，一直养着它。主进程通过“队列”（Queue）把任务传给它。</li>
+<li><strong>优点</strong>：效率高，不用反复创建进程。</li>
+<li><strong>代码特征</strong>：<ul>
+<li><code>self.queue</code>: 主进程把任务塞进这个队列。</li>
+<li><code>self.comp_q</code>: 工人干完了，往这个队列发个信号告诉主进程。</li>
+<li><code>async_loop</code>: 这是全职员工的无限循环代码，一直在等活干。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Todo List 3: 派发任务 (开始后台存盘)</h3>
+<p><strong>对应代码方法：</strong> <code>schedule_async_call</code></p>
+<p>现在主进程（训练进程）决定要存盘了，它会执行以下步骤：</p>
+<ol>
+<li><strong>数据搬运</strong>：如果有 <code>preload_fn</code>，先在主进程里执行它。通常是把 GPU 上的模型参数拷贝到 CPU 内存里。<strong>注意：这一步是阻塞的，但很快</strong>（只是显存到内存的拷贝，不涉及磁盘 IO）。</li>
+<li><strong>启动后台</strong>：<ul>
+<li>如果是<strong>临时工</strong>：直接 <code>Process(...).start()</code>。</li>
+<li>如果是<strong>全职员工</strong>：把 <code>AsyncRequest</code> 对象 <code>put</code> 到 <code>self.queue</code> 队列里。</li>
+</ul>
+</li>
+<li><strong>主进程回归</strong>：派发完任务后，主进程立刻回头去跑训练代码，不再等待磁盘写入。</li>
+</ol>
+<hr />
+<h3>Todo List 4: 检查进度 (询问“你干完了没？”)</h3>
+<p><strong>对应代码方法：</strong> <code>is_current_async_call_done</code></p>
+<p>训练还在跑，但主进程偶尔需要知道后台存盘是不是结束了（比如为了释放内存，或者防止还没存完就存下一个）。</p>
+<ul>
+<li><strong>单卡检查</strong>：看后台进程是不是还在活（<code>is_alive</code>）或者完成队列里有没有消息。</li>
+<li><strong>全员对齐 (<code>sync_all_async_calls</code>)</strong>：这是一个分布式训练的难点。<ul>
+<li>因为有几百个 GPU 在同时跑，必须<strong>所有</strong> GPU 的后台进程都存完了，才算这次存盘彻底结束。</li>
+<li>代码里用了一个 <code>torch.distributed.all_reduce</code> 来确认：只要有一个 GPU 还在存，大家就都算没存完。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Todo List 5: 任务队列管理 (大管家)</h3>
+<p><strong>对应代码类：</strong> <code>class AsyncCallsQueue</code></p>
+<p>如果训练很快，存盘很慢，可能会积压好几个存盘任务。这个类用来管理所有的任务。</p>
+<ul>
+<li><strong><code>schedule_async_request</code></strong>: 新建一个任务，加入队列，并根据配置选择找“临时工”还是“全职员工”去执行。</li>
+<li><strong><code>maybe_finalize_async_calls</code></strong>: 这是一个清理函数。主进程会在适当的时候调用它（比如每个 step 结束时）。<ul>
+<li>它会问：队头的任务做完了吗？</li>
+<li>如果做完了：执行收尾函数 (<code>finalize_fns</code>)，把任务从队列移除。</li>
+<li>如果没做完：那就接着等，或者先不管它。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：整个流程的一步步图解</h3>
+<ol>
+<li><strong>主进程</strong>：训练跑了一段时间，该存 Checkpoint 了。</li>
+<li><strong>主进程</strong>：创建一个 <code>AsyncRequest</code>（工单），指定要把哪些 Tensor 存盘。</li>
+<li><strong>主进程</strong>：调用 <code>AsyncCallsQueue.schedule_async_request</code>。</li>
+<li><strong>AsyncCaller</strong>：<ul>
+<li>先把 Tensor 从显存复制到内存（Preload）。</li>
+<li>把数据丢给后台进程（Worker Process）。</li>
+</ul>
+</li>
+<li><strong>主进程</strong>：<strong>立刻返回</strong>，继续去跑下一个 Step 的训练（此时 GPU 又忙起来了）。</li>
+<li><strong>后台进程</strong>：在 CPU 上慢悠悠地把内存里的数据写入硬盘（IO 操作）。</li>
+<li><strong>主进程</strong>：（过了一会儿）调用 <code>maybe_finalize_async_calls</code> 检查状态。<ul>
+<li>如果后台进程发信号说“写完了”，主进程就清理掉这个任务，释放相关内存。</li>
+</ul>
+</li>
+</ol>
+<p><strong>这个文件就是为了实现上面的第 2 到 第 7 步，确保存盘操作不卡住 GPU 训练。</strong></p>

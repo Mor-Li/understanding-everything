@@ -1,0 +1,97 @@
+<h1>tests/single_controller/test_auto_padding_on_cpu.py</h1>
+<p>这份代码其实是一个<strong>单元测试（Unit Test）</strong>文件。它的核心目的是验证一个叫 <code>verl</code> 的分布式框架中，<strong>“自动填充（Auto Padding）”</strong> 这个功能是否正常工作。</p>
+<p>为了让你听懂，我们先设定一个<strong>场景</strong>：
+假设你有 <strong>4 个工人（Worker）</strong>，但你手上有 <strong>10 个任务（Data）</strong>。
+在分布式计算中，通常要求每个工人拿到的任务数量必须是一样的。
+但是 $10 \div 4 = 2.5$，任务不能切开。
+<strong>“自动填充”</strong> 的作用就是：系统自动补上 2 个假任务（Padding），变成 12 个任务。这样 $12 \div 4 = 3$，每个工人正好分 3 个。等工人做完，系统再悄悄把那 2 个假任务的结果扔掉，只把原本 10 个任务的结果还给你。</p>
+<p>下面我列一个 <strong>学习清单（Task List）</strong>，带你一步步看懂代码在干什么。</p>
+<hr />
+<h3>Task 1: 理解环境配置 (Setup)</h3>
+<p><strong>代码位置：</strong> 开头到 <code>class Actor</code> 定义结束。</p>
+<ul>
+<li><strong>目的：</strong> 准备好干活的工人和规则。</li>
+<li><strong>解读：</strong><ol>
+<li><code>DataProtoConfig.auto_padding = True</code>：这是<strong>全局开关</strong>。意思是告诉系统：“默认情况下，只要数据量不够分，你就帮我自动补齐。”</li>
+<li><code>class Actor(Worker)</code>：定义了工人的工作内容。<ul>
+<li><code>add</code> 函数：工人拿到的数据后，会把自己的编号（Rank）加到数据上。这只是为了证明工人确实干活了。</li>
+</ul>
+</li>
+<li><code>@register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)</code>：这是一个装饰器，意思是“这个函数支持把数据切分（Data Parallel）发给多个工人”。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 2: 启动测试与资源池 (Initialization)</h3>
+<p><strong>代码位置：</strong> <code>test_auto_padding</code> 函数的前几行。</p>
+<ul>
+<li><strong>目的：</strong> 招募工人。</li>
+<li><strong>解读：</strong><ol>
+<li><code>chunk_size = 4</code>：这很重要。设定了我们有 <strong>4 个工人</strong>（或者说数据会被切成 4 份）。</li>
+<li><code>RayWorkerGroup(...)</code>：利用 Ray（一个分布式计算框架）启动了这 4 个工人，组成一个工作组。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 3: 本地逻辑验证 (Local Math Check)</h3>
+<p><strong>代码位置：</strong> <code>for test_size in range(4, 20): ...</code> 这一段循环。</p>
+<ul>
+<li><strong>目的：</strong> 在真的把数据发给工人之前，先在本地算一下数学题，看看“补齐逻辑”对不对。</li>
+<li><strong>解读：</strong><ul>
+<li>代码模拟了数据量从 4 到 19 的各种情况。</li>
+<li><code>padding_size = ...</code>：计算需要补多少个空数据。比如数据量是 10，<code>chunk_size</code> 是 4，它算出需要补 2 个。</li>
+<li><code>local_data.padding(...)</code>：执行补齐。</li>
+<li><code>chunked = local_data.chunk(...)</code>：尝试切分数据。</li>
+<li><strong>断言 (Assert)：</strong> 检查切分后的每一份数据长度是否符合预期（比如 10 个数据补成 12 个，切 4 份，每份应该是 3 个）。</li>
+<li><strong>结论：</strong> 这段代码不涉及真正的分布式计算，只是在测“切蛋糕的数学公式”对不对。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 分布式自动填充测试 (Global Config Test)</h3>
+<p><strong>代码位置：</strong> 从循环结束后的 <code>data = DataProto.from_dict(...)</code> 开始，到 <code>DataProtoConfig.auto_padding = False</code> 之前。</p>
+<ul>
+<li><strong>目的：</strong> 真的让 4 个工人去跑任务，看看系统会不会自动帮我处理“数据量无法整除”的问题。</li>
+<li><strong>解读：</strong><ol>
+<li><strong>测试数据量 10：</strong><ul>
+<li>你有 10 个数据，工人有 4 个。</li>
+<li><code>actor_wg.add(data)</code>：你直接把 10 个数据扔进去。</li>
+<li><strong>系统幕后操作：</strong> 自动补成 12 -&gt; 分发 -&gt; 计算 -&gt; 收集结果 -&gt; 删掉 2 个假结果 -&gt; 返回 10 个结果。</li>
+<li><code>assert len(output) == 10</code>：验证最后回来的确实是 10 个，不多不少。</li>
+</ul>
+</li>
+<li><strong>测试数据量 1：</strong><ul>
+<li>只有 1 个数据，4 个工人。</li>
+<li>系统应该补 3 个假数据，变成 4 个，每人分 1 个。</li>
+<li>最后验证回来的长度还是 1。</li>
+</ul>
+</li>
+<li><strong>测试数据量 8：</strong><ul>
+<li>8 个数据，4 个工人。正好整除（8/4=2）。</li>
+<li>系统应该不补数据（Padding=0）。</li>
+<li>最后验证长度是 8。</li>
+</ul>
+</li>
+<li><strong>Args vs Kwargs：</strong> 代码里重复测了 <code>add(data)</code> 和 <code>add(data=data)</code>，这是为了确保不管是按位置传参还是按关键字传参，自动填充都生效。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 5: 特定对象配置测试 (Specific Config Test)</h3>
+<p><strong>代码位置：</strong> 从 <code>DataProtoConfig.auto_padding = False</code> 开始到最后。</p>
+<ul>
+<li><strong>目的：</strong> 如果我把全局开关关了，但我只想对<strong>某一个特定的数据包</strong>开启自动填充，行不行？</li>
+<li><strong>解读：</strong><ol>
+<li><code>DataProtoConfig.auto_padding = False</code>：<strong>关掉全局开关</strong>。现在默认不自动填充了。</li>
+<li><code>DataProto.from_dict(..., auto_padding=True)</code>：创建数据时，<strong>显式地</strong>在这个数据对象上标记“我要自动填充”。</li>
+<li>再次运行上面的测试（数据量 10, 1, 8...）。</li>
+<li><code>assert ...</code>：验证即使全局开关关了，只要数据自己要求填充，系统依然能正确处理。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这个文件的逻辑流是：</p>
+<ol>
+<li><strong>设定规则：</strong> 我们有 4 个工人。</li>
+<li><strong>数学检查：</strong> 在本地算一下，如果数据量不是 4 的倍数，补齐算法写得对不对？</li>
+<li><strong>实战检查（全局开）：</strong> 开启全局自动补齐，扔给工人各种“尴尬”数量的数据（10个、1个），看系统能不能完美处理并把结果还原。</li>
+<li><strong>实战检查（局部开）：</strong> 关闭全局自动补齐，只对特定数据开启，看系统是不是依然能识别并处理。</li>
+</ol>
+<p><strong>一句话概括：</strong> 这个测试保证了当你使用 <code>verl</code> 框架进行分布式计算时，不需要自己操心“数据量能不能被卡显卡数量整除”这种烦人的数学问题，框架会自动帮你搞定。</p>

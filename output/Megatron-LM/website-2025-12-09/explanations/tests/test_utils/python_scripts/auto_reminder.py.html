@@ -1,0 +1,104 @@
+<h1>tests/test_utils/python_scripts/auto_reminder.py</h1>
+<p>这份代码其实就是一个<strong>“自动催更机器人”</strong>。</p>
+<p>它的主要作用是：<strong>去 GitLab 上扫描那些还没合并的代码（MR），看看谁还没审核（Review），然后去 Slack 群里发消息 @这些人，提醒他们赶紧干活。</strong></p>
+<p>为了让你看懂，我把这个脚本的逻辑拆解成一个 <strong>Task List（任务清单）</strong>，就像这个机器人上班后一步一步要做的事情：</p>
+<h3>🤖 机器人的工作任务清单 (To-Do List)</h3>
+<h4>第一阶段：上班打卡与准备 (初始化)</h4>
+<ol>
+<li><strong>检查装备 (Env Vars)</strong>:<ul>
+<li>检查有没有 GitLab 的地址和令牌（Token）。</li>
+<li>检查有没有 Slack 的发送地址（Webhook）和令牌。</li>
+<li><em>如果不全，直接报错罢工。</em></li>
+</ul>
+</li>
+<li><strong>确认“大老板”名单 (Hardcoded Reviewers)</strong>:<ul>
+<li>代码里写死了一份 <code>final_reviewers</code> 名单（最终审核人），这些人通常是核心大佬。</li>
+</ul>
+</li>
+<li><strong>连接系统</strong>:<ul>
+<li>登录 GitLab (<code>get_gitlab_handle</code>)。</li>
+<li>登录 Slack (<code>slack_client</code>)。</li>
+</ul>
+</li>
+</ol>
+<h4>第二阶段：收集情报 (获取数据)</h4>
+<ol>
+<li><strong>确认当前项目</strong>:<ul>
+<li>找到指定的 GitLab 项目（ID: 19378）。</li>
+</ul>
+</li>
+<li><strong>确认现在的任务周期 (Milestones)</strong>:<ul>
+<li>去看看项目里最近的两个活跃里程碑（Milestones），比如 "v1.0", "v2.0"，只关心这些里程碑下的代码。</li>
+</ul>
+</li>
+<li><strong>扩充专家名单</strong>:<ul>
+<li>去 GitLab 上抓取 <code>mcore-reviewers</code> 这个用户组里的所有人。</li>
+<li>把这些人减去上面的“大老板”，剩下的归类为“专家审核人” (<code>expert_reviewers</code>)。</li>
+</ul>
+</li>
+</ol>
+<h4>第三阶段：地毯式搜索 (扫描 MR)</h4>
+<ol>
+<li><strong>筛选目标</strong>:<ul>
+<li>在刚才找到的里程碑里，寻找<strong>状态是 Open（未关闭）</strong> 的 Merge Request (MR)。</li>
+<li>只看贴了 <code>Expert Review</code> (专家评审) 或 <code>Final Review</code> (最终评审) 标签的 MR。</li>
+</ul>
+</li>
+<li><strong>逐个分析 MR (核心逻辑)</strong>:<ul>
+<li><strong>计算拖延时间</strong>:<ul>
+<li>这个 MR 在当前阶段停了几天了？(<code>get_days_in_stage</code>)</li>
+</ul>
+</li>
+<li><strong>定级报警 (Priority)</strong>:<ul>
+<li>拖了 &lt;= 1天：P2 (普通，✨图标)</li>
+<li>拖了 &lt;= 3天：P1 (重要，⚠️图标)</li>
+<li>拖了 &gt; 3天：P0 (紧急，🚨图标，必须要骂人了)</li>
+</ul>
+</li>
+<li><strong>揪出谁没干活 (Find Reviewers)</strong>:<ul>
+<li>看看这个 MR 被指派给了谁 (<code>Assigned reviewers</code>)。</li>
+<li>看看谁已经点过赞/通过了 (<code>Approved users</code>)。</li>
+<li><strong>做减法</strong>：<code>指派的人</code> - <code>已通过的人</code> = <strong><code>还没干活的人</code></strong>。</li>
+<li><em>特殊情况</em>：如果是 Final Review 阶段且流水线（Pipeline）挂了，就不催人了（因为代码跑不通没法审）。</li>
+</ul>
+</li>
+<li><strong>查找联系方式</strong>:<ul>
+<li>拿这些人的邮箱去 Slack 查他们的 User ID，方便发消息的时候直接 @他们。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<h4>第四阶段：发送通报 (Slack 通知)</h4>
+<ol>
+<li><strong>生成小报告</strong>:<ul>
+<li>把上面算出来的数据（标题、作者、优先级、拖了几天、该谁审了）拼成一段文字。</li>
+</ul>
+</li>
+<li><strong>发送消息</strong>:<ul>
+<li>通过 Slack Webhook 把这段文字发到群里。</li>
+<li><em>如果是 <code>dry-run</code> 模式（演习模式），只打印在屏幕上，不真的发到群里。</em></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结文中的关键观点（逻辑点）</h3>
+<ol>
+<li><strong>分级评审制度</strong>：代码评审分为两个阶段，先是 <code>Expert Review</code>（普通专家），通过后进入 <code>Final Review</code>（核心大佬）。脚本会根据当前标签判断该催哪拨人。</li>
+<li><strong>基于时间的优先级</strong>：脚本认为，代码卡在评审阶段越久，优先级越高（P2 -&gt; P1 -&gt; P0），催得越急。</li>
+<li><strong>精准定位懒人</strong>：它不会无脑 @所有人，而是会对比“指派列表”和“已批准列表”，只 @那些被指派了但还没点通过的人。</li>
+<li><strong>容错机制</strong>：代码里有很多 <code>retry_with_backoff</code>，意思是如果网络不好（GitLab 或 Slack 连不上），它会等待几秒重试，不会立刻崩溃。</li>
+</ol>
+<h3>简单举例</h3>
+<p>假如你是 <code>zhangsan@nvidia.com</code>。
+1.  有一个 MR 贴了 <code>Expert Review</code> 标签。
+2.  你被指派为 Reviewer。
+3.  这个 MR 已经开了 4 天了。
+4.  你还没点 Approve。</p>
+<p><strong>脚本运行后，Slack 群里就会弹出一行字：</strong></p>
+<blockquote>
+<p><strong>MR</strong>: &lt;链接&gt; ...
+<strong>Priority</strong>: P0 🚨 (因为超过3天了)
+<strong>Reviewers</strong>: @zhangsan (因为你没批)</p>
+</blockquote>
+<p>这就是这个脚本干的事。</p>

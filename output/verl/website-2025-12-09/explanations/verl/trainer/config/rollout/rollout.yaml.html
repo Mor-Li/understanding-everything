@@ -1,0 +1,75 @@
+<h1>verl/trainer/config/rollout/rollout.yaml</h1>
+<p>这份配置文件主要是在配置 <strong>“Rollout（采样/生成）”</strong> 环节。</p>
+<p>在强化学习（RLHF）训练大模型时，整个过程可以简单理解为：
+1.  <strong>出题</strong>：给模型一个 Prompt。
+2.  <strong>做题（Rollout）</strong>：模型根据 Prompt 生成回答。<strong>&lt;-- 这份文件就是管这一步的</strong>
+3.  <strong>打分</strong>：Reward Model 给回答打分。
+4.  <strong>学习</strong>：模型根据分数调整参数。</p>
+<p><strong>“Rollout” 本质上就是一次“推理（Inference）”过程</strong>。</p>
+<p>为了让你听懂，我把配置这份文件想象成 <strong>“给考生（模型）安排一场模拟考试”</strong>。我们需要制定考试的规则、考场的纪律、以及使用的工具。</p>
+<p>下面是一个 <strong>Task Todo List</strong>，带你一步步看懂这些参数在干什么：</p>
+<hr />
+<h3>Task 1：决定“谁”来监考？（选择推理引擎）</h3>
+<p>你要决定用哪种技术来让模型生成文字。现在最流行的是 vLLM，因为它快。</p>
+<ul>
+<li><strong><code>name</code></strong>: 这里填 <code>vllm</code> 或 <code>sglang</code>（目前最快的两个推理框架）。</li>
+<li><strong><code>mode</code></strong>: <code>async</code>（异步）。可以让多个 GPU 同时干活，不用傻等。</li>
+<li><strong><code>load_format</code></strong>: <code>dummy</code> 或 <code>hf</code>。你是要加载真实的权重（hf），还是随便弄个假的权重测试一下代码跑不跑得通（dummy）。</li>
+</ul>
+<h3>Task 2：分配“考场”资源（硬件与并行）</h3>
+<p>模型很大，一张显卡装不下，或者为了算得快，需要多卡合作。</p>
+<ul>
+<li><strong><code>tensor_model_parallel_size</code></strong>: <strong>关键参数</strong>。比如你的模型很大（70B），一张卡放不下，你设为 <code>4</code>，就是把模型切成 4 份，放在 4 张卡上一起跑。</li>
+<li><strong><code>gpu_memory_utilization</code></strong>: <code>0.5</code>。意思是显存只用 50% 给 vLLM 推理用。<strong>为什么不是 100%？</strong> 因为训练的时候，显存还要留给梯度更新、优化器状态等其他东西。这里如果设太高，训练就会 OOM（显存爆炸）。</li>
+</ul>
+<h3>Task 3：规定“答题风格”（采样参数）</h3>
+<p>你希望模型生成的回答是“天马行空”的，还是“严谨死板”的？</p>
+<ul>
+<li><strong><code>temperature</code></strong>: <code>1.0</code>。温度。越高越随机，越低越保守。</li>
+<li><strong><code>top_p</code></strong> / <strong><code>top_k</code></strong>: 也是控制随机性的参数。</li>
+<li><strong><code>n</code></strong>: <code>1</code>。每个 Prompt 生成几个回答？<ul>
+<li>如果是 PPO 算法，通常是 1。</li>
+<li>如果是 GRPO（DeepSeek-R1 用的算法），这里通常要设为 8 或 16（一次生成很多个，然后挑最好的学习）。</li>
+</ul>
+</li>
+<li><strong><code>do_sample</code></strong>: <code>True</code>。开启采样（随机），否则就是贪婪搜索（每次只选概率最大的词，但这在 RL 训练中通常不好，因为需要探索）。</li>
+</ul>
+<h3>Task 4：限制“试卷长度”（输入输出长度）</h3>
+<p>防止显存爆掉，或者模型废话连篇。</p>
+<ul>
+<li><strong><code>prompt_length</code></strong>: <code>512</code>。题目的最大长度。</li>
+<li><strong><code>response_length</code></strong>: <code>512</code>。允许模型回答的最大长度。</li>
+<li><strong><code>max_num_batched_tokens</code></strong>: <code>8192</code>。一次性最多处理多少个 Token。这个数值越大，吞吐量越高，但显存占用也越大。</li>
+</ul>
+<h3>Task 5：开启“作弊加速”（性能优化）</h3>
+<p>这些是 vLLM 等引擎的高级功能，为了让生成速度更快。</p>
+<ul>
+<li><strong><code>enable_prefix_caching</code></strong>: <code>True</code>。如果很多题目有相同的前缀（比如 System Prompt），缓存下来，不用重复算。</li>
+<li><strong><code>enable_chunked_prefill</code></strong>: <code>True</code>。把长的 Prompt 切成小块处理，防止卡顿。</li>
+<li><strong><code>free_cache_engine</code></strong>: <code>True</code>。生成完一次后，赶紧释放 KV Cache 显存，把地盘腾出来给“学习（训练）”阶段用。</li>
+</ul>
+<h3>Task 6：特殊题型（多轮对话与 Agent）</h3>
+<p>如果你的训练任务不是简单的问答，而是像 ChatGPT 那样多轮聊天，或者是 Agent 调用工具。</p>
+<ul>
+<li><strong><code>multi_turn</code></strong>: 下面的 <code>enable</code> 如果是 True，就开启多轮对话模式。<ul>
+<li><code>max_turns</code>: 最多聊几轮。</li>
+<li><code>tool_config_path</code>: 如果模型能用工具（比如计算器），这里指定工具的配置。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 7：事后复盘（调试与监控）</h3>
+<p>用来检查配置对不对，或者性能好不好。</p>
+<ul>
+<li><strong><code>skip_rollout</code></strong>: <code>False</code>。如果设为 True，就会跳过生成过程，直接读取硬盘上存好的数据。这通常是程序员 Debug 用的，不想每次都花几小时重新生成。</li>
+<li><strong><code>profiler</code></strong>: 性能分析器。如果你觉得训练太慢，开启这个来看看时间都花哪儿了。</li>
+</ul>
+<hr />
+<h3>总结：在这个文件中，你最需要关注的几个参数</h3>
+<p>如果你只是想跑通一个 demo，或者微调一下参数，主要看这几个：</p>
+<ol>
+<li><strong><code>name</code></strong>: 确保选了 <code>vllm</code> (通常性能最好)。</li>
+<li><strong><code>tensor_model_parallel_size</code></strong>: 根据你的显卡数量和模型大小调整（例如 7B 模型单卡够用设 1，70B 可能需要设 4 或 8）。</li>
+<li><strong><code>gpu_memory_utilization</code></strong>: 如果报错 OOM（显存不足），尝试把这个数字调小（比如 0.4 或 0.3）。</li>
+<li><strong><code>n</code></strong>: 如果你在复现 DeepSeek R1 (GRPO)，这个数字要改大。</li>
+<li><strong><code>prompt_length</code> / <code>response_length</code></strong>: 根据你的数据实际长度调整，设太大会浪费显存，设太小会被截断。</li>
+</ol>

@@ -1,0 +1,104 @@
+<h1>recipe/one_step_off_policy/shell/dapo_7b_math_fsdp2_64_64_ris.sh</h1>
+<p>这份脚本确实包含了很多大模型训练（特别是强化学习 RLHF/PPO）的专业术语。不用担心，我们可以把它看作是一份<strong>“烹饪菜谱”</strong>（实际上文件路径里也叫 <code>recipe</code>）。</p>
+<p>这份“菜谱”的目的是：<strong>使用 DAPO 算法（一种强化学习方法），在 Qwen2.5-Math-7B 这个数学模型的基础上，通过“一步偏离策略（One-step off-policy）”进行训练，让它做数学题更厉害。</strong></p>
+<p>为了让你听懂，我把阅读这份代码拆解成一个 <strong>Task List（任务清单）</strong>，我们一步步划掉这些任务。</p>
+<hr />
+<h3>✅ Task 1: 搞清楚“我是谁，我在哪”（基础配置）</h3>
+<p>脚本的前几行是在定义这次训练的“身份”和“文件位置”。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>bash
+    project_name='DAPO'
+    exp_name='dapo_qwen2-7B-math_28k_fsdp2_one_step_off_64-64-ris'
+    MODEL_PATH=... # 模型在哪里
+    TRAIN_FILE=... # 训练题库在哪里
+    TEST_FILE=...  # 考试题库在哪里</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>身份</strong>：这次实验叫 <code>DAPO</code>，具体名字很长，暗示了它用了 FSDP2（一种显存优化技术）、Math数据、Ris（一种修正算法）。</li>
+<li><strong>食材（数据）</strong>：<ul>
+<li><strong>模型</strong>：用的是 <code>Qwen2.5-Math-7B</code>。</li>
+<li><strong>训练集</strong>：<code>dapo-math-17k</code>（1.7万道数学题）。</li>
+<li><strong>测试集</strong>：<code>aime-2024</code>（美国数学邀请赛题目，用来测试模型水平）。</li>
+</ul>
+</li>
+<li><strong>注意点</strong>：注释里有一句 <code>very important!</code>，提醒要把模型的配置文件里的 <code>max_position_embeddings</code> 改成 32768。这意味着这个模型要处理<strong>超长上下文</strong>（做复杂的数学推理需要写很长的步骤）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 设定“烹饪手法”（核心算法参数）</h3>
+<p>这里定义了模型怎么“学习”。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>bash
+    adv_estimator=grpo  # 关键点
+    use_kl_in_reward=False
+    max_response_length=$((1024 * 28)) # 28k tokens</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>GRPO</strong>：这是一种比传统 PPO 更省资源的算法。简单说，它不额外训练一个“打分模型（Critic）”，而是让模型生成一组答案，通过对比这组答案的好坏来学习。</li>
+<li><strong>Long COT (长思维链)</strong>：<code>max_response_length</code> 设置得非常大（28k tokens）。这是为了让模型能够进行极长的数学推理（System 2 Thinking，类似 OpenAI o1 的思路）。</li>
+<li><strong>One-step Off-policy</strong>：脚本名字里提到的。通常强化学习要求“边生成边学”（On-policy），这很慢。这个脚本允许使用“稍微旧一点的模型生成的样本”来学习，为了修正误差，它后面用到了 <code>rollout_correction</code>（见 Task 5）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 搭建“厨房设施”（硬件与加速）</h3>
+<p>大模型训练非常吃显存，这里定义了如何把模型塞进 GPU。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>bash
+    actor_offload=False
+    ref_offload=True
+    gen_tp=4    # 张量并行
+    sp_size=4   # 序列并行
+    fsdp_size=8 # FSDP并行</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>Ray</strong>：这是一个分布式计算框架，用来管理多台机器。</li>
+<li><strong>Offload (卸载)</strong>：<code>ref_offload=True</code> 意思是把“参考模型”（用来防止模型学歪的那个原始模型）的参数存在 CPU 内存里，用的时候再拿，为了省 GPU 显存。</li>
+<li><strong>切分模型 (Parallelism)</strong>：<ul>
+<li><strong>TP (Tensor Parallel)</strong>: 把模型的一层切开放在4张卡上。</li>
+<li><strong>SP (Sequence Parallel)</strong>: 因为上下文长达32k，把长句子切开放在4张卡上处理。</li>
+<li><strong>FSDP</strong>: 类似于把模型参数碎片化存储。</li>
+</ul>
+</li>
+<li><strong>vLLM</strong>: 脚本里提到了 <code>actor_rollout_ref.rollout.name=vllm</code>，意思是使用 vLLM 这个超快的库来生成模型的回答（Rollout）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 具体的“修正技巧”（Off-policy Correction）</h3>
+<p>这是这个脚本最核心、最学术的部分。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>bash
+    algorithm.rollout_correction.rollout_rs=geometric
+    algorithm.rollout_correction.rollout_rs_threshold=1.001</code></li>
+<li><strong>解读：</strong><ul>
+<li>因为我们用的是“Off-policy”（稍微旧一点的数据），直接学可能会学歪。</li>
+<li>这里用了一种叫 <strong>Geometric Resampling (几何重采样)</strong> 的数学技巧来修正概率分布。简单理解：<strong>给数据加个过滤器，确保模型学的是“对”的概率，而不是旧模型产生的偏差。</strong></li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 按下“开始按钮”（执行命令）</h3>
+<p>最后那一大段 <code>python -m ...</code> 就是把上面定义的变量全部塞给 Python 程序去执行。</p>
+<ul>
+<li><strong>流程总结</strong>：<ol>
+<li><strong>加载数据</strong>：读取数学题。</li>
+<li><strong>Actor (演员)</strong>：模型针对题目生成解题步骤（使用 vLLM 加速，生成 TP=4）。</li>
+<li><strong>Reward (奖励)</strong>：判断解题对不对（GRPO 算法）。</li>
+<li><strong>Correction (修正)</strong>：因为是 Off-policy，用上面定义的几何重采样修正一下数据。</li>
+<li><strong>Update (更新)</strong>：使用 FSDP2 并行策略，更新模型的参数，让它下次做题更准。</li>
+<li><strong>Loop (循环)</strong>：重复这个过程 400 步（<code>total_training_steps=400</code>）。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这脚本到底是干啥的？</h3>
+<p>用一句话说：
+<strong>这是一个配置脚本，动用了8个节点（很多显卡），使用 Ray 框架和 vLLM 加速，通过 DAPO/GRPO 算法，训练一个 7B 的数学模型，让它学会进行超长步骤（32k长度）的数学推理。</strong></p>
+<p><strong>你的学习 Todo List 建议：</strong>
+1.  <strong>先不看细节</strong>：知道它是做 RLHF/PPO 训练的启动脚本即可。
+2.  <strong>关注资源</strong>：看 <code>NNODES</code> 和 <code>NGPUS</code>，知道这需要巨大的算力（64张卡）。
+3.  <strong>关注数据</strong>：看 <code>TRAIN_FILE</code>，知道它在学数学。
+4.  <strong>关注特色</strong>：看 <code>max_response_length</code>，知道它主打长思维链（Long CoT）。</p>

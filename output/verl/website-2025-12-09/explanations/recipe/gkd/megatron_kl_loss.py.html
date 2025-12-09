@@ -1,0 +1,92 @@
+<h1>recipe/gkd/megatron_kl_loss.py</h1>
+<p>这份代码确实比较硬核，因为它结合了三个复杂的概念：<strong>知识蒸馏（Knowledge Distillation）</strong>、<strong>Megatron 分布式训练（Tensor Parallel）</strong> 和 <strong>自定义自动求导（Autograd Function）</strong>。</p>
+<p>简单来说，这段代码在算一个<strong>“老师”模型（Target）</strong>和一个<strong>“学生”模型（Source）</strong>之间的差距（KL散度 Loss），但是“学生”模型太大了，它的词表（Vocabulary）被切分到了多张显卡上。</p>
+<p>为了让你看懂，我列了一个 <strong>Task Todo List</strong>，我们一步一步来完成这个任务。</p>
+<hr />
+<h3>📋 任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1:搞清楚角色</strong> —— 谁是学生？谁是老师？输入是什么？</li>
+<li><strong>Task 2: 理解核心难点 (TP)</strong> —— 什么是“词表并行 (Vocab Parallel)”？</li>
+<li><strong>Task 3: 前向传播 (Forward) 之 算概率</strong> —— 学生怎么在多张卡上算出正确的概率？</li>
+<li><strong>Task 4: 前向传播 (Forward) 之 对齐数据</strong> —— 老师给的 Top-K 答案，怎么分发给持有不同词表的显卡？</li>
+<li><strong>Task 5: 前向传播 (Forward) 之 算 Loss</strong> —— 最后的 Loss 是怎么加起来的？</li>
+<li><strong>Task 6: 反向传播 (Backward)</strong> —— 怎么手动算梯度传回去？</li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>Task 1: 搞清楚角色</h4>
+<p>首先看函数的输入 <code>forward(ctx, vocab_parallel_logits, target_topk_logps, target_topk_indices)</code>：</p>
+<ul>
+<li><strong>学生 (Source)</strong>: <code>vocab_parallel_logits</code>。这是当前正在训练的模型输出的原始分数。<ul>
+<li><em>注意</em>：它是“Parallel”的，意味着如果你词表有 10万个词，用了2张卡，每张卡上只有 5万个词的分数。</li>
+</ul>
+</li>
+<li><strong>老师 (Target)</strong>: <code>target_topk_logps</code> 和 <code>target_topk_indices</code>。<ul>
+<li>老师为了省空间，没有给出 10万个词的全部概率，只给了它认为最重要的 <strong>Top-K</strong> (比如前100个) 的概率和对应的词 ID。</li>
+</ul>
+</li>
+</ul>
+<p><strong>目标</strong>：让学生的概率分布去拟合老师的 Top-K 分布。</p>
+<h4>Task 2: 理解核心难点 (TP - Tensor Parallel)</h4>
+<p>这是最晕的地方。假设词表大小 <code>Vocab = 8</code>，用了 <code>2</code> 张显卡 (GPU 0 和 GPU 1)。
+*   <strong>GPU 0</strong> 负责词 ID: <code>[0, 1, 2, 3]</code>
+*   <strong>GPU 1</strong> 负责词 ID: <code>[4, 5, 6, 7]</code></p>
+<p>代码里的 <code>partition_vocab_size</code> 就是 4。
+<code>VocabUtility.vocab_range_from_per_partition_vocab_size</code> 这行代码就是在算当前显卡负责哪个范围的词。</p>
+<h4>Task 3: 前向传播之算概率 (Softmax)</h4>
+<p>学生输出的是 Logits（原始分数），要变成概率需要做 Softmax：$P = \frac{e^{x_i}}{\sum e^{x_j}}$。
+问题来了：分母 $\sum e^{x_j}$ 需要所有词的和。但 GPU 0 只有前一半词，GPU 1 只有后一半词。</p>
+<ul>
+<li><strong>代码动作</strong>:<ol>
+<li><code>calculate_logits_max</code>: 先找最大值（为了数值稳定性）。</li>
+<li><code>torch.distributed.all_reduce(..., op=MAX)</code>: <strong>关键点！</strong> 显卡之间通气，大家交换信息，拿到全局最大的那个数。</li>
+<li><code>exp_logits.sum(dim=-1)</code>: 自己算自己那部分词的 e 指数之和。</li>
+<li><code>torch.distributed.all_reduce(..., op=SUM)</code>: <strong>关键点！</strong> 显卡再次通气，把大家的和加在一起，得到全局的分母。</li>
+</ol>
+</li>
+</ul>
+<p>现在，每张卡都有了全局分母，就可以算出自己手里那部分词的正确概率 <code>vocab_parallel_source_probs</code> 了。</p>
+<h4>Task 4: 前向传播之对齐数据 (Masking)</h4>
+<p>这是代码逻辑最绕的部分。
+<strong>场景</strong>：老师说 Top-K 里的第 1 个词是 ID <code>5</code>。
+*   <strong>GPU 0 (负责 0-3)</strong>: 看了看 ID 5，说：“不在我这，我不管。” -&gt; <strong>Mask 掉 (设为0)</strong>。
+*   <strong>GPU 1 (负责 4-7)</strong>: 看了看 ID 5，说：“在我这！我要负责算这个词的 Loss。” -&gt; <strong>保留</strong>。</p>
+<p><strong>代码对应</strong>:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 判断老师给的 Top-K 索引是否在当前显卡的管辖范围内</span>
+<span class="n">topk_indices_in_vocab_mask</span> <span class="o">=</span> <span class="p">(</span><span class="n">target_topk_indices</span> <span class="o">&gt;=</span> <span class="n">vocab_start_index</span><span class="p">)</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">target_topk_indices</span> <span class="o">&lt;</span> <span class="n">vocab_end_index</span><span class="p">)</span>
+
+<span class="c1"># 如果不在我这，就把概率和 LogP 都设为 0，我不参与计算</span>
+<span class="n">vocab_parallel_target_topk_probs</span><span class="p">[</span><span class="o">~</span><span class="n">topk_indices_in_vocab_mask</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
+</code></pre></div>
+
+<p>这就保证了虽然数据是切开的，但每张卡只计算属于它的那部分 Loss，不会算重，也不会算漏。</p>
+<h4>Task 5: 前向传播之算 Loss</h4>
+<p>现在每张卡都知道了：
+1.  学生在这个卡管辖范围内的预测概率。
+2.  老师在这个卡管辖范围内的目标概率（非管辖范围的都被置0了）。</p>
+<p><strong>公式</strong>: KL 散度 $\sum P_{teacher} \cdot (\log P_{teacher} - \log P_{student})$</p>
+<p>代码里 <code>per_token_kl_loss</code> 就是在算这个。算完后，因为每张卡只算了一部分词的 Loss，最后需要：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">all_reduce</span><span class="p">(</span><span class="n">per_token_kl_loss</span><span class="p">,</span> <span class="n">op</span><span class="o">=</span><span class="n">SUM</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p>把所有卡算出来的 Loss 加在一起，得到最终的总 Loss。</p>
+<h4>Task 6: 反向传播 (Backward)</h4>
+<p>为什么要写 <code>backward</code> 函数？因为这是自定义的 Autograd Function。我们需要告诉 PyTorch 怎么算梯度。</p>
+<p>KL Loss (或者 Cross Entropy) 有个非常优雅的梯度性质。
+如果 Loss 是 $L = -\sum y_{true} \log y_{pred}$，那么关于 Logits 的梯度 $\frac{\partial L}{\partial z}$ 简直简单得离谱：
+$$ \text{Gradient} = P_{student} - P_{teacher} $$
+(即：学生的预测概率 - 老师的目标概率)</p>
+<p><strong>代码逻辑</strong>:
+1.  <code>grad_input = vocab_parallel_source_probs</code>: 先把学生的概率拿过来（这就是 $P_{student}$）。
+2.  <code>grad_input[...] -= vocab_parallel_target_topk_probs</code>: 在对应的位置减去老师的概率（这就是 $- P_{teacher}$）。
+    *   <em>注意</em>：这里用了复杂的索引操作 <code>grad_input_2d[...]</code>，是因为老师只给了 Top-K，我们只在 Top-K 对应的那些词的位置减去概率，其他位置老师概率视为 0，梯度就是 $P_{student} - 0$。</p>
+<p>这样算出来的 <code>grad_input</code> 就是要传回给神经网络的梯度。</p>
+<hr />
+<h3>总结</h3>
+<p>这段代码在做一个<strong>“分布式课代表”</strong>的工作：
+1.  <strong>全班同学（所有GPU）</strong>一起凑出分母，算出学生的概率。
+2.  <strong>老师（Target）</strong>发下标准答案（Top-K）。
+3.  <strong>每个课代表（GPU）</strong>只检查自己负责的那几个题（Vocab Partition）。
+4.  如果老师的答案在我的负责范围内，我就算一下差距（Loss）。
+5.  最后把所有课代表算的差距加起来。
+6.  反向传播时，用“预测值 - 真实值”作为梯度推回去。</p>

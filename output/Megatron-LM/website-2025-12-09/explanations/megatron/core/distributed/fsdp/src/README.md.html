@@ -1,0 +1,89 @@
+<h1>megatron/core/distributed/fsdp/src/README.md</h1>
+<p>这份文档读起来确实比较硬核，因为它涉及到了<strong>大规模AI模型分布式训练</strong>中最底层的技术。</p>
+<p>简单来说，<strong>Megatron-FSDP</strong> 是 NVIDIA 专门为 PyTorch 开发的一个插件，用来解决<strong>“模型太大，单张显卡装不下”</strong>以及<strong>“多卡训练速度不够快”</strong>的问题。它比 PyTorch 自带的 FSDP 更快、更省显存，而且针对 NVIDIA 的硬件（如 NVLink, InfiniBand）做了极致优化。</p>
+<p>为了让你听懂，我把这份文档拆解成一个<strong>“从0到1启动大模型训练”的 Todo List</strong>，我们一步一步来完成这个任务。</p>
+<hr />
+<h3>📋 任务清单：启动 Megatron-FSDP</h3>
+<ol>
+<li><strong>[环境准备]</strong> 安装软件</li>
+<li><strong>[规划地盘]</strong> 定义设备网格 (Device Mesh)</li>
+<li><strong>[核心操作]</strong> “切分”你的模型 (Fully Sharding)</li>
+<li><strong>[进阶配置]</strong> 选择切分策略 (ZeRO Strategy)</li>
+<li><strong>[开始干活]</strong> 训练与保存 (Checkpointing)</li>
+</ol>
+<hr />
+<h3>🛠️ 逐步详解</h3>
+<h4>Task 1: [环境准备] 安装软件</h4>
+<p>这是最简单的一步。文档告诉你，别用旧的 FSDP 了，装这个专门优化过的版本。
+*   <strong>动作</strong>：在终端运行 <code>pip install megatron-fsdp</code>。
+*   <strong>背景</strong>：它支持 Python 3.10+，并且能和 HuggingFace、Megatron-LM 等主流框架配合。</p>
+<h4>Task 2: [规划地盘] 定义设备网格 (Device Mesh)</h4>
+<p>在大规模训练中，你可能有一堆显卡（比如 8 张、16 张甚至几千张）。你需要告诉程序，这些卡是怎么排列组合的。
+*   <strong>概念</strong>：<code>DeviceMesh</code> 就像一张地图，告诉系统哪些卡是一组。
+*   <strong>动作</strong>：
+    <code>python
+    # 比如你有 8 张卡，你可以把它们看作一个维度
+    device_mesh = init_device_mesh("cuda", mesh_shape=(8,), mesh_dim_names=("dp",))</code>
+    <em>文档中提到的 <code>dp_shard_cp</code> 等复杂名词，是在处理更高级的“混合并行”时的分组方式，初学者先理解为“把所有显卡拉个群”即可。</em></p>
+<h4>Task 3: [核心操作] “切分”你的模型 (Fully Sharding)</h4>
+<p>这是文档的重头戏。以前你可能需要手动去模型里把每一层都标记一下，现在 Megatron-FSDP 提供了一个“一键切分”的函数 <code>fully_shard</code>。
+*   <strong>痛点</strong>：PyTorch 原生的 FSDP2 需要你写循环，一层层去切（文档里的对比代码展示了这点）。
+*   <strong>Megatron-FSDP 的优势</strong>：只需要一行代码，把整个模型扔进去，它自动帮你搞定。
+*   <strong>动作</strong>：
+    ```python
+    from megatron_fsdp import fully_shard</p>
+<div class="codehilite"><pre><span></span><code><span class="err">#</span><span class="w"> </span><span class="n">你的原始模型和优化器</span>
+<span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MyLargeModel</span><span class="p">()</span>
+<span class="n">optimizer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Adam</span><span class="p">(</span><span class="n">model</span><span class="p">.</span><span class="k">parameters</span><span class="p">())</span>
+
+<span class="err">#</span><span class="w"> </span><span class="n">一键切分</span><span class="err">！</span>
+<span class="n">model</span><span class="p">,</span><span class="w"> </span><span class="n">optimizer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fully_shard</span><span class="p">(</span>
+<span class="w">    </span><span class="n">model</span><span class="p">,</span>
+<span class="w">    </span><span class="n">optimizer</span><span class="p">,</span>
+<span class="w">    </span><span class="n">device_mesh</span><span class="o">=</span><span class="n">device_mesh</span><span class="p">,</span><span class="w">       </span><span class="err">#</span><span class="w"> </span><span class="n">刚才定义的显卡地图</span>
+<span class="w">    </span><span class="n">fsdp_unit_modules</span><span class="o">=[</span><span class="n">MyTransformerBlock</span><span class="o">]</span><span class="p">,</span><span class="w"> </span><span class="err">#</span><span class="w"> </span><span class="n">告诉它哪个模块是</span><span class="err">“</span><span class="n">积木块</span><span class="err">”（</span><span class="n">通常是</span><span class="w"> </span><span class="n">Transformer</span><span class="w"> </span><span class="n">Layer</span><span class="err">）</span>
+<span class="w">    </span><span class="n">dp_shard_dim</span><span class="o">=</span><span class="ss">&quot;dp&quot;</span><span class="p">,</span><span class="w">             </span><span class="err">#</span><span class="w"> </span><span class="n">告诉它沿着哪个维度切</span>
+<span class="p">)</span>
+<span class="err">```</span>
+</code></pre></div>
+
+<h4>Task 4: [进阶配置] 选择切分策略 (ZeRO Strategy)</h4>
+<p>文档中提到了 <code>zero_dp_strategy</code>，这是在问你：<strong>“你想切得有多碎？”</strong>
+这决定了省多少显存 vs 通信开销有多大。
+*   <strong>选项解释</strong>（文档里的 0, 1, 2, 3）：
+    *   <strong>0 (No Shard)</strong>: 不切。这就跟普通的 DDP 一样，每张卡都存一份完整的模型。显存占用最大，但通信少。
+    *   <strong>1 (Optim)</strong>: 只切“优化器状态”。显存省一点。
+    *   <strong>2 (Optim+Grads)</strong>: 切“优化器”和“梯度”。显存更省。
+    *   <strong>3 (Optim+Grads+Params)</strong>: <strong>全切</strong>。连模型参数都切碎了分散在各张卡上。<strong>这是最省显存的模式</strong>（也就是所谓的 ZeRO-3），也是训练超大模型的默认选择。
+*   <strong>动作</strong>：在 <code>fully_shard</code> 函数里设置 <code>zero_dp_strategy=3</code>。</p>
+<h4>Task 5: [开始干活] 训练与保存</h4>
+<p>一旦模型被切碎了，保存和加载（Checkpointing）就变得麻烦了，因为参数散落在不同的卡上。
+*   <strong>训练</strong>：正常的 <code>model(input)</code> 和 <code>loss.backward()</code>。
+    *   <em>黑科技</em>：文档提到了 <code>overlap_grad_reduce</code>，意思是它会在你计算的同时，悄悄地在后台传输数据，不浪费时间。
+*   <strong>保存/加载</strong>：不能直接用 <code>torch.save</code> 了。
+*   <strong>动作</strong>：使用 <code>torch.distributed.checkpoint</code> (DCP)。
+    <code>python
+    # 保存：它会自动把分散的碎片收集起来存好
+    torch.distributed.checkpoint.save({"model": model.state_dict()}, checkpoint_id="path/to/save")</code>
+    文档特意提到 <code>preproc_state_dict_for_dcp_ckpt=True</code>，就是为了让这个保存过程自动化，不需要你操心。</p>
+<hr />
+<h3>🚀 为什么这个库很厉害？（文档中的 Features &amp; Optimizations）</h3>
+<p>如果你完成了上面的 Todo，你其实已经跑起来了。但文档花了很多篇幅吹牛（Features），主要是为了告诉你它比别人强在哪：</p>
+<ol>
+<li><strong>更快 (Speed up)</strong>: 比 PyTorch 原生的 FSDP2 快 25%。</li>
+<li><strong>更省 (Memory)</strong>: 省 23% 的显存。</li>
+<li><strong>硬件大招 (SHARP / In-Switch Processing)</strong>:<ul>
+<li>这是 NVIDIA 的杀手锏。通常多卡通信需要占用显卡的计算核心（SM）。</li>
+<li>这个库能利用 <strong>交换机 (Switch)</strong> 里的芯片来做数据聚合。</li>
+<li><strong>人话</strong>：显卡专心算数学题，传递答案和汇总答案的工作交给网线连接处的交换机去做。这样显卡就不分心了，速度飞快。</li>
+</ul>
+</li>
+<li><strong>初始化优化 (Meta Device)</strong>:<ul>
+<li>如果模型特别大（比如 100B 参数），连初始化加载到内存里都会爆内存。</li>
+<li>它支持 <code>init_model_with_meta_device=True</code>，意思是先创建一个“空壳”模型（不占内存），然后切分好之后，再往显存里填数据。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这篇文档其实就是说：
+<strong>“嘿，如果你在用 NVIDIA 的卡训大模型，别用 PyTorch 自带的 FSDP 了，用我这个。我 API 写法更简单（fully_shard 一行搞定），而且我能调用底层的硬件加速（SHARP），还能帮你省显存。”</strong></p>

@@ -1,0 +1,98 @@
+<h1>tests/special_e2e/run_one_step_off_policy.sh</h1>
+<p>这个脚本确实包含了很多术语和配置。别担心，我们可以把它想象成一个<strong>“AI 训练任务的启动清单”</strong>。</p>
+<p>简单来说，这个脚本的作用是：<strong>启动一个端到端（E2E）的强化学习训练任务（具体算法是 GRPO/PPO 的变体），并测试系统在不同底层加速框架（FSDP2 或 Megatron）下能否正常工作。</strong></p>
+<p>为了让你听懂，我把这个脚本拆解成一个 <strong>Task Todo List（任务清单）</strong>，模拟计算机执行这个脚本时的思维过程：</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>[准备] 盘点家底：</strong> 检查我有多少显卡 (GPU)，决定用什么模型。</li>
+<li><strong>[设定] 制定游戏规则：</strong> 设置强化学习的奖励机制、惩罚机制和算法参数。</li>
+<li><strong>[分工] 安排工位：</strong> 把显卡分成两组，一组负责“写作业”（生成数据），一组负责“学习”（训练模型）。</li>
+<li><strong>[配置] 填写详细表格：</strong> 把所有通用的训练参数（数据路径、显存占用、保存频率等）打包好。</li>
+<li><strong>[决策] 选择引擎：</strong> 决定是用 PyTorch 原生的加速方案 (FSDP2) 还是 NVIDIA 的重型方案 (Megatron)。</li>
+<li><strong>[执行] 启动发射：</strong> 拼接最终命令，按下启动键。</li>
+</ol>
+<hr />
+<h3>🧐 详细步骤讲解</h3>
+<p>下面我按照上面的清单，一步步带你看代码里的对应部分：</p>
+<h4>Task 1: [准备] 盘点家底</h4>
+<p><strong>代码位置：</strong> 开头部分</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">NUM_GPUS</span><span class="o">=</span><span class="si">${</span><span class="nv">NUM_GPUS</span><span class="k">:-</span><span class="nv">8</span><span class="si">}</span><span class="w">              </span><span class="c1"># 默认我有8张显卡</span>
+<span class="nv">ACTOR_STRATEGY</span><span class="o">=</span><span class="si">${</span><span class="nv">ACTOR_STRATEGY</span><span class="k">:-</span><span class="s2">&quot;fsdp2&quot;</span><span class="si">}</span><span class="w"> </span><span class="c1"># 默认使用 FSDP2 加速策略</span>
+<span class="nv">MODEL_ID</span><span class="o">=</span><span class="si">${</span><span class="nv">MODEL_ID</span><span class="k">:-</span><span class="nv">Qwen</span><span class="p">/Qwen2.5-0.5B-Instruct</span><span class="si">}</span><span class="w"> </span><span class="c1"># 这里的“学生”是 Qwen 0.5B 模型</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 脚本先确认硬件资源和要训练的模型对象。如果没指定，就默认用 8 卡跑 Qwen-0.5B。</li>
+</ul>
+<h4>Task 2: [设定] 制定游戏规则 (算法参数)</h4>
+<p><strong>代码位置：</strong> 中间部分 (<code>Algorithm parameters</code> 等)</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">adv_estimator</span><span class="o">=</span>grpo<span class="w">       </span><span class="c1"># 使用 GRPO 算法（一种比 PPO 更省显存的算法）</span>
+<span class="nv">use_kl_in_reward</span><span class="o">=</span>False<span class="w">   </span><span class="c1"># 奖励里不包含 KL 散度（一种约束模型不要乱变的数学项）</span>
+<span class="nv">max_prompt_length</span><span class="o">=</span><span class="m">1024</span><span class="w">   </span><span class="c1"># 题目最长 1024 个词</span>
+<span class="nv">max_response_length</span><span class="o">=</span><span class="m">2048</span><span class="w"> </span><span class="c1"># 回答最长 2048 个词</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 这里定义了训练的数学逻辑。比如 <code>grpo</code> 是最近很火的算法（DeepSeek-R1 同款思路），告诉机器怎么算“优势”。</li>
+</ul>
+<h4>Task 3: [分工] 安排工位 (关键点！)</h4>
+<p><strong>代码位置：</strong> <code>One-step-off-policy specific parameters</code></p>
+<div class="codehilite"><pre><span></span><code><span class="nv">n_gpus_rollout</span><span class="o">=</span><span class="m">2</span><span class="w">                       </span><span class="c1"># 拿出 2 张卡专门负责“生成文本”(Rollout)</span>
+<span class="nv">n_gpus_training</span><span class="o">=</span><span class="k">$((</span><span class="nv">NUM_GPUS</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nv">n_gpus_rollout</span><span class="k">))</span><span class="w"> </span><span class="c1"># 剩下的 6 张卡负责“计算梯度并更新模型”(Training)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 这是这个脚本的核心逻辑之一。它把 GPU 资源拆分了：<ul>
+<li><strong>Rollout Worker (2张卡):</strong> 负责用 vLLM 快速推理，生成模型的回答。</li>
+<li><strong>Training Worker (6张卡):</strong> 负责拿生成的数据进行复杂的反向传播计算。</li>
+<li><strong>目的：</strong> 这种拆分是为了让推理和训练可以异步进行，提高效率。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: [配置] 填写详细表格 (Common Params)</h4>
+<p><strong>代码位置：</strong> <code>common_params=(...)</code></p>
+<div class="codehilite"><pre><span></span><code><span class="nv">common_params</span><span class="o">=(</span>
+<span class="w">    </span>data.train_files<span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">HOME</span><span class="si">}</span><span class="s2">/data/gsm8k/train.parquet&quot;</span><span class="w"> </span><span class="c1"># 训练教材是 GSM8K (数学题)</span>
+<span class="w">    </span>actor_rollout_ref.rollout.name<span class="o">=</span>vllm<span class="w">                 </span><span class="c1"># 推理引擎使用 vLLM</span>
+<span class="w">    </span>trainer.total_epochs<span class="o">=</span><span class="m">2</span><span class="w">                              </span><span class="c1"># 总共学 2 轮</span>
+<span class="w">    </span>...
+<span class="o">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 这里是一个巨大的数组，里面全是配置项。它告诉程序数据在哪里、显存怎么分配、日志打在哪里。这就像是填好了一张巨大的报名表。</li>
+</ul>
+<h4>Task 5: [决策] 选择引擎 (FSDP2 vs Megatron)</h4>
+<p><strong>代码位置：</strong> <code>if [ "${ACTOR_STRATEGY}" == "fsdp2" ]; then ...</code>
+脚本在这里做了一个分支判断：</p>
+<ul>
+<li>
+<p><strong>分支 A (FSDP2):</strong></p>
+<ul>
+<li>这是 PyTorch 自带的“完全分片数据并行”。</li>
+<li>配置比较轻量，适合中小模型。</li>
+<li>代码里设置了 <code>strategy=fsdp2</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>分支 B (Megatron):</strong></p>
+<ul>
+<li>这是 NVIDIA 开发的超大规模模型训练框架。</li>
+<li>配置极其复杂，涉及 <code>pipeline_model_parallel</code> (流水线并行) 和 <code>tensor_model_parallel</code> (张量并行)。</li>
+<li>代码里你可以看到 <code>train_pp=2</code> (流水线切2段) 这种复杂的切分参数。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: [执行] 启动发射</h4>
+<p><strong>代码位置：</strong> <code>python3 -m recipe.one_step_off_policy.main_ppo ...</code>
+*   <strong>解读：</strong> 最后，脚本把上面所有的变量拼接成一条长长的 Python 命令并执行。这才是真正开始跑程序的地方。</p>
+<hr />
+<h3>💡 总结：这篇文档的核心观点</h3>
+<ol>
+<li><strong>异步训练架构：</strong> 这个脚本在测试一种<strong>分离式架构</strong>，即生成（Rollout）和训练（Train）在不同的 GPU 上进行。</li>
+<li><strong>兼容性测试：</strong> 它想证明这套训练代码既能跑在 <strong>FSDP2</strong> (PyTorch原生) 上，也能跑在 <strong>Megatron</strong> (英伟达企业级) 上。</li>
+<li><strong>算法验证：</strong> 它是为了验证 <strong>GRPO/PPO</strong> 算法在这种分离架构下的正确性。</li>
+</ol>
+<p><strong>如果你要运行它：</strong>
+你需要确保你的机器有 8 张显卡（或者修改 <code>NUM_GPUS</code>），并且安装了 <code>verl</code> 框架（从代码结构看这是 verl 的脚本）以及 <code>vllm</code>。</p>

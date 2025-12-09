@@ -1,0 +1,88 @@
+<h1>recipe/one_step_off_policy/distributed_util.py</h1>
+<p>这段代码确实涉及到了<strong>分布式计算</strong>和<strong>底层通信</strong>的知识，如果没有相关背景，看起来确实像天书。</p>
+<p>别担心，我们把这当作一个“拆解任务”。这段代码的核心目的是：<strong>在大模型训练中，建立一条“私密的、不冲突的”通讯线路。</strong></p>
+<p>为了让你彻底理解，我制定了一个 <strong>5步走的 To-Do List</strong>，我们一步步来打勾。</p>
+<hr />
+<h3>✅ Task 1: 理解背景——为什么要“打电话”？</h3>
+<p><strong>概念：</strong> 训练大模型通常需要很多张显卡（GPU）。
+<strong>问题：</strong> 这些显卡之间需要随时同步数据（比如传输模型参数、梯度）。
+<strong>类比：</strong> 想象一个由 8 个人（8张卡）组成的团队在做同一个项目。他们必须时刻保持通话，确认进度。</p>
+<ul>
+<li><strong>Rank (等级/编号):</strong> 团队里每个人的工号（0号, 1号...）。</li>
+<li><strong>World Size (世界大小):</strong> 团队总共有多少人。</li>
+<li><strong>Master Address/Port:</strong> 团队队长的地址和电话端口，大家都要连在这个端口上开会。</li>
+</ul>
+<p><strong>这一步的结论：</strong> 这段代码是在<strong>建立显卡之间的通讯连接</strong>。</p>
+<hr />
+<h3>✅ Task 2: 理解冲突——为什么要“Stateless（无状态）”？</h3>
+<p><strong>概念：</strong> PyTorch（最常用的AI框架）有一个全局的通讯组，叫 <code>Default Process Group</code>。
+<strong>问题：</strong>
+在某些复杂的训练场景（比如 RLHF 强化学习）中，我们需要一边做<strong>训练</strong>（用 PyTorch），一边做<strong>推理生成</strong>（用 vLLM 库）。
+*   <strong>PyTorch</strong> 说：“我是老大，我占用了全局通讯频道。”
+*   <strong>vLLM</strong> 说：“我也需要通讯，但我不能干扰 PyTorch 的全局频道，否则会报错或死锁。”</p>
+<p><strong>代码里的 <code>StatelessProcessGroup</code>：</strong>
+这就是解决方案。它不依赖 PyTorch 的全局状态，而是<strong>另外开辟了一个独立的聊天室</strong>。</p>
+<p><strong>这一步的结论：</strong> 这段代码是为了让 vLLM 能够建立一个<strong>独立的、不干扰主进程</strong>的通讯组。</p>
+<hr />
+<h3>✅ Task 3: 理解硬件兼容——NVIDIA vs 华为 (NPU)</h3>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">is_npu_available</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm_ascend...</span><span class="w"> </span><span class="kn">import</span> <span class="n">PyHcclCommunicator</span> <span class="k">as</span> <span class="n">PyNcclCommunicator</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm...</span><span class="w"> </span><span class="kn">import</span> <span class="n">PyNcclCommunicator</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+*   <strong>NCCL:</strong> NVIDIA 显卡专用的通信语言（最高效）。
+*   <strong>HCCL:</strong> 华为昇腾（NPU）显卡专用的通信语言。</p>
+<p><strong>这一步的结论：</strong> 这段代码很智能，它会先看你的硬件是华为的（NPU）还是英伟达的，然后<strong>自动选择</strong>对应的“方言”翻译器（Communicator）。</p>
+<hr />
+<h3>✅ Task 4: 核心逻辑拆解——函数在干嘛？</h3>
+<p>现在我们把函数 <code>vllm_stateless_init_process_group</code> 拆开看，它就像在<strong>安装电话机</strong>：</p>
+<ol>
+<li>
+<p><strong>输入参数：</strong></p>
+<ul>
+<li><code>master_address</code>, <code>master_port</code>: 电话会议的号码。</li>
+<li><code>rank</code>, <code>world_size</code>: 我是谁，总共多少人。</li>
+<li><code>device</code>: 我用哪张卡。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>StatelessProcessGroup.create(...)</code>：</strong></p>
+<ul>
+<li><strong>动作：</strong> 实际上网注册了一个虚拟的通讯组。</li>
+<li><strong>类比：</strong> 类似于建了一个微信群，但这个群不在公司（PyTorch）的通讯录里，是私下的。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>PyNcclCommunicator(pg, device=device)</code>：</strong></p>
+<ul>
+<li><strong>动作：</strong> 拿着上面的群信息，初始化底层的通信硬件。</li>
+<li><strong>类比：</strong> 每个人领到一个对讲机，频段已经调到了刚才建的那个群。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>return pynccl</code>：</strong></p>
+<ul>
+<li><strong>结果：</strong> 返回这个“对讲机”对象。以后要发数据，直接用这个对象就行。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 总结——这段代码到底想说什么？</h3>
+<p>如果我们把这段代码翻译成一句人话，它是对计算机说：</p>
+<blockquote>
+<p>“嘿，我要在 vLLM 里搞点并行计算。</p>
+<ol>
+<li>先帮我检查下是<strong>华为卡</strong>还是<strong>英伟达卡</strong>，拿对驱动。</li>
+<li>不管 PyTorch 那边在干啥，给我<strong>单独开一个私密的通讯频道</strong>（Stateless）。</li>
+<li>根据队长的地址和我的编号，把<strong>通信线路接通</strong>。</li>
+<li>最后，把这个<strong>控制通信的遥控器</strong>（Communicator）交给我。”</li>
+</ol>
+</blockquote>
+<h3>为什么这个文件很重要？</h3>
+<p>在强化学习（RLHF）中，通常有一个<strong>Actor（负责生成文本）</strong>和一个<strong>Critic（负责打分）</strong>。
+*   Actor 生成文本时，为了速度快，通常用 <strong>vLLM</strong> 引擎。
+*   但是训练又要用到分布式环境。
+*   这个文件就是为了<strong>打通 vLLM 和外部训练进程之间的数据传输</strong>（比如把生成的文本传给训练进程去算 Loss），同时保证不乱套。</p>

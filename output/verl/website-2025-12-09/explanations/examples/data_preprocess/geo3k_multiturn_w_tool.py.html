@@ -1,0 +1,98 @@
+<h1>examples/data_preprocess/geo3k_multiturn_w_tool.py</h1>
+<p>这份代码确实看起来有点复杂，因为它涉及到<strong>强化学习（RL）训练数据的预处理</strong>，特别是针对一个叫 <code>verl</code> 的框架。</p>
+<p>简单来说，这个脚本是一个<strong>“加工厂”</strong>。它的作用是把原始的几何数学题数据（原材料），加工成 AI 训练框架能看懂的、带有“工具调用”功能的特殊格式（成品），最后保存起来。</p>
+<p>为了让你看懂，我把这个脚本的工作流程拆解成一个 <strong>Task To-Do List（任务清单）</strong>，我们一步步来打钩完成。</p>
+<hr />
+<h3>📝 脚本任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>[准备阶段]</strong> 设置文件路径：决定从哪读数据，存到哪里去。</li>
+<li><strong>[进货阶段]</strong> 加载原始数据：下载或读取 <code>geometry3k</code>（几何题）数据集。</li>
+<li><strong>[制定规则]</strong> 编写提示词（Prompt）：规定 AI 必须怎么思考（先思考再回答，且要用工具）。</li>
+<li><strong>[核心加工]</strong> 数据格式转换（最重要的一步）：<ul>
+<li>把每道题包装成“对话”格式。</li>
+<li>给每道题配备一个“工具包”（用于验证答案）。</li>
+<li>把正确答案藏在工具配置里，用来算奖励（Reward）。</li>
+</ul>
+</li>
+<li><strong>[出货阶段]</strong> 保存文件：把处理好的数据存为 <code>.parquet</code> 格式。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解</h3>
+<p>现在我们按照上面的清单，对照代码来看看它具体做了什么。</p>
+<h4>1. [准备阶段] 设置文件路径</h4>
+<p><strong>代码位置：</strong> <code>if __name__ == "__main__":</code> 到 <code>dataset = ...</code> 之前。</p>
+<ul>
+<li><strong>发生了什么：</strong>
+    脚本使用 <code>argparse</code> 来接收命令行参数。它主要关心两个事：<ul>
+<li><code>--local_dataset_path</code>: 如果你电脑上已经下载了数据，就告诉我路径（没有就去网上下载）。</li>
+<li><code>--local_save_dir</code>: 加工好的数据存到哪里（默认是 <code>~/data/geo3k_multiturn_w_tool</code>）。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [进货阶段] 加载原始数据</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">data_source</span> <span class="o">=</span> <span class="s2">&quot;hiyouga/geometry3k&quot;</span>
+<span class="k">if</span> <span class="n">local_dataset_path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">dataset</span> <span class="o">=</span> <span class="n">datasets</span><span class="o">.</span><span class="n">load_dataset</span><span class="p">(</span><span class="n">local_dataset_path</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">dataset</span> <span class="o">=</span> <span class="n">datasets</span><span class="o">.</span><span class="n">load_dataset</span><span class="p">(</span><span class="n">data_source</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>发生了什么：</strong>
+    它加载了一个叫 <code>geometry3k</code> 的数据集。这个数据集里全是几何题，包含题目（problem）、图片（images）和答案（answer）。</li>
+</ul>
+<h4>3. [制定规则] 编写提示词</h4>
+<p><strong>代码位置：</strong> 定义 <code>instruction_following</code> 变量。
+*   <strong>发生了什么：</strong>
+    它定义了一段强制性的要求，稍后会拼接到每道题后面。
+    *   <em>内容翻译：</em> “你必须先在 <code>&lt;think&gt;</code> 标签里进行内心独白（推理），最后把答案放在 <code>\boxed{}</code> 里。”</p>
+<h4>4. [核心加工] 数据格式转换 (重点!)</h4>
+<p>这是整个脚本最难懂、也是最核心的部分。它定义了一个 <code>make_map_fn</code> 函数，用来把每一行原始数据“变身”。</p>
+<p><strong>代码位置：</strong> <code>def make_map_fn(split): ...</code> 及其内部。</p>
+<p><strong>具体加工步骤：</strong></p>
+<ul>
+<li>
+<p><strong>A. 设定人设 (System Prompt):</strong>
+    代码里构建了一个 <code>prompt</code> 列表。</p>
+<ul>
+<li><code>role: system</code>: 告诉 AI “你是一个数学专家。你要一步步推理。<strong>关键点：</strong> 在生成最终答案前，你必须调用一个叫 <code>calc_geo3k_reward</code> 的工具来验证你的步骤。”</li>
+<li><code>role: user</code>: 放入具体的几何题目 + 刚才定义的“必须思考”的要求。</li>
+</ul>
+</li>
+<li>
+<p><strong>B. 配置工具 (Tools Kwargs):</strong>
+    你看 <code>extra_info</code> 里的这段代码：
+    <code>python
+    "tools_kwargs": {
+        "calc_geo3k_reward": {
+            "create_kwargs": {"ground_truth": answer},
+        },
+    },</code></p>
+<ul>
+<li><strong>这是啥意思？</strong> 这是一个多轮对话（Multi-turn）且带工具（Tool）的任务。</li>
+<li>AI 在做题时，会尝试调用 <code>calc_geo3k_reward</code> 这个工具。</li>
+<li>脚本在这里把这道题的<strong>标准答案 (<code>ground_truth</code>: answer)</strong> 悄悄塞进了工具的配置里。</li>
+<li><strong>为什么？</strong> 这样当 AI 调用工具时，背后的系统就能拿 AI 的中间结果和这个标准答案比对，从而给 AI 一个反馈（Reward/奖励），告诉它“你做对了”还是“做错了”。</li>
+</ul>
+</li>
+<li>
+<p><strong>C. 组装成字典:</strong>
+    最后返回一个包含 <code>prompt</code>, <code>images</code>, <code>reward_model</code>, <code>extra_info</code> 等字段的大字典。这正是 <code>verl</code> 训练框架所需要的数据结构。</p>
+</li>
+</ul>
+<h4>5. [出货阶段] 保存文件</h4>
+<p><strong>代码位置：</strong> 最后的 <code>train_dataset.to_parquet(...)</code>。
+*   <strong>发生了什么：</strong>
+    *   它把处理好的训练集（Train）和测试集（Test）分别保存为 <code>train.parquet</code> 和 <code>test.parquet</code>。
+    *   <code>parquet</code> 是一种高效的数据存储格式，类似于 Excel 但读写更快，适合大数据。
+    *   最后如果有 HDFS（分布式文件系统）路径，它还会把数据备份到云端。</p>
+<hr />
+<h3>💡 总结：这篇文章的观点是什么？</h3>
+<p>这不算是一篇“文章”，而是一个<strong>工程脚本</strong>。如果非要提取它的“观点”或“意图”，那就是：</p>
+<ol>
+<li><strong>AI 需要学会使用工具：</strong> 解决复杂的几何数学题，光靠瞎猜不行。这个脚本旨在训练 AI <strong>先推理，然后调用工具（验证器），最后给答案</strong>。</li>
+<li><strong>强化学习需要反馈：</strong> 通过在数据里预埋 <code>ground_truth</code>（标准答案）到工具配置中，它构建了一个环境，让 AI 在训练时能通过工具获得“我做得对不对”的即时反馈。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这个脚本把普通的几何题数据，转换成了<strong>“带工具调用的强化学习训练数据”</strong>，目的是训练出一个能像数学家一样思考、并能利用工具验证自己答案的 AI。</p>

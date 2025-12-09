@@ -1,0 +1,114 @@
+<h1>tests/test_utils/python_scripts/launch_nemo_run_workload.py</h1>
+<p>这份代码其实是一个 <strong>“智能测试启动器”</strong>。</p>
+<p>它的主要工作是：在一个 Docker 容器里运行某个 AI 模型（比如 Megatron-LM）的测试任务。如果任务失败了，它会当一次“侦探”，看看是因为<strong>代码写错了</strong>，还是因为<strong>机器/网络抽风了</strong>（所谓的 Flaky Failure）。如果是机器抽风，它会自动重试。</p>
+<p>为了让你更容易理解，我把你当作这个脚本的执行者（Manager），给你列一个 <strong>Task To-Do List</strong>。你只需要按照这个清单一步步做，就能理解代码在干嘛了。</p>
+<hr />
+<h3>📋 你的任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>接单 (接收指令)</strong>：搞清楚这次要测哪个模型？用什么环境？</li>
+<li><strong>查菜谱 (加载配置)</strong>：根据指令，去查找对应的测试脚本怎么写。</li>
+<li><strong>备菜 (准备环境)</strong>：配置好 Docker 容器，准备好文件路径和 GPU 设置。</li>
+<li><strong>开火 (运行测试)</strong>：启动任务，但要注意，我们最多允许重试 3 次。</li>
+<li><strong>验货 (检查结果)</strong>：<ul>
+<li>如果成功 -&gt; <strong>下班 (退出)</strong>。</li>
+<li>如果失败 -&gt; <strong>进入下一步</strong>。</li>
+</ul>
+</li>
+<li><strong>查案 (分析日志)</strong>：翻看错误日志。<ul>
+<li>如果是“玄学问题”（硬件/网络抖动） -&gt; <strong>回到第 4 步重试</strong>。</li>
+<li>如果是“代码逻辑错误” -&gt; <strong>报错，彻底下班</strong>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 详细步骤讲解</h3>
+<p>下面我把代码对应到上面的每一个步骤里去解释：</p>
+<h4>1. 接单 (接收指令)</h4>
+<p><strong>代码位置：</strong> <code>@click.command()</code> 和 <code>def main(...)</code> 的参数部分。
+<strong>解释：</strong>
+你需要知道老板（用户）想测什么。用户通过命令行传参数给你，比如：
+*   <code>--model</code>: 测什么模型？
+*   <code>--test-case</code>: 测哪个案例？
+*   <code>--container-image</code>: 用哪个 Docker 镜像？
+这些参数都被 <code>main</code> 函数接收了。</p>
+<h4>2. 查菜谱 (加载配置)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">workloads</span> <span class="o">=</span> <span class="n">recipe_parser</span><span class="o">.</span><span class="n">load_workloads</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">workloads</span> <span class="o">=</span> <span class="p">[</span><span class="n">workload</span> <span class="k">for</span> <span class="n">workload</span> <span class="ow">in</span> <span class="n">workloads</span> <span class="k">if</span> <span class="n">workload</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">&quot;build&quot;</span><span class="p">]</span>
+<span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">workloads</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="o">...</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+你调用了一个叫 <code>recipe_parser</code> 的工具，根据刚才接收的参数，找到具体的“工作负载”（Workload）。
+代码里还做了一个过滤：只跑测试任务，不跑构建（build）任务。最后确认一下，必须正好只有 1 个任务要跑，多了少了都不行。</p>
+<h4>3. 备菜 (准备环境)</h4>
+<p><strong>代码位置：</strong>
+*   <strong>设置变量 (Magic Values):</strong>
+    <code>python
+    magic_values = dict(workload.spec)
+    magic_values["assets_dir"] = "/opt/megatron-lm/assets_dir"
+    # ... 也就是把路径字符串里的占位符填好</code>
+*   <strong>配置 Docker (Executor):</strong>
+    <code>python
+    executor = run.DockerExecutor(
+        container_image=container_image,
+        num_gpus=-1, # 使用所有 GPU
+        shm_size="30g", # 分配 30G 共享内存
+        volumes=artifacts, # 挂载硬盘目录
+        # ...
+    )</code>
+<strong>解释：</strong>
+这是在搭建舞台。
+*   你把脚本里的一些占位符（比如 <code>{assets_dir}</code>）替换成真实的路径。
+*   你告诉电脑：“我要用 Docker 跑，给我所有的 GPU，给我 30G 内存，把当前文件夹挂载进去。”</p>
+<h4>4. 开火 (运行测试 - 包含重试机制)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">n_attempts</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="k">while</span> <span class="n">n_attempts</span> <span class="o">&lt;</span> <span class="mi">3</span><span class="p">:</span> <span class="c1"># 最多尝试 3 次</span>
+    <span class="k">with</span> <span class="n">run</span><span class="o">.</span><span class="n">Experiment</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="k">as</span> <span class="n">exp</span><span class="p">:</span>
+        <span class="n">_</span> <span class="o">=</span> <span class="n">exp</span><span class="o">.</span><span class="n">add</span><span class="p">([</span><span class="n">inline_script</span><span class="p">],</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 添加任务</span>
+        <span class="n">exp</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 开始跑！</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+这是一个循环（<code>while</code>）。你心里想着：“我最多试 3 次”。然后调用 <code>nemo_run</code> 这个工具（代码里的 <code>run</code>）来真正执行刚才准备好的脚本。</p>
+<h4>5. 验货 (检查结果)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">result_dict</span> <span class="o">=</span> <span class="n">exp</span><span class="o">.</span><span class="n">status</span><span class="p">(</span><span class="n">return_dict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">succeeded</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">job_dict</span><span class="p">[</span><span class="s2">&quot;status&quot;</span><span class="p">])</span> <span class="o">==</span> <span class="s2">&quot;SUCCEEDED&quot;</span>
+
+<span class="k">if</span> <span class="n">succeeded</span><span class="p">:</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">sys</span><span class="o">.</span><span class="n">exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="c1"># 成功了！退出程序，返回 0</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+跑完之后，你看一眼状态。如果是 <code>SUCCEEDED</code>，太好了，直接 <code>sys.exit(0)</code>，任务圆满结束。</p>
+<h4>6. 查案 (分析日志与决策)</h4>
+<p><strong>代码位置：</strong> 这是这段代码最核心的逻辑。
+如果失败了，代码会去读取日志文件（<code>std*.log</code>），把所有日志拼成一个长字符串。然后调用最上面定义的 <code>is_flaky_failure</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 读取日志</span>
+<span class="n">all_ranks_all_logs_string</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">all_ranks_all_logs</span><span class="p">)</span>
+
+<span class="c1"># 关键判断</span>
+<span class="k">if</span> <span class="n">is_flaky_failure</span><span class="p">(</span><span class="n">all_ranks_all_logs_string</span><span class="p">):</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">&quot;Detected flaky failure, attempt restart.&quot;</span><span class="p">)</span>
+    <span class="n">n_attempts</span> <span class="o">+=</span> <span class="mi">1</span>
+    <span class="k">continue</span> <span class="c1"># 重试，回到 while 循环开头</span>
+
+<span class="n">sys</span><span class="o">.</span><span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="c1"># 是真代码错误，不重试了，直接报错退出</span>
+</code></pre></div>
+
+<p><strong>关于 <code>is_flaky_failure</code> 函数：</strong>
+你看代码最上面那个长长的 <code>return</code> 语句，里面全是 <code>or</code>。它在检查日志里有没有这些字眼：
+*   "NCCL operations have failed" (通信库崩了)
+*   "uncorrectable ECC error" (显卡硬件报错)
+*   "Segmentation fault" (段错误)
+*   "Address already in use" (端口被占用)
+*   ...</p>
+<p><strong>逻辑总结：</strong>
+*   <strong>如果是这些错误</strong>：说明是你倒霉，机器有问题，不是代码写错了。所以 <code>n_attempts + 1</code>，<strong>再试一次</strong> (<code>continue</code>)。
+*   <strong>如果不是这些错误</strong>：说明大概率是代码逻辑写错了，重试也没用，直接<strong>报错退出</strong> (<code>sys.exit(1)</code>)。</p>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>带有“自动重试功能”的 Docker 任务启动器</strong>。它专门用来应对大规模 AI 训练测试中常见的“硬件不稳定”问题，防止因为偶尔的网络波动或 GPU 故障导致测试误报失败。</p>

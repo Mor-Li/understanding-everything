@@ -1,0 +1,74 @@
+<h1>docs/advance/async-on-policy-distill.md</h1>
+<p>这篇文档确实涉及了深度强化学习（RL）、分布式系统（Ray/Megatron）以及模型蒸馏（Distillation）的交叉领域，术语非常多，读不懂很正常。</p>
+<p>为了让你理解，我把这篇文档拆解成一个<strong>“学习理解清单”（To-Do List）</strong>，我们把这个复杂的系统想象成一个<strong>“学生向老师学习写作文”</strong>的过程。</p>
+<p>请按照以下 5 个步骤（Task）来逐一理解：</p>
+<hr />
+<h3>Task 1：搞懂我们在做什么（核心概念）</h3>
+<p><strong>目标</strong>：理解什么是“在线策略知识蒸馏”（On-Policy Knowledge Distillation）。</p>
+<ul>
+<li><strong>通俗解释</strong>：<ul>
+<li><strong>角色</strong>：有一个“学生模型”（Student，比较小/弱）和一个“老师模型”（Teacher，比较大/强）。</li>
+<li><strong>任务</strong>：学生要学会像老师那样思考。</li>
+<li><strong>怎么学（On-Policy）</strong>：<ol>
+<li>学生自己先根据当前的水平写一篇作文（这叫 <strong>Rollout/采样</strong>）。</li>
+<li>老师看这篇作文，告诉学生：“在这个地方，我会用哪个词，概率是多少”（这叫 <strong>Teacher Signal/老师信号</strong>）。</li>
+<li>学生根据老师的指点，修改自己的脑子（参数），让自己下次写得更像老师（这叫 <strong>Update/更新</strong>）。</li>
+</ol>
+</li>
+<li><strong>为什么叫 On-Policy</strong>：因为作文必须是学生<strong>当前</strong>自己写的，而不是拿以前的旧作文或者别人的作文来改。这样学生学得更准。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 2：发现痛点（为什么要写这篇文档？）</h3>
+<p><strong>目标</strong>：理解“同步”（Sync）训练为什么慢。</p>
+<ul>
+<li><strong>原来的做法（串行/排队）</strong>：<ul>
+<li>步骤是：<code>学生写作文</code> -&gt; <code>老师批改</code> -&gt; <code>学生消化并更新大脑</code> -&gt; <code>学生再写下一篇</code>...</li>
+<li><strong>问题</strong>：当学生在写作文时，老师在闲着；当学生在更新大脑时，写作文的手停了。大家都在互相等，GPU（显卡）利用率很低，训练很慢。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3：理解解决方案（核心改进）</h3>
+<p><strong>目标</strong>：理解“异步”（Async）和“流水线”（Pipeline）。</p>
+<ul>
+<li><strong>现在的做法（异步/并行）</strong>：<ul>
+<li>文档提出了 <strong>One-Step-Off</strong> 或 <strong>Two-Step-Off</strong> 策略。</li>
+<li>意思就是：<strong>大家别闲着，重叠起来干活</strong>。</li>
+<li>当学生正在“消化并更新大脑”（学习上一篇作文的经验）时，他的手（Rollout Worker）不要停，立刻开始写“下一篇作文”。</li>
+<li>虽然这时候“手”用的脑子比“正在更新的脑子”稍微旧了一点点（滞后一步，所以叫 One-Step-Off），但因为没有停顿，整体速度快了很多。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4：拆解系统分工（谁在干什么？）</h3>
+<p><strong>目标</strong>：看懂文档里的架构图。</p>
+<p>文档把系统分成了三个打工仔：
+1.  <strong>Actor（学生的大脑）</strong>：
+    *   <strong>工作</strong>：负责计算误差（KL散度），修改参数（学习）。
+    *   <strong>工具</strong>：用 Megatron（一种在大规模显卡上训练的框架）。
+2.  <strong>Rollout Worker（学生的手）</strong>：
+    *   <strong>工作</strong>：只负责拼命写作文（生成文本）。它需要定期从 Actor 那里同步最新的参数（脑子）。
+    *   <strong>工具</strong>：用 vLLM（一种推理速度很快的框架）。
+3.  <strong>Teacher（老师）</strong>：
+    *   <strong>工作</strong>：坐在旁边，收到作文后，给出标准的“打分”和“建议”（Top-k logprobs）。
+    *   <strong>工具</strong>：一个独立的服务。</p>
+<hr />
+<h3>Task 5：最后的技术细节（怎么优化？）</h3>
+<p><strong>目标</strong>：理解文档里提到的“优化技巧”。</p>
+<p>因为大家分头干活了，中间的<strong>沟通</strong>（传数据）成了新问题。文档做了这些改进：
+*   <strong>通信优化</strong>：以前是一个词一个词地传数据，太慢。现在是<strong>打包（Batch）</strong>一起传。
+*   <strong>权重同步</strong>：学生的大脑（Actor）更新了，要告诉手（Rollout）。文档优化了这一步的传输方式（Broadcast），让同步更快。
+*   <strong>调度器（Scheduler）</strong>：这就是个指挥官，决定什么时候让谁干活（是滞后一步 One-Step，还是滞后两步 Two-Step），目的是把时间塞满，不留空隙。</p>
+<hr />
+<h3>总结：这篇文档到底讲了啥？</h3>
+<p><strong>一句话总结</strong>：
+这是一份<strong>操作指南（Recipe）</strong>，教你如何搭建一套<strong>极速版</strong>的“老师带学生”训练系统。</p>
+<p><strong>核心思想</strong>：
+不要让 GPU 闲着。通过允许数据稍微有一点点“过时”（Off-Policy），让“生成数据”、“老师打分”、“模型训练”这三件事同时进行（异步），从而大幅提升训练速度。</p>
+<p><strong>你需要做的 Todo List（如果你要运行它）</strong>：
+1.  准备好老师模型服务（启动 Teacher Server）。
+2.  配置好学生模型（Actor）和生成器（Rollout）的 GPU 数量。
+3.  在配置文件里选一个调度模式（推荐 <code>one_step_off</code>，比较稳）。
+4.  运行脚本，监控 GPU 是不是都跑满了（没有闲置）。</p>

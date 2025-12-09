@@ -1,0 +1,123 @@
+<h1>recipe/sppo/dp_actor.py</h1>
+<p>这份代码确实涉及很多强化学习（RL）和分布式训练的术语，看起来比较晦涩。简单来说，这是一个 <strong>SPPO（Self-Play Preference Optimization）算法中的“演员（Actor）”在多卡并行环境下如何更新自己参数</strong> 的代码。</p>
+<p>为了让你能够循序渐进地理解，我为你列了一个 <strong>“学习任务清单 (Todo List)”</strong>，我们按照这个顺序，一步步拆解这段代码的逻辑。</p>
+<hr />
+<h3>📝 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 搞清楚角色</strong> —— 什么是 <code>Actor</code>？什么是 <code>DP</code>？</li>
+<li><strong>Task 2: 核心数学题</strong> —— 读懂 <code>compute_sppo_loss</code> 函数（SPPO 到底在算什么？）。</li>
+<li><strong>Task 3: 准备“食材”</strong> —— 理解 <code>update_policy</code> 中的数据切分（Mini-batch 和 Micro-batch）。</li>
+<li><strong>Task 4: 正式“烹饪”</strong> —— 理解前向传播与 Loss 计算流程。</li>
+<li><strong>Task 5: 增加“调料”</strong> —— 理解 Entropy 和 KL Loss 的作用。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 搞清楚角色</h4>
+<p><strong>代码对应部分：</strong> 类名 <code>DataParallelSPPOActor</code></p>
+<ul>
+<li><strong>Actor (演员/策略模型)：</strong> 在强化学习中，Actor 就是我们要训练的那个大模型（比如 Llama 3）。它的任务是根据提示词（Prompt）生成回复（Response）。</li>
+<li><strong>DP (Data Parallel, 数据并行)：</strong> 这意味着你的模型太大或者数据太多，需要把数据切分成很多份，分发到不同的 GPU 上去训练，最后把梯度（Gradient）汇总起来更新模型。</li>
+<li><strong>SPPO：</strong> 这是一种具体的算法。相比于 PPO（Proximal Policy Optimization），SPPO 的核心思想是通过自我博弈（Self-Play）产生的概率变化来逼近奖励值。</li>
+</ul>
+<p><strong>总结：</strong> 这个文件定义了一个类，用来管理大模型在多张显卡上如何利用 SPPO 算法进行一次参数更新。</p>
+<hr />
+<h4>Task 2: 核心数学题 (SPPO Loss)</h4>
+<p>这是全篇最核心的算法逻辑。</p>
+<p><strong>代码对应部分：</strong> 函数 <code>compute_sppo_loss</code></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">compute_sppo_loss</span><span class="p">(</span><span class="n">old_log_prob</span><span class="p">,</span> <span class="n">log_prob</span><span class="p">,</span> <span class="n">rewards</span><span class="p">,</span> <span class="n">response_mask</span><span class="p">,</span> <span class="n">eta</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 1. 计算概率变化量 (Log Ratios)</span>
+    <span class="c1"># log_prob 是现在的模型生成的概率，old_log_prob 是更新前模型的概率</span>
+    <span class="n">log_prob_sum</span> <span class="o">=</span> <span class="p">(</span><span class="n">log_prob</span> <span class="o">*</span> <span class="n">response_mask</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">old_log_prob_sum</span> <span class="o">=</span> <span class="p">(</span><span class="n">old_log_prob</span> <span class="o">*</span> <span class="n">response_mask</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">log_ratios</span> <span class="o">=</span> <span class="n">log_prob_sum</span> <span class="o">-</span> <span class="n">old_log_prob_sum</span> 
+
+    <span class="c1"># 2. 计算目标值 (Scaled Rewards)</span>
+    <span class="c1"># eta 是一个超参数，rewards 是这个回复得的分数</span>
+    <span class="n">scaled_rewards</span> <span class="o">=</span> <span class="n">eta</span> <span class="o">*</span> <span class="p">(</span><span class="n">rewards</span><span class="p">)</span>
+
+    <span class="c1"># 3. 计算均方误差 (MSE Loss)</span>
+    <span class="c1"># 核心公式：(概率变化量 - 缩放后的奖励)^2</span>
+    <span class="n">loss_vec</span> <span class="o">=</span> <span class="p">(</span><span class="n">log_ratios</span> <span class="o">-</span> <span class="n">scaled_rewards</span><span class="p">)</span> <span class="o">**</span> <span class="mi">2</span> 
+
+    <span class="k">return</span> <span class="n">loss</span><span class="p">,</span> <span class="o">...</span>
+</code></pre></div>
+
+<p><strong>人话解释：</strong>
+SPPO 认为：<strong>模型对某个回复的信心提升程度（概率变化量），应该等于这个回复得到的奖励分值。</strong>
+*   如果奖励很高，模型下次生成这个回复的概率就应该大大增加。
+*   代码里的 <code>loss_vec</code> 就是在算：<strong>“实际提升的信心”和“应该提升的信心（奖励）”之间的差距</strong>。我们要最小化这个差距。</p>
+<hr />
+<h4>Task 3: 准备“食材” (数据切分)</h4>
+<p><strong>代码对应部分：</strong> <code>update_policy</code> 方法的前半部分</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># ...</span>
+<span class="c1"># 把一大批数据 (batch) 切分成小批 (mini-batch)</span>
+<span class="n">dataloader</span> <span class="o">=</span> <span class="n">batch</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">ppo_mini_batch_size</span><span class="p">)</span>
+
+<span class="k">for</span> <span class="n">epoch</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">ppo_epochs</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">batch_idx</span><span class="p">,</span> <span class="n">data</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">dataloader</span><span class="p">):</span>
+        <span class="c1"># 再把小批切分成极小批 (micro-batches)</span>
+        <span class="n">micro_batches</span> <span class="o">=</span> <span class="n">mini_batch</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">ppo_micro_batch_size_per_gpu</span><span class="p">)</span>
+        <span class="c1"># ...</span>
+</code></pre></div>
+
+<p><strong>人话解释：</strong>
+*   <strong>显存是有限的</strong>：大模型训练非常吃显存，一次性把所有数据塞进去显卡会爆炸（OOM）。
+*   <strong>切蛋糕策略</strong>：
+    1.  <strong>Batch</strong>: 总的训练数据。
+    2.  <strong>Mini-batch</strong>: 切一刀，分几次更新参数。
+    3.  <strong>Micro-batch</strong>: 再切一刀，这是显卡一次能实际处理的最小单元。
+    4.  <strong>Gradient Accumulation (梯度累积)</strong>: 既然一次只能吃一小口（Micro-batch），那就多吃几口，把算出来的梯度攒在肚子里，攒够了一个 Mini-batch 的量，再真正去修改模型参数。</p>
+<hr />
+<h4>Task 4: 正式“烹饪” (前向传播与 Loss 计算)</h4>
+<p><strong>代码对应部分：</strong> <code>update_policy</code> 里的循环体</p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">data</span> <span class="ow">in</span> <span class="n">micro_batches</span><span class="p">:</span>
+    <span class="c1"># 1. 拿到数据</span>
+    <span class="n">responses</span> <span class="o">=</span> <span class="n">data</span><span class="p">[</span><span class="s2">&quot;responses&quot;</span><span class="p">]</span>
+    <span class="n">old_log_prob</span> <span class="o">=</span> <span class="n">data</span><span class="p">[</span><span class="s2">&quot;old_log_probs&quot;</span><span class="p">]</span> <span class="c1"># 旧模型的概率</span>
+    <span class="n">rewards</span> <span class="o">=</span> <span class="n">data</span><span class="p">[</span><span class="s2">&quot;seq_level_rewards&quot;</span><span class="p">]</span>  <span class="c1"># 奖励分</span>
+
+    <span class="c1"># 2. 前向传播 (Forward)</span>
+    <span class="c1"># 让现在的模型把这句话再读一遍，算出现在的概率 (log_prob)</span>
+    <span class="n">entropy</span><span class="p">,</span> <span class="n">log_prob</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_forward_micro_batch</span><span class="p">(</span><span class="n">micro_batch</span><span class="o">=</span><span class="n">data</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 3. 算核心 Loss (调用 Task 2 的函数)</span>
+    <span class="n">pg_loss</span><span class="p">,</span> <span class="n">log_ratios</span><span class="p">,</span> <span class="n">preference</span> <span class="o">=</span> <span class="n">compute_sppo_loss</span><span class="p">(</span>
+        <span class="n">old_log_prob</span><span class="o">=</span><span class="n">old_log_prob</span><span class="p">,</span>
+        <span class="n">log_prob</span><span class="o">=</span><span class="n">log_prob</span><span class="p">,</span>
+        <span class="n">rewards</span><span class="o">=</span><span class="n">rewards</span><span class="p">,</span>
+        <span class="o">...</span>
+    <span class="p">)</span>
+
+    <span class="c1"># 4. 算出总 Loss 并反向传播 (Backward)</span>
+    <span class="n">loss</span> <span class="o">=</span> <span class="n">policy_loss</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">gradient_accumulation</span>
+    <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span> <span class="c1"># 算梯度</span>
+</code></pre></div>
+
+<p><strong>人话解释：</strong>
+这是训练的主循环。机器拿着旧的作业（old_log_prob）和老师的评分（rewards），自己现在重做一遍（forward 得到 log_prob），然后对比一下：
+*   “我现在的做法符合老师的评分要求吗？”（计算 SPPO Loss）。
+*   如果不符合，就计算一下该怎么改（Backward 算梯度）。</p>
+<hr />
+<h4>Task 5: 增加“调料” (Entropy 和 KL)</h4>
+<p>为了防止模型“学傻了”或者“走火入魔”，代码里加了两个约束项。</p>
+<p><strong>代码对应部分：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. Entropy (熵)</span>
+<span class="k">if</span> <span class="n">entropy_coeff</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="c1"># 熵越大，代表模型输出越多样。</span>
+    <span class="c1"># 我们希望模型保持一定的探索性，不要只会说一种话。</span>
+    <span class="n">policy_loss</span> <span class="o">=</span> <span class="n">pg_loss</span> <span class="o">-</span> <span class="n">entropy_loss</span> <span class="o">*</span> <span class="n">entropy_coeff</span>
+
+<span class="c1"># 2. KL Loss (KL 散度)</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">use_kl_loss</span><span class="p">:</span>
+    <span class="c1"># 计算当前模型和参考模型(Reference Model)的差距。</span>
+    <span class="c1"># 我们希望模型变聪明，但不要变得连“人话”都不会说了（防止灾难性遗忘）。</span>
+    <span class="n">policy_loss</span> <span class="o">=</span> <span class="n">policy_loss</span> <span class="o">+</span> <span class="n">kl_loss</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kl_loss_coef</span>
+</code></pre></div>
+
+<p><strong>人话解释：</strong>
+*   <strong>Entropy (熵)</strong>：防止模型变得太死板。比如问“你好”，不要每次都只会回“你好”，偶尔也要会说“您好”。
+*   <strong>KL Loss</strong>：这是一根“狗绳”。虽然我们希望模型通过强化学习去拿高分，但不能让它跑得离原始模型太远，否则可能会输出乱码或者奇怪的内容。</p>
+<hr />
+<h3>💡 最终总结</h3>
+<p>这个脚本 <code>dp_actor.py</code> 做的事情就是：
+<strong>在一个多显卡的环境下，把数据切成小块，让大模型根据 SPPO 算法（目标是让概率变化匹配奖励值），同时兼顾多样性（Entropy）和安全性（KL），一步步调整自己的参数，让自己变得更好。</strong></p>

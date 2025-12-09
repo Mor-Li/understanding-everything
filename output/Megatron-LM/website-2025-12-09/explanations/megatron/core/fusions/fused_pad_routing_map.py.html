@@ -1,0 +1,121 @@
+<h1>megatron/core/fusions/fused_pad_routing_map.py</h1>
+<p>这段代码确实比较晦涩，因为它涉及到了 <strong>混合专家模型 (MoE)</strong> 的底层优化以及 <strong>Triton</strong>（一种用于编写高效 GPU 内核的语言）。</p>
+<p>简单来说，这段代码的功能是：<strong>为了让 GPU 计算更高效，给分配给每个“专家”的任务数量凑个整（Padding）。</strong></p>
+<p>为了让你彻底理解，我制定了一个 <strong>5步学习 To-Do List</strong>。我们一步步来拆解。</p>
+<hr />
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解业务背景</strong> —— 什么是 Routing Map？为什么要凑整？</li>
+<li><strong>Task 2: 理解数据形状</strong> —— 输入的矩阵长什么样？</li>
+<li><strong>Task 3: 理解核心逻辑</strong> —— 如何计算需要补多少？怎么补？</li>
+<li><strong>Task 4: 理解代码实现 (Python层)</strong> —— 为什么要转置 (Transpose)？</li>
+<li><strong>Task 5: 理解代码实现 (Triton内核层)</strong> —— GPU 内部具体是怎么操作的？</li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>✅ Task 1: 理解业务背景</h4>
+<ul>
+<li><strong>场景</strong>：这是混合专家模型 (Mixture of Experts, MoE)。想象有 8 个“专家”（Experts，也就是 8 个神经网络小模型），还有一堆“Token”（单词/数据）。</li>
+<li><strong>Routing Map (路由表)</strong>：这是一个表格，记录了哪个 Token 被分配给了哪个 Expert。</li>
+<li><strong>问题</strong>：GPU 喜欢处理整齐的数据。比如，如果一个 Expert 被分配了 7 个 Token，但 GPU 处理 8 的倍数才最快（Tensor Core 的特性）。</li>
+<li><strong>目标</strong>：如果某个 Expert 收到了 7 个 Token，我们需要强行再塞给它 1 个（哪怕是无意义的空数据），凑成 8 个。这就是 <code>pad_multiple</code>（填充倍数）的作用。</li>
+</ul>
+<h4>✅ Task 2: 理解数据形状</h4>
+<p>代码里的 <code>routing_map</code> 是一个二维矩阵。
+*   <strong>形状</strong>：<code>[num_tokens, num_experts]</code> (Token数量 x 专家数量)。
+*   <strong>内容</strong>：<code>1</code> 表示分配，<code>0</code> 表示未分配。</p>
+<p><strong>例子</strong>：假设有 3 个 Token，2 个 Expert。</p>
+<div class="codehilite"><pre><span></span><code>Token 0 -&gt; Expert A
+Token 1 -&gt; Expert B
+Token 2 -&gt; Expert A
+</code></pre></div>
+
+<p>矩阵长这样：</p>
+<div class="codehilite"><pre><span></span><code>      Exp A   Exp B
+Tok 0   [1,      0]
+Tok 1   [0,      1]
+Tok 2   [1,      0]
+</code></pre></div>
+
+<p>现在 Expert A 有 2 个任务，Expert B 有 1 个任务。</p>
+<h4>✅ Task 3: 理解核心逻辑 (算法)</h4>
+<p>假设 <code>pad_multiple = 2</code> (必须凑成 2 的倍数)。</p>
+<ol>
+<li><strong>检查 Expert A</strong>：现有 2 个。2 % 2 = 0。余数为 0，<strong>不需要补</strong>。</li>
+<li><strong>检查 Expert B</strong>：现有 1 个。1 % 2 = 1。余数为 1，<strong>需要补 1 个</strong>。</li>
+<li><strong>怎么补？</strong>：在 Expert B 的列里，找那些本来是 <code>0</code> 的位置，强行改成 <code>1</code>，直到凑够数为止。<ul>
+<li>Expert B 原来是 <code>[0, 1, 0]</code>。</li>
+<li>我们需要把其中一个 <code>0</code> 变成 <code>1</code>。</li>
+<li>结果可能变成 <code>[1, 1, 0]</code> (把 Token 0 强行塞给 Expert B 用作填充)。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 4: 理解代码实现 (Python层 <code>fused_pad_routing_map</code>)</h4>
+<p>看代码底部的 <code>fused_pad_routing_map</code> 函数：</p>
+<ol>
+<li><strong><code>input_map = routing_map.transpose(0, 1)</code></strong>:<ul>
+<li><strong>关键动作</strong>：把矩阵转置了。</li>
+<li><strong>原因</strong>：原来的每一行是一个 Token，每一列是一个 Expert。为了让 GPU 并行处理每个 Expert 的任务，我们需要把数据变成 <strong>[Experts, Tokens]</strong>。这样，内存里每一行代表一个 Expert 的所有分配情况，连续读取速度最快。</li>
+</ul>
+</li>
+<li><strong><code>grid = (num_experts,)</code></strong>:<ul>
+<li>启动 GPU 任务。如果有 8 个 Expert，就启动 8 个并行程序（Block），每个程序负责处理一个 Expert 的数据。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 5: 理解代码实现 (Triton内核层 <code>_pad_routing_map_kernel</code>)</h4>
+<p>这是最难懂的部分，它是直接在 GPU 上跑的逻辑。我们只看一个 Expert (一行数据) 是怎么被处理的：</p>
+<ul>
+<li>
+<p><strong>Step 1: 加载数据</strong>
+    <code>row = tl.load(...)</code>
+    拿到当前 Expert 的一行数据，比如：<code>[0, 1, 0, 0, 1]</code> (共5个Token，现有2个1)。</p>
+</li>
+<li>
+<p><strong>Step 2: 计算现有的 1 (Num Ones)</strong>
+    <code>num_ones = tl.sum(row)</code>
+    结果：2。</p>
+</li>
+<li>
+<p><strong>Step 3: 计算需要补多少 (Num to Pad)</strong>
+    假设 <code>pad_multiple = 4</code>。
+    <code>remainder = 2 % 4 = 2</code>
+    <code>num_to_pad = 4 - 2 = 2</code>。
+    <strong>结论</strong>：还需要补 2 个 1。</p>
+</li>
+<li>
+<p><strong>Step 4: 找到谁是 0 (Is Zero)</strong>
+    <code>is_zero = row == 0</code>
+    结果：<code>[True, False, True, True, False]</code> (对应上面的 <code>[0, 1, 0, 0, 1]</code>)。</p>
+</li>
+<li>
+<p><strong>Step 5: 给 0 排序 (Cumsum)</strong>
+    这是最巧妙的一步。它计算“这是第几个 0”。
+    <code>zero_ranks = tl.cumsum(is_zero)</code>
+    结果：<code>[1, 1, 2, 3, 3]</code></p>
+<ul>
+<li>第一个位置是第 1 个 0。</li>
+<li>第二个位置不是 0，所以计数保持 1。</li>
+<li>第三个位置是第 2 个 0。</li>
+<li>第四个位置是第 3 个 0。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 6: 决定翻转哪些 (Mask to Flip)</strong>
+    我们需要补 2 个。所以，我们要翻转 <strong>排名 &lt;= 2</strong> 的那些 0。
+    逻辑：<code>(zero_ranks &lt;= num_to_pad) &amp; is_zero</code></p>
+<ul>
+<li>位置 0 (Rank 1): <strong>翻转</strong> (1 &lt;= 2)</li>
+<li>位置 2 (Rank 2): <strong>翻转</strong> (2 &lt;= 2)</li>
+<li>位置 3 (Rank 3): <strong>不翻转</strong> (3 &gt; 2)</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 7: 生成结果</strong>
+    把原来的 <code>1</code> 保持住，把选中的 <code>0</code> 变成 <code>1</code>。
+    原数据：<code>[0, 1, 0, 0, 1]</code>
+    补全后：<code>[1, 1, 1, 0, 1]</code> (现在有 4 个 1 了，满足倍数要求)。</p>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的作用就是：<strong>拿着一张任务分配表，检查每个专家的任务数量。如果数量不是 <code>pad_multiple</code> 的倍数，就从还没分配给他的任务里，强行抓几个凑数，把表格填满。</strong> 使用 Triton 是为了在 GPU 上极快地完成这个“数数并修改”的过程。</p>

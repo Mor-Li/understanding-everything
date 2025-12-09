@@ -1,0 +1,143 @@
+<h1>tests/unit_tests/tensor_parallel/test_mappings.py</h1>
+<p>这份代码确实比较晦涩，因为它测试的是 <strong>Megatron-Core</strong> 中最底层的 <strong>张量并行（Tensor Parallelism）</strong> 通信原语。这些代码负责在多张显卡之间“切分”或“合并”数据。</p>
+<p>为了让你看懂，我制定了一个 <strong>学习任务清单 (Task List)</strong>，然后按照这个清单一步步拆解给你看。</p>
+<h3>📋 学习任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>环境设定理解</strong>：搞清楚 <code>initialize_model_parallel(4, 2)</code> 到底意味着什么（有多少张卡，怎么分组）。</li>
+<li><strong>核心概念：前向与反向的“镜像关系”</strong>：理解为什么 Forward 做复制，Backward 就要做求和。</li>
+<li><strong>第一组原语：复制与规约 (Copy &amp; Reduce)</strong>：理解数据如何在并行区和普通区之间转换。</li>
+<li><strong>第二组原语：切分与收集 (Scatter &amp; Gather)</strong>：理解如何把一个大张量切开分给不同显卡，以及怎么拼回来。</li>
+<li><strong>第三组原语：序列并行 (Sequence Parallel)</strong>：理解针对序列长度（Sequence Length）维度的切分。</li>
+</ol>
+<hr />
+<h3>1. 环境设定理解</h3>
+<p>代码开头有一句：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">Utils</span><span class="o">.</span><span class="n">initialize_model_parallel</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这是理解所有数字（比如结果里的 <code>6</code>）的关键：
+*   <strong>TP Size (Tensor Parallel) = 4</strong>：表示模型并行组有 <strong>4张显卡</strong>。这是我们关注的重点。这意味着一个大的矩阵会被切成 4 份。
+*   <strong>Rank (显卡编号)</strong>：在这个测试组里，显卡的编号（Rank）分别是 0, 1, 2, 3。
+*   <strong>测试数据</strong>：代码中经常出现 <code>input_data = ... * Utils.rank</code>。
+    *   显卡0的数据是 0
+    *   显卡1的数据是 1
+    *   显卡2的数据是 2
+    *   显卡3的数据是 3
+    *   <strong>它们的和 = 0+1+2+3 = 6</strong>。记住这个 <strong>6</strong>，后面会反复用到。</p>
+<hr />
+<h3>2. 核心概念：前向与反向的“镜像关系”</h3>
+<p>这些测试都在测 <code>mappings</code> 里的类。这些类都是 <code>torch.autograd.Function</code>，它们定义了两个动作：
+*   <strong>Forward (前向传播)</strong>：正常计算时数据怎么走。
+*   <strong>Backward (反向传播)</strong>：算梯度时数据怎么走。</p>
+<p><strong>核心规则</strong>：如果前向传播是“切分（Split）”，反向传播就是“合并（Gather）”；如果前向传播是“复制（Copy/Broadcast）”，反向传播就是“求和（Sum/All-Reduce）”。</p>
+<hr />
+<h3>3. 第一组原语：复制与规约 (Copy &amp; Reduce)</h3>
+<p>这一组处理的是 <strong>单卡数据</strong> 和 <strong>多卡全量数据</strong> 之间的转换。</p>
+<h4>任务 A: <code>test_CopyToModelParallelRegion</code></h4>
+<ul>
+<li><strong>场景</strong>：你有一个普通的张量，现在要进入“张量并行”区域计算了。虽然每张卡都有这个张量，但在逻辑上，我们标记它为“进入并行区”。</li>
+<li><strong>Forward (前向)</strong>：<code>Pass-through</code> (直接复制)。输入是什么，输出就是什么。<ul>
+<li><em>代码验证</em>：<code>assert torch.equal(input_data, mappings.copy_to_tensor_model_parallel_region(input_data))</code></li>
+</ul>
+</li>
+<li><strong>Backward (反向)</strong>：<strong>All-Reduce (Sum)</strong>。<ul>
+<li><em>逻辑</em>：既然前向是大家都有同一份数据（复制），那么反向传播回来的梯度，就需要把大家算出来的梯度<strong>加起来</strong>，还原给源头。</li>
+<li><em>代码验证</em>：测试里手动调用了 <code>.backward</code>。因为 Rank 0~3 的输入分别是 0~3，反向求和后就是 <strong>6</strong>。</li>
+<li><code>result * 6</code> 就是这么来的。</li>
+</ul>
+</li>
+</ul>
+<h4>任务 B: <code>test_ReduceFromModelParallelRegion</code></h4>
+<ul>
+<li><strong>场景</strong>：并行计算结束了，每张卡上都有一部分结果，现在要离开并行区，需要把大家的结果汇总。</li>
+<li><strong>Forward (前向)</strong>：<strong>All-Reduce (Sum)</strong>。把 4 张卡上的数值加起来，同步给所有人。<ul>
+<li><em>代码验证</em>：输入是 0,1,2,3，经过 Reduce 后，每张卡得到的都是 <strong>6</strong>。</li>
+</ul>
+</li>
+<li><strong>Backward (反向)</strong>：<code>Pass-through</code> (直接复制)。<ul>
+<li><em>逻辑</em>：前向是求和，反向传播梯度时，总和的梯度会原封不动地分发给每一个参与加法的人。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>4. 第二组原语：切分与收集 (Scatter &amp; Gather)</h3>
+<p>这一组涉及 <strong>物理上的切分张量</strong>。通常是沿着 Hidden Dimension（隐藏层维度）切。</p>
+<h4>任务 C: <code>test_ScatterToModelParallelRegion</code></h4>
+<ul>
+<li><strong>场景</strong>：你有一个巨大的权重矩阵（比如 8行4列），你想让 4 张卡每人只存 1 列（8行1列），以此节省显存。</li>
+<li><strong>Forward (前向)</strong>：<strong>Split (切分)</strong>。<ul>
+<li>输入：<code>[8, 4]</code> 的矩阵。</li>
+<li>输出：每张卡拿到 <code>[8, 1]</code> 的矩阵。Rank 0 拿第0列，Rank 1 拿第1列...</li>
+<li><em>代码验证</em>：<code>input_data[:, req_dim]</code>，验证了每张卡只拿到了属于自己的那一列。</li>
+</ul>
+</li>
+<li><strong>Backward (反向)</strong>：<strong>Gather (收集)</strong>。<ul>
+<li><em>逻辑</em>：前向切开了，反向就要拼回去。</li>
+<li><em>代码验证</em>：测试里构造了 <code>expected_output</code>，是用 <code>torch.cat</code> 把大家的梯度拼起来。</li>
+</ul>
+</li>
+</ul>
+<h4>任务 D: <code>test_GatherFromModelParallelRegion</code></h4>
+<ul>
+<li><strong>场景</strong>：每张卡算完了自己那部分（8行1列），现在要输出最终结果，需要把大家的碎片拼成一个完整的矩阵（8行4列）。</li>
+<li><strong>Forward (前向)</strong>：<strong>Gather (收集)</strong>。<ul>
+<li>输入：每张卡 <code>[8, 1]</code>。</li>
+<li>输出：每张卡都得到完整的 <code>[8, 4]</code>。</li>
+<li><em>代码验证</em>：<code>torch.cat(...)</code> 验证了拼接结果。</li>
+</ul>
+</li>
+<li><strong>Backward (反向)</strong>：<strong>Split (切分)</strong>。<ul>
+<li><em>逻辑</em>：前向是拼接，反向梯度流回来时，只需要把自己负责的那一列梯度拿走就行了。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>5. 第三组原语：序列并行 (Sequence Parallel)</h3>
+<p>这是 Megatron-Core 较新的特性。普通的张量并行切的是“隐藏层维度”，<strong>序列并行切的是“序列长度 (Sequence Length)”维度</strong>（通常是第0维或第1维）。</p>
+<h4>任务 E: <code>test_ScatterToSequenceParallelRegion</code></h4>
+<ul>
+<li><strong>区别</strong>：<code>ScatterToModel</code> 切的是最后一维（列），<code>ScatterToSequence</code> 切的是第一维（行/序列）。</li>
+<li><strong>Forward</strong>：沿着第0维切分。<ul>
+<li>输入：<code>[8, 4]</code>。</li>
+<li>TP=4，所以每张卡分到 <code>8 / 4 = 2</code> 行。</li>
+<li>输出：<code>[2, 4]</code>。</li>
+</ul>
+</li>
+<li><strong>Backward</strong>：沿着第0维拼接 (Gather)。</li>
+</ul>
+<h4>任务 F: <code>test_GatherFromSequenceParallelRegion</code></h4>
+<ul>
+<li><strong>Forward</strong>：沿着第0维拼接。<ul>
+<li>输入：<code>[2, 4]</code>。</li>
+<li>输出：<code>[8, 4]</code>。</li>
+</ul>
+</li>
+<li><strong>Backward</strong>：沿着第0维切分。</li>
+</ul>
+<h4>任务 G: <code>test_ReduceScatterToSequenceParallelRegion</code></h4>
+<ul>
+<li><strong>这是个组合技</strong>。在 Transformer 的某些层（如 LayerNorm 之前），我们需要先做一次 Reduce（求和），然后为了省显存，不保留完整的求和结果，而是直接把结果切分（Scatter）给各张卡。</li>
+<li><strong>操作</strong>：<code>Reduce (Sum)</code> + <code>Scatter (Split)</code>。</li>
+<li><strong>Forward</strong>：<ul>
+<li>假设大家都有一个 <code>[4]</code> 大小的向量。</li>
+<li>先 Sum：所有卡的值加起来。</li>
+<li>再 Scatter：把加起来的结果切成 4 份，每人拿一份。</li>
+<li><em>代码验证</em>：输入是 <code>vstack</code> 堆叠的，输出验证了 <code>expected_output</code> 是求和后被切分的一小块。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就在测试三件事的 <strong>正向逻辑</strong> 和 <strong>反向梯度逻辑</strong> 是否正确：</p>
+<ol>
+<li><strong>Copy / Reduce</strong>：全量数据 &lt;-&gt; 全量数据（但在逻辑上进出并行区）。<ul>
+<li><em>口诀</em>：进并行区Forward不干活Backward求和；出并行区Forward求和Backward不干活。</li>
+</ul>
+</li>
+<li><strong>Scatter / Gather</strong>：全量数据 &lt;-&gt; 切片数据（切的是特征/列维度）。<ul>
+<li><em>口诀</em>：Scatter是切，Gather是拼。</li>
+</ul>
+</li>
+<li><strong>Sequence Parallel</strong>：全量数据 &lt;-&gt; 切片数据（切的是序列/行维度）。</li>
+</ol>
+<p>只要记住了 <strong>TP Size = 4</strong> 以及 <strong>Rank 0,1,2,3 的数据分别是 0,1,2,3 (和为6)</strong>，就能看懂里面所有的 <code>assert</code> 逻辑了。</p>

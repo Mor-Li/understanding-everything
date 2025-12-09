@@ -1,0 +1,117 @@
+<h1>scripts/legacy_model_merger.py</h1>
+<p>这段代码确实比较硬核，因为它处理的是<strong>分布式大模型训练后的“碎片”合并</strong>问题。</p>
+<p>简单来说，当我们在多张显卡上训练大模型（比如使用 FSDP 或 Megatron 框架）时，模型权重是被<strong>切分</strong>（Sharding/Slicing）保存在不同文件里的。<strong>这个脚本的作用就是把这些切碎的权重“拼”回一个完整的、标准的 Hugging Face 格式模型文件</strong>，以便后续加载使用或发布。</p>
+<p>我把这个脚本的逻辑拆解成一个 <strong>Task List (任务清单)</strong>，带你一步步看它在干什么：</p>
+<h3>核心任务：将分布式 Checkpoint 转换为 Hugging Face 格式</h3>
+<h4>Phase 1: 准备阶段 (初始化与配置)</h4>
+<ol>
+<li>
+<p><strong>解析命令行参数 (<code>main</code> 函数)</strong></p>
+<ul>
+<li><strong>Todo:</strong> 确定你是要 <code>merge</code>（合并并保存）还是 <code>test</code>（合并后只做测试）。</li>
+<li><strong>Todo:</strong> 确定你的训练后端是 <code>fsdp</code> 还是 <code>megatron</code>（这决定了拼图的方式）。</li>
+<li><strong>Todo:</strong> 获取文件路径（碎片在哪？）和目标路径（拼好放哪？）。</li>
+</ul>
+</li>
+<li>
+<p><strong>加载基础配置 (<code>BaseModelMerger</code> 类)</strong></p>
+<ul>
+<li><strong>Todo:</strong> 找到原始模型的 Hugging Face 配置文件（<code>config.json</code>），因为拼图需要参照图纸。</li>
+<li><strong>Todo:</strong> 自动判断模型架构（是 Llama 这种 CausalLM，还是视觉模型 Vision2Seq 等）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Phase 2: 分支任务 - 根据后端类型选择合并策略</h4>
+<p>这里代码分成了两条路，因为 FSDP 和 Megatron 切分模型的方式完全不同。</p>
+<p><strong>分支 A：如果你用的是 FSDP (<code>FSDPModelMerger</code> 类)</strong>
+<em>FSDP (Fully Sharded Data Parallel) 通常是把参数打散在不同 GPU 上。</em></p>
+<ol>
+<li><strong>侦察切分情况</strong><ul>
+<li><strong>Todo:</strong> 扫描文件夹，看一共有多少个分片（<code>world_size</code>）。</li>
+<li><strong>Todo:</strong> 读取第0号分片，分析参数是按什么规则切分的（<code>_extract_device_mesh_info</code>）。</li>
+</ul>
+</li>
+<li><strong>并行加载碎片</strong><ul>
+<li><strong>Todo:</strong> 开启多线程（<code>ThreadPoolExecutor</code>），把所有 <code>rank_*.pt</code> 文件全部读入内存。</li>
+</ul>
+</li>
+<li><strong>物理拼接 (<code>_load_and_merge_state_dicts</code>)</strong><ul>
+<li><strong>Todo:</strong> 遍历每一个参数名（key）。</li>
+<li><strong>Todo:</strong> 如果参数是 <code>DTensor</code> (分布式张量)，根据它的切分信息（Placement），把分散在各 <code>rank</code> 的数据拼接（<code>torch.cat</code>）起来。</li>
+<li><strong>Todo:</strong> 还原成完整的参数张量。</li>
+</ul>
+</li>
+</ol>
+<p><strong>分支 B：如果你用的是 Megatron (<code>MegatronModelMerger</code> 类)</strong>
+<em>Megatron 使用张量并行 (TP) 和流水线并行 (PP)，切分逻辑更复杂，且变量名和 Hugging Face 不一致。</em></p>
+<ol>
+<li><strong>侦察切分情况</strong><ul>
+<li><strong>Todo:</strong> 扫描文件夹，根据文件名（如 <code>mp_rank_00_000</code>）计算 TP（张量并行度）和 PP（流水线并行度）的大小。</li>
+</ul>
+</li>
+<li><strong>并行加载碎片</strong><ul>
+<li><strong>Todo:</strong> 同样开启多线程，把所有分片文件读入内存。</li>
+</ul>
+</li>
+<li><strong>变量名翻译 (<code>params_mapping</code> 字典)</strong><ul>
+<li><strong>Todo:</strong> <strong>这是最关键的一步</strong>。Megatron 的变量名（如 <code>self_attention.linear_qkv</code>）和 Hugging Face 的变量名（如 <code>self_attn.qkv_proj</code>）不一样。脚本里写死了一个巨大的映射表，把 Megatron 的名字“翻译”成 HF 的名字。</li>
+</ul>
+</li>
+<li><strong>智能拼接 (<code>_merge_across_tp</code>)</strong><ul>
+<li><strong>Todo:</strong> 根据层的类型决定怎么拼：<ul>
+<li><strong>列并行 (Column Parallel):</strong> 比如 QKV 层，要在维度 0 拼接。</li>
+<li><strong>行并行 (Row Parallel):</strong> 比如输出层，要在维度 1 拼接。</li>
+<li><strong>特殊处理:</strong> 对于 QKV（查询/键/值），Megatron 可能是合在一起存的，合并后可能还需要拆分或重组。</li>
+</ul>
+</li>
+<li><strong>Todo:</strong> 处理层号（Layer Number），因为 PP 模式下，层号是分散在不同文件夹里的，需要累加计算正确的层号。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Phase 3: 收尾阶段 (保存与验证)</h4>
+<ol>
+<li>
+<p><strong>处理 LoRA (<code>save_lora_adapter</code>)</strong></p>
+<ul>
+<li><strong>Todo:</strong> 如果发现权重里包含 <code>lora_</code> 开头的参数，说明这是微调后的模型。</li>
+<li><strong>Todo:</strong> 把 LoRA 部分单独提取出来，存为 <code>adapter_model.safetensors</code>，把基础模型还原。</li>
+</ul>
+</li>
+<li>
+<p><strong>保存模型 (<code>save_hf_model_and_tokenizer</code>)</strong></p>
+<ul>
+<li><strong>Todo:</strong> 创建一个空的 Hugging Face 模型骨架（<code>init_empty_weights</code>）。</li>
+<li><strong>Todo:</strong> 把刚才辛苦拼好的完整参数字典（<code>state_dict</code>）填进去。</li>
+<li><strong>Todo:</strong> 调用 <code>model.save_pretrained()</code> 保存成标准的 Hugging Face 格式。</li>
+<li><strong>Todo:</strong> 顺便把 Tokenizer（分词器）也存进去。</li>
+</ul>
+</li>
+<li>
+<p><strong>验证 (可选, <code>test</code> 模式)</strong></p>
+<ul>
+<li><strong>Todo:</strong> 如果用户选了 <code>test</code>，加载一个标准的 HF 模型作为“标准答案”。</li>
+<li><strong>Todo:</strong> 对比拼出来的参数和标准答案的参数，检查形状（Shape）、数据类型（Dtype）和数值（Close Check），确保拼接无误。</li>
+</ul>
+</li>
+<li>
+<p><strong>上传 (可选)</strong></p>
+<ul>
+<li><strong>Todo:</strong> 如果配置了上传路径，自动调用 Hugging Face API 把拼好的模型传到云端。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>“拼图机器人”</strong>。</p>
+<ul>
+<li><strong>输入</strong>：一堆被切得乱七八糟的 <code>pt</code> 文件（来自 FSDP 或 Megatron 训练）。</li>
+<li><strong>处理</strong>：<ol>
+<li>识别切分规则。</li>
+<li>把碎片读进内存。</li>
+<li>把变量名改成通用的名字（Megatron 需要）。</li>
+<li>按正确的维度把矩阵拼起来。</li>
+</ol>
+</li>
+<li><strong>输出</strong>：一个可以直接用 <code>AutoModel.from_pretrained()</code> 加载的标准模型文件夹。</li>
+</ul>

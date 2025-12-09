@@ -1,0 +1,79 @@
+<h1>examples/inference/README.md</h1>
+<p>没问题。这份文档主要是在讲 <strong>如何使用 Megatron Core 来进行模型推理（Inference）</strong>，也就是怎么让你训练好的大模型“开口说话”生成文本。</p>
+<p>因为原文涉及很多代码细节和架构逻辑，我把它拆解成一个 <strong>5步走的 Task List（任务清单）</strong>，带你从宏观到微观逐步理解。</p>
+<hr />
+<h3>✅ Task 1: 搞清楚目标（Overview）</h3>
+<p><strong>目标：</strong> 理解这份文档是用来干嘛的。
+*   <strong>核心内容：</strong> 这是一个指南，教你如何加载一个用 Megatron Core 训练好的模型，并让它运行推理（生成文本）。
+*   <strong>主要场景：</strong> 静态批量推理（Static Batching），即一次处理固定数量的请求。
+*   <strong>入口文件：</strong> <code>gpt_static_inference.py</code> 是主程序。</p>
+<hr />
+<h3>✅ Task 2: 快速上手 - 代码逻辑是怎样的？(Code Walkthrough)</h3>
+<p><strong>目标：</strong> 理解写一个推理脚本需要哪 4 个关键步骤（对应文档 1.1 节）。</p>
+<ul>
+<li><strong>Step 1: 初始化 (Initialize)</strong><ul>
+<li>设置并行参数（比如模型并行、数据并行）。这里提到微批次（micro batch size）默认为1。</li>
+</ul>
+</li>
+<li><strong>Step 2: 加载模型 (Load Model)</strong><ul>
+<li>使用 <code>get_model</code> 和 <code>load_checkpoint</code> 把训练好的模型权重读进内存。</li>
+</ul>
+</li>
+<li><strong>Step 3: 选择引擎 (Choose Engine)</strong><ul>
+<li>这是核心。你需要创建一个 <strong>“推理引擎” (Inference Engine)</strong>。</li>
+<li>还需要一个 <strong>“文本生成控制器” (TextGenerationController)</strong>，它负责管理生成的循环（比如生成一个词后，怎么生成下一个）。</li>
+</ul>
+</li>
+<li><strong>Step 4: 开始生成 (Run Generation)</strong><ul>
+<li>设置采样参数（比如 <code>top_p</code>, <code>temperature</code>）。</li>
+<li>调用 <code>engine.generate()</code>，传入提示词（prompts），最后得到结果列表。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 动手运行 - 怎么跑起来？(Running The Code)</h3>
+<p><strong>目标：</strong> 学会配置启动脚本（对应文档 1.2 节）。</p>
+<p>你需要写一个 Slurm 脚本或直接用命令行运行。主要关注以下几类参数：
+1.  <strong>路径设置：</strong>
+    *   <code>TOKENIZER_ARGS</code>: 词表文件在哪里（vocab, merge file）。
+    *   <code>MODEL_ARGS</code>: 模型检查点（ckpt）在哪里。
+2.  <strong>推理参数 (Inference Specific)：</strong>
+    *   <code>--num-tokens-to-generate</code>: 每个提示词生成多少个字（token）。
+    *   <code>--max-batch-size</code>: 一次最多处理几句话。
+    *   <code>--temperature</code>, <code>--top_k</code>, <code>--top_p</code>: 控制生成文本的随机性和多样性。
+3.  <strong>启动命令：</strong>
+    *   使用 <code>torchrun</code> 来启动 <code>gpt_static_inference.py</code>。</p>
+<hr />
+<h3>✅ Task 4: 进阶理解 - 内部是怎么流转的？(Control Flow)</h3>
+<p><strong>目标：</strong> 理解当你调用 <code>generate()</code> 时，黑盒子里发生了什么（对应文档第 2 节）。</p>
+<p>这是一个循环过程，文档描述了数据流向：
+1.  <strong>入队：</strong> 用户输入的 Prompt 被 <code>Scheduler</code>（调度器）放入请求池。
+2.  <strong>批处理：</strong> 引擎取出一定数量的请求（Active Requests）。
+3.  <strong>循环生成 (Autoregressive Loop)：</strong>
+    *   <strong>准备数据：</strong> 切分输入的 token 和 mask。
+    *   <strong>前向传播 (Forward)：</strong> 模型计算，得出概率分布（Logits）。
+    *   <strong>同步：</strong> 在多张显卡间同步数据。
+    *   <strong>采样 (Sample)：</strong> 根据概率选出下一个 token。
+    *   <strong>拼接：</strong> 把新生成的 token 拼接到输入后面，作为下一次的输入。
+    *   <strong>检查结束：</strong> 看看是不是生成完了（遇到结束符或达到长度限制）。
+4.  <strong>解码：</strong> 把生成的 token 数字转回文字，返回结果。</p>
+<hr />
+<h3>✅ Task 5: 高级定制 - 我想改代码怎么办？(Customizing)</h3>
+<p><strong>目标：</strong> 知道如果现有功能不够用，该去改哪个文件（对应文档第 3 节）。</p>
+<p>文档列出了你可以自定义的三个层级：
+1.  <strong>改后端 (Inference Engine):</strong>
+    *   如果你想换一种推理后端（比如未来支持的 TensorRT-LLM），去改 <code>abstract_engine.py</code>。
+2.  <strong>改采样逻辑 (Text Generation Controller):</strong>
+    *   如果你想发明新的采样算法，或者改变 Tokenizer 的处理方式，去改 <code>TextGenerationController</code> 类。
+3.  <strong>改模型支持 (Model Wrapper):</strong>
+    *   如果你用的不是 GPT，而是 Llama 或其他模型，需要继承 <code>AbstractModelInferenceWrapper</code> 来定义模型如何做 Forward。
+4.  <strong>改参数 (Parameters):</strong>
+    *   想加一些奇怪的采样参数（比如 <code>min_length</code>），可以在 <code>SamplingParams</code> 里添加。</p>
+<hr />
+<h3>总结</h3>
+<p>这就好比你在开一家<strong>餐馆</strong>（推理服务）：
+*   <strong>Task 1</strong> 是告诉你这家餐馆是卖什么的（Megatron推理）。
+*   <strong>Task 2</strong> 是教厨师怎么备菜、开火（代码逻辑）。
+*   <strong>Task 3</strong> 是教服务员怎么下单、传菜（运行脚本）。
+*   <strong>Task 4</strong> 是解释厨房里的流水线是怎么运作的（内部数据流）。
+*   <strong>Task 5</strong> 是告诉你如果想换菜单或装修厨房该找谁（自定义修改）。</p>

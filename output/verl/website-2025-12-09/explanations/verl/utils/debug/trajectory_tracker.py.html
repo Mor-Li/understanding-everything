@@ -1,0 +1,76 @@
+<h1>verl/utils/debug/trajectory_tracker.py</h1>
+<p>这段代码确实涉及到了<strong>分布式计算（Ray）</strong>、<strong>文件系统操作（HDFS）</strong>和<strong>PyTorch</strong>，如果不熟悉这些背景，看起来会很晕。</p>
+<p>你可以把这段代码想象成给一个复杂的工厂流水线安装了一个<strong>“黑匣子”监控系统</strong>。</p>
+<p>为了让你听懂，我为你列了一个 <strong>“学习任务清单” (ToDo List)</strong>，我们一步一步拆解这个文件的功能：</p>
+<hr />
+<h3>✅ Task 1: 理解核心目标 —— “它是干嘛的？”</h3>
+<p><strong>核心观点：</strong> 这是一个<strong>调试工具</strong>，用来给程序“拍照”并存到底层仓库里。</p>
+<ul>
+<li><strong>场景：</strong> 假设你在训练一个超大的AI模型（比如ChatGPT），这需要很多台机器一起跑。突然，模型训练崩了（Loss变成了NaN）。</li>
+<li><strong>痛点：</strong> 你想知道崩之前中间的数据（Tensor）长什么样，但因为是多机并行，数据很难抓取。</li>
+<li><strong>本代码的作用：</strong> 它允许你在代码的任何地方插入一个“探针”，把当时的中间结果（Trajectory/Tensor）保存下来，上传到一个共享的超大硬盘（HDFS）上，方便你事后下载下来分析。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 理解技术难点 —— “为什么这么写？”</h3>
+<p><strong>核心观点：</strong> 为了<strong>不卡顿</strong>，必须用<strong>异步（Asynchronous）</strong>的方式。</p>
+<ul>
+<li><strong>问题：</strong> 往硬盘（特别是网络硬盘HDFS）写数据是很慢的。如果你在训练循环里直接写文件，CPU/GPU就会停下来等硬盘写完，训练速度会慢得像蜗牛。</li>
+<li><strong>解决方案（Ray）：</strong> 代码里大量使用了 <code>@ray.remote</code>。这相当于请了一个“秘书”。<ul>
+<li><strong>主程序：</strong> “秘书，帮我把这份数据存一下。”（然后主程序立刻继续往下跑，不等待）。</li>
+<li><strong>秘书（Ray）：</strong> “好的，你忙你的，我在后台慢慢存。”</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 拆解关键角色 —— “谁负责什么？”</h3>
+<p>我们把代码里的几个主要函数/类对应到现实角色：</p>
+<h4>1. <code>dump_data(data, name)</code> —— <strong>发令员</strong></h4>
+<p>这是你唯一需要直接调用的函数。
+*   <strong>逻辑：</strong>
+    1.  先看一眼开关（环境变量 <code>VERL_ENABLE_TRACKER</code>），如果是关着的，直接退出，不浪费时间。
+    2.  如果开着，把数据（Tensor）打包成一个内存包（<code>io.BytesIO</code>）。
+    3.  把这个包扔给“总管”，喊一声：“存它！”。</p>
+<h4>2. <code>TrajectoryTracker</code> (类) —— <strong>仓库总管</strong></h4>
+<p>这是一个全局唯一的管理者（通过 <code>get_trajectory_tracker</code> 保证全局只有一个）。
+*   <strong>逻辑：</strong>
+    1.  它知道仓库在哪里（<code>hdfs_dir</code>）。
+    2.  它手里有个小本本（<code>self.handle</code>），记录了所有正在进行的存储任务。
+    3.  它不亲自搬运，它指挥“搬运工”去干活。
+    4.  <code>wait_for_hdfs</code>：这是“下班打卡”功能。主程序结束前调用它，意思是：“总管，等所有搬运工把活儿干完我们再关机。”</p>
+<h4>3. <code>save_to_hdfs</code> (函数) —— <strong>搬运工</strong></h4>
+<p>这是真正干苦力的。
+*   <strong>逻辑：</strong>
+    1.  拿到数据包。
+    2.  在本地创建一个临时文件。
+    3.  把数据写入临时文件。
+    4.  把临时文件上传到远程硬盘（HDFS）。</p>
+<hr />
+<h3>✅ Task 4: 梳理工作流程 —— “一步步发生了什么？”</h3>
+<p>假设你在训练代码里写了这么一行：
+<code>dump_data(my_tensor, "step_100_output")</code></p>
+<p><strong>代码内部的执行顺序是：</strong></p>
+<ol>
+<li><strong>检查开关：</strong> <code>dump_data</code> 发现 <code>VERL_ENABLE_TRACKER="1"</code>，决定开始工作。</li>
+<li><strong>打包：</strong> <code>my_tensor</code> 被转换成了二进制流（Buffer）。</li>
+<li><strong>呼叫总管：</strong> 找到 <code>TrajectoryTracker</code> 这个后台进程。</li>
+<li><strong>异步派单：</strong> <code>TrajectoryTracker</code> 接到请求，立刻指派一个 <code>save_to_hdfs</code> 任务在后台运行。<strong>注意：此时主程序已经跑完了这行代码，继续往下执行了，完全没感觉到卡顿。</strong></li>
+<li><strong>后台上传：</strong> 在另一个进程里，数据被写入文件并上传到 HDFS。</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 总结与怎么用</h3>
+<p><strong>总结：</strong>
+这个文件就是实现了一个<strong>“由于写硬盘太慢，所以利用 Ray 在后台偷偷写，以免影响主模型训练速度”</strong>的记录器。</p>
+<p><strong>怎么用（看最后的 <code>__main__</code> 测试部分）：</strong></p>
+<p>你需要设置两个环境变量才能启动它：
+1.  <code>export VERL_ENABLE_TRACKER=1</code> (打开开关)
+2.  <code>export VERL_TRACKER_HDFS_DIR=~/debug/test</code> (告诉它存哪)</p>
+<p>然后在你的代码里：</p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">verl.utils.debug.trajectory_tracker</span><span class="w"> </span><span class="kn">import</span> <span class="n">dump_data</span>
+
+<span class="c1"># ... 你的训练代码 ...</span>
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="mi">10</span><span class="p">)</span>
+<span class="c1"># 这一行就是给 x 拍个照，存名为 &quot;my_debug_data&quot;</span>
+<span class="n">dump_data</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="s2">&quot;my_debug_data&quot;</span><span class="p">)</span> 
+</code></pre></div>
+
+<p>现在，这段代码对你来说应该不再是天书了。</p>

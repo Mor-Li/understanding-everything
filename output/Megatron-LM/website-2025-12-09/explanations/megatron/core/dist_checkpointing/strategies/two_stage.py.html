@@ -1,0 +1,97 @@
+<h1>megatron/core/dist_checkpointing/strategies/two_stage.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了<strong>分布式深度学习</strong>中一个非常具体的痛点：<strong>大规模模型加载时的磁盘I/O瓶颈</strong>。</p>
+<p>简单来说，这个文件的核心目的是：<strong>为了防止成百上千个GPU同时读取硬盘把文件系统搞崩，我们采用“一人读书，大家听写”的策略。</strong></p>
+<p>注意：代码开头有一个 <code>logger.warning</code>，提示这个模块已经<strong>过时（deprecated）</strong>，未来会被移除，建议使用 <code>FullyParallelLoadStrategyWrapper</code>。但理解这个逻辑对理解分布式系统很有帮助。</p>
+<p>下面我为你列一个 <strong>Task Todo List</strong>，把这个代码的逻辑拆解成一步步的任务，就像你在指挥一个团队干活一样。</p>
+<hr />
+<h3>核心背景：为什么要这么做？</h3>
+<p>假设你有 8 张显卡（Rank 0-7）在做数据并行（Data Parallel）。通常这意味着这 8 张卡需要持有<strong>完全相同</strong>的模型权重。
+*   <strong>笨办法</strong>：8 张卡同时去读硬盘上的同一个权重文件。硬盘读写速度跟不上，卡死。
+*   <strong>这个代码的办法（Two-Stage）</strong>：
+    *   <strong>Stage 1</strong>：选一个代表（比如 Rank 0）去读硬盘。
+    *   <strong>Stage 2</strong>：Rank 0 读完后，通过网络（广播 Broadcast）发给 Rank 1-7。
+    *   <strong>好处</strong>：硬盘只承受 1 次读取，网络传输通常比硬盘快且并发能力强。</p>
+<hr />
+<h3>Task Todo List：代码执行流程拆解</h3>
+<p>我们将代码中的 <code>load</code> 方法拆解为以下步骤：</p>
+<h4>✅ Task 0: 组建通讯群组 (Preparation)</h4>
+<p><strong>对应代码</strong>: <code>maybe_init_gloo_group</code>
+*   <strong>情景</strong>: 如果我们要用 CPU 内存来中转数据（防止 GPU 显存爆了），我们需要建立一个基于 CPU 的通讯网络（Gloo 后端）。
+*   <strong>动作</strong>:
+    1.  检查是否开启了 <code>cpu_transfer</code>。
+    2.  找出所有做数据并行（DP）的进程。
+    3.  建立一个通讯组（Group），大家进群，准备听指挥。</p>
+<h4>✅ Task 1: 制定加载计划 (Planning)</h4>
+<p><strong>对应代码</strong>: <code>_build_load_plan</code>
+*   <strong>情景</strong>: 模型被切分成了很多块（Sharded Tensor），每一块数据都有多个副本（因为是数据并行）。我们需要决定<strong>谁负责读哪一块</strong>。
+*   <strong>动作</strong>:
+    1.  <strong>统计</strong>: 每张卡看看自己需要哪些权重数据 (<code>local_meta</code>)。
+    2.  <strong>开会 (All-Gather)</strong>: 大家把自己的需求发到群里，汇总成一个总表 (<code>all_meta</code>)。
+    3.  <strong>去重与指派 (Deduplicate)</strong>: 既然大家要的数据是一样的，不要重复读。
+        *   代码逻辑是：<code>min(key=attrgetter('dist_group_rank'))</code>。
+        *   意思就是：<strong>谁的 Rank 号最小，谁负责去读硬盘</strong>。通常是 Rank 0 负责读，其他人等着。
+    4.  <strong>产出</strong>: 一个排序好的任务列表 <code>all_tensors_sorted</code>。</p>
+<h4>✅ Task 2: 执行“读取-广播”循环 (Execution Loop)</h4>
+<p><strong>对应代码</strong>: <code>_exchange_loaded_tensors</code>
+*   <strong>情景</strong>: 拿着上面的计划表，开始逐个处理每一个权重张量（Tensor）。这是最核心的循环。
+*   <strong>动作</strong>: 遍历每一个权重任务：
+    *   <strong>Step 2.1: 认领任务</strong>
+        *   判断：当前这个权重，是不是归我（本 GPU）读？
+    *   <strong>Step 2.2: 读取或准备接收</strong>
+        *   <strong>如果是我的活 (Rank 0)</strong>: 调用 <code>load_tensor_from_storage</code> 从硬盘读取文件到内存（或显存）。
+        *   <strong>如果不是我的活 (Rank 1-7)</strong>: 我知道 Rank 0 会发给我，所以我先申请一块空的内存/显存 (<code>torch.empty</code>)，坐等数据。
+    *   <strong>Step 2.3: 广播数据 (Broadcast)</strong>
+        *   <strong>动作</strong>: <code>torch.distributed.broadcast(exchange_tensor, ...)</code>
+        *   Rank 0 把手里的数据通过网络发给群里所有人。
+        *   现在，所有人手里都有这份数据了。
+    *   <strong>Step 2.4: 填入模型 (Fill)</strong>
+        *   <strong>对应代码</strong>: <code>_distribute_data_to_state_dict</code>
+        *   大家把手里刚拿到的热乎数据，复制到模型真正的参数位置上 (<code>sharded_tensor.data.data.copy_(x)</code>)。
+    *   <strong>Step 2.5: 清理</strong>
+        *   释放掉刚才用来传输的临时 Buffer，防止内存溢出。</p>
+<h4>✅ Task 3: 总结汇报 (Reporting)</h4>
+<p><strong>对应代码</strong>: <code>summarize_load_times</code>
+*   <strong>动作</strong>: 统计一下刚才加载花了多少时间，打印日志告诉用户“加载完成”。</p>
+<hr />
+<h3>代码片段对照解释</h3>
+<p>我把几个关键函数挑出来，用中文注释一下它的功能：</p>
+<ol>
+<li>
+<p><strong><code>deduplicate_chunks</code> (去重)</strong>
+    <code>python
+    # 这里的逻辑是：既然大家都在同一个数据并行组（Data Parallel Group），
+    # 意味着大家需要的权重是一模一样的。
+    # 不要大家都去读硬盘。
+    # 选一个 Rank ID 最小的人（min），让他去读，别人等着。
+    reduce_fn=partial(min, key=attrgetter('dist_group_rank'))</code></p>
+</li>
+<li>
+<p><strong><code>_exchange_loaded_tensors</code> (交换数据)</strong>
+    ```python
+    # 拿到源头是谁（通常是 Rank 0）
+    src_rank = torch.distributed.get_global_rank(...)</p>
+<p>if self.dp_group_rank == ten_meta.dist_group_rank:
+    # 如果我是那个被选中的人：我去读硬盘
+    exchange_tensor = self.load_tensor_from_storage(...)
+else:
+    # 如果我不是：我创建一个空数组，准备接盘
+    exchange_tensor = torch.empty(...)</p>
+<h1>所有人执行这行代码：</h1>
+<h1>源头人发送，其他人接收</h1>
+<p>torch.distributed.broadcast(exchange_tensor, src=src_rank, ...)
+```</p>
+</li>
+<li>
+<p><strong><code>load_tensor_from_storage</code> (读硬盘)</strong>
+    <code>python
+    # 使用 tensorstore 库（_load_from_array）高效读取文件
+    # 这里的 checkpoint_dir 就是你的权重文件路径
+    ret = _load_from_array(..., checkpoint_dir, ...)</code></p>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件的逻辑就是：
+<strong>为了省硬盘 I/O，不要一拥而上。先在内部开会决定谁去读（Rank 0），读完的人再通过网络分发给其他人。</strong></p>
+<p>这就是所谓的 "Two-Stage"（两阶段）：
+1.  <strong>Load Stage</strong>: 从磁盘加载到内存。
+2.  <strong>Broadcast Stage</strong>: 从内存广播到其他节点。</p>

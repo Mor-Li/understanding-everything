@@ -1,0 +1,81 @@
+<h1>megatron/core/export/trtllm/trtllm_layers.py</h1>
+<p>这个文件 <code>trtllm_layers.py</code> 的核心作用可以理解为 <strong>“翻译器”</strong> 和 <strong>“标准字典”</strong>。</p>
+<p>它的背景是：你有一个用 Megatron 训练出来的模型（源格式），现在你想把它导出给 NVIDIA 的 TensorRT-LLM（目标格式）去加速推理。但是，Megatron 里的层名字（比如叫 <code>decoder.layers.0.self_attention</code>）和 TRT-LLM 要求的名字（比如叫 <code>transformer.layers.0.attention.qkv</code>）是不一样的。</p>
+<p>这个文件就是负责把“旧名字”改成“新名字”的。</p>
+<p>为了让你看懂，我把这个文件的逻辑拆解成一个 <strong>Task Todo List（任务清单）</strong>，我们一步步来完成这个“改名任务”。</p>
+<hr />
+<h3>Task 1: 定义目标语言的标准词汇表 (建立 <code>TRTLLMLayers</code> 枚举)</h3>
+<p>首先，我们需要知道 TensorRT-LLM 那边到底管各个层叫什么。这部分代码定义了一个“标准答案库”。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>class TRTLLMLayers(Enum)</code></li>
+<li><strong>解读</strong>:<ul>
+<li>这是一个枚举类（Enum），里面列出了所有 TRT-LLM 能识别的层名字。</li>
+<li><strong>One Time Layers</strong>: 那些全模型只有一个的层，比如 <code>vocab_embedding</code>（词嵌入）、<code>lm_head</code>（最后的输出层）。它们不需要编号。</li>
+<li><strong>Transformer Layers</strong>: 那些会重复很多次的层（Transformer Block），比如 Attention（注意力机制）和 MLP（前馈神经网络）。</li>
+<li><strong>例子</strong>: TRT-LLM 说：“别管你以前叫啥，到我这儿，Attention 的权重必须叫 <code>transformer.layers.attention.qkv.weight</code>”。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 2: 制作一个“层号提取器” (编写 <code>return_layer_name_and_number</code>)</h3>
+<p>在模型里，Transformer 层是有很多层的（比如第0层、第1层...第31层）。源名字里通常夹杂着数字，比如 <code>decoder.layers.2.self_attention...</code>。为了翻译，我们需要把“名字”和“楼层号”分开处理。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>def return_layer_name_and_number(...)</code></li>
+<li><strong>解读</strong>:<ul>
+<li><strong>输入</strong>: 一个复杂的层名字，例如 <code>decoder.layers.2.self_attention.linear_qkv.weight</code>。</li>
+<li><strong>动作</strong>: 使用正则表达式（Regex）在 <code>layers.</code> 后面找数字。</li>
+<li><strong>输出</strong>: 把数字和名字拆开。<ul>
+<li>名字变成通用的：<code>decoder.layers.self_attention.linear_qkv.weight</code> (去掉了 <code>2</code>)。</li>
+<li>数字提取出来：<code>2</code>。</li>
+</ul>
+</li>
+<li><strong>目的</strong>: 这样我们就可以只翻译通用的名字，最后再把数字 <code>2</code> 插回去。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 执行核心翻译任务 (编写 <code>rename_input_layer_names_to_trtllm_layer_names</code>)</h3>
+<p>这是整个文件最复杂的函数，也就是“干活”的地方。它要把整个模型的权重字典遍历一遍，把旧标签撕下来，贴上新标签。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>def rename_input_layer_names_to_trtllm_layer_names(...)</code></li>
+<li><strong>步骤分解</strong>:<ol>
+<li><strong>准备工作</strong>: 接收 <code>model_state_dict</code>（装着模型所有权重的字典）和 <code>trtllm_conversion_dict</code>（一本翻译字典，告诉程序“Megatron的A”对应“TRT的B”）。</li>
+<li><strong>遍历所有层</strong>: 拿到每一个旧名字（key）。</li>
+<li><strong>清洗数据</strong>: 如果名字里包含 <code>_extra_state</code> 或 <code>adapter_layer</code> 这种不需要的杂质，直接删掉，跳过。</li>
+<li><strong>拆解旧名字</strong>: 调用 Task 2 的工具，把旧名字里的“层号”提取出来。</li>
+<li><strong>查字典</strong>:拿着去掉了数字的旧名字，去 <code>trtllm_conversion_dict</code> 里查，看它对应的 <code>TRTLLMLayers</code> 标准名是什么。<ul>
+<li><em>如果查不到？</em> 报错 <code>ValueError</code>，说明你没提供翻译规则。</li>
+</ul>
+</li>
+<li><strong>组装新名字</strong>:<ul>
+<li>拿到标准名（比如 <code>transformer.layers.attention.qkv.weight</code>）。</li>
+<li>如果刚才提取到了层号（比如 <code>2</code>），就把这个数字插回到标准名的 <code>layers.</code> 后面，变成 <code>transformer.layers.2.attention.qkv.weight</code>。</li>
+</ul>
+</li>
+<li><strong>替换</strong>: 在字典里把旧 key 删掉，用新 key 存入对应的权重数据。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 4: 定义“无编号”层的名单 (定义 <code>NON_TRANSFORMER_LAYERS_NAMES</code>)</h3>
+<p>有些层是不属于 Transformer 重复块的，它们不需要层号。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>NON_TRANSFORMER_LAYERS_NAMES = [...]</code></li>
+<li><strong>解读</strong>:<ul>
+<li>列出了像 <code>vocab_embedding</code> (词表)、<code>position_embedding</code> (位置编码)、<code>lm_head</code> (输出头) 等名字。</li>
+<li>这主要是为了方便后续程序判断：如果遇到这些层，就不用费劲去找它是“第几层”了。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 5: 提供一个小工具去掉前缀 (编写 <code>get_layer_name_without_prefix</code>)</h3>
+<p>有时候我们需要简化的名字，不需要 <code>transformer.layers.</code> 这么长的前缀。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>def get_layer_name_without_prefix(...)</code></li>
+<li><strong>解读</strong>:<ul>
+<li>输入：<code>TRTLLMLayers.attention_qkv_weight</code> (值为 <code>transformer.layers.attention.qkv.weight</code>)</li>
+<li>输出：<code>attention.qkv.weight</code></li>
+<li>作用：只是为了某些特定的处理逻辑方便，把通用的前缀切掉。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件讲了啥？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>命名转换工具箱</strong>。它定义了 TensorRT-LLM 需要的<strong>标准层命名格式</strong>，并提供了一套逻辑，将 Megatron 模型的层名字<strong>批量、自动地重命名</strong>为 TRT-LLM 认可的格式，同时智能地处理了“第几层”这个编号问题。</p>

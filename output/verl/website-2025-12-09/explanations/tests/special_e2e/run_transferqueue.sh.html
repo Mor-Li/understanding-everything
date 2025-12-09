@@ -1,0 +1,70 @@
+<h1>tests/special_e2e/run_transferqueue.sh</h1>
+<p>这份脚本确实包含了很多机器学习（特别是大模型训练）的术语。简单来说，这是一个 <strong>“启动脚本”</strong>，它的作用是 <strong>配置并启动一个大模型的强化学习（RLHF）训练任务</strong>。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“任务清单 (To-Do List)”</strong>。你可以把这个脚本看作是一个项目经理，它在开工前需要完成以下 5 个步骤的准备工作。</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 准备基础设施与原材料 (环境与模型)</h4>
+<p><strong>代码位置：</strong> 第 4-11 行
+<strong>解读：</strong>
+就像做饭需要先买菜和准备锅具一样，这里在准备 GPU 和模型。
+*   <strong>设定 GPU 数量</strong>：<code>NUM_GPUS=8</code>，默认使用 8 张显卡来干活。
+*   <strong>选择策略</strong>：<code>ACTOR_STRATEGY</code>，决定怎么分配显卡的工作（是切分模型参数，还是切分数据，后面会细讲）。
+*   <strong>下载模型</strong>：脚本检查你有没有 <code>Qwen/Qwen2.5-0.5B-Instruct</code> 这个模型。如果没有，它会自动从 HuggingFace 下载到本地。这是我们要训练的“底座”模型。</p>
+<h4>✅ Task 2: 制定“学习计划” (算法参数配置)</h4>
+<p><strong>代码位置：</strong> 第 14-41 行
+<strong>解读：</strong>
+这里定义了模型该“怎么学”以及“怎么回答问题”。
+*   <strong>生成模式 (<code>rollout_mode</code>)</strong>：设置为 <code>async</code> (异步) 和 <code>vllm</code>。意思是让模型生成回答时动作快一点，一边生成一边做别的。
+*   <strong>算法核心 (<code>adv_estimator</code>)</strong>：设置为 <code>grpo</code>。这是一种强化学习算法（Group Relative Policy Optimization），用来告诉模型什么样的回答是好的。
+*   <strong>奖惩机制 (<code>kl_coef</code>, <code>clip_ratio</code>)</strong>：
+    *   防止模型“学歪了”或者为了拿高分胡乱回答，设置了一些约束（KL 散度系数）。
+    *   <code>temperature=1.0</code>：控制模型回答的随机性（创造力）。
+*   <strong>输入输出长度</strong>：限制提问 (<code>max_prompt_length</code>) 和回答 (<code>max_response_length</code>) 的字数，防止显存爆掉。</p>
+<h4>✅ Task 3: 打包行囊 (组装通用参数)</h4>
+<p><strong>代码位置：</strong> 第 66-125 行 (<code>common_params=(...)</code>)
+<strong>解读：</strong>
+这是最长的一段，它其实就是把一大堆配置打包成一个列表，传给后面的 Python 程序。你可以把它看作是填好的一张 <strong>“训练申请表”</strong>。
+*   <strong>数据哪里来？</strong> 指定了 GSM8K 数据集的路径 (<code>train.parquet</code>)，这是数学题数据集。
+*   <strong>怎么训练？</strong>
+    *   <code>actor_rollout_ref</code>: 这里面包含了三个角色：<strong>Actor</strong> (正在学的学生模型)、<strong>Rollout</strong> (负责做题的生成器)、<strong>Ref</strong> (参考模型，防止学生学偏)。
+    *   <code>n_resp_per_prompt=5</code>: 每一道题，让模型生成 5 个不同的答案，然后从中挑好的学。
+    *   <code>trainer.nnodes=1</code>: 单机训练。
+    *   <code>total_epochs=15</code>: 教材要学 15 遍。</p>
+<h4>✅ Task 4: 选择“团队协作模式” (并行策略)</h4>
+<p><strong>代码位置：</strong> 第 127-185 行 (if/elif 语句块)
+<strong>解读：</strong>
+大模型很大，单张显卡装不下或者跑得慢，需要多卡协作。这里有两种协作模式：</p>
+<ul>
+<li>
+<p><strong>模式 A: FSDP (Fully Sharded Data Parallel)</strong></p>
+<ul>
+<li><strong>适合场景</strong>：通用性强，显存不够时用。</li>
+<li><strong>原理</strong>：把模型的参数切碎，每张显卡只拿一部分，计算时再临时拼凑。</li>
+<li><strong>脚本操作</strong>：如果选了 <code>fsdp</code>，它会设置 <code>fsdp_size</code> 等参数，告诉 Python 程序用这种省显存的方式跑。</li>
+</ul>
+</li>
+<li>
+<p><strong>模式 B: Megatron (Megatron-LM)</strong></p>
+<ul>
+<li><strong>适合场景</strong>：超大模型，追求极致速度。</li>
+<li><strong>原理</strong>：更复杂的切分方式（模型并行 + 流水线并行）。</li>
+<li><strong>脚本操作</strong>：如果选了 <code>megatron</code>，它会设置 <code>pipeline_model_parallel_size</code> (流水线并行) 和 <code>tensor_model_parallel_size</code> (张量并行) 等参数。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 按下启动键 (执行 Python 命令)</h4>
+<p><strong>代码位置：</strong> <code>python3 -m recipe.transfer_queue.main_ppo ...</code>
+<strong>解读：</strong>
+这是最后一步。脚本把前面准备好的所有参数（Common Params + 策略特定参数）拼接起来，运行一个 Python 程序。
+*   <strong>核心程序</strong>：<code>recipe.transfer_queue.main_ppo</code>。这是实际干活的代码，执行 PPO (Proximal Policy Optimization) 训练。
+*   <strong>TransferQueue</strong>：这是这个脚本独特的地方。它暗示了一种架构，把“生成数据”（Rollout）和“模型更新”（Train）分离开来，通过一个队列（Queue）传输数据，这样效率更高。</p>
+<hr />
+<h3>总结：这脚本到底是干啥的？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>自动化脚本</strong>，用来在<strong>8张显卡</strong>上，使用 <strong>PPO/GRPO 强化学习算法</strong>，对 <strong>Qwen2.5-0.5B</strong> 这个小模型进行<strong>数学能力（GSM8K）的训练</strong>。</p>
+<p><strong>它的核心逻辑流：</strong>
+1.  下载模型。
+2.  设置好“怎么学”（算法参数）。
+3.  设置好“用什么学”（数据路径）。
+4.  根据你选的模式（FSDP 还是 Megatron），决定显卡之间怎么配合。
+5.  启动 Python 程序开始炼丹（训练）。</p>

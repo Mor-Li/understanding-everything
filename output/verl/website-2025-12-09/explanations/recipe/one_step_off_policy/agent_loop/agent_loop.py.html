@@ -1,0 +1,111 @@
+<h1>recipe/one_step_off_policy/agent_loop/agent_loop.py</h1>
+<p>这份代码看起来确实充满了“分布式计算”和“异步编程”的术语，容易让人晕头转向。</p>
+<p>别担心，我们把它想象成一个<strong>“包工头”（Manager）</strong>，它的工作是指挥手下的<strong>“工人”（Workers）</strong>去完成任务。</p>
+<p>为了让你听懂，我把阅读这份代码的任务拆解成一个 <strong>To-Do List (任务清单)</strong>。我们一步一步打钩，读完你就会了。</p>
+<hr />
+<h3>✅ Task 1: 搞清楚“我是谁” (类的定位)</h3>
+<p><strong>代码位置：</strong> <code>class OneStepOffAgentLoopManager(AgentLoopManager):</code></p>
+<ul>
+<li><strong>解读：</strong><ul>
+<li>这个类叫 <code>OneStepOffAgentLoopManager</code>。</li>
+<li>它的角色是一个 <strong>“管理者”</strong>。</li>
+<li>它的背景是强化学习（RL）。在强化学习中，我们需要让 AI 模型（Agent）去和环境互动，生成很多数据（比如写很多回答）。这个过程叫“Rollout”或“Generation”。</li>
+<li><strong>结论：</strong> 这个类的核心职责就是 <strong>“高效地指挥多台机器同时生成数据”</strong>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 理解核心工作流 (发活儿与收活儿)</h3>
+<p>这是代码里最长、最重要的方法：<code>generate_sequences_async</code>。我们把它拆开看。</p>
+<p><strong>步骤 2.1：把大任务切碎</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">chunkes</span> <span class="o">=</span> <span class="n">prompts</span><span class="o">.</span><span class="n">chunk</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">agent_loop_workers</span><span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>场景：</strong> 假设你手里有 1000 道题（<code>prompts</code>）要 AI 做，而你有 10 个工人（<code>workers</code>）。</li>
+<li><strong>动作：</strong> 你不能把 1000 道题给一个人。这行代码就是把 1000 道题<strong>切分</strong>（chunk）成 10 份，每份 100 题，准备分给 10 个工人。</li>
+</ul>
+<p><strong>步骤 2.2：异步派活儿 (关键点)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">outputs</span> <span class="o">=</span> <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span>
+    <span class="o">*</span><span class="p">[</span>
+        <span class="n">asyncio</span><span class="o">.</span><span class="n">to_thread</span><span class="p">(</span><span class="n">ray</span><span class="o">.</span><span class="n">get</span><span class="p">,</span> <span class="n">worker</span><span class="o">.</span><span class="n">generate_sequences</span><span class="o">.</span><span class="n">remote</span><span class="p">(</span><span class="n">chunk</span><span class="p">))</span>
+        <span class="k">for</span> <span class="n">worker</span><span class="p">,</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">agent_loop_workers</span><span class="p">,</span> <span class="n">chunkes</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="p">]</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>场景：</strong> 你把题分发下去了。</li>
+<li><strong>Ray的作用 (<code>remote</code>):</strong> 这是分布式计算工具。意思是“把这堆题发到另一台服务器上去算，别占我的电脑”。</li>
+<li><strong>Asyncio的作用 (<code>await</code>, <code>gather</code>):</strong><ul>
+<li>如果不异步：你发给工人A，盯着他做完，拿回来，再发给工人B……这太慢了。</li>
+<li><strong>异步 (这里用的方式)：</strong> 你大喊一声：“大家一起开工！”然后你就坐在那儿喝茶，直到<strong>所有人</strong>都做完了，你再一次性把结果收上来。</li>
+<li><code>ray.get</code> 是取结果，<code>asyncio.to_thread</code> 是为了防止取结果的时候卡住主线程。</li>
+</ul>
+</li>
+</ul>
+<p><strong>步骤 2.3：拼凑结果</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">output</span> <span class="o">=</span> <span class="n">DataProto</span><span class="o">.</span><span class="n">concat</span><span class="p">(</span><span class="n">outputs</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作：</strong> 10 个工人每人交回来 100 份答案。这行代码把这 10 堆答案<strong>拼接</strong>（concat）成原本的 1000 份完整的大作业。</li>
+</ul>
+<p><strong>步骤 2.4：算算花了多久 (绩效考核)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">metrics</span> <span class="o">=</span> <span class="o">...</span>
+<span class="n">timing</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_performance_metrics</span><span class="p">(</span><span class="n">metrics</span><span class="p">,</span> <span class="n">output</span><span class="p">)</span>
+<span class="n">output</span><span class="o">.</span><span class="n">meta_info</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;timing&quot;</span><span class="p">:</span> <span class="n">timing</span><span class="p">,</span> <span class="o">...</span><span class="p">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作：</strong> 统计一下大家干活花了多少时间，记录在案，方便后续分析性能。</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 理解后勤保障 (管吃管睡管打扫)</h3>
+<p>除了核心的发活儿，这个经理还需要管理工人的状态。</p>
+<p><strong>步骤 3.1：叫醒服务</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">wake_up</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="o">*</span><span class="p">[</span><span class="n">replica</span><span class="o">.</span><span class="n">wake_up</span><span class="p">()</span> <span class="k">for</span> <span class="n">replica</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">rollout_replicas</span><span class="p">])</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义：</strong> 比如为了省电或省资源，GPU 可能处于休眠或待机状态。这个方法是<strong>并行地</strong>把所有机器（replicas）都叫醒，准备干活。</li>
+</ul>
+<p><strong>步骤 3.2：休眠服务</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">sleep</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="o">*</span><span class="p">[</span><span class="n">replica</span><span class="o">.</span><span class="n">sleep</span><span class="p">()</span> <span class="k">for</span> <span class="n">replica</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">rollout_replicas</span><span class="p">])</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义：</strong> 干完活了，让所有机器去休息，释放资源给其他任务用。</li>
+</ul>
+<p><strong>步骤 3.3：打扫卫生 (清理缓存)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">clear_kv_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="o">*</span><span class="p">[</span><span class="n">replica</span><span class="o">.</span><span class="n">clear_kv_cache</span><span class="p">()</span> <span class="k">for</span> <span class="n">replica</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">rollout_replicas</span><span class="p">])</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义：</strong> 大语言模型生成文本时会产生 KV Cache（显存里的临时数据）。</li>
+<li><strong>动作：</strong> 在开始下一轮新任务前，必须把上一轮的“垃圾”清理掉，防止显存爆炸。这个方法就是命令所有机器：<strong>“把你们的黑板擦干净！”</strong></li>
+</ul>
+<hr />
+<h3>📝 总结 (TL;DR)</h3>
+<p>如果把这个文件看作一个人，他的工作描述如下：</p>
+<ol>
+<li><strong>职位：</strong> 分布式生成经理 (OneStepOffAgentLoopManager)。</li>
+<li><strong>主线任务 (<code>generate_sequences_async</code>)：</strong><ul>
+<li>收到一大堆提示词 (Prompts)。</li>
+<li>把它们切分成小块。</li>
+<li><strong>同时</strong>扔给好几个远程工人 (Workers) 去写回答。</li>
+<li>坐等所有人写完。</li>
+<li>把回答拼起来，顺便记一下耗时，交差。</li>
+</ul>
+</li>
+<li><strong>支线任务：</strong><ul>
+<li>喊工人起床 (<code>wake_up</code>)。</li>
+<li>让工人睡觉 (<code>sleep</code>)。</li>
+<li>让工人擦黑板 (<code>clear_kv_cache</code>)。</li>
+</ul>
+</li>
+</ol>
+<p><strong>核心观点：</strong> 这个文件不涉及复杂的数学公式，它是一个纯粹的<strong>工程调度模块</strong>，目的是利用并行计算（Ray + Asyncio）来加速大规模的数据生成过程。</p>

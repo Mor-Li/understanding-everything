@@ -1,0 +1,75 @@
+<h1>verl/trainer/config/critic/megatron_critic.yaml</h1>
+<p>这个文件确实看起来很像“天书”，因为它是一个高度结构化的配置文件（基于 Hydra/OmegaConf 框架），专门用于配置 <strong>超大模型（Megatron）</strong> 训练中的 <strong>Critic（评论家）</strong> 模型。</p>
+<p>为了让你看懂，我们把这个过程想象成<strong>“组装一台超级电脑并给它下达任务书”</strong>。</p>
+<p>我为你列了一个 <strong>5步走的 Task List（任务清单）</strong>，我们一步步来拆解这个文件到底在说什么。</p>
+<hr />
+<h3>Task 1: 搞清楚“我是谁”和“我在哪” (文件定位)</h3>
+<p>首先，我们要明白这个文件是给谁用的。
+*   <strong>文件名</strong>：<code>megatron_critic.yaml</code>
+*   <strong>角色</strong>：<strong>Critic (评论家)</strong>。在强化学习（RLHF）中，Actor 负责写文章，Critic 负责打分。这个文件就是用来配置那个“打分员”的。
+*   <strong>环境</strong>：<strong>Megatron</strong>。这说明我们在训练一个<strong>巨型模型</strong>（比如几十亿、几百亿参数），单张显卡装不下，需要用 Megatron-LM 这种分布式框架把模型切开放在多张显卡上跑。</p>
+<h3>Task 2: 准备“原材料” (defaults 部分)</h3>
+<p>代码最开头的 <code>defaults</code> 部分，实际上是在<strong>继承</strong>别人的设置。就像你写作业抄模版，然后只改动你需要的部分。</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">defaults</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">../optim@optim</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">megatron</span><span class="w">      </span><span class="c1"># 抄作业：用 Megatron 的优化器配置</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">../engine@megatron</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">megatron</span><span class="w">  </span><span class="c1"># 抄作业：用 Megatron 的引擎配置</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">critic</span><span class="w">                        </span><span class="c1"># 抄作业：继承通用的 Critic 基础配置</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">_self_</span><span class="w">                        </span><span class="c1"># 重点：如果下面有重复的设置，以“我自己”写的为准</span>
+</code></pre></div>
+
+<p><strong>观点：</strong> 不要从零开始配置，复用现有的高性能组件（优化器、引擎），只关注 Critic 特有的修改。</p>
+<h3>Task 3: 设定“厨房规则” (基础设施设置)</h3>
+<p>接下来是告诉程序怎么运行这个庞然大物。</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">_target_</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">verl.workers.config.McoreCriticConfig</span><span class="w"> </span><span class="c1"># 这是 Python 代码的入口类</span>
+<span class="nt">strategy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">megatron</span><span class="w">  </span><span class="c1"># 再次确认：我们要用 Megatron 分布式策略</span>
+<span class="nt">nccl_timeout</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">600</span><span class="w">   </span><span class="c1"># 观点：大模型训练很慢，如果不设长一点（600秒），GPU 之间稍微卡顿一下程序就会报错崩溃。</span>
+</code></pre></div>
+
+<p><strong>观点：</strong> 这是一个针对大规模分布式训练的配置，容错时间（Timeout）被特意拉长了，为了防止大模型运算时通讯超时。</p>
+<h3>Task 4: 打造“大脑” (Model 部分) —— <strong>这是最核心的 Task</strong></h3>
+<p>这一块决定了模型长什么样，以及怎么训练。</p>
+<h4>4.1 混合专家模型 (MoE)</h4>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="nt">moe_config</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">freeze_moe_router</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">False</span>
+</code></pre></div>
+
+<p><strong>观点：</strong> 如果你的模型是 MoE（比如 Mixtral 或 DeepSeek），这里设定<strong>不冻结</strong>路由（Router）。也就是说，训练过程中，模型会根据数据动态调整“把任务分给哪个专家去处理”。</p>
+<h4>4.2 LoRA 微调配置 (省钱省显存的关键)</h4>
+<p>这里有一大段 <code>lora:</code> 的配置。LoRA 是一种“轻量级微调”技术。</p>
+<ul>
+<li><strong><code>rank: 0</code> (关键点)</strong>：<ul>
+<li><strong>观点：</strong> 这里默认是 <code>0</code>，意味着 <strong>LoRA 默认是关闭的</strong>。</li>
+<li><strong>潜台词：</strong> 如果你想开启省显存的微调，你需要把这个数字改成 8, 16, 32 等。</li>
+</ul>
+</li>
+<li><strong><code>target_modules</code></strong>:<ul>
+<li><strong>观点：</strong> 如果开启 LoRA，这些是我们要“动手术”的地方（Query, Key, Value, Projection 等层）。</li>
+</ul>
+</li>
+<li><strong><code>freeze_vision_model: True</code></strong>:<ul>
+<li><strong>观点：</strong> 如果这是个多模态模型（能看图的），我们<strong>只训练语言部分，锁死视觉部分</strong>。这能极大节省资源。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 5: 启动前的最后检查 (杂项)</h3>
+<div class="codehilite"><pre><span></span><code><span class="nt">load_weight</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">True</span><span class="w">   </span><span class="c1"># 观点：我们要加载预训练好的模型权重，而不是从随机乱猜开始训练。</span>
+<span class="nt">data_loader_seed</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">...</span><span class="w"> </span><span class="c1"># 观点：设定随机种子，保证每次实验的数据顺序是一样的，方便排查 Bug。</span>
+</code></pre></div>
+
+<hr />
+<h3>总结：这个文件到底想干嘛？</h3>
+<p>如果你把这个文件翻译成人话，它在对程序说：</p>
+<blockquote>
+<p>“嘿，我们要启动一个 <strong>Critic（打分模型）</strong> 的训练任务。</p>
+<ol>
+<li>请去把 <strong>Megatron</strong> 的分布式引擎和优化器准备好。</li>
+<li>通讯超时设为 <strong>10分钟</strong>，别轻易报错。</li>
+<li>关于模型：我们准备用 <strong>LoRA</strong> 技术（虽然默认 rank=0 是关着的，但参数都预留好了）。</li>
+<li>如果是多模态模型，<strong>别动视觉部分</strong>，只练语言部分。</li>
+<li>记得<strong>加载预训练权重</strong>，别让我从头练起。”</li>
+</ol>
+</blockquote>
+<p><strong>你需要做的 Todo（如果你要修改它）：</strong>
+1.  <strong>想用 LoRA 省显存吗？</strong> -&gt; 去把 <code>rank: 0</code> 改成 <code>rank: 16</code> 或 <code>64</code>。
+2.  <strong>模型特别大导致报错？</strong> -&gt; 检查 <code>nccl_timeout</code> 是不是还要加大。
+3.  <strong>你是纯语言模型还是多模态？</strong> -&gt; 关注 <code>freeze_vision_model</code> 那几行。</p>

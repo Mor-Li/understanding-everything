@@ -1,0 +1,164 @@
+<h1>megatron/core/dist_checkpointing/serialization.py</h1>
+<p>这就好比你在看一本关于“如何搬运一座巨大的图书馆”的说明书，而不是搬运几本书。普通的 <code>torch.load</code> 和 <code>torch.save</code> 就像搬运几本书，一个人（一张显卡）就能搞定。</p>
+<p>但是 Megatron-LM 处理的是超大模型，模型被切碎（Sharded）分散在很多张显卡上。这个文件 <code>serialization.py</code> 就是<strong>总指挥</strong>，负责协调如何把这些碎片的拼图保存下来，或者重新拼回去。</p>
+<p>为了让你看懂，我把这个文件拆解成<strong>核心概念</strong>、<strong>保存任务清单 (Save ToDo)</strong> 和 <strong>加载任务清单 (Load ToDo)</strong> 三个部分来讲。</p>
+<hr />
+<h3>第一部分：核心概念（先搞懂这几个词）</h3>
+<p>在看代码逻辑前，你需要知道它在操作什么对象：</p>
+<ol>
+<li><strong>ShardedStateDict (分片状态字典)</strong>:<ul>
+<li>普通的 <code>state_dict</code> 里面存的是完整的 Tensor 数据。</li>
+<li>这里的字典里存的是“占位符”或者“地图”。它告诉程序：这个参数叫什么，它原本有多大，现在被切分到了哪里。</li>
+</ul>
+</li>
+<li><strong>ShardedTensor (分片张量)</strong>:<ul>
+<li>指那些被切开的大矩阵。比如一个巨大的权重矩阵，被切成了 8 份，每一份就是一个 ShardedTensor。</li>
+</ul>
+</li>
+<li><strong>Common Data (通用数据)</strong>:<ul>
+<li>指那些很小、不需要切分的数据。比如“当前训练到了第几步 (global_step)”、“学习率是多少”。这些数据所有显卡都一样，或者只需要存一份。</li>
+</ul>
+</li>
+<li><strong>Strategy (策略)</strong>:<ul>
+<li>指“用什么方式存/读”。是直接用 PyTorch 的原生格式存？还是用 Zarr 存？还是异步存？这决定了具体干活的后端。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>第二部分：加载流程 (Load Task List)</h3>
+<p>函数：<code>def load(...)</code>
+<strong>场景</strong>：你要开始训练了，需要把硬盘上的 checkpoint 读取到当前分散在各个显卡上的模型里。</p>
+<p><strong>ToDo List:</strong></p>
+<ol>
+<li>
+<p><strong>[准备阶段] 确定加载策略</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>verify_checkpoint_and_load_strategy</code></li>
+<li><em>解释:</em> 检查文件夹路径对不对，确定我们要用什么后端（比如 torch_dist）来读取文件。</li>
+</ul>
+</li>
+<li>
+<p><strong>[数据清洗] 强制转换 FP8 类型</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>force_all_tensors_to_non_fp8</code></li>
+<li><em>解释:</em> 如果模型用了 FP8（8位浮点数），加载时为了精度或兼容性，通常先强制转回高精度格式，避免初始化出问题。</li>
+</ul>
+</li>
+<li>
+<p><strong>[第一步加载] 读取通用数据 (Common Data)</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>common_strategy.load_common</code></li>
+<li><em>解释:</em> 先把那些不占地方的小数据（如 args, iteration）读进来。</li>
+</ul>
+</li>
+<li>
+<p><strong>[预处理] 整理当前模型的“地图”</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>load_preprocess</code></li>
+<li><em>解释:</em> 看看当前显卡上的模型结构是怎样的。剔除掉那些不需要保存的临时变量（NonPersistent），整理好分片张量的结构。</li>
+</ul>
+</li>
+<li>
+<p><strong>[安检] 完整性校验 (Validation)</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>validate_integrity_and_strict_load</code></li>
+<li><em>解释:</em> <strong>这是最关键的一步。</strong></li>
+<li>它会对比：<strong>硬盘里的文件</strong> vs <strong>你当前模型的结构</strong>。</li>
+<li>如果硬盘里有某个参数，但你模型里没有（Unexpected）；或者你模型需要某个参数，硬盘里没存（Missing）。根据 <code>strict</code> 参数决定是报错崩溃，还是仅仅打印警告。</li>
+</ul>
+</li>
+<li>
+<p><strong>[第二步加载] 读取特殊分片对象 (Sharded Objects)</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>common_strategy.load_sharded_objects</code></li>
+<li><em>解释:</em> 处理一些特殊的非 Tensor 对象，如果策略不支持直接处理它们，就用通用策略读进来。</li>
+</ul>
+</li>
+<li>
+<p><strong>[第三步加载] 读取分片张量 (Sharded Tensors)</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>sharded_strategy.load</code></li>
+<li><em>解释:</em> <strong>重头戏。</strong></li>
+<li>各个显卡根据刚才整理的“地图”，去硬盘里读取属于自己的那一部分数据块。因为是并行的，所以速度很快。</li>
+</ul>
+</li>
+<li>
+<p><strong>[收尾] 合并与返回</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>merge</code>, <code>apply_factory_merges</code></li>
+<li><em>解释:</em> 把读到的通用数据、分片数据合并成一个完整的字典返回给调用者。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>第三部分：保存流程 (Save Task List)</h3>
+<p>函数：<code>def save(...)</code>
+<strong>场景</strong>：训练了一段时间，需要把当前显存里的状态保存到硬盘，防止断电白跑。</p>
+<p><strong>ToDo List:</strong></p>
+<ol>
+<li>
+<p><strong>[环境检查] 路径与多存储客户端</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>MultiStorageClientFeature...</code>, 检查 <code>checkpoint_dir</code></li>
+<li><em>解释:</em> 确定要把文件存在哪。如果是云存储（S3, Azure等），这里会做特殊处理。如果目录非空，Rank 0 (主进程) 会发出警告：“我要覆盖旧文件了哦”。</li>
+</ul>
+</li>
+<li>
+<p><strong>[策略检查] 确定保存方式</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>get_default_save_sharded_strategy</code></li>
+<li><em>解释:</em> 如果没指定怎么存，就用默认配置（通常是 torch_dist 后端）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[预处理] 分离数据</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>save_preprocess</code></li>
+<li><em>解释:</em> 把手头的 <code>state_dict</code> 拆开。</li>
+<li>哪些是必须切分的巨型 Tensor？</li>
+<li>哪些是所有人都一样的小数据（Common）？</li>
+<li>顺便做一下“访问完整性检查”（确保每个分片都有人负责保存，别漏了）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[第一步保存] 写入通用数据</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>common_strategy.save_common</code></li>
+<li><em>解释:</em> Rank 0 负责把那些小数据（step, lr 等）写到一个通用的文件里（通常叫 <code>common.pt</code>）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[第二步保存] 写入特殊分片对象</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>common_strategy.save_sharded_objects</code></li>
+<li><em>解释:</em> 如果有特殊的 ShardedObject 且分片策略处理不了，就用通用策略存。</li>
+</ul>
+</li>
+<li>
+<p><strong>[第三步保存] 写入分片张量 (核心)</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>sharded_strategy.save</code> 或 <code>async_save</code></li>
+<li><em>解释:</em> <strong>最耗时的一步。</strong></li>
+<li>每张显卡把自己负责的那部分数据写入硬盘。</li>
+<li><strong>亮点</strong>: 支持 <code>async_sharded_save</code> (异步保存)。如果不开启，大家得停下来等写完硬盘（阻塞）；如果开启，CPU 发起保存请求后，GPU 可以立刻回去继续训练，后台慢慢写硬盘。</li>
+</ul>
+</li>
+<li>
+<p><strong>[收尾] 写入元数据 (Metadata)</strong></p>
+<ul>
+<li><em>代码对应:</em> <code>metadata_finalize_fn</code>, <code>save_config</code></li>
+<li><em>解释:</em> 最后写一个 <code>metadata.json</code>。这相当于“收据”或“目录”。</li>
+<li>它记录了：这次保存用了什么后端？版本号是多少？</li>
+<li><strong>注意</strong>: 只有所有数据都写完了，才会写这个文件。这样下次加载时，如果看到这个文件，就知道存档是完整的；如果没这个文件，说明上次保存中途崩溃了，存档不可用。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这个文件到底在讲啥？</h3>
+<p><strong>一句话总结</strong>：
+这个文件是 Megatron-LM 的<strong>存档管理员</strong>。它不直接操作具体的二进制读写（那是 Strategy 后端的工作），它的工作是<strong>流程控制</strong>。</p>
+<p>它负责：
+1.  <strong>分类</strong>：把模型参数分成“大家都有的”和“需要切分的”。
+2.  <strong>协调</strong>：指挥成百上千张显卡，“大家听口令，Rank 0 存目录，其他人存自己的那一块数据”。
+3.  <strong>校验</strong>：加载时检查“这个存档能不能匹配当前的模型结构”。
+4.  <strong>异步</strong>：提供“边训练边存档”的能力，不浪费计算时间。</p>

@@ -1,0 +1,96 @@
+<h1>examples/tuning/14b/qwen2_14b_grpo_4_h800_fsdp_vllm.sh</h1>
+<p>这份脚本（<code>.sh</code> 文件）本质上是一个<strong>启动命令</strong>。它的作用是告诉计算机：“嘿，用这几块显卡，按照我设定的规则，去训练这个大模型，让它变得更聪明。”</p>
+<p>为了让你看懂，我把这份代码拆解成一个<strong>“训练大模型的 6 步 To-Do List”</strong>。我们将从最基础的准备工作，一步步讲到复杂的性能优化。</p>
+<hr />
+<h3>📋 任务清单：训练一个数学解题高手</h3>
+<h4>✅ Task 1: 准备“教材”和“学生” (基础配置)</h4>
+<p>首先，我们需要指定谁来学（模型），以及学什么（数据）。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    gsm8k_train_path=$HOME/data/rlhf/gsm8k/train.parquet
+    model_path=Qwen/Qwen2.5-Coder-14B-Instruct</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>学生 (Model)</strong>: 这是一个叫 <code>Qwen2.5-Coder-14B</code> 的模型。它有 140 亿个参数，是个比较聪明的“中学生”。</li>
+<li><strong>教材 (Data)</strong>: <code>gsm8k</code> 是一个经典的小学数学应用题数据集。</li>
+<li><strong>目标</strong>: 我们要通过强化学习（RL），让这个模型做数学题做得更好。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 制定“教学大纲” (算法选择)</h4>
+<p>我们要用什么方法来训练它？不是普通的死记硬背，而是“强化学习”。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    algorithm.adv_estimator=grpo</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>GRPO (Group Relative Policy Optimization)</strong>: 这是这份配置的核心！</li>
+<li><strong>通俗解释</strong>: 以前的方法（如 PPO）需要一个额外的“打分老师”（Critic模型）来评判好坏，很占显存。<strong>GRPO</strong> 的做法是：让模型对同一个问题生成好几个不同的答案（比如 5 个），然后把这 5 个答案放在一起比，谁做得好谁就得分高。这是一种<strong>省显存、效率高</strong>的训练方法。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 设定“考试规则” (采样与环境)</h4>
+<p>为了让 GRPO 生效，模型必须对每道题进行多次尝试。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    actor_rollout_ref.rollout.n=5
+    data.max_prompt_length=1024
+    data.max_response_length=1024</code></li>
+<li><strong>解读：</strong><ul>
+<li><code>rollout.n=5</code>: 对于每一道数学题，强迫模型生成 <strong>5 个不同的解题过程</strong>。这样 GRPO 才能在内部进行“优胜劣汰”的比较。</li>
+<li><code>length=1024</code>: 题目和答案最长不能超过 1024 个字（token），太长了就截断，防止显存爆掉。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 安排“硬件资源”与“加速黑科技” (系统优化)</h4>
+<p>14B 的模型很大，4 张 H800 显卡虽然强，但也需要精打细算才能跑得动。这里用了很多技术术语。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    actor_rollout_ref.rollout.name=vllm
+    actor_rollout_ref.actor.fsdp_config.param_offload=True
+    actor_rollout_ref.rollout.tensor_model_parallel_size=4</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>vLLM</strong>: 这是一个<strong>超快的推理引擎</strong>。训练时需要模型先生成答案（做作业），vLLM 能让“做作业”的速度提升好几倍。</li>
+<li><strong>FSDP (Fully Sharded Data Parallel)</strong>: 这是一个<strong>切分技术</strong>。模型太大，单张卡放不下。FSDP 把模型切碎，每张显卡只存一部分。</li>
+<li><strong>Offload (卸载)</strong>: 显存（GPU内存）不够时，把暂时不用的参数搬到内存（CPU内存）里去，用时间换空间。</li>
+<li><strong>Parallel_size=4</strong>: 把模型横向切开，铺在 4 张显卡上一起跑。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 设定“奖惩机制” (损失函数与约束)</h4>
+<p>我们要防止模型为了刷高分而“走火入魔”（比如乱输出乱码但碰巧对了）。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    actor_rollout_ref.actor.use_kl_loss=True
+    actor_rollout_ref.actor.kl_loss_coef=0.001
+    actor_rollout_ref.actor.optim.lr=1e-6</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>KL Loss</strong>: 这是一个“紧箍咒”。它限制现在的模型（Actor）不能偏离原始模型（Ref）太远。也就是让它<strong>学会解题的同时，不要忘记怎么正常说话</strong>。</li>
+<li><strong>lr=1e-6 (学习率)</strong>: 学习的步子迈得很小。因为模型已经很聪明了，我们只是微调，步子太大会把它“学傻”。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 项目管理 (日志与保存)</h4>
+<p>最后，我们要监控训练过程，并保存结果。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    trainer.logger='["console","wandb"]'
+    trainer.project_name='verl_grpo_example_gsm8k'
+    trainer.total_epochs=1</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>wandb</strong>: 一个可视化的网页工具，你可以像看股票K线图一样看模型的准确率是不是在上升。</li>
+<li><strong>total_epochs=1</strong>: 教材只学一遍。因为强化学习很容易过拟合（死记硬背），通常只需要很少的轮次。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p>用一句话概括：</p>
+<blockquote>
+<p><strong>“使用 4 张 H800 显卡，配合 vLLM 加速生成和 FSDP 显存优化技术，采用 GRPO 算法（每题生成 5 个答案对比），对 Qwen-14B 模型进行一轮微调，目的是让它做 GSM8K 数学题更准。”</strong></p>
+</blockquote>
+<p>如果你是初学者，最需要关注的是 <strong>Data（数据）</strong>、<strong>Model（模型路径）</strong> 和 <strong>Total Epochs（训练几轮）</strong>，其他的参数通常是工程师为了让机器跑得动、跑得快而调优的“黑魔法”。</p>

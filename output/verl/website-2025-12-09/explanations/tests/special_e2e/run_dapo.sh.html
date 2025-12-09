@@ -1,0 +1,89 @@
+<h1>tests/special_e2e/run_dapo.sh</h1>
+<p>这份文件 <code>run_dapo.sh</code> 其实是一个<strong>大模型训练的启动脚本</strong>。</p>
+<p>简单来说，它的作用是：<strong>指挥 8 张显卡，用一种叫 DAPO（或 GRPO）的强化学习算法，去训练 Qwen-0.5B 这个模型，让它学会做数学题（使用 GSM8K 数据集）。</strong></p>
+<p>之所以你觉得难懂，是因为它把“配置参数”和“复杂的计算逻辑”混在了一起。</p>
+<p>为了让你看懂，我把这个脚本拆解成一个<strong>项目经理的 To-Do List（任务清单）</strong>，带你一步步看它是怎么把这个训练任务跑起来的。</p>
+<hr />
+<h3>📋 任务清单：训练一个会做数学题的 AI</h3>
+<h4>✅ Task 1: 准备“学生”和“教室” (基础环境配置)</h4>
+<p>首先，脚本定义了我们要训练谁，以及用多少资源来训练。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>NUM_GPUS=${NUM_GPUS:-8}</code>：准备 8 张显卡（教室）。</li>
+<li><code>MODEL_ID=...Qwen2.5-0.5B-Instruct</code>：指定“学生”是 Qwen 2.5 的 0.5B 版本。</li>
+</ul>
+</li>
+<li><strong>观点/逻辑：</strong> 这是一个相对较小的模型（0.5B），适合用来做实验或测试流程（E2E Test）。</li>
+</ul>
+<h4>✅ Task 2: 确定“教学方法” (算法核心参数)</h4>
+<p>这是脚本最核心的观点部分。它决定了模型怎么学习。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>adv_estimator=grpo</code>：使用 <strong>GRPO</strong> (Group Relative Policy Optimization) 算法。这是一种比传统 PPO 更省显存的强化学习方法。</li>
+<li><code>kl_coef=0.0</code> / <code>use_kl_loss=False</code>：<strong>关键观点！</strong> 这里把 KL 散度惩罚设为了 0。<ul>
+<li><em>解释：</em> 通常强化学习怕模型“学歪了”，会强制它不能偏离原模型太远（KL Penalty）。但这里设为 0，说明 DAPO/GRPO 这个算法可能通过其他方式（比如对一组输出进行对比）来约束模型，或者在这个实验中允许模型放飞自我。</li>
+</ul>
+</li>
+<li><code>clip_ratio_low=0.2</code> / <code>high=0.28</code>：这是更新参数时的“刹车片”，防止模型一次步子迈太大扯着蛋。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 设定“考试规则” (输入输出限制)</h4>
+<p>规定模型读题和答题的长度限制，以及超时怎么办。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>max_prompt_length=1024</code>：题目最长 1024 个词。</li>
+<li><code>max_response_length=2048</code>：回答最长 2048 个词。</li>
+<li><code>overlong_penalty_factor=1.0</code>：<strong>观点！</strong> 如果回答太长（废话连篇），会被惩罚（扣分），迫使模型学会简洁或在规定长度内说完。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 安排“课程表” (Batch Size 计算)</h4>
+<p>这是脚本里最复杂的数学计算部分。为了让显卡不闲着也不撑爆，需要精心计算一次喂多少数据。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>n_resp_per_prompt=4</code>：<strong>核心逻辑！</strong> 对于每一道数学题，让模型生成 <strong>4 个不同的答案</strong>。这是 GRPO 算法的特征（通过对比这 4 个答案的好坏来学习，而不是只看一个）。</li>
+<li><code>train_traj_micro_bsz_per_gpu=2</code>：每张卡每次处理 2 个数据片段。</li>
+<li><code>train_prompt_bsz=...</code>：脚本里那一堆乘法公式（<code>$((...))</code>），其实就是在算：<strong>“8张卡 x 每卡处理量 x 4个答案 = 总共一批次训练多少道题”</strong>。</li>
+</ul>
+</li>
+<li><strong>目的：</strong> 自动化计算出适合当前显卡数量的最佳吞吐量，不需要人肉去算。</li>
+</ul>
+<h4>✅ Task 5: 准备“教材”和“评分标准” (数据与奖励)</h4>
+<p>告诉 Python 程序数据在哪里，以及怎么算分。</p>
+<ul>
+<li><strong>代码对应 (Python 命令参数)：</strong><ul>
+<li><code>data.train_files=...gsm8k...</code>：教材是 GSM8K（著名的小学数学题库）。</li>
+<li><code>reward_model.reward_manager=dapo</code>：评分经理是 DAPO。</li>
+<li><code>algorithm.filter_groups.metric=seq_reward</code>：根据序列的奖励分（做对没做对）来筛选数据。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 配置“基础设施” (加速与优化)</h4>
+<p>为了跑得快，脚本开启了很多高级加速功能。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>actor_rollout_ref.rollout.name=vllm</code>：使用 <strong>vLLM</strong> 引擎来生成答案（vLLM 生成速度极快，适合强化学习中的“采样”阶段）。</li>
+<li><code>fsdp_config.param_offload=False</code>：FSDP（全分片数据并行）配置。</li>
+<li><code>tensor_model_parallel_size=2</code>：开启张量并行，把模型切开放在不同卡上跑。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 7: 正式“开跑” (运行命令)</h4>
+<p>最后，脚本把上面所有定义的变量，拼凑成一条超长的 <code>python3</code> 命令并执行。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>python3 -m recipe.dapo.main_dapo ...</code></li>
+<li><strong>动作：</strong> 启动 Python 程序，开始训练 2 个 Epoch（<code>trainer.total_epochs=2</code>），虽然最后只跑 1 步用于测试（<code>total_training_steps=1</code>，因为这是个测试脚本）。</li>
+</ul>
+<hr />
+<h3>总结：文中的核心观点</h3>
+<p>如果你要向别人复述这个脚本在干嘛，你可以这样说：</p>
+<blockquote>
+<p>“这是一个针对 <strong>Qwen-0.5B</strong> 模型的 <strong>DAPO/GRPO 强化学习</strong>测试脚本。</p>
+<p>它的核心逻辑是：
+1.  让模型做 <strong>GSM8K 数学题</strong>。
+2.  每道题生成 <strong>4 个答案</strong> (<code>n=4</code>) 进行对比学习。
+3.  <strong>关掉了 KL 惩罚</strong> (<code>kl=0</code>)，尝试让模型更自由地探索。
+4.  使用了 <strong>vLLM</strong> 进行加速采样。
+5.  脚本自动计算了各种 Batch Size 以适配 8 卡环境。”</p>
+</blockquote>

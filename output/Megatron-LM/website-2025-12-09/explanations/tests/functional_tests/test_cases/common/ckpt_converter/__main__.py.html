@@ -1,0 +1,59 @@
+<h1>tests/functional_tests/test_cases/common/ckpt_converter/<strong>main</strong>.py</h1>
+<p>这份代码是一个<strong>自动化测试脚本</strong>（Functional Test），专门用来测试 NVIDIA Megatron-LM 框架中的<strong>检查点转换器（Checkpoint Converter）</strong>功能。</p>
+<p>简单来说，Megatron-LM 训练大模型时会将模型切分到多个 GPU 上（模型并行）。当你改变 GPU 的数量或切分方式（例如从 8 个 GPU 变成 4 个 GPU）时，你需要把保存的模型文件（Checkpoint）进行“格式转换”。这个脚本就是为了验证这个“转换”过程是否正确，转换后的模型输出是否和原模型一致。</p>
+<p>为了让你更容易理解，我将这个脚本的执行逻辑拆解为一个<strong>“任务清单 (To-Do List)”</strong>。脚本运行时，实际上就是在按顺序执行这些任务。</p>
+<hr />
+<h3>任务清单：验证模型转换工具是否可靠</h3>
+<h4>✅ Task 1: 定义测试场景 (Define Pipelines)</h4>
+<p><strong>目标</strong>：列出我们需要测试哪些转换情况。
+*   <strong>逻辑</strong>：模型并行主要分为 TP (Tensor Parallel, 张量并行) 和 PP (Pipeline Parallel, 流水线并行)。我们需要测试各种组合。
+*   <strong>例子</strong>：
+    *   场景 A：把 TP=8, PP=1 的模型 ➡️ 转换成 TP=1, PP=8 的模型。
+    *   场景 B：把 TP=4, PP=2 的模型 ➡️ 转换成 TP=2, PP=4 的模型。
+*   <strong>代码对应</strong>：<code>get_gpt_pipelines()</code>, <code>get_moe_pipelines()</code>, <code>get_llava_pipelines()</code> 以及 <code>test_all_pipelines()</code> 函数。</p>
+<h4>✅ Task 2: 准备环境 (Setup)</h4>
+<p><strong>目标</strong>：为当前测试创建一个干净的临时文件夹，清理旧数据。
+*   <strong>逻辑</strong>：每次测试前，创建一个 <code>/tmp/ckpt-converter-tests</code> 目录用来放模型文件。
+*   <strong>代码对应</strong>：<code>TempSharedDir</code> 类。</p>
+<h4>✅ Task 3: 运行“源模型”并保存 (Source Model: Save &amp; Run)</h4>
+<p><strong>目标</strong>：生成一个随机模型作为起点，记录它的标准答案。
+*   <strong>步骤</strong>：
+    1.  <strong>初始化模型</strong>：按照“源配置”（比如 TP=8）初始化一个随机参数的 GPT 模型。
+    2.  <strong>生成数据</strong>：随机生成一些输入数据（Input IDs）。
+    3.  <strong>前向传播 (Forward)</strong>：让模型跑一遍这些数据，拿到<strong>输出结果 (Output Tensor)</strong>。这个结果就是我们的“标准答案”。
+    4.  <strong>保存权重</strong>：把当前模型的权重保存到硬盘上（Save Checkpoint）。
+*   <strong>代码对应</strong>：<code>Pipeline.save_checkpoint()</code> 方法。</p>
+<h4>✅ Task 4: 执行转换 (Execute Conversion)</h4>
+<p><strong>目标</strong>：测试核心功能——转换脚本。
+*   <strong>逻辑</strong>：调用实际的转换工具（<code>tools/checkpoint/convert.py</code>），把刚才保存的“源模型”转换成“目标配置”（比如 TP=1）。
+*   <strong>关键点</strong>：这一步是通过 <code>subprocess</code> 调用外部命令完成的，模拟用户在命令行操作。
+*   <strong>代码对应</strong>：<code>Pipeline.convert_checkpoint()</code> 方法。</p>
+<h4>✅ Task 5: 加载“目标模型”并运行 (Target Model: Load &amp; Run)</h4>
+<p><strong>目标</strong>：验证转换后的文件能不能用，结果对不对。
+*   <strong>步骤</strong>：
+    1.  <strong>初始化模型</strong>：按照“目标配置”（比如 TP=1）初始化模型结构。
+    2.  <strong>加载权重</strong>：读取 Task 4 中转换生成的 Checkpoint 文件。
+    3.  <strong>前向传播</strong>：使用和 Task 3 完全相同的输入数据，跑一遍模型。
+    4.  <strong>拿到结果</strong>：得到<strong>目标输出 (Output Tensor Real)</strong>。
+    5.  <em>(对照组)</em>：为了严谨，脚本还会再跑一次完全随机初始化的模型，得到一个“错误输出 (Output Tensor Fake)”，用来证明前面的匹配不是巧合。
+*   <strong>代码对应</strong>：<code>Pipeline.load_checkpoint()</code> 方法。</p>
+<h4>✅ Task 6: 验证结果 (Validation)</h4>
+<p><strong>目标</strong>：对比 Task 3 和 Task 5 的结果，判断测试通过与否。
+*   <strong>逻辑</strong>：
+    *   计算 <strong>MSE Loss (均方误差)</strong>：对比“源模型输出”和“转换后模型输出”。
+    *   <strong>判定标准</strong>：
+        *   <code>mse_real</code> (转换后的误差) 应该极小（接近 0）。
+        *   <code>mse_fake</code> (随机模型的误差) 应该很大。
+        *   脚本要求：<code>mse_real &lt; 0.05 * mse_fake</code>（即转换后的误差必须远小于随机瞎猜的误差）。
+*   <strong>代码对应</strong>：<code>Pipeline.run()</code> 方法的末尾部分。</p>
+<h4>✅ Task 7: 报告与清理 (Report &amp; Teardown)</h4>
+<p><strong>目标</strong>：输出测试结果，清理垃圾。
+*   <strong>逻辑</strong>：
+    *   打印每个测试场景的耗时、MSE 误差值。
+    *   如果所有测试都通过，程序正常结束；如果有失败，抛出异常。
+    *   删除临时文件夹。
+*   <strong>代码对应</strong>：<code>test_all_pipelines()</code> 中的 print 语句和 <code>TempSharedDir.__exit__</code>。</p>
+<hr />
+<h3>总结</h3>
+<p>这个脚本其实就是做了一件事：
+<strong>“我先用 A 配置跑个结果存下来，然后把模型转成 B 配置，再加载跑一遍。如果两次结果一样，说明转换工具没问题。”</strong></p>

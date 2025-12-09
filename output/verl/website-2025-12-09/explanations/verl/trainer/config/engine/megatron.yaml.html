@@ -1,0 +1,101 @@
+<h1>verl/trainer/config/engine/megatron.yaml</h1>
+<p>这份配置文件确实充斥着大模型训练（LLM Training）中最硬核的术语。别担心，我们把它想象成<strong>“如何指挥一群工人（GPU显卡）去搬运一座大山（训练超大模型）”</strong>的说明书。</p>
+<p>我为你设计了一个 <strong>“从小白到专家的 5 步通关 Task List”</strong>，我们一步步拆解这些参数。</p>
+<hr />
+<h3>🗺️ 全局概念：这是什么？</h3>
+<p>这是一个 <strong>Megatron-Core (Mcore)</strong> 的配置文件。
+<strong>简单说：</strong> 当模型太大，一张显卡装不下、算不动时，我们需要用 Megatron 这种技术把模型“切碎”，分给多张显卡一起算。这个文件就是告诉程序<strong>怎么切、怎么省内存、怎么加速</strong>。</p>
+<hr />
+<h3>✅ Task 1: 显存不够怎么办？（内存卸载）</h3>
+<p><strong>目标：</strong> 理解如何利用 CPU 内存来“救急”。
+<strong>核心逻辑：</strong> 显卡内存（VRAM）很贵且有限，电脑内存（RAM）便宜且大。如果显卡塞满了，就把东西暂时扔给 CPU。</p>
+<ul>
+<li><strong><code>param_offload: False</code></strong> (模型参数卸载)</li>
+<li><strong><code>grad_offload: False</code></strong> (梯度卸载)</li>
+<li><strong><code>optimizer_offload: False</code></strong> (优化器状态卸载)<ul>
+<li><strong>解读：</strong> 这里全是 <code>False</code>，意思是“全部放在显卡里算，不要往 CPU 搬”。</li>
+<li><strong>为什么：</strong> 往 CPU 搬会变慢（因为传输数据慢）。如果你的显卡显存足够大（比如 A100/H100），就设为 <code>False</code> 以求最快速度；如果显存爆了（OOM），就把这些改成 <code>True</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 模型太大了怎么切？（模型并行）</h3>
+<p><strong>目标：</strong> 理解如何把一个巨大的模型切开，分给不同的显卡。
+<strong>核心逻辑：</strong> “切蛋糕”的两种切法——横着切和竖着切。</p>
+<ul>
+<li><strong><code>tensor_model_parallel_size: 1</code> (TP)</strong><ul>
+<li><strong>解读：</strong> 张量并行。意思是把模型的<strong>每一层</strong>（比如矩阵乘法）拆开，几张卡合力算一层。</li>
+<li><strong>现状：</strong> <code>1</code> 表示不拆。如果你模型很大（比如 70B），单卡放不下一层，这里就要设为 2, 4, 8 等。</li>
+</ul>
+</li>
+<li><strong><code>pipeline_model_parallel_size: 1</code> (PP)</strong><ul>
+<li><strong>解读：</strong> 流水线并行。意思是把模型的<strong>层数</strong>拆开。比如模型有 32 层，卡 A 算前 16 层，卡 B 算后 16 层，像工厂流水线一样传递。</li>
+<li><strong>现状：</strong> <code>1</code> 表示不拆。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 输入的文本太长怎么办？（序列与上下文并行）</h3>
+<p><strong>目标：</strong> 理解当 Prompt（提示词）特别长（比如 100k token）时怎么处理。
+<strong>核心逻辑：</strong> 一句话太长，单卡存不下所有的字，把这句话切成几段给不同卡。</p>
+<ul>
+<li><strong><code>sequence_parallel: True</code> (SP)</strong><ul>
+<li><strong>解读：</strong> 序列并行。这是 Megatron 的一个特性，结合上面的 TP 使用。它把长文本在这个层面切分，能省很多显存。这里默认开启。</li>
+</ul>
+</li>
+<li><strong><code>context_parallel_size: 1</code> (CP)</strong><ul>
+<li><strong>解读：</strong> 上下文并行。专门为了处理<strong>极长上下文</strong>（比如处理整本书）。</li>
+<li><strong>现状：</strong> <code>1</code> 表示不启用。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 还有什么省显存的“黑科技”？（优化策略）</h3>
+<p><strong>目标：</strong> 在不切模型的情况下，用算法技巧挤出更多空间。</p>
+<ul>
+<li><strong><code>use_distributed_optimizer: True</code></strong><ul>
+<li><strong>解读：</strong> 分布式优化器。这是最常用的省显存技巧（类似 DeepSpeed ZeRO-1/2）。它把优化器状态（占显存的大头）打散存在不同卡上。<strong>强烈建议开启。</strong></li>
+</ul>
+</li>
+<li><strong><code>override_transformer_config</code> 下的 <code>recompute_...</code></strong><ul>
+<li><strong>解读：</strong> 重计算（Recomputation/Checkpointing）。</li>
+<li><strong>原理：</strong> 正常训练是“算出中间结果 -&gt; 存下来 -&gt; 反向传播用”。重计算是“算出中间结果 -&gt; <strong>删掉</strong> -&gt; 反向传播时<strong>再算一遍</strong>”。</li>
+<li><strong>权衡：</strong> 用“时间”换“空间”。这里配置比较细致，<code>recompute_modules: ["core_attn"]</code> 意思是只在注意力机制部分重新计算，省显存。</li>
+</ul>
+</li>
+<li><strong><code>dtype: bfloat16</code></strong><ul>
+<li><strong>解读：</strong> 精度。使用 <code>bfloat16</code>（半精度），比传统的 <code>float32</code> 省一半内存，且比 <code>float16</code> 训练更稳定。现在的大模型标配。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 高级与杂项（MoE 与 数据处理）</h3>
+<p><strong>目标：</strong> 了解针对特定架构和数据的设置。</p>
+<ul>
+<li><strong><code>expert_model_parallel_size: 1</code></strong><ul>
+<li><strong>解读：</strong> 如果你训练的是 <strong>MoE (混合专家模型)</strong>（比如 Mixtral 8x7B, DeepSeek-V3），这个参数决定把“专家”分到几张卡上。普通模型用不到。</li>
+</ul>
+</li>
+<li><strong><code>attention_backend: flash</code></strong><ul>
+<li><strong>解读：</strong> 使用 <strong>Flash Attention</strong>。这是目前加速 Transformer 计算的标准技术，必须开，速度极快。</li>
+</ul>
+</li>
+<li><strong><code>use_remove_padding: True</code></strong><ul>
+<li><strong>解读：</strong> 去除填充。</li>
+<li><strong>原理：</strong> 一个 batch 里有的句子长有的短，通常短的要补 0 (padding) 对齐。这个选项意味着把 0 去掉，把所有句子拼起来算，不浪费算力去算 0。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：怎么用这个文件？</h3>
+<p>如果你想跑起来，按照这个思路修改：</p>
+<ol>
+<li><strong>先看显存爆不爆：</strong> 如果爆了，先开 <code>use_distributed_optimizer: True</code>。</li>
+<li><strong>还爆？</strong> 开启 <code>recompute</code> (重计算)。</li>
+<li><strong>模型太大单卡放不下？</strong> 增加 <code>tensor_model_parallel_size</code> (TP) 或 <code>pipeline_model_parallel_size</code> (PP)。<ul>
+<li><em>注意：TP * PP * CP 不能超过你拥有的总显卡数。</em></li>
+</ul>
+</li>
+<li><strong>CPU 也不想闲着？</strong> 如果显存实在不够，把 Task 1 里的 <code>offload</code> 改成 <code>True</code>（但这会很慢）。</li>
+</ol>
+<p>现在的配置是一个<strong>“单机多卡或多机多卡，主要依赖分布式优化器省显存，使用 Flash Attention 加速，不做模型切分”</strong>的基础配置。</p>

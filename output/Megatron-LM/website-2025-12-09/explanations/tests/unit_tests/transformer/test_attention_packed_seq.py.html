@@ -1,0 +1,118 @@
+<h1>tests/unit_tests/transformer/test_attention_packed_seq.py</h1>
+<p>这份代码确实涉及了很多大模型底层的优化概念，如果不是专门做底层系统优化的，看着确实会很晕。</p>
+<p>简单来说，这是一个 <strong>单元测试（Unit Test）</strong> 文件。它的作用不是训练模型，而是<strong>验证 Megatron-Core 里的“注意力机制（Attention）”模块，在处理“打包序列（Packed Sequence）”时，能不能正常工作。</strong></p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>学习任务清单 (Task To-Do List)</strong>，然后一步步带你过一遍。</p>
+<hr />
+<h3>📋 任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>概念扫盲</strong>：搞懂什么是 <code>Packed Sequence</code>（打包序列）以及为什么要用它。</li>
+<li><strong>数据准备</strong>：看懂 <code>make_test_packed_seq_params</code> 是怎么切分数据的。</li>
+<li><strong>环境搭建</strong>：看懂 <code>setup_method</code> 是怎么造出一个迷你 Attention 层的。</li>
+<li><strong>核心测试</strong>：看懂 <code>test_gpu_forward</code> 是怎么运行并验证结果的。</li>
+<li><strong>进阶测试</strong>：了解 RoPE（旋转位置编码）和 Checkpointing（重计算）的测试。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 概念扫盲 - 什么是 Packed Sequence？</h4>
+<p>在传统的 Transformer 训练中，我们通常把一堆长短不一的句子放进一个 Batch。为了让它们长度对齐，短句子后面要补很多 0（Padding）。
+*   <strong>问题</strong>：这些 0 也要参与计算，浪费了显卡算力，也浪费了显存。
+*   <strong>解决 (Packed Sequence)</strong>：我们把 Padding 去掉，把多个短句子首尾相连，拼成一个长长的一维数组。
+*   <strong>关键点</strong>：既然拼在一起了，Attention 计算时怎么知道哪儿是句子的开头，哪儿是结尾？<strong>这就需要一个索引列表（cu_seqlens）来告诉 GPU 每一句话的起止位置。</strong></p>
+<h4>Task 2: 数据准备 - <code>make_test_packed_seq_params</code></h4>
+<p>代码开头定义的这个函数，就是在模拟“告诉 GPU 句子边界”的过程。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">make_test_packed_seq_params</span><span class="p">(</span><span class="n">sequence_length</span><span class="p">):</span>
+    <span class="c1"># cu_seqlens = Cumulative Sequence Lengths (累积序列长度)</span>
+    <span class="c1"># 这里的数字 [0, 6, 19, 22, sequence_length] 意思是：</span>
+    <span class="c1"># 第1句话：索引 0 到 6</span>
+    <span class="c1"># 第2句话：索引 6 到 19</span>
+    <span class="c1"># 第3句话：索引 19 到 22</span>
+    <span class="c1"># ...以此类推</span>
+    <span class="n">cu_seqlens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="mi">19</span><span class="p">,</span> <span class="mi">22</span><span class="p">,</span> <span class="n">sequence_length</span><span class="p">])</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
+
+    <span class="c1"># ...中间代码省略...</span>
+
+    <span class="c1"># 最后打包成一个参数对象 PackedSeqParams，传给模型用</span>
+    <span class="k">return</span> <span class="n">packed_seq_params</span>
+</code></pre></div>
+
+<p><strong>这一步做了什么？</strong>
+它造了一份“说明书”，告诉 Attention 模块：“待会儿给你的一长串数据里，里面其实藏着好几句话，你按照这个索引去切分计算 Attention，别算串味了。”</p>
+<h4>Task 3: 环境搭建 - <code>setup_method</code></h4>
+<p>这是测试类的初始化部分。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">setup_method</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">method</span><span class="p">):</span>
+    <span class="c1"># 初始化并行环境（这里设为1，简化测试，不搞多卡并行）</span>
+    <span class="n">Utils</span><span class="o">.</span><span class="n">initialize_model_parallel</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+
+    <span class="c1"># 配置一个迷你的 Transformer 层</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">transformer_config</span> <span class="o">=</span> <span class="n">TransformerConfig</span><span class="p">(</span>
+        <span class="n">num_layers</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+        <span class="n">hidden_size</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>   <span class="c1"># 隐藏层很小，为了测试跑得快</span>
+        <span class="n">num_attention_heads</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+        <span class="n">bf16</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>        <span class="c1"># 使用 bfloat16 精度（现代GPU常用）</span>
+        <span class="c1"># ...</span>
+    <span class="p">)</span>
+
+    <span class="c1"># 实例化一个 SelfAttention (自注意力) 模块</span>
+    <span class="c1"># 这就是我们要测试的主角！</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">parallel_attention</span> <span class="o">=</span> <span class="n">SelfAttention</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>这一步做了什么？</strong>
+它在显卡上创建了一个迷你的、尚未训练的 Attention 模块，准备好接受拷打。</p>
+<h4>Task 4: 核心测试 - <code>test_gpu_forward</code></h4>
+<p>这是最关键的测试函数，验证最基础的前向传播（Forward Pass）。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">test_gpu_forward</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="c1"># 1. 准备假数据</span>
+    <span class="n">sequence_length</span> <span class="o">=</span> <span class="mi">32</span>  <span class="c1"># 假设拼起来的总长度是32</span>
+    <span class="c1"># 造一个全为1的张量，形状是 [32, 1, 64]</span>
+    <span class="c1"># [总长度, Batch大小, 隐藏层维度]</span>
+    <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+
+    <span class="c1"># 2. 拿到 Task 2 里做的“说明书”</span>
+    <span class="n">packed_seq_params</span> <span class="o">=</span> <span class="n">make_test_packed_seq_params</span><span class="p">(</span><span class="n">sequence_length</span><span class="p">)</span>
+
+    <span class="c1"># 3. 【关键动作】把数据和说明书扔进 Attention 层计算</span>
+    <span class="n">output</span><span class="p">,</span> <span class="n">bias</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">parallel_attention</span><span class="p">(</span>
+        <span class="n">hidden_states</span><span class="p">,</span> 
+        <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="c1"># Packed模式下不需要常规Mask</span>
+        <span class="n">packed_seq_params</span><span class="o">=</span><span class="n">packed_seq_params</span> <span class="c1"># 传入说明书</span>
+    <span class="p">)</span>
+
+    <span class="c1"># 4. 验证结果</span>
+    <span class="c1"># 检查输出的形状是不是 [32, 1, 64]</span>
+    <span class="c1"># 如果形状变了，说明代码写Bug了</span>
+    <span class="k">assert</span> <span class="n">output</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">sequence_length</span>
+    <span class="k">assert</span> <span class="n">output</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">==</span> <span class="n">micro_batch_size</span>
+    <span class="k">assert</span> <span class="n">output</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">==</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span>
+</code></pre></div>
+
+<p><strong>这一步做了什么？</strong>
+它把拼凑好的数据扔进模型，看看模型能不能在 <code>PackedSeqParams</code> 的指导下顺利跑通，并且吐出形状正确的结果。如果报错或形状不对，测试就挂了。</p>
+<h4>Task 5: 进阶测试 (RoPE &amp; Checkpointing)</h4>
+<p>文件里还有两个类似的测试，只是加了点“佐料”：</p>
+<ol>
+<li>
+<p><strong><code>test_fused_rope_gpu_forward</code></strong>:</p>
+<ul>
+<li><strong>佐料</strong>：开启 <code>apply_rope_fusion = True</code>。</li>
+<li><strong>目的</strong>：测试在开启“旋转位置编码（RoPE）”的融合算子优化时，Packed Sequence 还能不能正常工作。RoPE 是 LLaMA 等模型必备的位置编码技术。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>test_checkpointed_gpu_forward</code></strong>:</p>
+<ul>
+<li><strong>佐料</strong>：开启 <code>recompute_granularity = 'selective'</code>。</li>
+<li><strong>目的</strong>：测试“激活重计算（Activation Checkpointing）”。这是一种为了省显存，在反向传播时重新计算前向值的技术。这里验证开启它会不会导致 Packed Sequence 报错。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>TestParallelAttentionWithPackedPaddedSequence</code> (文件末尾)</strong>:</p>
+<ul>
+<li>这是一个子类。它测试的是一种特殊情况：虽然是 Packed Sequence，但为了对齐硬件（比如 Tensor Core 的要求），可能还是会稍微补一点点 Padding。这个测试确保这种混合情况也能跑通。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这篇文章（代码）讲的其实就是：
+<strong>“喂，Megatron 的开发人员，我写了个脚本。它会造一些假装‘打包’好的数据，喂给你的 Attention 模块。如果不报错且输出形状对，说明你的代码支持 Packed Sequence 功能，没毛病。”</strong></p>

@@ -1,0 +1,108 @@
+<h1>recipe/gkd/test_qwen.sh</h1>
+<p>这份脚本实际上是一个用于<strong>训练（或微调）大模型</strong>的启动脚本。更具体地说，它是在执行一种叫 <strong>GKD (Generalized Knowledge Distillation，广义知识蒸馏)</strong> 的任务。</p>
+<p>简单来说，就是让一个<strong>小模型（学生，这里是 Qwen）</strong> 去模仿一个<strong>大模型（老师）</strong> 的行为，或者通过强化学习的方式进行自我优化。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>5步走的 To-Do List</strong>，你只需要按顺序理解这五件事，就能明白脚本在干什么。</p>
+<hr />
+<h3>✅ Task 1: 准备“原材料” (下载模型和配置文件)</h3>
+<p>在开始做饭（训练）之前，你得先买菜（下载模型）。脚本开头的注释部分（带 <code>#</code> 号的）就是在告诉你需要准备什么。</p>
+<ul>
+<li><strong>你需要做什么？</strong><ul>
+<li><strong>第0步 (注释中)</strong>：去 HuggingFace 下载 DeepSeek 或 Qwen 的配置文件（<code>config.json</code> 等）。脚本里特别提醒要修改配置，关掉某些不支持的功能（如 MTP）。</li>
+<li><strong>第1步 (注释中)</strong>：下载模型权重文件（Checkpoint）。注释里给了一个示例链接，但你需要把它换成你自己的路径。</li>
+</ul>
+</li>
+<li><strong>脚本对应代码：</strong>
+    <code>bash
+    # 0. download the config ...
+    # 1. download the dist_ckpt format model ...</code></li>
+</ul>
+<h3>✅ Task 2: 设置“厨房环境” (指定路径和环境变量)</h3>
+<p>菜买回来了，你要告诉程序它们放在哪，并设置一下灶台的火力（环境变量）。</p>
+<ul>
+<li><strong>你需要做什么？</strong><ul>
+<li><strong>指定模型路径</strong>：修改 <code>HF_MODEL_PATH</code>，指向你刚才下载好的 Qwen 模型文件夹。</li>
+<li><strong>指定数据路径</strong>：设置 <code>gsm8k_train_path</code> 和 <code>test_path</code>。这里使用的是 GSM8K 数据集（通常是小学数学题），用来训练模型的逻辑推理能力。</li>
+<li><strong>设置加速开关</strong>：那些 <code>export NVTE_...</code> 是在配置 NVIDIA 的加速引擎，为了让训练跑得更快。</li>
+</ul>
+</li>
+<li><strong>脚本对应代码：</strong>
+    <code>bash
+    HF_MODEL_PATH=/path/to/Qwen3-0.6B  # &lt;--- 这里要换成你的路径
+    gsm8k_train_path=/path/to/train.parquet # &lt;--- 训练数据
+    export NVTE_FLASH_ATTN=1           # &lt;--- 开启 Flash Attention 加速</code></li>
+</ul>
+<h3>✅ Task 3: 分配“厨师人手” (配置显卡并行策略)</h3>
+<p>训练大模型很费显存，一张卡可能放不下，或者跑得太慢。这一步是在分配任务。</p>
+<ul>
+<li><strong>你需要做什么？</strong><ul>
+<li><strong>设置并行参数</strong>：<ul>
+<li><code>NODES=1</code>: 用几台服务器（这里是1台）。</li>
+<li><code>TP=1</code> (Tensor Parallel): 把模型切开，几张卡合起来算一层。</li>
+<li><code>PP=1</code> (Pipeline Parallel): 把模型切成几段，几张卡接力算。</li>
+</ul>
+</li>
+<li><strong>理解显存策略</strong>：注释里提到的 <code># full recompute</code> 是一段被注释掉的代码。如果你的显卡显存不够（OOM），你需要把这几行注释打开，通过“以时间换空间”的方式防止显存爆炸。</li>
+</ul>
+</li>
+<li><strong>脚本对应代码：</strong>
+    <code>bash
+    NODES=1
+    PP=1
+    TP=1
+    # ...</code></li>
+</ul>
+<h3>✅ Task 4: 启动“中央指挥部” (Ray Cluster)</h3>
+<p>这个脚本使用了一个叫 <strong>Ray</strong> 的框架来管理任务。你可以把 Ray 想象成一个包工头，它负责把你的训练任务分发给各个显卡。</p>
+<ul>
+<li><strong>你需要做什么？</strong><ul>
+<li>这段代码不需要你改，但你需要知道它在干嘛。它会提交一个作业（Job）到当前目录的工作区。</li>
+</ul>
+</li>
+<li><strong>脚本对应代码：</strong>
+    <code>bash
+    ray job submit --no-wait ... -- python3 -m main_gkd ...</code></li>
+</ul>
+<h3>✅ Task 5: 调整“烹饪细节” (训练超参数)</h3>
+<p>这是脚本里最长的一段，全是 <code>--</code> 开头的参数。这实际上是在运行 <code>python3 -m main_gkd</code> 命令，后面跟的一大堆都是给这个 Python 程序的配置。</p>
+<p>我把这一大堆参数按功能分类给你看：</p>
+<ol>
+<li>
+<p><strong>数据设置 (<code>data...</code>)</strong>:</p>
+<ul>
+<li><code>train_batch_size=64</code>: 一次学64道题。</li>
+<li><code>max_prompt_length=512</code>: 题目最长512个字。</li>
+<li><code>max_response_length=1024</code>: 回答最长1024个字。</li>
+</ul>
+</li>
+<li>
+<p><strong>老师设置 (<code>teacher...</code>)</strong>:</p>
+<ul>
+<li><code>server_ip/port</code>: 这是一个“蒸馏”任务，意味着有一个更强的“老师模型”在某个端口运行，学生模型会向它请教。</li>
+</ul>
+</li>
+<li>
+<p><strong>学生模型设置 (<code>actor_rollout_ref...</code>)</strong>:</p>
+<ul>
+<li><code>model.path</code>: 学生模型的路径。</li>
+<li><code>optim.lr=1e-6</code>: 学习率，意思是学得有多快（太快容易学杂，太慢学不会）。</li>
+<li><code>rollout.name=vllm</code>: 使用 vLLM 引擎来加速生成回答。</li>
+</ul>
+</li>
+<li>
+<p><strong>训练器设置 (<code>trainer...</code>)</strong>:</p>
+<ul>
+<li><code>project_name='verl_examples'</code>: 项目名字。</li>
+<li><code>n_gpus_per_node=4</code>: 每台机器用4张显卡。</li>
+<li><code>total_epochs=1</code>: 所有题目只学一遍。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这脚本到底在干嘛？</h3>
+<p><strong>一句话总结：</strong>
+这是一个配置单，指挥 4 张显卡，利用 Ray 框架，让 Qwen-0.6B 模型（学生）去学习 GSM8K 数学题。在学习过程中，它可能会参考一个远程的“老师模型”（通过 IP 端口连接），目的是把 Qwen 训练得更聪明。</p>
+<p><strong>如果你要运行它，你的 Todo List 是：</strong>
+1.  修改 <code>HF_MODEL_PATH</code> 为你硬盘上的真实路径。
+2.  修改 <code>gsm8k_train_path</code> 为你硬盘上的真实数据路径。
+3.  确保你机器上有 4 张显卡（因为 <code>n_gpus_per_node=4</code>），如果没有，把这里的数字改成你实际的显卡数。
+4.  运行脚本 <code>bash recipe/gkd/test_qwen.sh</code>。</p>

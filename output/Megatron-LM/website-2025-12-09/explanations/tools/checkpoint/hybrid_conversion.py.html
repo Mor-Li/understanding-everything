@@ -1,0 +1,116 @@
+<h1>tools/checkpoint/hybrid_conversion.py</h1>
+<p>这份代码的核心功能是<strong>模型权重转换（Checkpoint Conversion）</strong>。</p>
+<p>简单来说，当你训练大模型时，通常会把模型切碎了放在很多张显卡上（比如使用了张量并行 TP 或流水线并行 PP）。如果你想改变显卡的数量（例如从8卡训练变成1卡推理，或者从4卡变成8卡继续训练），你就需要把这些切碎的权重文件重新“拼起来”再按新的规则“切分”。</p>
+<p>这个脚本专门针对 <strong>Hybrid Mamba-Transformer</strong> 架构的模型进行这种转换。</p>
+<p>下面我为你列一个 <strong>Task Todo List</strong>，然后一步一步详细讲解代码是如何完成这些任务的。</p>
+<hr />
+<h3>📋 Task Todo List (代码执行流程)</h3>
+<ol>
+<li><strong>准备阶段 (Setup)</strong>:<ul>
+<li>读取命令行参数（源路径、目标路径、目标并行度 TP/PP）。</li>
+<li>计算 Mamba 模型特有的维度参数（如 <code>d_inner</code>, <code>n_heads</code>）。</li>
+</ul>
+</li>
+<li><strong>定位源检查点 (Locate Source)</strong>:<ul>
+<li>读取 <code>latest_checkpointed_iteration.txt</code> 找到最新的训练步数。</li>
+<li>确定源文件的存放目录。</li>
+</ul>
+</li>
+<li><strong>加载并还原完整模型 (Load &amp; Merge)</strong>:<ul>
+<li><strong>合并张量并行 (TP Merge)</strong>: 遍历源文件的 TP 分片，利用特殊规则将它们拼成完整的层。</li>
+<li><strong>合并流水线并行 (PP Merge)</strong>: 遍历源文件的 PP 分片，将分散在不同阶段的层（Layer 0-N）按顺序组合成一个完整的模型字典。</li>
+</ul>
+</li>
+<li><strong>按新规则切分模型 (Split &amp; Reshard)</strong>:<ul>
+<li><strong>切分流水线并行 (New PP Split)</strong>: 根据目标 PP 大小，决定哪些层分给哪个 Rank。</li>
+<li><strong>切分张量并行 (New TP Split)</strong>: 根据目标 TP 大小，利用特殊规则将每一层的权重切成小块。</li>
+</ul>
+</li>
+<li><strong>保存与收尾 (Save &amp; Finalize)</strong>:<ul>
+<li>更新模型的元数据（Metadata），如 <code>args</code> 中的并行度参数。</li>
+<li>将切分好的权重保存到目标文件夹。</li>
+<li>生成新的 <code>latest_checkpointed_iteration.txt</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解</h3>
+<h4>1. 准备阶段：定义切分规则</h4>
+<p>代码开头定义了一个字典 <code>tp_split_dim</code>。
+*   <strong>观点</strong>：不同的权重矩阵切分方式不同。
+*   <strong>解释</strong>：
+    *   <code>0</code>：表示按<strong>行</strong>切分（Row Parallel）。
+    *   <code>1</code>：表示按<strong>列</strong>切分（Column Parallel）。
+    *   <code>-1</code>：表示<strong>不切分</strong>，每个显卡都复制一份（如 LayerNorm）。
+    *   <strong>Mamba 的特殊性</strong>：代码中大量逻辑在处理 Mamba 层的特殊权重（如 <code>A_log</code>, <code>D</code>, <code>dt_bias</code> 等），这些是 Mamba 架构特有的组件。</p>
+<h4>2. 加载并还原完整模型 (核心逻辑在 <code>main</code> 函数前半部分)</h4>
+<p>这是代码最“累”的地方。它需要把原来的碎块拼回去。</p>
+<ul>
+<li>
+<p><strong>加载源文件</strong>：
+    代码通过双重循环遍历：<code>for pp in range(input_pp_rank)</code> 和 <code>for tp in range(input_tp_rank)</code>。这意味着它会把所有显卡上的文件都读进内存。</p>
+</li>
+<li>
+<p><strong>处理 <code>combine_tp_tensors</code> 函数</strong>：</p>
+<ul>
+<li><strong>普通层</strong>：如果是普通的 Linear 层，直接用 <code>torch.cat</code> 拼接即可。</li>
+<li><strong>Mamba 层 (难点)</strong>：
+    代码中有一大段 <code>if 'mixer.in_proj.weight' in key...</code>。
+    <strong>原因</strong>：Mamba 为了效率，经常把多个权重矩阵（比如 x, z, B, C, dt）合并存储在一个大 Tensor 里。
+    <strong>操作</strong>：<ol>
+<li>先 <code>split</code>：把读进来的大 Tensor 拆解成 x, z, B, C 等小分量。</li>
+<li>再 <code>cat</code>：把每个分量按 TP 维度拼成完整的分量。</li>
+<li>最后 <code>cat</code>：把拼好的完整分量再次打包回一个大 Tensor。
+<em>这就好比你有两盒拼装玩具，每盒里都有红蓝绿三种积木混在一起。你要先把红蓝绿挑出来，把两盒的红色拼一起、蓝色拼一起，最后再混装回去。</em></li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>处理流水线 (PP) 合并</strong>：
+    <code>new_key = key.replace(str(layer_num), str(layer_num + pp*num_layers_per_pipeline_rank), 1)</code>
+    <strong>解释</strong>：假设你有2个 PP Rank，每个负责4层。Rank 0 的层号是 0-3，Rank 1 的文件里层号也是 0-3。但在完整模型里，Rank 1 的层其实是 4-7。这行代码就是把层号修正，从而构建一个包含 Layer 0-7 的 <code>full_model</code>。</p>
+</li>
+</ul>
+<h4>3. 按新规则切分模型 (核心逻辑在 <code>main</code> 函数后半部分)</h4>
+<p>现在内存里有了一个完整的模型 <code>full_model</code>，接下来要根据用户指定的 <code>--target-tp-size</code> 和 <code>--target-pp-size</code> 重新切蛋糕。</p>
+<ul>
+<li>
+<p><strong>分配层到新的 PP Rank</strong>：
+    代码计算 <code>num_layers_per_pipeline_rank</code>，通过循环决定哪些层归哪个新的 PP Rank 管。</p>
+</li>
+<li>
+<p><strong>处理 <code>split_tensor_for_tp</code> 函数</strong>：
+    这是 <code>combine</code> 的逆过程。</p>
+<ul>
+<li><strong>普通层</strong>：直接 <code>torch.chunk</code> 切分。</li>
+<li><strong>Mamba 层</strong>：
+    同样，因为 Mamba 权重是“打包”的，不能直接切。
+    <strong>操作</strong>：<ol>
+<li>先解包（split 出 x, z, B, C...）。</li>
+<li>对每个分量进行切分（chunk）。</li>
+<li>把切分后的碎片重新打包（cat）。
+<em>这保证了切分后的每个小文件里，依然保持着 Mamba 需要的 x, z, B, C 混合结构，只是尺寸变小了。</em></li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>4. 保存与收尾 (<code>finalize_checkpoint</code> 和 <code>torch.save</code>)</h4>
+<ul>
+<li>
+<p><strong>元数据修正</strong>：
+    <code>finalize_checkpoint</code> 函数会修改保存字典里的 <code>args</code>。
+    比如，你把 TP 从 8 改成了 1，那么保存的文件里 <code>args.tensor_model_parallel_size</code> 必须写成 1，否则下次加载会报错。</p>
+</li>
+<li>
+<p><strong>目录结构</strong>：
+    代码会创建类似 <code>mp_rank_00</code>, <code>mp_rank_01</code> 的文件夹，模拟 Megatron-LM 的标准存储结构，然后把 <code>.pt</code> 文件写进去。</p>
+</li>
+</ul>
+<h3>总结文中的核心观点</h3>
+<ol>
+<li><strong>模型即数据结构</strong>：无论模型多大，本质上就是一堆 OrderedDict（有序字典）。转换并行度的本质就是对这些 Tensor 进行 拼接 (Concat) 和 切片 (Chunk)。</li>
+<li><strong>Mamba 的复杂性</strong>：相比于纯 Transformer（主要是矩阵乘法，切分很简单），Hybrid Mamba 架构引入了特殊的算子（SSM）。这些算子的权重在物理存储上是混合打包的，因此在转换 TP 时，必须<strong>先解包、再处理、后打包</strong>，不能无脑切分。这是这个脚本存在的最大意义。</li>
+<li><strong>临时性 (Temporary)</strong>：文件开头的注释写着 "This is a temporary file"。这说明 Mamba 这种新架构目前还没有完全标准化进 Megatron-Core 的官方库中，所以需要这样一个独立的脚本来处理它的特殊权重格式。</li>
+</ol>

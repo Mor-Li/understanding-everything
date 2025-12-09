@@ -1,0 +1,95 @@
+<h1>tests/special_e2e/sft/test_sp_loss_match.py</h1>
+<p>这份代码其实不是在“训练”模型，而是在<strong>做测试（Testing/Debugging）</strong>。</p>
+<p>简单来说，它的目的是：<strong>验证一种复杂的加速技术（序列并行+去Padding）算出来的 Loss（误差），和普通方法算出来的 Loss 是否一致。</strong> 也就是验证代码有没有写出 Bug。</p>
+<p>为了让你更容易理解，我把你当作这个脚本的执行者，给你列一份 <strong>“任务清单 (To-Do List)”</strong>，然后一步步解释它是怎么完成这些任务的。</p>
+<hr />
+<h3>📋 任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>【准备工作】</strong>：搭建好训练环境，把模型和数据加载进来。</li>
+<li><strong>【第一步：算个标准答案】</strong>：先把所有“花里胡哨”的加速功能（SP 和 rmpad）关掉，用最原始的方法算一次 Loss。我们把这个叫“基准值” (Reference)。</li>
+<li><strong>【第二步：算个测试答案】</strong>：把“花里胡哨”的加速功能（SP 和 rmpad）全部打开，再用同样的数据算一次 Loss。我们把这个叫“实验值” (SP Loss)。</li>
+<li><strong>【第三步：对比改卷子】</strong>：比较“基准值”和“实验值”。如果两者几乎一样（误差极小），说明加速功能没写错；如果差很多，说明代码有 Bug，报错退出。</li>
+</ol>
+<hr />
+<h3>🦶 逐步详解 (Step-by-Step Walkthrough)</h3>
+<p>下面我结合代码，一步步带你走完这个流程：</p>
+<h4>1. 【准备工作】搭建环境</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>create_trainer</code> 函数 和 <code>main</code> 函数。</li>
+<li><strong>做了什么</strong>：<ul>
+<li>初始化分布式环境（也就是在这个脚本里模拟多张显卡一起工作）。</li>
+<li>加载模型（Model）和分词器（Tokenizer）。</li>
+<li>准备训练数据（Dataset）。</li>
+<li>创建一个 <code>FSDPSFTTrainer</code>（训练器），这是这个库核心的训练管家。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 【第一步：算个标准答案】(Reference Loss)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>test_trainer_forward_consistency</code> 函数内的第一个循环里。</li>
+<li>
+<p><strong>核心逻辑</strong>：
+    ```python
+    # 关掉 Remove Padding (去填充) 功能
+    trainer.use_remove_padding = False</p>
+<h1>备份之前的并行设置，然后把“序列并行” (Sequence Parallel) 设为 1 (也就是关掉)</h1>
+<p>old_sp = trainer.config.ulysses_sequence_parallel_size
+trainer.config.ulysses_sequence_parallel_size = 1</p>
+<h1>计算 Loss，不进行反向传播 (do_backward=False)，因为我们只关心 Loss 的数值</h1>
+<p>loss_ref = trainer._compute_loss_and_backward(micro_batch.copy(), do_backward=False)
+```
+*   <strong>解释</strong>：这里是为了得到一个<strong>绝对正确</strong>的参考值。因为最原始的方法虽然慢、显存占用高，但它是经过千锤百炼验证过的，算出来的数肯定是物理意义上正确的。</p>
+</li>
+</ul>
+<h4>3. 【第二步：算个测试答案】(SP + rmpad Loss)</h4>
+<ul>
+<li><strong>代码位置</strong>：紧接着上一步。</li>
+<li>
+<p><strong>核心逻辑</strong>：
+    ```python
+    # 恢复之前的“序列并行”设置 (开启 SP)
+    trainer.config.ulysses_sequence_parallel_size = old_sp</p>
+<h1>打开 Remove Padding 功能</h1>
+<p>trainer.use_remove_padding = True</p>
+<h1>再次计算 Loss</h1>
+<p>loss_sp = trainer._compute_loss_and_backward(micro_batch.copy(), do_backward=False)
+```
+*   <strong>解释</strong>：这里开启了两个核心技术：
+*   <strong>SP (Sequence Parallel)</strong>: 把一句话切开，分给不同的显卡算。
+*   <strong>rmpad (Remove Padding)</strong>: 把数据里用来凑数的 0 (padding) 删掉，只算有效数据。
+*   <strong>目的</strong>：看看在这一顿复杂操作下，算出来的 Loss 是不是还和刚才一样。</p>
+</li>
+</ul>
+<h4>4. 【第三步：对比改卷子】(Verification)</h4>
+<ul>
+<li><strong>代码位置</strong>：循环的尾部。</li>
+<li>
+<p><strong>核心逻辑</strong>：
+    ```python
+    # 因为是多卡环境，把所有卡算出来的 Loss 收集起来取平均
+    torch.distributed.all_reduce(loss_ref_all, op=torch.distributed.ReduceOp.AVG)
+    torch.distributed.all_reduce(loss_sp_all, op=torch.distributed.ReduceOp.AVG)</p>
+<h1>计算相对误差 (Relative Difference)</h1>
+<h1>公式：|标准值 - 实验值| / 标准值</h1>
+<p>rel_diff = torch.abs(loss_ref_all - loss_sp_all) / (torch.abs(loss_ref_all) + 1e-8)</p>
+<h1>打印结果</h1>
+<p>print(f"Reference Loss: {loss_ref_all.item():.6f}")
+print(f"SP+rmpad Loss: {loss_sp_all.item():.6f}")</p>
+<h1>断言：如果误差超过 1% (1e-2)，就报错！</h1>
+<p>assert rel_diff.item() &lt; 1e-2, "Significant difference detected..."
+<code>``
+*   **解释**：这是质量检测关口。
+*   如果</code>rel_diff<code>很小（比如 0.000001），说明这两个复杂的加速技术实现得非常完美，数学上是等价的。
+*   如果</code>rel_diff` 很大，说明在切分数据或者去 Padding 的过程中，把数据搞乱了，导致结果不对。</p>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：文中的核心观点</h3>
+<p>这个脚本本身不阐述大道理，它是一个<strong>工程验证工具</strong>。它隐含的观点是：</p>
+<ol>
+<li><strong>正确性优于性能</strong>：无论 Sequence Parallel (SP) 和 Remove Padding (rmpad) 能让训练跑多快，前提是<strong>算出来的数必须是对的</strong>。</li>
+<li><strong>数学等价性</strong>：通过对比“原始慢速模式”和“高级加速模式”的结果，证明高级模式在数学上是等价的，没有引入额外的计算误差。</li>
+<li><strong>自动化测试</strong>：这种复杂的分布式逻辑很容易写错，必须用这种自动化脚本（CI/CD的一部分）来守门，防止代码更新引入 Bug。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这代码是在问电脑：“嘿，我用新开发的‘超级加速模式’算的题，和用‘笨办法’算的题，答案是不是一样的？如果不一样你就报错。”</p>

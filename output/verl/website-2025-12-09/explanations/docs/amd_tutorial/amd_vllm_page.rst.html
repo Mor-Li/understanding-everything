@@ -1,0 +1,72 @@
+<h1>docs/amd_tutorial/amd_vllm_page.rst</h1>
+<p>这份文档主要是关于 <strong>如何在 AMD 显卡（特别是 MI3xx 系列）上优化 <code>verl</code> 这个 AI 训练框架的性能</strong>。</p>
+<p>简单来说，它的核心目的是解决两个痛点：
+1.  <strong>省显存</strong>：让显卡在不干活的时候把显存空出来。
+2.  <strong>提速度且不崩</strong>：解决 AMD 显卡上加速功能（CUDA Graph）容易崩溃的问题。</p>
+<p>为了让你更容易理解，我把你当作一个正在配置服务器的工程师，列了一个 <strong>Task To-Do List</strong>，一步一步带你过一遍文档里的观点。</p>
+<hr />
+<h3>核心任务清单 (Task List)</h3>
+<h4>✅ Task 1: 准备基础环境 (升级 ROCm)</h4>
+<ul>
+<li><strong>文档观点</strong>：AMD 的软件栈 ROCm 需要比较新的版本才能支持后面的功能。</li>
+<li><strong>你的行动</strong>：<ul>
+<li>检查你的服务器环境。</li>
+<li><strong>建议</strong>：确保你的 ROCm 版本 <strong>大于或等于 7.0</strong>。如果版本太老，后面的优化都做不了。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 安装特制的 vLLM (推理引擎)</h4>
+<ul>
+<li><strong>文档观点</strong>：<code>verl</code> 依赖 <code>vLLM</code> 来生成文本。默认的 <code>vLLM</code> 在 AMD 上有个“睡眠模式” (Sleep Mode) 功能，这个功能非常关键，它能让显卡在推理结束后，把数据从显存（GPU Memory）搬到内存（CPU Memory），从而腾出宝贵的显存。</li>
+<li><strong>你的行动</strong>：<ul>
+<li>你需要安装 vLLM 的 <strong>0.11.0 以后的版本</strong>。</li>
+<li>文档推荐直接从源码编译（因为可能是最新的修补版）。</li>
+<li><strong>执行命令</strong>（文档中提供的代码块）：<ol>
+<li><code>git clone ...</code> (下载代码)</li>
+<li><code>git reset ...</code> (回退到指定的一个稳定版本 commit)</li>
+<li><code>pip install ...</code> (安装依赖)</li>
+<li><code>python3 setup.py develop</code> (编译安装)</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 验证“省显存”是否生效 (Sleep Mode)</h4>
+<ul>
+<li><strong>文档观点</strong>：装好后，你得确认“睡眠模式”真的在工作。如果生效了，你应该能看到显存占用在“睡眠”时下降。这对于训练超长文本（Long-context）或者多机训练非常重要，否则显存会爆。</li>
+<li><strong>你的行动</strong>：<ul>
+<li>跑一下文档里提到的测试脚本（链接在文中 <code>these scripts</code> 处）。</li>
+<li>观察显存监控，看它是否会在空闲时释放内存。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 解决“加速崩溃”问题 (配置 CUDA Graph)</h4>
+<ul>
+<li><strong>文档观点</strong>：这是文档的第二部分，非常关键。<ul>
+<li><strong>背景</strong>：<code>vLLM</code> 有个加速功能叫 <code>CUDA Graph</code>（虽然叫 CUDA，但也用于 AMD ROCm），能让推理变快。</li>
+<li><strong>问题</strong>：在 AMD 显卡上，如果开启这个加速功能并处理大批次数据（Large Batches），程序容易<strong>崩溃 (Crash)</strong>。</li>
+<li><strong>如果不解决</strong>：你只能关掉加速（用 Eager Mode），那速度会<strong>非常慢</strong>。</li>
+</ul>
+</li>
+<li><strong>你的行动 (Workaround 变通方案)</strong>：<ul>
+<li>既要开加速，又不能让它崩。</li>
+<li><strong>修改配置 1</strong>：在 <code>verl</code> 的配置文件里，手动限制 <code>cudagraph_capture_sizes</code>。<ul>
+<li>把它设为：<code>[1, 2, 4, 8, 16, 32, 64]</code>。</li>
+<li><em>解释</em>：这是告诉程序，“只对这些小的显存块进行图捕获”，避免处理太大的块导致崩溃。具体最大值（64还是更大）取决于你的显存大小。</li>
+</ul>
+</li>
+<li><strong>修改配置 2</strong>：设置 <code>enforce_eager</code> 为 <code>False</code>。<ul>
+<li><em>解释</em>：<code>False</code> 意味着“<strong>不要</strong>强制用慢速模式”，也就是<strong>开启加速模式</strong>。配合上面的限制，就能在不崩溃的前提下享受到加速了。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这就好比你在调教一辆赛车（AMD 显卡）：</p>
+<ol>
+<li><strong>Task 1 &amp; 2</strong> 是在换新引擎（升级 ROCm 和 vLLM），并开启“自动启停”功能（Sleep Mode），停车时自动熄火省油（省显存）。</li>
+<li><strong>Task 3</strong> 是检查自动启停是不是真的好用。</li>
+<li><strong>Task 4</strong> 是解决变速箱问题。原来的变速箱一上高速（大 Batch）就炸，现在的解决办法是限制它只在低档位区间（1~64）使用高性能模式，这样既能跑得快，又不会炸缸。</li>
+</ol>

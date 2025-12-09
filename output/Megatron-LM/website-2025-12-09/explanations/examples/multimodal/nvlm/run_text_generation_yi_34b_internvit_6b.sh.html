@@ -1,0 +1,126 @@
+<h1>examples/multimodal/nvlm/run_text_generation_yi_34b_internvit_6b.sh</h1>
+<p>这份脚本 (<code>run_text_generation_yi_34b_internvit_6b.sh</code>) 看起来很长，全是参数，非常容易劝退。但其实它的逻辑非常简单。</p>
+<p>简单来说，<strong>这是一个“启动器”</strong>。它的作用是配置好环境，然后启动一个巨大的<strong>多模态大模型（NVLM）</strong> 来帮你看图说话（生成文本）。</p>
+<p>为了让你看懂，我把它拆解成一个<strong>Task Todo List（任务清单）</strong>。想象你是一个指挥官，这个脚本就是你下达给计算机的一系列指令。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<p>为了完成“让AI看图写字”这个任务，脚本按顺序执行了以下 4 个步骤：</p>
+<ol>
+<li><strong>【准备工作】设定环境</strong>：调整显卡和网络设置，确保机器处于最佳状态。</li>
+<li><strong>【接收指令】读取用户输入</strong>：弄清楚你要用哪个模型？看哪张图？结果存哪里？</li>
+<li><strong>【制定策略】调整视觉模式</strong>：决定是“粗略看全图”还是“切片看细节”（Tiling）。</li>
+<li><strong>【执行任务】启动模型</strong>：召唤 8 张显卡，加载 Yi-34B（大脑）和 InternViT（眼睛），开始推理。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详解 (Step-by-Step)</h3>
+<p>下面我按照上面的清单，一步步带你看代码里的对应部分。</p>
+<h4>Step 1: 【准备工作】设定环境</h4>
+<p>这是脚本的开头部分。</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">NCCL_IB_SL</span><span class="o">=</span><span class="m">1</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">CUDA_DEVICE_MAX_CONNECTIONS</span><span class="o">=</span><span class="m">1</span>
+...
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这些 <code>export</code> 命令就像是<strong>工前检查</strong>。<ul>
+<li>它告诉计算机：“把显卡连接数设为1”、“优化网络传输（NCCL）”。</li>
+<li><strong>目的</strong>：为了让这种超大模型（需要多张显卡一起跑）运行得更稳定、更快。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 2: 【接收指令】读取用户输入</h4>
+<p>这是那个长长的 <code>while</code> 循环部分。</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">INPUT_IMAGE_PATH</span><span class="o">=</span><span class="s2">&quot;placeholder&quot;</span><span class="w"> </span><span class="c1"># 默认占位符</span>
+...
+<span class="k">while</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="nv">$#</span><span class="w"> </span>-gt<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="k">case</span><span class="w"> </span><span class="nv">$1</span><span class="w"> </span><span class="k">in</span>
+<span class="w">        </span>--input-image-path<span class="o">)</span>
+<span class="w">            </span><span class="nv">INPUT_IMAGE_PATH</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$2</span><span class="s2">&quot;</span><span class="w"> </span><span class="c1"># 如果用户指定了图片路径，就记下来</span>
+<span class="w">            </span><span class="nb">shift</span>
+<span class="w">            </span><span class="nb">shift</span>
+<span class="w">            </span><span class="p">;;</span>
+<span class="w">        </span>-m<span class="p">|</span>--model-path<span class="o">)</span>
+<span class="w">            </span><span class="nv">MODEL_PATH</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$2</span><span class="s2">&quot;</span><span class="w">       </span><span class="c1"># 记下模型在哪里</span>
+<span class="w">            </span>...
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这就像服务员在<strong>记菜单</strong>。<ul>
+<li>脚本支持你运行的时候带参数，比如 <code>sh run.sh --input-image-path dog.jpg</code>。</li>
+<li>它会把你输入的图片路径、模型路径、输出路径都存到变量里，后面要用。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 3: 【制定策略】调整视觉模式</h4>
+<p>这是关于 <code>USE_TILING</code> 和 <code>SEQ_LEN</code> 的判断逻辑。</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">SEQ_LEN</span><span class="o">=</span><span class="m">1024</span><span class="w">     </span><span class="c1"># 默认视觉序列长度</span>
+
+<span class="c1"># 如果启用了切片模式 (Tiling)</span>
+<span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="nv">$USE_TILING</span><span class="w"> </span>-eq<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nv">EXTRA_ARGS</span><span class="o">+=</span><span class="s2">&quot; --pixel-shuffle --use-tiling ...&quot;</span>
+<span class="w">    </span><span class="nv">SEQ_LEN</span><span class="o">=</span><span class="m">261</span><span class="w">  </span><span class="c1"># 调整序列长度</span>
+<span class="k">fi</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这是在决定<strong>怎么看图</strong>。<ul>
+<li><strong>普通模式</strong>：把图片压缩一下直接看。</li>
+<li><strong>Tiling（切片）模式</strong>：如果图片很高清，模型会把图片切成好几块（Tiles）细看，就像拿放大镜看一样。</li>
+<li><strong>观点</strong>：代码逻辑是“如果你选择了切片模式，我就必须修改参数（<code>SEQ_LEN</code>），并添加额外的配置标签”。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 4: 【执行任务】启动模型 (核心部分)</h4>
+<p>这是最后那个巨大的 <code>torchrun</code> 命令。这是整个脚本的<strong>灵魂</strong>。</p>
+<div class="codehilite"><pre><span></span><code>torchrun<span class="w"> </span>--nproc_per_node<span class="w"> </span><span class="m">8</span><span class="w"> </span>examples/multimodal/run_text_generation.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>...
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li><code>torchrun --nproc_per_node 8</code>：<strong>召唤 8 张显卡</strong>。这模型太大了（340亿参数），一张卡放不下，必须 8 张卡一起扛。</li>
+<li><code>run_text_generation.py</code>：这是真正干活的 Python 代码。</li>
+</ul>
+</li>
+</ul>
+<p><strong>这个命令里有一堆参数，我帮你分了个类，你一看就懂了：</strong></p>
+<ol>
+<li>
+<p><strong>我是谁（模型身份）：</strong></p>
+<ul>
+<li><code>--language-model-type yi-34b</code>：我的大脑是 <strong>Yi-34B</strong>（零一万物的语言模型）。</li>
+<li><code>--vision-model-type internvit</code>：我的眼睛是 <strong>InternViT-6B</strong>（书生·浦语的视觉模型）。</li>
+<li>这就是所谓的 <strong>NVLM</strong>（NVIDIA Vision Language Model），它把这两个模型缝合在一起了。</li>
+</ul>
+</li>
+<li>
+<p><strong>我多大（模型规模）：</strong></p>
+<ul>
+<li><code>--num-layers 60</code>：我有60层神经网络。</li>
+<li><code>--hidden-size 7168</code>：我的神经元连接很宽。</li>
+<li><code>--tensor-model-parallel-size 8</code>：把模型切成8份，每张显卡放一份。</li>
+</ul>
+</li>
+<li>
+<p><strong>我要干嘛（任务）：</strong></p>
+<ul>
+<li><code>--load ${MODEL_PATH}</code>：从这里读取权重。</li>
+<li><code>--input-image-path ...</code>：看这张图。</li>
+<li><code>--output-path ...</code>：把生成的文字存这里。</li>
+<li><code>--task ${TASK}</code>：比如“描述这张图”或者“回答图里的问题”。</li>
+</ul>
+</li>
+<li>
+<p><strong>技术细节（优化）：</strong></p>
+<ul>
+<li><code>--bf16</code>：使用 BFloat16 精度（省显存，跑得快）。</li>
+<li><code>--freeze-LM --freeze-ViT</code>：<strong>重点</strong>！这里锁定了语言模型和视觉模型，只运行推理，不进行训练（学习）。</li>
+</ul>
+</li>
+</ol>
+<h3>💡 总结</h3>
+<p>这个脚本的<strong>中心思想</strong>是：</p>
+<blockquote>
+<p>"我要利用 8 张显卡的算力，加载一个由 Yi-34B 和 InternViT 组成的超大模型，根据你指定的图片处理策略（是否切片），去读取一张图片，并生成对应的文本描述。"</p>
+</blockquote>
+<p>你不需要看懂每一行参数（那是给机器看的），你只需要知道：<strong>改前面的路径变量，运行脚本，就能得到结果。</strong></p>

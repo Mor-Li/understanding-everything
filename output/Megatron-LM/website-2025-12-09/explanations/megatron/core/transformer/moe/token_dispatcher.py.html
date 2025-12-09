@@ -1,0 +1,129 @@
+<h1>megatron/core/transformer/moe/token_dispatcher.py</h1>
+<p>这份代码确实非常硬核，因为它涉及到了 <strong>分布式深度学习</strong> 中最复杂的 <strong>MoE（混合专家模型）</strong> 的核心通信逻辑。</p>
+<p>为了让你看懂，我们先把所有复杂的术语（TP, EP, AlltoAll, Permute）扔到一边，用一个生活中的例子来建立直觉。</p>
+<h3>0. 核心比喻：MoE 就像一个“大医院”</h3>
+<ul>
+<li><strong>模型（Model）</strong>：是一个大医院。</li>
+<li><strong>Token（数据）</strong>：是来看病的 <strong>病人</strong>。</li>
+<li><strong>Expert（专家）</strong>：是不同科室的 <strong>医生</strong>（有的治头疼，有的治脚气）。</li>
+<li><strong>GPU（显卡）</strong>：是不同的 <strong>院区</strong>（比如朝阳院区、海淀院区）。每个院区只住着一部分医生。</li>
+<li><strong>Token Dispatcher（这个文件的作用）</strong>：是医院的 <strong>转运中心（救护车调度室）</strong>。</li>
+</ul>
+<p><strong>这个文件的任务就是：</strong>
+病人挂好号了（路由算好了），你需要把成千上万个病人，从他们现在的院区，用救护车拉到医生所在的院区，看完病后，再把他们拉回原来的院区拿药回家。</p>
+<hr />
+<h3>1. 你的 Task Todo List (任务清单)</h3>
+<p>要读懂这个代码，你只需要关注这一条“流水线”。不管代码里写得多复杂，它永远在做这 4 个阶段的事情：</p>
+<ol>
+<li><strong>出发前打包 (Dispatch Preprocess)</strong>：<ul>
+<li><em>任务</em>：看挂号单（Router），把去往同一个院区的病人排好队，打包在一起。</li>
+<li><em>代码术语</em>：Permute (重排), Sort (排序)。</li>
+</ul>
+</li>
+<li><strong>转运去程 (Token Dispatch)</strong>：<ul>
+<li><em>任务</em>：救护车上路。把病人送到对应的院区。</li>
+<li><em>代码术语</em>：All-to-All (多对多通信), AllGather。</li>
+</ul>
+</li>
+<li><strong>看完病，转运回程 (Token Combine)</strong>：<ul>
+<li><em>任务</em>：医生看完病了，把诊断结果（Hidden States）送回病人原本来的院区。</li>
+<li><em>代码术语</em>：All-to-All (反向), Reduce-Scatter。</li>
+</ul>
+</li>
+<li><strong>回家后解包 (Combine Postprocess)</strong>：<ul>
+<li><em>任务</em>：病人回到了原来的院区，把他们按原来的顺序排好，恢复成还没看病前的队列顺序，准备去下一层网络。</li>
+<li><em>代码术语</em>：Unpermute (反向重排)。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>2. 逐步讲解代码观点 (Mapping to Code)</h3>
+<p>现在我们拿着上面的清单，去对应代码里的类和方法。</p>
+<h4>第一层：基类 <code>MoETokenDispatcher</code> (定义标准流程)</h4>
+<p>这是所有调度器的“父类”，它规定了必须完成的四个动作：
+*   <code>dispatch_preprocess</code>: 准备数据。
+*   <code>token_dispatch</code>: <strong>核心通信</strong>（发送数据）。
+*   <code>combine_preprocess</code>: 准备返回的数据。
+*   <code>token_combine</code>: <strong>核心通信</strong>（接收数据）。
+*   <code>combine_postprocess</code>: 恢复数据形状。</p>
+<h4>第二层：具体实现 (三种不同的转运策略)</h4>
+<p>这个文件里有三个主要的类，代表了三种不同的“救护车调度策略”。</p>
+<hr />
+<h4>策略 A: <code>MoEAllGatherTokenDispatcher</code> (简单粗暴型)</h4>
+<ul>
+<li><strong>场景</strong>：适合小医院（GPU少，或者为了省事）。</li>
+<li><strong>逻辑</strong>：<ul>
+<li><strong>Dispatch</strong>：不管病人去哪个院区，我把<strong>所有病人</strong>的信息复印一份，发给<strong>所有院区</strong>。</li>
+<li><strong>Postprocess</strong>：每个院区收到所有人的信息后，只挑出“挂了我这个院区医生号”的病人进行处理。</li>
+</ul>
+</li>
+<li><strong>代码解读</strong>：<ul>
+<li>它用了 <code>gather_from_sequence_parallel_region</code>。这就像在大广播里喊所有人的名字。</li>
+<li>优点：逻辑简单。</li>
+<li>缺点：浪费带宽，人多了（模型大了）会卡死。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>策略 B: <code>MoEAlltoAllTokenDispatcher</code> (精打细算型 - 重点!)</h4>
+<p>这是最常用的工业级实现。</p>
+<ul>
+<li><strong>场景</strong>：大模型标准配置。</li>
+<li><strong>逻辑</strong>：<ul>
+<li><strong>Preprocess (打包)</strong>：<ul>
+<li>代码里有 <code>permute</code>。</li>
+<li>意思是：原来的病人是乱序的 <code>[A去1院, B去2院, C去1院]</code>。</li>
+<li>现在要在本地重排成 <code>[A, C (都去1院) | B (去2院)]</code>。这样才好装车。</li>
+</ul>
+</li>
+<li><strong>Token Dispatch (精准运输)</strong>：<ul>
+<li>代码调用 <code>all_to_all</code>。</li>
+<li>意思是：GPU 0 只把去 GPU 1 的数据发给 GPU 1，去 GPU 2 的发给 GPU 2。绝不发送多余数据。</li>
+</ul>
+</li>
+<li><strong>Postprocess (分诊)</strong>：<ul>
+<li>数据到了目的地，可能还需要再排一次序（<code>sort_chunks_by_idxs</code>），方便本地的专家模型批量处理。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>策略 C: <code>MoEFlexTokenDispatcher</code> (黑科技型 - DeepEP/HybridEP)</h4>
+<ul>
+<li><strong>场景</strong>：追求极致速度，使用了 NVIDIA/DeepSeek 优化的底层库。</li>
+<li><strong>逻辑</strong>：<ul>
+<li>前面的策略是：先在 CPU/GPU 上算好谁去哪（排序），再调用通信库发送。</li>
+<li>这个策略是：<strong>融合（Fused）</strong>。</li>
+<li>它调用了 <code>_DeepepManager</code> 或 <code>_HybridEPManager</code>。</li>
+<li>这些 Manager 底层直接调用 C++/CUDA 核心，把“排序”和“发送”两个动作合二为一了。</li>
+<li><strong>观点</strong>：代码里你看不到显式的 <code>permute</code> 或者是 Python 写的循环，因为它全在 <code>fused_dispatch</code> 这个黑盒子里完成了。这是目前最先进的 MoE 优化方向。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>3. 总结与建议</h3>
+<p>如果你想读懂这个文件，建议按以下顺序看：</p>
+<ol>
+<li>
+<p><strong>先看 <code>MoEAlltoAllTokenDispatcher</code> 类的 <code>token_dispatch</code> 方法</strong>。</p>
+<ul>
+<li>看它怎么计算 <code>input_splits</code> (我要发给别人多少) 和 <code>output_splits</code> (我要收多少)。</li>
+<li>这就是分布式 MoE 的灵魂：<strong>流量控制</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>再看 <code>permute</code> 和 <code>unpermute</code> 的概念</strong>。</p>
+<ul>
+<li>虽然具体实现在 <code>moe_utils.py</code> 里，但你要理解在这个文件里，它们的作用就是<strong>为了通信效率而重新排列数组</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>最后看 <code>MoEFlexTokenDispatcher</code></strong>。</p>
+<ul>
+<li>只需要知道它是为了绕过 Python 慢速逻辑，直接调用底层优化库的高级封装即可。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结这个文件讲了啥：</strong>
+它在管理 MoE 模型中，Token 如何在不同 GPU 之间<strong>高效、正确</strong>地“流浪”并找到自己的专家，最后安全回家的全过程。</p>

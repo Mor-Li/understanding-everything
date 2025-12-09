@@ -1,0 +1,85 @@
+<h1>recipe/entropy/32b_kl_cov.sh</h1>
+<p>这份脚本确实包含了很多术语，看起来像是一个复杂的深度学习（特别是强化学习/RLHF）训练启动脚本。</p>
+<p>简单来说，这个脚本的<strong>核心目的</strong>是：<strong>使用一种特殊的强化学习方法（GRPO + KL Covariance），在多卡GPU环境下微调一个 Qwen2.5-32B 大模型。</strong></p>
+<p>为了让你听懂，我把这个脚本要做的事情拆解成一个<strong>Task Todo List（任务清单）</strong>，然后针对清单里的每一步，给你详细解释其中的核心观点。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<p>想象你是一个项目经理，这个脚本就是你发给工人的施工图纸。执行流程如下：</p>
+<ol>
+<li><strong>[环境准备]</strong>：设置身份认证（WandB）和项目名称。</li>
+<li><strong>[算法定调]</strong>：确定训练的核心算法（GRPO）和特殊的损失函数策略（KL Covariance）。</li>
+<li><strong>[规格设定]</strong>：规定输入多长、输出多长、一次处理多少数据（Batch Size）。</li>
+<li><strong>[基建配置]</strong>：指定服务器集群地址（Ray）、模型路径、数据路径。</li>
+<li><strong>[启动引擎]</strong>：通过 Python 命令行，把上面所有的配置注入到训练程序中，开始跑模型。</li>
+</ol>
+<hr />
+<h3>💡 逐步观点解析 (Step-by-Step Breakdown)</h3>
+<p>下面我按照上面的清单，一步步讲讲文中体现的关键技术观点：</p>
+<h4>第一步：算法定调 —— 什么是 GRPO 和 KL Covariance？</h4>
+<p>脚本中有这两行关键代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">adv_estimator</span><span class="o">=</span>grpo
+<span class="nv">loss_mode</span><span class="o">=</span><span class="s2">&quot;kl_cov&quot;</span>
+<span class="nv">kl_cov_ratio</span><span class="o">=</span><span class="m">0</span>.0002
+</code></pre></div>
+
+<ul>
+<li>
+<p><strong>观点 1：放弃传统 PPO，使用 GRPO (Group Relative Policy Optimization)。</strong></p>
+<ul>
+<li>传统的 RLHF（PPO）通常需要一个额外的“Critic 模型”来打分，但这很占显存。</li>
+<li><strong>GRPO</strong> 是最近很火（DeepSeek-R1 也在用）的方法。它的逻辑是：对于同一个问题（Prompt），让模型生成一组（比如 8 个）回答，然后对比这一组回答的好坏。<strong>脚本里的 <code>n_resp_per_prompt=8</code> 就是指每道题生成 8 个答案来互相比对。</strong></li>
+</ul>
+</li>
+<li>
+<p><strong>观点 2：引入 KL Covariance (KL 协方差) 作为约束。</strong></p>
+<ul>
+<li>这是这个脚本最独特的地方（文件名就叫 <code>kl_cov</code>）。</li>
+<li><strong>背景</strong>：在训练时，我们希望模型变聪明，但不要“变异”太厉害（不要胡言乱语），通常用 KL 散度来限制它偏离原始模型的程度。</li>
+<li><strong>文中观点</strong>：普通的 KL 限制可能不够好。这里加了一个 <code>kl_cov</code>（KL 协方差）项。这通常是一种<strong>更高级的正则化手段</strong>，用来控制模型生成的多样性（Entropy），防止模型为了拿高分而“坍缩”到只会说一种套话。它试图在“探索新答案”和“保持稳定”之间找更好的平衡。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：规格设定 —— 数据怎么喂？</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">max_prompt_length</span><span class="o">=</span><span class="k">$((</span><span class="m">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">2</span><span class="k">))</span><span class="w">  </span><span class="c1"># 提问最多 2k token</span>
+<span class="nv">max_response_length</span><span class="o">=</span><span class="k">$((</span><span class="m">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">8</span><span class="k">))</span><span class="w"> </span><span class="c1"># 回答最多 8k token</span>
+<span class="nv">train_prompt_bsz</span><span class="o">=</span><span class="m">256</span><span class="w">              </span><span class="c1"># 训练时的批次大小</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点 3：偏向长文本/推理任务。</strong><ul>
+<li>回答长度设为了 8192 (8k)，比提问长度多很多。这通常意味着模型在做<strong>思维链（CoT）推理</strong>任务，需要很长的篇幅来一步步推导答案。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：基建配置 —— 分布式训练 (Ray + vLLM)</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">RAY_ADDRESS</span><span class="o">=</span><span class="si">${</span><span class="nv">RAY_ADDRESS</span><span class="k">:-</span><span class="s2">&quot;http://localhost:8265&quot;</span><span class="si">}</span>
+<span class="nv">NNODES</span><span class="o">=</span><span class="si">${</span><span class="nv">NNODES</span><span class="k">:-</span><span class="nv">4</span><span class="si">}</span>
+actor_rollout_ref.rollout.name<span class="o">=</span>vllm
+</code></pre></div>
+
+<ul>
+<li><strong>观点 4：训练与推理分离，追求极致效率。</strong><ul>
+<li><strong>Ray</strong>：这是一个分布式计算框架。因为 32B 的模型很大，单卡跑不动，需要把很多 GPU 连起来（脚本默认是 4 个节点，每节点 8 张卡，共 32 张卡）。</li>
+<li><strong>vLLM</strong>：脚本指定了 <code>rollout.name=vllm</code>。在强化学习中，模型需要先“做题”（生成答案），然后再“学习”。vLLM 是目前最快的推理引擎之一。这个配置的意思是：<strong>用 vLLM 极速生成答案，然后用 PyTorch 进行训练更新，两者无缝切换。</strong></li>
+</ul>
+</li>
+</ul>
+<h4>第四步：启动引擎 —— 复杂的 Python 命令</h4>
+<p>脚本最后那一大段 <code>HYDRA_FULL_ERROR=1 python -m ...</code> 是在做什么？</p>
+<ul>
+<li><strong>观点 5：配置即代码 (Hydra)。</strong><ul>
+<li>它用了一个叫 Hydra 的工具。你可以看到无数个 <code>.</code> 分隔的参数（如 <code>actor_rollout_ref.actor.optim.lr=1e-6</code>）。</li>
+<li>这说明代码结构非常模块化：<ul>
+<li><strong>Actor</strong>: 正在训练的模型（学生）。</li>
+<li><strong>Ref</strong>: 参考模型（老师，用来防止学生跑偏）。</li>
+<li><strong>Rollout</strong>: 生成答案的环节。</li>
+<li><strong>Reward</strong>: 奖励模型（判卷老师）。</li>
+</ul>
+</li>
+<li>脚本显式地把这些模块的参数（学习率、显存优化、并行策略）都通过命令行传进去了。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p><strong>这一页代码在讲什么故事？</strong></p>
+<p>它在说：“我们要训练一个 <strong>Qwen2.5-32B</strong> 模型。为了让它更聪明（可能是在做数学或逻辑推理），我们不单独训练一个打分模型，而是让它针对每个问题<strong>生成 8 个答案（GRPO）</strong>。为了防止它为了高分而变得单一乏味，我们引入了一个特殊的数学技巧 <strong>KL Covariance</strong> 来控制它的熵（多样性）。为了跑得动这么大的模型，我们动用了 <strong>Ray 集群</strong> 和 <strong>vLLM 加速</strong>。”</p>

@@ -1,0 +1,100 @@
+<h1>recipe/fapo/run_baseline_32b.sh</h1>
+<p>这份脚本确实包含了很多术语，看起来很复杂。其实，你可以把它想象成<strong>给一位“超级大厨”（AI训练集群）写的一张详细的“烹饪清单”</strong>。</p>
+<p>这张清单的目标是：<strong>训练一个 32B（320亿参数）的大模型，让它通过强化学习（具体算法是 GRPO）来提升能力。</strong></p>
+<p>为了让你看懂，我把这个脚本拆解成一个 <strong>Task Todo List（任务待办清单）</strong>，按照脚本执行的逻辑顺序，一步步给你讲。</p>
+<hr />
+<h3>📋 Task Todo List：训练任务启动流程</h3>
+<h4>✅ Task 1: 定义身份与基本规则 (Basic Setup)</h4>
+<p><strong>（对应脚本第 4-22 行）</strong>
+在开始干活前，先给这次任务起个名，定好基本的规矩。</p>
+<ul>
+<li><strong>起名</strong>：<ul>
+<li>项目叫 <code>FAPO-Reproduce</code>，实验名叫 <code>Baseline-32B</code>。这样以后看日志知道是哪次跑的。</li>
+</ul>
+</li>
+<li><strong>定算法</strong>：<ul>
+<li><code>adv_estimator=grpo</code>：<strong>重点</strong>，这里用的是 <strong>GRPO</strong> 算法（类似 DeepSeek-R1 用的算法），而不是传统的 PPO。</li>
+<li><code>kl_coef=0.0</code>：这里把 KL 散度惩罚设为了 0，意味着允许模型在探索时稍微“放飞自我”一点，不受原始模型太大的约束。</li>
+</ul>
+</li>
+<li><strong>定长度限制</strong>：<ul>
+<li><code>max_prompt_length</code> (2048) 和 <code>max_response_length</code> (20480)：输入最多 2k token，输出允许很长（20k token），这说明任务可能涉及<strong>长思维链（Chain-of-Thought）</strong>的推理。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 准备食材与厨房 (Environment &amp; Paths)</h4>
+<p><strong>（对应脚本第 25-40 行）</strong>
+告诉程序去哪里找模型，数据在哪，以及用什么机器跑。</p>
+<ul>
+<li><strong>找厨房 (Ray)</strong>：<ul>
+<li>脚本依赖 <code>Ray</code>（一个分布式计算框架）。它会连接到 <code>localhost:8265</code> 或者集群地址。</li>
+<li><code>NNODES=8</code>：这次训练要用 <strong>8台服务器</strong>（节点）一起跑，阵仗很大。</li>
+</ul>
+</li>
+<li><strong>找食材 (Model &amp; Data)</strong>：<ul>
+<li><strong>模型</strong>：<code>Qwen2.5-32B</code>。这是通义千问 2.5 的 320亿参数版本作为底座。</li>
+<li><strong>数据</strong>：训练数据在 <code>fapo-train-boxed.parquet</code>，测试数据在 <code>fapo-test-full-boxed.parquet</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 设定烹饪手法 (Algorithm Hyperparameters)</h4>
+<p><strong>（对应脚本第 42-57 行）</strong>
+这里全是“微调火候”的参数，决定了模型怎么生成文本，怎么分配显卡资源。</p>
+<ul>
+<li><strong>生成参数</strong>：<ul>
+<li><code>temperature=1.0</code>：让模型生成时保持一定的随机性（多样性）。</li>
+</ul>
+</li>
+<li><strong>显卡资源分配 (Parallelism)</strong>：<ul>
+<li><code>sp_size=8</code> (Sequence Parallel)：序列并行，处理超长文本用的。</li>
+<li><code>gen_tp=4</code> (Tensor Parallel)：张量并行，把模型切开放在4张卡上推理。</li>
+<li><code>fsdp_size=32</code>：全分片数据并行，用来省显存的。</li>
+<li><strong>人话总结</strong>：32B 模型很大，一张显卡装不下，所以要把模型切碎了，分散在多张显卡和多台机器上跑。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 按下启动按钮 (Execution Command)</h4>
+<p><strong>（对应脚本第 62行 <code>ray job submit</code> 开始直到结束）</strong>
+这是脚本里最长的一段，其实就是一个<strong>超长的 Python 命令</strong>。它把上面定义的所有变量，填入到 <code>verl.trainer.main_ppo</code> 这个程序里去执行。</p>
+<p>我们可以把这个命令拆解成几个关键动作：</p>
+<ol>
+<li>
+<p><strong>加载配置</strong>：</p>
+<ul>
+<li><code>--config-name rm_config.yaml</code>：读取基础配置文件。</li>
+</ul>
+</li>
+<li>
+<p><strong>告诉 Actor（演员模型）怎么做</strong>：</p>
+<ul>
+<li><code>actor_rollout_ref.model.path</code>: 加载 Qwen2.5-32B。</li>
+<li><code>actor_rollout_ref.rollout.name=vllm</code>: 使用 <strong>vLLM</strong> 进行推理加速（生成答案更快）。</li>
+<li><code>optim.lr=1e-6</code>: 学习率非常低，小心翼翼地学，防止学坏。</li>
+</ul>
+</li>
+<li>
+<p><strong>告诉 Reward Model（裁判）怎么打分</strong>：</p>
+<ul>
+<li><code>reward_model.reward_manager=dapo</code>: 使用特定的奖励管理器。</li>
+<li><code>custom_reward_function.path=.../reward_fn_reasoning.py</code>: <strong>核心点</strong>。加载了一个自定义的奖励函数脚本，名字叫 <code>reasoning</code>（推理）。</li>
+<li>这意味着模型写出的答案，会通过这个 Python 脚本来打分（比如数学题做对没，代码能不能跑通）。</li>
+</ul>
+</li>
+<li>
+<p><strong>设定训练周期</strong>：</p>
+<ul>
+<li><code>trainer.total_epochs=10</code>: 总共学 10 轮。</li>
+<li><code>trainer.total_training_steps=600</code>: 总共更新 600 步。</li>
+<li><code>trainer.test_freq=10</code>: 每 10 步考试（验证）一次。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 总结：这个文件在干嘛？</h3>
+<p><strong>一句话解释：</strong>
+这是一个<strong>启动脚本</strong>，它指挥 8 台服务器，利用 <strong>GRPO 强化学习算法</strong>，基于 <strong>Qwen2.5-32B</strong> 模型，针对<strong>长思维链推理任务</strong>（因为输出很长且奖励函数涉及 reasoning）进行训练。</p>
+<p><strong>核心观点/逻辑链：</strong>
+1.  <strong>不依赖人工标注的偏好（RM）</strong>：脚本里没有加载传统的 Reward Model 模型文件，而是用了 <code>custom_reward_function</code>（自定义规则打分）。这通常意味着像 DeepSeek-R1 那样，通过“答案对不对”这种硬规则来训练模型，而不是靠人给好坏评价。
+2.  <strong>极度追求长输出</strong>：给 output 留了 20k token 的空间，专门为了让模型学会“思考很久”。
+3.  <strong>资源密集型</strong>：用了复杂的并行策略（TP, SP, FSDP），说明 32B 模型的训练对显存和计算要求很高。</p>
+<p>现在再看这个文件，是不是感觉它就是一个<strong>填满了参数的“发射控制台”</strong>？</p>

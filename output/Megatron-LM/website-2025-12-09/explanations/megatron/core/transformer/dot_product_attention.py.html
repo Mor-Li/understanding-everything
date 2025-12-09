@@ -1,0 +1,140 @@
+<h1>megatron/core/transformer/dot_product_attention.py</h1>
+<p>这份代码确实很难懂，因为它不仅仅是标准的 <code>Attention</code>（注意力机制），它是 <strong>Megatron-LM</strong> 里的实现。</p>
+<p><strong>Megatron-LM 的代码有两个巨大的认知门槛：</strong>
+1.  <strong>分布式计算（Tensor Parallelism）</strong>：代码里充斥着把一个大矩阵切分成小块分给不同显卡计算的逻辑。
+2.  <strong>极致优化</strong>：为了速度，它用了很多 reshape（变形）、view（视图）和 fused kernels（融合算子），牺牲了可读性。</p>
+<p>别慌，我们把这份代码看作是一个<strong>“流水线任务”</strong>。我为你列一个 <strong>Todo List</strong>，我们一项一项把这个任务勾掉。</p>
+<hr />
+<h3>📝 任务清单：拆解 DotProductAttention</h3>
+<ol>
+<li><strong>【准备工作】搞懂我们在哪儿、有多少资源</strong> (<code>__init__</code>)</li>
+<li><strong>【预处理】处理“多头”不对等的情况 (GQA/MQA)</strong> (<code>forward</code> 开头)</li>
+<li><strong>【第一步计算】计算 Q 和 K 的相似度 (Scores)</strong> (<code>torch.baddbmm</code>)</li>
+<li><strong>【归一化】打分、缩放与遮盖 (Softmax &amp; Mask)</strong> (<code>FusedScaleMaskSoftmax</code>)</li>
+<li><strong>【第二步计算】根据分数提取信息 (Context)</strong> (<code>torch.bmm</code>)</li>
+<li><strong>【收尾】整理形状，输出结果</strong> (<code>return</code>)</li>
+</ol>
+<hr />
+<h3>🟢 Task 1: 【准备工作】搞懂我们在哪儿 (<code>__init__</code>)</h3>
+<p><strong>目标</strong>：算出这张显卡负责计算多少个“头”（Heads），以及缩放系数是多少。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 world_size 就是并行的显卡数量</span>
+<span class="n">world_size</span> <span class="o">=</span> <span class="n">pg_collection</span><span class="o">.</span><span class="n">tp</span><span class="o">.</span><span class="n">size</span><span class="p">()</span> 
+
+<span class="c1"># 核心逻辑：总共有多少个头，除以显卡数量。</span>
+<span class="c1"># 比如总共 32 个头，有 8 张卡，那么这张卡只负责计算 4 个头。</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads_per_partition</span> <span class="o">=</span> <span class="n">divide</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span> <span class="n">world_size</span><span class="p">)</span>
+
+<span class="c1"># 计算缩放因子 (1 / sqrt(d))，这是 Attention 公式的标准操作</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">softmax_scale</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="n">math</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_size_per_attention_head</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>大白话</strong>：
+这是一个分布式模块。假设模型很大，我们把注意力头切分了。初始化时，程序先算清楚：“我（这张显卡）只需要负责全模型中 <code>1/N</code> 的工作量”。</p>
+<hr />
+<h3>🟢 Task 2: 【预处理】处理 Q、K、V 数量不匹配 (<code>forward</code> 起手式)</h3>
+<p><strong>目标</strong>：如果 Query（提问者）很多，但 Key/Value（资料库）很少，需要把资料库复制几份对齐。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 检查：如果 Query 的头数 比 Key 的头数多 (这是 Group Query Attention 技术的特征)</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads_per_partition</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_query_groups_per_partition</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+    <span class="c1"># 比如 Query 有 8 个头，Key 只有 1 个头。</span>
+    <span class="c1"># 这里就把 Key 复制 8 份，强行对齐，方便后面做矩阵乘法。</span>
+    <span class="n">key</span> <span class="o">=</span> <span class="n">key</span><span class="o">.</span><span class="n">repeat_interleave</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">value</span> <span class="o">=</span> <span class="n">value</span><span class="o">.</span><span class="n">repeat_interleave</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>大白话</strong>：
+现在的 LLM（如 LLaMA 2/3）常用 <strong>GQA (Group Query Attention)</strong>。
+意思是：有 8 个人（Query Heads）想查资料，但只有 1 份字典（Key/Value Head）。
+为了不排队，代码里直接把这 1 份字典复印了 8 份，每个人发一份。这样形状就对齐了。</p>
+<hr />
+<h3>🟢 Task 3: 【第一步计算】计算 Q 和 K 的相似度</h3>
+<p><strong>目标</strong>：执行公式 $Q \times K^T$。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># [sq, b, np, hn] -&gt; [sq, b * np, hn]</span>
+<span class="c1"># 把 Batch Size(b) 和 注意力头数(np) 合并在一起。</span>
+<span class="c1"># 为什么要合并？因为对 GPU 来说，把它们看作一大堆独立的向量并行算最快。</span>
+<span class="n">query</span> <span class="o">=</span> <span class="n">query</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">output_size</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span> <span class="n">output_size</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">output_size</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="n">key</span> <span class="o">=</span> <span class="n">key</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">output_size</span><span class="p">[</span><span class="mi">3</span><span class="p">],</span> <span class="n">output_size</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">output_size</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+
+<span class="c1"># torch.baddbmm 是 &quot;Batch Add Batch Matrix Multiply&quot;</span>
+<span class="c1"># 实际上就是做 Q * K 的转置。</span>
+<span class="c1"># beta=0.0 表示没有偏置项，alpha=self.softmax_scale 表示顺便乘上缩放因子</span>
+<span class="n">matmul_result</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">baddbmm</span><span class="p">(</span>
+    <span class="n">matmul_input_buffer</span><span class="p">,</span>
+    <span class="n">query</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> 
+    <span class="n">key</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> 
+    <span class="n">beta</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+    <span class="n">alpha</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">softmax_scale</span><span class="p">,</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>大白话</strong>：
+这是 Attention 的第一脚射门。
+把 Query（问题）和 Key（关键词）做矩阵乘法。
+结果 <code>matmul_result</code> 就是<strong>“原始分数”</strong>——代表每个 Query 对每个 Key 的关注程度。</p>
+<hr />
+<h3>🟢 Task 4: 【归一化】打分、缩放与遮盖</h3>
+<p><strong>目标</strong>：执行 $Softmax(Mask(Scores))$。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这是一个融合算子（Fused Kernel），它一次性干了三件事：</span>
+<span class="c1"># 1. Scale：虽然上面乘过了，这里逻辑上包含缩放。</span>
+<span class="c1"># 2. Mask：把未来的词遮住（对于 GPT 这种生成模型，不能看后面的词）。</span>
+<span class="c1"># 3. Softmax：把分数变成概率（和为1）。</span>
+<span class="n">attention_probs</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">scale_mask_softmax</span><span class="p">(</span>
+    <span class="n">attention_scores</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">softmax_offset</span>
+<span class="p">)</span>
+
+<span class="c1"># Dropout：随机扔掉一些注意力，防止过拟合</span>
+<span class="n">attention_probs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_dropout</span><span class="p">(</span><span class="n">attention_probs</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>大白话</strong>：
+刚才算出的分数是原始数值（比如 10.5, -3.2）。
+这一步把它们变成<strong>概率</strong>（比如 90%, 0.1%）。
+同时，如果是像 GPT 这样的模型，这里会把“剧透”的部分（未来的词）强行设为 0（Mask 操作）。
+Megatron 为了快，把这些操作合并成了一个 C++ 写的算子 <code>scale_mask_softmax</code>。</p>
+<hr />
+<h3>🟢 Task 5: 【第二步计算】根据分数提取信息</h3>
+<p><strong>目标</strong>：执行 $Probs \times V$。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 attention_probs 是刚才算出的概率矩阵</span>
+<span class="c1"># value 是实际的内容信息</span>
+<span class="c1"># context 就是最终提取出的上下文向量</span>
+<span class="n">context</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bmm</span><span class="p">(</span><span class="n">attention_probs</span><span class="p">,</span> <span class="n">value</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>大白话</strong>：
+这是 Attention 的第二脚射门。
+既然算出概率了（比如我对第 3 个词关注度 90%），那就把第 3 个词的 Value（内容）拿过来，乘以 0.9。
+把所有词加权求和，就得到了当前的<strong>Context（上下文表示）</strong>。</p>
+<hr />
+<h3>🟢 Task 6: 【收尾】整理形状，输出结果</h3>
+<p><strong>目标</strong>：把数据形状变回 <code>[Sequence, Batch, Hidden]</code>，方便传给下一层。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># [b, np, sq, hn] --&gt; [sq, b, np, hn]</span>
+<span class="c1"># 调整维度顺序，把序列长度放到第一维（Megatron 习惯的做法）</span>
+<span class="n">context</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">permute</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+
+<span class="c1"># [sq, b, np, hn] --&gt; [sq, b, hp]</span>
+<span class="c1"># 把 &quot;头数(np)&quot; 和 &quot;每个头的大小(hn)&quot; 合并回 &quot;总隐藏层大小(hp)&quot;</span>
+<span class="c1"># 注意：这里的 hp 依然是当前显卡负责的那一部分大小，不是全模型的 hidden size。</span>
+<span class="n">new_context_shape</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">size</span><span class="p">()[:</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span> <span class="o">+</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_size_per_partition</span><span class="p">,)</span>
+<span class="n">context</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">*</span><span class="n">new_context_shape</span><span class="p">)</span>
+
+<span class="k">return</span> <span class="n">context</span>
+</code></pre></div>
+
+<p><strong>大白话</strong>：
+计算完了，现在的形状是散乱的（分头算的）。
+这一步把数据重新打包整理，变成一个整齐的张量，扔给 Transformer 的下一部分（通常是 Linear 层）。</p>
+<hr />
+<h3>总结一下</h3>
+<p>这个文件的核心逻辑就是标准的 Attention 公式：
+$$ \text{Attention}(Q, K, V) = \text{Softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V $$</p>
+<p><strong>为什么你看不懂？</strong>
+因为代码里有 80% 的行数是在处理：
+1.  <strong>形状变换</strong> (<code>view</code>, <code>permute</code>, <code>reshape</code>)：为了让 GPU 批量算得更快。
+2.  <strong>分布式切分</strong> (<code>per_partition</code>)：因为这个 Attention 只算全模型的一小部分。
+3.  <strong>特殊优化</strong> (<code>GQA repeat</code>, <code>FusedScaleMaskSoftmax</code>)：为了省显存和加速。</p>
+<p>现在对照这个 list 再看一遍代码，应该会清晰很多！</p>

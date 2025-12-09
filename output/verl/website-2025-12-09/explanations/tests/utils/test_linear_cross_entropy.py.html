@@ -1,0 +1,114 @@
+<h1>tests/utils/test_linear_cross_entropy.py</h1>
+<p>这份代码其实是一个<strong>“比武擂台”</strong>（Benchmark/Test Script）。</p>
+<p>它的核心目的是：<strong>验证一个新的、经过优化的算法（Kernel）是否正确，并且测试它比传统的 PyTorch 写法快多少、省多少显存。</strong></p>
+<p>这个算法主要做的事情是：在大模型训练（特别是 PPO 强化学习）中，计算<strong>线性层输出（Linear）</strong> + <strong>交叉熵损失（Cross Entropy）</strong> + <strong>熵（Entropy）</strong>。</p>
+<p>我把它拆解成一个 <strong>Task Todo List</strong>，带你一步步看懂它在干嘛：</p>
+<hr />
+<h3>✅ Task 1：召集 4 位“参赛选手”</h3>
+<p>代码首先定义了 4 种实现同样功能的方法，它们是这次比武的选手：</p>
+<ol>
+<li>
+<p><strong>选手 A (基准线): <code>run_torch_entropy</code></strong></p>
+<ul>
+<li><strong>身份</strong>：这是最普通的 PyTorch 写法。</li>
+<li><strong>做法</strong>：一步一步算。先做矩阵乘法（Linear），再算 Softmax，再算 LogSumExp，最后减一减得到结果。</li>
+<li><strong>作用</strong>：它是<strong>标准答案</strong>。因为它逻辑最简单，不容易错，用来检验其他选手算得对不对。</li>
+</ul>
+</li>
+<li>
+<p><strong>选手 B: <code>run_verl_original_entropy</code></strong></p>
+<ul>
+<li><strong>身份</strong>：Verl 库原本的写法。</li>
+<li><strong>做法</strong>：用了一些工具函数 <code>compute_entropy_from_logits</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>选手 C: <code>run_verl_torch_fused_entropy</code></strong></p>
+<ul>
+<li><strong>身份</strong>：使用了 <code>torch.compile</code> 编译优化过的“融合算子”。</li>
+<li><strong>做法</strong>：试图把几个计算步骤合并在一起，利用 PyTorch 的动态编译加速。</li>
+</ul>
+</li>
+<li>
+<p><strong>选手 D (主角): <code>linear_cross_entropy</code></strong></p>
+<ul>
+<li><strong>身份</strong>：<strong>本次测试的核心主角</strong>，一个底层的自定义 Kernel（可能是手写的 Triton 或 CUDA）。</li>
+<li><strong>做法</strong>：深度优化，试图在极少的显存和极快的时间内一次性把所有事情做完。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 2：布置“考场” (Setup)</h3>
+<p>代码里的 <code>TestLinearCrossEntropy</code> 类负责搭建环境。</p>
+<ul>
+<li><strong><code>generate_hyper</code> (出题)</strong>：<ul>
+<li>设置不同的“题目难度”。比如 <code>test_case_idx=0</code> 是小模型，<code>idx=4</code> 是大模型（词表大小 10万+）。</li>
+<li>定义 Batch size（批次大小）、Seq len（序列长度）、Vocab size（词表大小）。</li>
+</ul>
+</li>
+<li><strong><code>generate_forward_inputs</code> (发卷子)</strong>：<ul>
+<li>随机生成一些输入数据（<code>hidden</code> 状态，<code>weight</code> 权重，<code>labels</code> 标签）。</li>
+<li>因为是随机生成的，所以我们不关心结果的<strong>意义</strong>，只关心<strong>计算过程</strong>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3：第一轮比试 —— 正确性 (Correctness)</h3>
+<p>这是 <code>verify_correctness</code> 函数做的事情。</p>
+<ul>
+<li>
+<p><strong>Step 3.1: 前向传播 (Forward Pass)</strong></p>
+<ul>
+<li>让 4 位选手分别计算结果（Loss 和 Entropy）。</li>
+<li><strong>核心逻辑</strong>：<code>torch.testing.assert_close(...)</code>。</li>
+<li><strong>人话解释</strong>：裁判拿着选手 A（标准答案）的结果，去比对选手 B、C、D。如果误差超过 0.001（atol/rtol），就直接报错，判定测试失败。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2: 反向传播 (Backward Pass)</strong></p>
+<ul>
+<li>训练模型不仅要算结果，还要算<strong>梯度</strong>（Gradient）以便更新参数。</li>
+<li>代码生成了随机的梯度信号 <code>g_entropy</code>, <code>g_logprobs</code>。</li>
+<li>让 4 位选手分别进行 <code>torch.autograd.grad</code>（求导）。</li>
+<li><strong>核心逻辑</strong>：再次比对。如果选手 D 算出来的梯度和选手 A 不一样，说明优化后的算法虽然结果对，但更新参数的方向错了，这也是不行的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4：第二轮比试 —— 速度 (Latency)</h3>
+<p>如果 Task 3 通过了，说明大家算的都对。接下来看谁跑得快。</p>
+<ul>
+<li>代码使用了 <code>torch.cuda.Event</code> 来计时。</li>
+<li>记录每个选手跑完 Forward 和 Backward 耗费了多少毫秒 (ms)。</li>
+<li>最后打印出来：<ul>
+<li><code>[INFO]: Forward pass: Kernel implementation average time: ... ms</code></li>
+<li><strong>目的</strong>：证明选手 D（Kernel）比选手 A（Torch）快很多。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5：第三轮比试 —— 显存占用 (Memory)</h3>
+<p>这是 <code>check_storage</code> 函数做的事情。</p>
+<ul>
+<li><strong>Step 5.1: 测量前向传播显存</strong><ul>
+<li>清空显存缓存。</li>
+<li>运行一遍函数，用 <code>torch.cuda.max_memory_allocated()</code> 看看显存峰值飙到了多少。</li>
+</ul>
+</li>
+<li><strong>Step 5.2: 测量反向传播显存</strong><ul>
+<li>同理，看算梯度时占了多少内存。</li>
+</ul>
+</li>
+<li><strong>目的</strong>：普通的 PyTorch 写法（选手 A）通常会产生很大的中间矩阵（Logits），非常吃显存。选手 D（Kernel）通常不需要把这个巨大的矩阵存下来，能<strong>极大节省显存</strong>。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑流就是：</p>
+<ol>
+<li><strong>准备数据</strong>：造一些假数据。</li>
+<li><strong>跑笨办法</strong>：用最基础的 PyTorch 算一遍，作为<strong>标准答案</strong>。</li>
+<li><strong>跑新办法</strong>：用新写的 Kernel 算一遍。</li>
+<li><strong>对答案</strong>：结果一样吗？梯度一样吗？（不一样就报错）。</li>
+<li><strong>比性能</strong>：新办法快了多少？省了多少内存？（打印日志炫耀一下）。</li>
+</ol>
+<p><strong>一句话概括：</strong> 这是一个<strong>质检员</strong>，确保那个新写的、很酷的加速算法是靠谱的，并且确实能起到加速和省内存的作用。</p>

@@ -1,0 +1,109 @@
+<h1>tests/unit_tests/test_num_microbatches_calculator.py</h1>
+<p>这个文件看起来确实比较抽象，因为它测试的是<strong>分布式训练中非常核心的一个数学逻辑</strong>：如何计算“梯度累积步数”（Gradient Accumulation Steps）。</p>
+<p>简单来说，这个文件的目的是确保 Megatron（一个大模型训练框架）能够正确地计算出：<strong>为了达到设定的总Batch Size，每个GPU需要跑多少个小Batch，然后再进行一次参数更新。</strong></p>
+<p>为了让你听懂，我把这个理解过程拆解成一个 <strong>Task Todo List</strong>，然后一步步带你过一遍。</p>
+<hr />
+<h3>📋 学习任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>基础概念扫盲</strong>：搞懂 Global Batch Size, Micro Batch Size 和 Data Parallel Size 的关系。（这是读懂代码的前提）</li>
+<li><strong>理解计算器的核心任务</strong>：为什么我们需要一个专门的类来计算这个数字？</li>
+<li><strong>模式一：固定模式 (Constant)</strong>：理解最简单的固定 Batch Size 逻辑。</li>
+<li><strong>模式二：预热模式 (Rampup)</strong>：理解 Batch Size 逐渐变大的逻辑。</li>
+<li><strong>代码映射</strong>：将文件中的测试函数对应到上面的逻辑中去。</li>
+</ol>
+<hr />
+<h3>第一步：基础概念扫盲 (核心公式)</h3>
+<p>在看代码前，你必须心中有这个公式。</p>
+<p>假设我们要训练一个大模型：
+*   <strong>Global Batch Size (GBS)</strong>: 全局批量大小。比如我们希望每过 <strong>32</strong> 条数据，就更新一次模型参数。
+*   <strong>Micro Batch Size (MBS)</strong>: 微批量大小。因为显存有限，一张卡一次只能塞进 <strong>8</strong> 条数据。
+*   <strong>Data Parallel Size (DP)</strong>: 数据并行大小。假设你有 <strong>2</strong> 张显卡在并行跑数据。</p>
+<p><strong>问题来了：</strong> 2张卡，每张跑8条数据，一次只能处理 $8 \times 2 = 16$ 条数据。
+但是我们要凑够 <strong>32</strong> 条数据才能更新参数。怎么办？</p>
+<p><strong>答案：</strong> 每张卡跑完一轮（16条）不要更新，攒着梯度，再跑一轮（又是16条），加起来就是32条了。这时候再更新。</p>
+<p>这个“跑几轮”，就是代码里的 <strong><code>num_microbatches</code></strong>。</p>
+<blockquote>
+<p><strong>公式：</strong>
+$$NumMicroBatches = \frac{\text{Global Batch Size}}{\text{Micro Batch Size} \times \text{Data Parallel Size}}$$</p>
+</blockquote>
+<p>带入上面的数字：$32 / (8 \times 2) = 2$。所以需要跑 2 个微批次。</p>
+<hr />
+<h3>第二步：理解计算器的核心任务</h3>
+<p>这个文件测试的 <code>mb_calculator</code> 就是专门干上面那个除法运算的。</p>
+<p><strong>为什么要专门写个代码？</strong>
+1.  <strong>除不尽的情况</strong>：如果 GBS 是 33，显卡一次跑 16，怎么算？是跑2轮还是3轮？
+2.  <strong>动态变化</strong>：训练刚开始时，为了稳定，GBS 通常比较小（比如从16开始），然后逐渐增加到 32。这个计算器需要根据训练了多少步，自动调整当前的 GBS。</p>
+<hr />
+<h3>第三步：代码逐行解析 (带入观点)</h3>
+<p>现在我们来看具体的测试函数，你会发现它们都在验证上面的逻辑。</p>
+<h4>1. 初始化测试 (<code>test_init_num_microbatches_calculator</code>)</h4>
+<p>这个测试在检查：如果我给了一组参数，计算器算出来的结果对不对。</p>
+<ul>
+<li>
+<p><strong>场景 A (整除):</strong>
+    <code>python
+    # GBS=32, MBS=8, DP=2
+    # 单次吞吐 = 8 * 2 = 16
+    # 结果应该是 32 / 16 = 2
+    mb_calculator.init_num_microbatches_calculator(0, None, 32, 8, 2, False)
+    assert mb_calculator.get_num_microbatches() == 2 # 验证通过</code></p>
+</li>
+<li>
+<p><strong>场景 B (除不尽):</strong>
+    <code>python
+    # GBS=32, MBS=8, DP=3 (注意这里变成了3张卡)
+    # 单次吞吐 = 8 * 3 = 24
+    # 32 / 24 = 1.33... 除不尽！
+    mb_calculator.init_num_microbatches_calculator(0, None, 32, 8, 3, True)
+    assert mb_calculator.get_num_microbatches() == 1
+    # 因为只能跑整数次，这里向下取整跑了1次。
+    # 实际跑的 GBS = 24 * 1 = 24 (而不是设定的32)
+    assert mb_calculator.get_current_running_global_batch_size() == 24</code></p>
+</li>
+</ul>
+<h4>2. 重新配置测试 (<code>test_reconfigure_num_microbatches_calculator</code>)</h4>
+<p>这个测试模拟：训练过程中参数变了（或者初始化错了需要重置），计算器能不能反应过来。</p>
+<ul>
+<li>代码先设 GBS=32，验证是2轮。</li>
+<li>然后调用 <code>reconfigure</code> 把 GBS 改成 16。</li>
+<li>$16 / (8 \times 2) = 1$。</li>
+<li><code>assert mb_calculator.get_num_microbatches() == 1</code>，验证通过。</li>
+</ul>
+<h4>3. 预热模式测试 (<code>test_ramp_up</code> 和 <code>TestRampupBatchsizeNumMicroBatchesCalculator</code>)</h4>
+<p>这是最复杂的部分。<strong>Rampup (预热)</strong> 指的是 GBS 不固定。</p>
+<ul>
+<li>
+<p><strong>配置参数</strong>: <code>[16, 16, 48]</code>。意思是：</p>
+<ul>
+<li>起始 GBS = 16</li>
+<li>每次增加 = 16</li>
+<li>每训练 48 个样本增加一次（或者达到某个步数）。</li>
+</ul>
+</li>
+<li>
+<p><strong>测试逻辑 (<code>test_ramp_up</code>)</strong>:
+    这是一个 <code>while</code> 循环，模拟训练过程：</p>
+<ol>
+<li>开始时，GBS 是 16。</li>
+<li>训练一波，<code>consumed_samples</code> 增加。</li>
+<li>代码检查：随着样本量的累积，GBS 有没有按计划变大？</li>
+<li>最终 GBS 会增加到目标值（比如 32 或更大）。</li>
+</ol>
+<p>```python</p>
+<h1>期望的样本消耗量列表</h1>
+<p>expected_consumed_samples = [0, 16, 32, 48, 64, ...]</p>
+<h1>随着循环，它在验证计算器告诉外部的“当前GBS”是否符合这个增长曲线。</h1>
+<p>```</p>
+</li>
+</ul>
+<h4>4. 构建器测试 (<code>test_build_num_microbatches_calculator</code>)</h4>
+<p>这是典型的工厂模式测试。
+*   如果传了 <code>None</code> (没有预热配置)，它应该创建一个 <code>ConstantNumMicroBatchesCalculator</code>（固定计算器）。
+*   如果传了 <code>[16, 16, 48]</code> (有配置)，它应该创建一个 <code>RampupBatchsizeNumMicroBatchesCalculator</code>（预热计算器）。</p>
+<hr />
+<h3>总结：这段代码到底在讲啥？</h3>
+<p>这段代码在<strong>保卫</strong> Megatron 训练框架的数学心脏。</p>
+<p>它确保：
+1.  当你告诉框架“我要用 Batch Size 1000 训练”时，框架能根据你的显卡数量（比如8张）和显存限制（单卡只能跑10），准确算出“每步需要累积 12.5 次（取整处理）”。
+2.  当你开启“预热”功能时，它能像一个定速巡航系统一样，随着训练的进行，平滑地把 Batch Size 从小拉大，而不会算错步数导致训练崩溃。</p>
+<p><strong>一句话总结：它是分布式训练中“分蛋糕”逻辑的单元测试。</strong></p>

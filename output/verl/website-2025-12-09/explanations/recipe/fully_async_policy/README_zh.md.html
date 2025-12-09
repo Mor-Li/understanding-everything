@@ -1,0 +1,120 @@
+<h1>recipe/fully_async_policy/README_zh.md</h1>
+<p>这份文档确实涉及很多强化学习（RL）系统工程的术语。简单来说，这是一份<strong>“如何让大模型强化学习训练速度翻倍”</strong>的各种加速秘籍（Recipe）说明书。</p>
+<p>为了让你听懂，我把这个复杂的系统比作一个<strong>饭店厨房</strong>，然后按照你的要求，分两部分来讲：
+1. <strong>观念解析</strong>：用大白话一步步拆解它的核心逻辑。
+2. <strong>Task To-Do List</strong>：如果你要用这套系统，你需要做哪些具体步骤。</p>
+<hr />
+<h3>第一部分：核心观点逐步解析（厨房比喻版）</h3>
+<h4>1. 过去的痛点：单人干活（Colocate/Sync）</h4>
+<ul>
+<li><strong>原文观点</strong>：传统的架构（Colocate）有“长尾问题”，GPU利用率低。</li>
+<li><strong>白话解释</strong>：以前训练模型像是一个厨师（GPU）既要<strong>备菜</strong>（生成数据/Rollout）又要<strong>炒菜</strong>（训练/Train）。<ul>
+<li>厨师切完菜才能炒，炒菜时切菜板闲着，切菜时炒锅闲着。</li>
+<li>而且有的菜特别难切（长尾样本），厨师切半天，锅就一直凉着等。</li>
+</ul>
+</li>
+<li><strong>结论</strong>：这太慢了，资源浪费严重。</li>
+</ul>
+<h4>2. 核心方案：分工协作（Decoupling/Async）</h4>
+<ul>
+<li><strong>原文观点</strong>：Rollout和Train分离，资源隔离，生成与训练并行。</li>
+<li><strong>白话解释</strong>：现在我们把GPU分成两拨人：<strong>备菜组（Rollouter）</strong> 和 <strong>炒菜组（Trainer）</strong>。<ul>
+<li>备菜组只管疯狂切菜，切好了就丢到一个传送带（MessageQueue）上。</li>
+<li>炒菜组只管从传送带拿菜下锅。</li>
+<li><strong>好处</strong>：大家都在干活，谁也不等谁。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 进阶技巧：流式传输（Streaming）</h4>
+<ul>
+<li><strong>原文观点</strong>：Rollouter逐样本生成，数据传输以单个sample为最小单位。</li>
+<li><strong>白话解释</strong>：<ul>
+<li>以前是备菜组必须切好<strong>100盘</strong>菜，才一次性端给炒菜组。</li>
+<li>现在是<strong>切好一盘端一盘</strong>。炒菜组只要凑够一锅的量（mini_batch）就开始炒，不用干等一大堆数据。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 难点与对策：关于“新鲜度”（Staleness）</h4>
+<ul>
+<li><strong>原文观点</strong>：异步训练支持使用旧参数生成的样本（Staleness Threshold）。</li>
+<li><strong>白话解释</strong>：<ul>
+<li>炒菜组炒完一锅，手艺（模型参数）就升级了。但备菜组手里切到一半的菜，是用“旧手艺”切的。</li>
+<li><strong>严格做法</strong>：把旧菜扔了，用新手艺重切（但这很浪费时间）。</li>
+<li><strong>本文做法</strong>：允许吃一点点“剩菜”。只要剩菜不超过一定比例（<code>staleness_threshold</code>），我们就认为没问题，直接下锅。这样速度最快。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 终极优化：切了一半怎么办？（Partial Rollout）</h4>
+<ul>
+<li><strong>原文观点</strong>：支持Partial Rollout，同步参数时保存进行中的任务。</li>
+<li><strong>白话解释</strong>：<ul>
+<li>当炒菜组大喊“手艺升级了，大家停一下同步新配方”时，备菜组手里正切着半根黄瓜。</li>
+<li><strong>普通做法</strong>：把半根黄瓜扔了，等同步完重新拿一根切。</li>
+<li><strong>本文做法</strong>：把半根黄瓜放下，记下切到哪了，同步完配方，拿起这半根黄瓜继续切。<strong>一点时间都不浪费。</strong></li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第二部分：Task To-Do List（实操清单）</h3>
+<p>如果你要运行这个系统，请按照以下步骤操作：</p>
+<h4>Step 1: 资源分配规划 (Resource Allocation)</h4>
+<p>你需要决定把多少张显卡分给“备菜组”，多少给“炒菜组”。
+*   <strong>Task</strong>: 检查你总共有多少GPU（例如128张）。
+*   <strong>Task</strong>: 初步分配。比如一半一半（64:64），或者根据经验调整。
+    *   <em>提示</em>：如果在跑的过程中发现“备菜组”老是闲着，就减少备菜组的卡，加给“炒菜组”。</p>
+<h4>Step 2: 基础参数配置 (Basic Config)</h4>
+<p>在启动脚本中设置基本信息。
+*   <strong>Task</strong>: 设置 <code>trainer.nnodes</code> 和 <code>trainer.n_gpus_per_node</code> （炒菜组人数）。
+*   <strong>Task</strong>: 设置 <code>rollout.nnodes</code> 和 <code>rollout.n_gpus_per_node</code> （备菜组人数）。
+*   <strong>Task</strong>: 设置 <code>rollout.total_rollout_steps</code> （总共要做多少道菜）。</p>
+<h4>Step 3: 选择加速模式 (Mode Selection) - <strong>最关键的一步</strong></h4>
+<p>根据你对<strong>速度</strong>和<strong>效果</strong>的要求，选择一种模式设置参数：</p>
+<ul>
+<li>
+<p><strong>模式 A：保守派（最稳，但最慢）</strong></p>
+<ul>
+<li><em>场景</em>：小任务，怕模型练崩。</li>
+<li><em>设置</em>：<code>trigger_parameter_sync_step=1</code>, <code>staleness_threshold=0</code>。</li>
+<li><em>解释</em>：做完一波立刻同步，绝不吃剩菜。</li>
+</ul>
+</li>
+<li>
+<p><strong>模式 B：流式派（快一点）</strong></p>
+<ul>
+<li><em>场景</em>：想要快点，但还是不敢吃剩菜。</li>
+<li><em>设置</em>：<code>trigger_parameter_sync_step &gt; 1</code>, <code>staleness_threshold=0</code>。</li>
+<li><em>解释</em>：备菜组多备点，炒菜组连炒好几锅再同步。</li>
+</ul>
+</li>
+<li>
+<p><strong>模式 C：极速派（推荐，非常快）</strong></p>
+<ul>
+<li><em>场景</em>：大模型训练，追求极致效率，能容忍一点点误差。</li>
+<li><em>设置</em>：<ul>
+<li><code>trigger_parameter_sync_step=4</code> (连炒4锅再同步)</li>
+<li><code>staleness_threshold=0.5</code> (允许一半的数据是旧的)</li>
+<li><code>partial_rollout=True</code> (切了一半的菜不许扔，接着切)</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Step 4: 启动与监控 (Run &amp; Monitor)</h4>
+<ul>
+<li><strong>Task</strong>: 运行启动脚本（参考文档中的 <code>快速开始</code> 代码块）。</li>
+<li><strong>Task</strong>: 观察监控指标（Wandb等）：<ul>
+<li>看 <code>trainer/idle_ratio</code>（炒菜组闲着吗？）：如果高，说明备菜太慢，要给备菜组加卡。</li>
+<li>看 <code>rollouter/idle_ratio</code>（备菜组闲着吗？）：如果高，说明炒菜太慢，要给炒菜组加卡。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 5: 进阶微调 (Fine-tuning)</h4>
+<ul>
+<li><strong>Task</strong>: 调整 <code>async_training.require_batches</code>。<ul>
+<li>设为1最快（纯流式），但可能导致训练不稳定。如果发现模型效果不好，适当调大这个数。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这篇文章讲的就是：<strong>别让显卡闲着。</strong>
+通过<strong>拆分任务</strong>、<strong>允许并行</strong>、<strong>容忍少量旧数据</strong>、<strong>不丢弃半成品</strong>，把128张显卡的利用率榨干，从而让训练速度提升2倍以上。</p>

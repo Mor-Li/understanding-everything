@@ -1,0 +1,78 @@
+<h1>verl/utils/dataset/vision_utils.py</h1>
+<p>这份代码文件 <code>verl/utils/dataset/vision_utils.py</code> 的核心作用是：<strong>把原始的图片和视频文件，加工成多模态大模型（如 Qwen-VL, MiniCPM）能“看懂”的数字格式（Tensor）。</strong></p>
+<p>你可以把它想象成一个<strong>“后厨备菜员”</strong>。原始的图片和视频是刚买回来的“生鲜食材”，模型是“顾客”。这个文件的任务就是清洗、切块、摆盘，最后端给模型。</p>
+<p>按照你的要求，我为你列了一个 <strong>Task Todo List</strong>，并一步步讲解它是如何完成这些任务的。</p>
+<hr />
+<h3>📋 备菜员的 Task Todo List (任务清单)</h3>
+<ol>
+<li><strong>[ ] 处理图片 (Task: Image Processing)</strong><ul>
+<li>不管图是文件路径、二进制流还是对象，统统转成统一的 RGB 格式，并切成小块（Patch）。</li>
+</ul>
+</li>
+<li><strong>[ ] 处理视频 (Task: Video Processing)</strong><ul>
+<li>读懂视频指令，决定是按“每秒几帧”切，还是“一共切几帧”，最后把视频变成一叠图片张量。</li>
+</ul>
+</li>
+<li><strong>[ ] 特殊摆盘 (Task: Model-Specific Adjustment)</strong><ul>
+<li>专门针对 <code>MiniCPM-o</code> 这个挑剔的“顾客”，调整图片数据和文本数据的对齐位置。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解 (Step-by-Step)</h3>
+<h4>第一步：处理图片 (<code>process_image</code>)</h4>
+<p><strong>目标：</strong> 无论用户传进来的是什么样子的图，最后都要变成模型能读的格式。</p>
+<ul>
+<li><strong>代码逻辑：</strong><ol>
+<li><strong>检查身份：</strong> 如果已经是 <code>PIL.Image</code> 对象，直接转成 RGB 颜色模式（防止有什么黑白图、透明图混进来）。</li>
+<li><strong>解压数据：</strong> 如果传进来的是 <code>bytes</code> (二进制数据)，就用 <code>BytesIO</code> 把它读成图片对象。</li>
+<li><strong>外包处理：</strong> 最后调用 <code>qwen_vl_utils.fetch_image</code>。这是 Qwen（通义千问）官方提供的工具，负责把图片像素转化成模型需要的张量，并按 <code>image_patch_size</code>（比如 14x14）切块。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>一句话总结：</strong> 把各种来源的图片洗净、转码，准备好喂给模型。</p>
+</blockquote>
+<h4>第二步：处理视频 (<code>process_video</code>)</h4>
+<p><strong>目标：</strong> 视频其实就是一连串的图片。这一步要决定“怎么抽帧”。</p>
+<ul>
+<li><strong>代码逻辑：</strong><ol>
+<li><strong>看说明书 (<code>VIDEO_FORMAT_HELP</code>)：</strong> 代码里那大段注释就是告诉用户，视频数据要写成 JSON 格式，比如 <code>{"type": "video", "video": "路径...", "fps": 2}</code>。</li>
+<li><strong>检查冲突：</strong> 也就是代码中的 <code>assert nframes is None or fps is None</code>。你不能同时要求“一共只截 10 张图”(<code>nframes</code>) 且 “每秒截 5 张图”(<code>fps</code>)，这会让备菜员精神分裂，只能二选一。</li>
+<li><strong>制定规则：</strong><ul>
+<li>如果没有指定规则，就用默认的。</li>
+<li>如果有指定，就把规则（fps, min_frames, max_frames）写进字典里。</li>
+</ul>
+</li>
+<li><strong>外包处理：</strong> 最后调用 <code>fetch_video</code>。它会根据上面的规则，把视频读出来，变成一个形状为 <code>[帧数, 3, 高, 宽]</code> 的巨大张量。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>一句话总结：</strong> 根据设定（是快进看还是慢放看），把视频变成一连串的图片数据。</p>
+</blockquote>
+<h4>第三步：特殊摆盘 (<code>process_multi_modal_inputs_for_minicpmo</code>)</h4>
+<p><strong>目标：</strong> 这是一个<strong>高级且特定</strong>的任务。<code>MiniCPM-o</code> 是一个特定的模型，它对数据的“摆放位置”非常敏感。</p>
+<ul>
+<li><strong>背景知识：</strong> 在训练模型时，因为每句话长短不一，短的句子前面通常会补零（Padding，即 <code>left_padding</code>）。</li>
+<li><strong>问题：</strong> 如果文本前面补了零，原本对应的图片位置（Image Bound）就对不上了！图片可能指到了补零的空白处。</li>
+<li><strong>代码逻辑：</strong><ol>
+<li><strong>计算偏移量：</strong> <code>left_padding_length = torch.argmax(attention_mask, dim=1)</code>。这行代码在算文本前面补了多少个零。</li>
+<li><strong>修正坐标：</strong> 循环遍历 <code>image_bound</code>，把图片的坐标减去 Padding 的长度，再加上当前的序列长度。简单说就是：<strong>把图片的指针往回拨，让它重新对准真正的文本位置。</strong></li>
+<li><strong>压扁数据 (Flatten)：</strong> 把所有图片的像素值 <code>pixel_values</code> 从复杂的列表结构拍扁成一个长列表，方便模型一口吞下。</li>
+<li><strong>打包：</strong> 把调整好的数据重新塞回字典返回。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>一句话总结：</strong> 专门伺候 MiniCPM-o 模型，修正因为“文本补全”导致的图片位置错位问题，确保图文对齐。</p>
+</blockquote>
+<hr />
+<h3>总结</h3>
+<p>这个文件 <code>vision_utils.py</code> 就是一个<strong>多模态数据的“前处理工厂”</strong>。</p>
+<ol>
+<li><strong><code>process_image</code></strong>: 图片转张量。</li>
+<li><strong><code>process_video</code></strong>: 视频抽帧转张量。</li>
+<li><strong><code>process_..._minicpmo</code></strong>: 修正特定模型的图文对齐坐标。</li>
+</ol>
+<p>如果你不是在用 MiniCPM-o 模型，你只需要关心前两个函数，它们就是负责把文件读进内存变成 PyTorch Tensor 的工具人。</p>

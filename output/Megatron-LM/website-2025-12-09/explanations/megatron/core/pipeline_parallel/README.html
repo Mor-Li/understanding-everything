@@ -1,0 +1,75 @@
+<h1>megatron/core/pipeline_parallel</h1>
+<p>这是一个非常棒的问题！面对这么硬核的分布式训练代码，如果陷入细节很容易“走火入魔”。</p>
+<p>为了让你一眼看透 <code>megatron/core/pipeline_parallel</code> 这个文件夹，我们用一个<strong>“超级工厂流水线”</strong>的比喻来统领全局。</p>
+<hr />
+<h3>1. 这个文件夹主要负责什么功能？</h3>
+<p><strong>核心功能：把一个巨型模型切成几段，让不同的显卡（GPU）像流水线工人一样接力干活。</strong></p>
+<p>想象你要造一架<strong>波音 747（超大模型）</strong>：
+*   你的车间（单张显卡显存）太小了，根本放不下整架飞机。
+*   <strong>解决办法</strong>：你把飞机切成三段——机头、机身、机尾。
+*   <strong>分工</strong>：
+    *   <strong>工人 A（GPU 0）</strong>：专门造机头。
+    *   <strong>工人 B（GPU 1）</strong>：专门造机身。
+    *   <strong>工人 C（GPU 2）</strong>：专门造机尾。</p>
+<p>这个文件夹里的代码，就是<strong>管理这条流水线的所有规则</strong>：怎么传零件？谁什么时候干活？怎么防止工人偷懒（闲置）？</p>
+<hr />
+<h3>2. 各个文件分别是干什么的？</h3>
+<p>我们要把这几个文件看作工厂里的<strong>不同角色</strong>：</p>
+<h4>👮‍♂️ <strong><code>schedules.py</code> —— 生产线总指挥（调度员）</strong></h4>
+<ul>
+<li><strong>角色</strong>：他是拿秒表的工头。</li>
+<li><strong>作用</strong>：流水线最大的问题是“傻等”（工人 A 没做完机头，工人 B 就在那发呆）。</li>
+<li>这个文件规定了复杂的<strong>轮班表</strong>（比如 1F1B 策略）：它指挥工人 A：“别等了，赶紧先处理下一个订单的机头，同时把上一个订单的废料清理掉！”</li>
+<li><strong>目的</strong>：让所有工人时刻都在忙，消灭“摸鱼时间”（气泡）。</li>
+</ul>
+<h4>🚚 <strong><code>p2p_communication.py</code> —— 内部快递员（传动带）</strong></h4>
+<ul>
+<li><strong>角色</strong>：负责在工人之间搬运半成品。</li>
+<li><strong>作用</strong>：当工人 A 做完机头，他不能直接扔给 B。这个文件定义了标准的<strong>交接动作</strong>：<ul>
+<li>“喂，B，我要发货了，你准备好接收了吗？”（握手）</li>
+<li>“这是多大的箱子？”（形状协商）</li>
+<li>“接好！”（发送 Tensor）</li>
+</ul>
+</li>
+</ul>
+<h4>🌉 <strong><code>bridge_communicator.py</code> —— 跨部门联络员（翻译官）</strong></h4>
+<ul>
+<li><strong>角色</strong>：处理复杂情况的中间人。</li>
+<li><strong>作用</strong>：如果“造机头”的部门有 4 个人合作，而“造机身”的部门只有 2 个人。</li>
+<li>零件传过去的时候，谁发给谁？是一对一，还是多对一？</li>
+<li>这个文件就是负责<strong>重新打包和分配</strong>数据，确保不同规模的部门能顺畅对接。</li>
+</ul>
+<h4>⚡ <strong><code>combined_1f1b.py</code> —— 熟练工的“左右互搏”秘籍</strong></h4>
+<ul>
+<li><strong>角色</strong>：一种极致的加速技巧。</li>
+<li><strong>作用</strong>：普通的流水线是“做完这个再做那个”。</li>
+<li>这个文件教工人学会<strong>“一心二用”</strong>：趁着把零件递给下一个人的那 0.1 秒空隙（通信延迟），赶紧扭个螺丝（计算）。把“搬运”和“干活”的时间叠在一起，快到飞起。</li>
+</ul>
+<h4>🛠️ <strong><code>utils.py</code> —— 员工手册与工具箱</strong></h4>
+<ul>
+<li><strong>角色</strong>：基础设施。</li>
+<li><strong>作用</strong>：<ul>
+<li><strong>发工牌</strong>：告诉 GPU “你是第一棒”还是“最后一棒”。</li>
+<li><strong>发工具</strong>：提供标准的“工作台”（ScheduleNode），不管你造什么零件，都放在这个统一的工作台上处理。</li>
+</ul>
+</li>
+</ul>
+<h4>📂 <strong><code>__init__.py</code> —— 传达室</strong></h4>
+<ul>
+<li><strong>作用</strong>：只是个门面，把上面那些真正干活的人叫出来。</li>
+</ul>
+<hr />
+<h3>3. 高层认知：如何快速理解这部分代码？</h3>
+<p>要理解这个文件夹，你脑子里只需要建立一个 <strong>“防拥堵的接力赛”</strong> 模型：</p>
+<ol>
+<li><strong>切分（Slicing）</strong>：大模型被切开了，每张卡只拿一部分。</li>
+<li><strong>接力（Relay）</strong>：数据像接力棒一样，从 GPU 0 传到 GPU N（由 <code>p2p</code> 负责）。</li>
+<li><strong>防拥堵（Scheduling）</strong>：<ul>
+<li>最笨的办法是：第一棒跑完，第二棒才跑。这样大部分人都在看戏。</li>
+<li><strong>Megatron 的办法（这个文件夹的核心价值）</strong>：让大家<strong>同时</strong>跑不同的圈。第一棒在跑第 10 圈的时候，第二棒在跑第 9 圈，最后一棒在跑第 1 圈。</li>
+<li>这需要极高精度的指挥（<code>schedules.py</code>），确保没人撞车，没人空转。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结：</strong>
+<strong>这个文件夹就是为了让一堆 GPU 排成一队，通过极其复杂的排班和物流管理，让它们看起来像一个超级巨大的 GPU 在流畅地工作。</strong></p>

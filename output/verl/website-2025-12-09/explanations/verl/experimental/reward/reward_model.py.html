@@ -1,0 +1,83 @@
+<h1>verl/experimental/reward/reward_model.py</h1>
+<p>这份代码确实涉及了很多分布式系统和强化学习（RLHF）工程实现的细节。如果没有相关背景，直接看代码很容易晕。</p>
+<p>我们可以把这个 <code>RewardModelManager</code>（奖励模型经理）想象成一个<strong>“专门负责给作文打分的阅卷组组长”</strong>。他的任务是管理一堆“阅卷老师”（GPU模型），并对外提供打分服务。</p>
+<p>为了帮你理解，我把这个组长要干的活拆解成一个 <strong>5步走的 To-Do List</strong>，一步步带你看懂他在干什么。</p>
+<hr />
+<h3>📋 阅卷组组长的 To-Do List</h3>
+<h4>✅ Task 1: 接到任务书，清点家底 (<code>__init__</code>)</h4>
+<p><strong>目标</strong>：组长刚上任，先看看上面发下来的手册（Config），看看手里有多少显卡资源。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>__init__</code> 方法。</li>
+<li><strong>他在做什么</strong>：<ol>
+<li><strong>存配置</strong>：把 <code>config</code> 存下来，这是干活的准则。</li>
+<li><strong>看资源</strong>：<code>resource_pool</code> 就是手里的显卡资源池（由 Ray 框架管理）。</li>
+<li><strong>开始干活</strong>：立刻调用 <code>_initialize_llm_servers()</code>（招人）和 <code>_initialize_router()</code>（设前台）。</li>
+<li><strong>特殊检查</strong>：确认必须要加载“分词器”（Tokenizer），否则看不懂作文。</li>
+<li><strong>省电模式</strong>：如果配置说 <code>free_cache_engine</code>，说明平时没事要休眠，刚启动先睡一会儿 (<code>self.sleep()</code>)，等有活再叫醒。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 2: 算算能招多少个“阅卷老师” (<code>_initialize_llm_servers</code> 上半部分)</h4>
+<p><strong>目标</strong>：奖励模型（Reward Model）通常很大，可能一张显卡装不下。组长要算算手里的显卡够组建几个阅卷小组。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>_initialize_llm_servers</code> 方法的前半段。</li>
+<li><strong>他在做什么</strong>：<ol>
+<li><strong>单个老师要多大地方</strong>：<code>rollout_world_size</code> = 一个模型副本需要几张卡（模型并行）。</li>
+<li><strong>总共有多大地方</strong>：<code>world_size</code> = 总共有多少张显卡。</li>
+<li><strong>算人头</strong>：<code>num_replicas = world_size // rollout_world_size</code>。<ul>
+<li><em>例子</em>：如果你有 8 张卡，一个模型需要 2 张卡跑起来，那你就能招 4 个“阅卷老师”（副本）。</li>
+</ul>
+</li>
+<li><strong>准备合同</strong>：<code>rollout_replica_class</code> 和 <code>HFModelConfig</code> 是准备加载模型权重的配置。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 3: 安排工位，让老师们上岗 (<code>_initialize_llm_servers</code> 下半部分)</h4>
+<p><strong>目标</strong>：计算清楚后，正式启动这些模型进程（Replicas），让它们在显卡上跑起来。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>_initialize_llm_servers</code> 方法的后半段。</li>
+<li><strong>他在做什么</strong>：<ol>
+<li><strong>创建对象</strong>：用列表推导式创建了 <code>self.rollout_replicas</code>，这只是创建了 Python 对象，还没真正占显卡。</li>
+<li><strong>分配资源并启动</strong>：<ul>
+<li><strong>Colocate 模式</strong>（资源池模式）：把大的资源池切分成小块（<code>split_resource_pool</code>），每一块分给一个老师，然后调用 <code>init_colocated</code> 启动。</li>
+<li><strong>Standalone 模式</strong>（独立模式）：直接调用 <code>init_standalone</code> 启动。</li>
+</ul>
+</li>
+<li><strong>记下联系方式</strong>：启动后，记录下每个老师的 <code>server_address</code>（IP和端口），方便后面派活。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 4: 设立“前台接待”，统一派活 (<code>_initialize_router</code>)</h4>
+<p><strong>目标</strong>：现在有 4 个老师在后台坐着了。外面送来一堆作文要打分，不能让外面的人直接找老师，需要一个“前台”（Router）来分发任务（负载均衡）。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>_initialize_router</code> 方法。</li>
+<li><strong>他在做什么</strong>：<ol>
+<li><strong>收集名单</strong>：把所有老师的地址 <code>worker_urls</code> 整理好。</li>
+<li><strong>选前台系统</strong>：<ul>
+<li>如果是 <code>sglang</code>（一种高性能推理后端），就启动 <code>inner_sglang_router</code>。</li>
+<li>否则，用普通的 <code>naive_router</code>。</li>
+</ul>
+</li>
+<li><strong>开张</strong>：<code>launch_router_process</code> 启动路由进程，并拿到 <code>router_address</code>。以后外面的人只要把作文发给这个地址，前台就会自动分给空闲的老师。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 5: 休息与叫醒服务 (Lifecycle Management)</h4>
+<p><strong>目标</strong>：在大模型训练中，显存非常宝贵。有时候是“写作文”（生成阶段），有时候是“打分”（奖励阶段）。打分的时候才需要奖励模型，不打分的时候最好把它“冻结”或“卸载”以节省显存。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>wake_up</code> 和 <code>sleep</code> 方法。</li>
+<li><strong>他在做什么</strong>：<ul>
+<li><strong>Sleep (睡觉)</strong>：调用所有老师的 <code>sleep()</code> 方法。这通常意味着清空 KV Cache 或把权重移到 CPU，把显存让给负责写作文的模型（Actor Model）。</li>
+<li><strong>Wake Up (起床)</strong>：调用所有老师的 <code>wake_up()</code> 方法。把权重加载回来，准备干活。</li>
+<li><strong>_run_all</strong>：这是一个辅助工具，利用 <code>asyncio</code> 并发地通知所有老师，不用一个一个打电话，而是群发消息。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件讲了啥？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>奖励模型的大管家</strong>。它不负责具体的打分算法（那是模型内部的事），它负责<strong>搞定计算资源</strong>：
+1.  根据显卡数量启动多个模型副本。
+2.  启动一个路由器（Router）来管理流量。
+3.  在不需要打分的时候让模型休眠省显存。</p>
+<p>这样，外面的训练主程序只需要对着这个 Manager 说：“我要打分”，或者“你可以睡了”，而不需要去管底层到底有几张卡、几个模型在跑。</p>

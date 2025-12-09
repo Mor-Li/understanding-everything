@@ -1,0 +1,117 @@
+<h1>tests/special_e2e/sft/run_sft.sh</h1>
+<p>没问题。面对这种充满了大写字母变量、各种参数和命令的脚本，一开始感到头晕是非常正常的。</p>
+<p>我们可以把这个脚本看作是一份<strong>“训练大模型的烹饪菜谱”</strong>。它的核心目的是：<strong>使用 SFT（监督微调）技术，在一个特定的数据集上训练一个 Qwen（千问）大模型。</strong></p>
+<p>为了让你容易理解，我把这个脚本做的事情拆解成了一个 <strong>Task To-Do List（任务清单）</strong>。我们会按照这个清单，一步一步把代码对应上去。</p>
+<hr />
+<h3>📋 脚本任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>[安全检查]</strong> 设定脚本运行的“安全规则”（报错就停止）。</li>
+<li><strong>[准备食材]</strong> 指定要用的 <strong>模型</strong>（Model）和 <strong>数据</strong>（Data）。</li>
+<li><strong>[设定火候]</strong> 配置 <strong>训练参数</strong>（显卡数量、是否用 LoRA、批次大小等）。</li>
+<li><strong>[准备餐盘]</strong> 创建用来存放训练结果（Checkpoints）的 <strong>文件夹</strong>。</li>
+<li><strong>[开始烹饪]</strong> 启动核心命令 <code>torchrun</code>，把所有参数传给训练程序，开始干活。</li>
+<li><strong>[打扫厨房]</strong> 训练完成后，删除生成的临时文件（因为这是个测试脚本）。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细讲解</h3>
+<p>下面我们按照上面的清单，一段一段看代码。</p>
+<h4>1. [安全检查] 设定脚本规则</h4>
+<div class="codehilite"><pre><span></span><code><span class="ch">#!/usr/bin/env bash</span>
+<span class="nb">set</span><span class="w"> </span>-xeuo<span class="w"> </span>pipefail
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这是 Bash 脚本的标准开头。</li>
+<li><code>set -xeuo pipefail</code>：这行代码非常重要，它相当于告诉电脑：“<strong>如果在执行过程中遇到任何一行报错、或者有变量没定义，立刻停止运行，不要硬撑。</strong>” 这样可以防止错误的命令继续执行导致更大的灾难。</li>
+</ul>
+<h4>2. [准备食材] 指定模型和数据</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">ENTRYPOINT</span><span class="o">=</span><span class="si">${</span><span class="nv">ENTRYPOINT</span><span class="k">:-</span><span class="s2">&quot;-m verl.trainer.fsdp_sft_trainer&quot;</span><span class="si">}</span>
+<span class="nv">NUM_GPUS</span><span class="o">=</span><span class="si">${</span><span class="nv">NUM_GPUS</span><span class="k">:-</span><span class="nv">8</span><span class="si">}</span>
+
+<span class="nv">MODEL_ID</span><span class="o">=</span><span class="si">${</span><span class="nv">MODEL_ID</span><span class="k">:-</span><span class="nv">Qwen</span><span class="p">/Qwen2.5-0.5B-Instruct</span><span class="si">}</span>
+<span class="nv">MODEL_PATH</span><span class="o">=</span><span class="si">${</span><span class="nv">MODEL_PATH</span><span class="k">:-</span><span class="si">${</span><span class="nv">HOME</span><span class="si">}</span><span class="p">/models/</span><span class="si">${</span><span class="nv">MODEL_ID</span><span class="si">}}</span>
+
+<span class="nv">TRAIN_FILES</span><span class="o">=</span><span class="si">${</span><span class="nv">TRAIN_FILES</span><span class="k">:-</span><span class="nv">$HOME</span><span class="p">/data/gsm8k/train.parquet</span><span class="si">}</span>
+<span class="nv">VAL_FILES</span><span class="o">=</span><span class="si">${</span><span class="nv">VAL_FILES</span><span class="k">:-</span><span class="nv">$HOME</span><span class="p">/data/gsm8k/test.parquet</span><span class="si">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这里定义了大量的 <strong>环境变量</strong>。</li>
+<li><code>${VARIABLE:-default}</code> 这种写法的意思是：<strong>“如果外面没给我传这个变量，我就用默认值”</strong>。</li>
+<li><strong>关键点</strong>：<ul>
+<li><code>ENTRYPOINT</code>: 真正干活的 Python 程序是 <code>verl.trainer.fsdp_sft_trainer</code>（SFT 训练器）。</li>
+<li><code>MODEL_ID</code>: 默认使用的是阿里千问的 <code>Qwen2.5-0.5B</code>（这是一个比较小的模型，适合测试）。</li>
+<li><code>TRAIN_FILES</code>: 训练用的“课本”，这里默认是 GSM8K（一个数学数据集）。</li>
+</ul>
+</li>
+</ul>
+<h4>3. [设定火候] 配置训练参数</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">SP_SIZE</span><span class="o">=</span><span class="si">${</span><span class="nv">SP_SIZE</span><span class="k">:-</span><span class="nv">1</span><span class="si">}</span><span class="w">      </span><span class="c1"># 序列并行大小（显存不够时用）</span>
+<span class="nv">LIGER</span><span class="o">=</span><span class="si">${</span><span class="nv">LIGER</span><span class="k">:-</span><span class="nv">False</span><span class="si">}</span><span class="w">      </span><span class="c1"># 是否使用 Liger 内核加速</span>
+<span class="nv">MULTITURN</span><span class="o">=</span><span class="si">${</span><span class="nv">MULTITURN</span><span class="k">:-</span><span class="nv">False</span><span class="si">}</span><span class="w"> </span><span class="c1"># 是否是多轮对话</span>
+<span class="nv">LORA_RANK</span><span class="o">=</span><span class="si">${</span><span class="nv">LORA_RANK</span><span class="k">:-</span><span class="nv">0</span><span class="si">}</span><span class="w">  </span><span class="c1"># LoRA 的秩（0代表全量微调，不使用LoRA）</span>
+<span class="nv">RM_PAD</span><span class="o">=</span><span class="si">${</span><span class="nv">RM_PAD</span><span class="k">:-</span><span class="nv">True</span><span class="si">}</span><span class="w">     </span><span class="c1"># 是否移除 Padding（提高效率）</span>
+
+<span class="nv">TOTAL_TRAIN_STEP</span><span class="o">=</span><span class="si">${</span><span class="nv">TOTAL_TRAIN_STEP</span><span class="k">:-</span><span class="nv">1</span><span class="si">}</span><span class="w"> </span><span class="c1"># 总共训练几步（这里设为1，说明只是跑通测试，不是真练）</span>
+<span class="nv">micro_bsz</span><span class="o">=</span><span class="m">2</span><span class="w">                </span><span class="c1"># 每次给显卡喂几条数据</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这些是控制训练细节的开关。</li>
+<li>你可以理解为：是用猛火炒（全量微调）还是文火炖（LoRA）？一次炒多少菜（Batch Size）？</li>
+<li>注意 <code>TOTAL_TRAIN_STEP</code> 默认为 1，这再次印证了<strong>这只是一个测试脚本</strong>，目的是为了验证代码能不能跑通，而不是为了练出一个聪明的模型。</li>
+</ul>
+<h4>4. [准备餐盘] 创建输出文件夹</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">project_name</span><span class="o">=</span><span class="s2">&quot;verl-test&quot;</span>
+<span class="nv">exp_name</span><span class="o">=</span><span class="s2">&quot;</span><span class="k">$(</span>basename<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">MODEL_ID</span><span class="p">,,</span><span class="si">}</span><span class="s2">&quot;</span><span class="k">)</span><span class="s2">-sft-minimal&quot;</span>
+<span class="nv">ckpts_home</span><span class="o">=</span><span class="si">${</span><span class="nv">ckpts_home</span><span class="k">:-</span><span class="nv">$HOME</span><span class="p">/</span><span class="si">${</span><span class="nv">project_name</span><span class="si">}</span><span class="p">/</span><span class="si">${</span><span class="nv">exp_name</span><span class="si">}}</span>
+
+mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">ckpts_home</span><span class="si">}</span><span class="s2">&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li>定义了项目名称 <code>verl-test</code>。</li>
+<li>计算出实验名称 <code>exp_name</code>。</li>
+<li><code>mkdir -p</code>: 在你的硬盘上创建一个文件夹，用来保存训练好的模型（Checkpoints）。</li>
+</ul>
+</li>
+</ul>
+<h4>5. [开始烹饪] 启动核心命令</h4>
+<p>这是最长、最复杂的一段，但其实它只是一个命令：</p>
+<div class="codehilite"><pre><span></span><code>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">1</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="si">${</span><span class="nv">NUM_GPUS</span><span class="si">}</span><span class="w"> </span><span class="si">${</span><span class="nv">ENTRYPOINT</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>data.train_files<span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">TRAIN_FILES</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>...
+<span class="w">    </span>trainer.logger<span class="o">=[</span><span class="s1">&#39;console&#39;</span><span class="o">]</span><span class="w"> </span><span class="nv">$@</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li><code>torchrun</code>: 这是 PyTorch 提供的启动器，用来管理多张显卡一起工作。</li>
+<li><code>--nproc_per_node=${NUM_GPUS}</code>: 告诉它用几张显卡（默认8张）。</li>
+<li>后面的所有 <code>key=value</code> 都是传给 Python 程序的参数：<ul>
+<li><strong><code>data...</code></strong>: 告诉程序去哪里读数据，数据的格式是什么（比如问题叫 <code>question</code>，答案叫 <code>answer</code>）。</li>
+<li><strong><code>model...</code></strong>: 告诉程序模型怎么加载。<code>model.lora_rank="${LORA_RANK}"</code> 决定了是微调所有参数还是只微调一小部分。</li>
+<li><strong><code>trainer...</code></strong>: 告诉程序怎么保存进度，训练多少步。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>6. [打扫厨房] 清理现场</h4>
+<div class="codehilite"><pre><span></span><code>rm<span class="w"> </span>-rf<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">ckpts_home</span><span class="p">:?</span><span class="si">}</span><span class="s2">/*&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<code>rm -rf</code> 是删除命令。</li>
+<li><strong>重点</strong>：脚本运行结束后，它把刚才辛苦训练（虽然只有1步）保存下来的模型文件<strong>全删了</strong>。</li>
+<li><strong>为什么？</strong> 因为文件路径里写着 <code>tests/special_e2e</code>。这是一个<strong>端到端测试（E2E Test）</strong>。它的唯一目的是证明“这个训练流程没有 Bug，能跑通”，跑完就把垃圾清理掉，不占用硬盘空间。</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个脚本在说：</p>
+<blockquote>
+<p>“嘿，我要用 8 张显卡，加载 Qwen-0.5B 模型，读 GSM8K 数据，试着跑 1 步 SFT 训练。如果能成功跑完不报错，就把生成的临时文件删掉，任务结束。”</p>
+</blockquote>
+<p><strong>如果你想用这个脚本真的去训练模型：</strong>
+你只需要把最后一行 <code>rm -rf ...</code> 删掉，并且把 <code>TOTAL_TRAIN_STEP</code> 改成一个比较大的数字（比如 1000 或 2000）即可。</p>

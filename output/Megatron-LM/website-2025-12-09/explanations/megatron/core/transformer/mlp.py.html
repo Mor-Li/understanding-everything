@@ -1,0 +1,147 @@
+<h1>megatron/core/transformer/mlp.py</h1>
+<p>这份代码确实比较硬核，因为它不仅仅是一个普通的神经网络层，而是 <strong>NVIDIA Megatron-LM</strong> 框架中的核心组件。Megatron-LM 是专门用来训练超大规模模型（如 GPT-3, LLaMA 等）的库，所以代码里塞满了<strong>并行计算（Parallelism）</strong>、<strong>显存优化</strong>和<strong>性能加速</strong>的逻辑。</p>
+<p>为了让你看懂，我把阅读这份代码拆解成一个 <strong>Task List（任务清单）</strong>，我们一步步来完成。</p>
+<hr />
+<h3>📋 Task 1: 搞清楚“我是谁” (定位模块功能)</h3>
+<p><strong>目标</strong>：理解 <code>MLP</code> 这个类在 Transformer 里的角色。</p>
+<ul>
+<li><strong>背景知识</strong>：Transformer 的每一层（Block）主要由两个部分组成：一个是 Attention（注意力机制），另一个就是 <strong>MLP（多层感知机 / 前馈神经网络）</strong>。</li>
+<li><strong>代码对应</strong>：<ul>
+<li>类名 <code>class MLP(MegatronModule)</code>。</li>
+<li>注释写道：<code>projects it to 4*h hidden dimension... and project back</code>。</li>
+</ul>
+</li>
+<li><strong>简单理解</strong>：这就是一个“三明治”结构：<ol>
+<li>输入 $x$ (维度 $h$)</li>
+<li>放大到 $4h$ (第一层线性层 FC1)</li>
+<li>激活函数 (GELU / Swish 等)</li>
+<li>缩小回 $h$ (第二层线性层 FC2)</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 2: 准备原材料 (初始化 <code>__init__</code>)</h3>
+<p><strong>目标</strong>：看懂 <code>__init__</code> 函数里到底构建了哪些层。</p>
+<ol>
+<li>
+<p><strong>Step 2.1: 确定隐藏层大小</strong></p>
+<ul>
+<li>代码：<code>ffn_hidden_size</code>。</li>
+<li>逻辑：通常是输入维度的 4 倍。如果用了 <code>gated_linear_unit</code> (GLU，比如 LLaMA 用的 SwiGLU)，这个维度通常会翻倍，因为 GLU 需要两路输入。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.2: 构建第一层线性层 (FC1)</strong></p>
+<ul>
+<li>代码：<code>self.linear_fc1 = build_module(...)</code>。</li>
+<li><strong>关键点</strong>：这里用的不是 <code>torch.nn.Linear</code>，而是 <code>build_module</code>。这是因为 Megatron 需要把这个巨大的矩阵切分到多张显卡上（Tensor Parallelism）。</li>
+<li>参数 <code>tp_group</code>：告诉程序这层网络属于哪个并行组。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.3: 选择激活函数</strong></p>
+<ul>
+<li>代码：<code>self.activation_func</code>。</li>
+<li>逻辑：根据配置选择是普通的 <code>GELU</code>，还是来自 Transformer Engine (TE) 的加速版本。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.4: 构建第二层线性层 (FC2)</strong></p>
+<ul>
+<li>代码：<code>self.linear_fc2 = build_module(...)</code>。</li>
+<li>逻辑：把维度从 $4h$ 变回 $h$。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📋 Task 3: 走一遍流程 (前向传播 <code>forward</code>)</h3>
+<p><strong>目标</strong>：这是全篇最复杂的地方，因为充满了性能优化的分支。我们需要理清数据怎么流动的。</p>
+<p><strong>输入</strong>：<code>hidden_states</code> (你的 token 向量)。</p>
+<ol>
+<li>
+<p><strong>Step 3.1: 第一刀 (FC1)</strong></p>
+<ul>
+<li>代码：<code>self.linear_fc1(hidden_states)</code></li>
+<li><code>nvtx_range_push</code>: 这是给 NVIDIA 性能分析工具（Nsight）看的标记，不用管。</li>
+<li>结果：得到 <code>intermediate_parallel</code>（中间层结果）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2: 激活函数 (最乱的一块)</strong></p>
+<ul>
+<li>这里有三个巨大的 <code>if/elif/else</code> 分支，目的是<strong>为了快</strong>：</li>
+<li><strong>分支 A (<code>config.use_te_activation_func</code>)</strong>:<ul>
+<li>如果安装了 Transformer Engine (TE)，直接调用 TE 的极速内核。</li>
+</ul>
+</li>
+<li><strong>分支 B (<code>config.bias_activation_fusion</code>)</strong>:<ul>
+<li><strong>这是重点</strong>。Megatron 手写了 CUDA Kernel（C++代码），把“加偏置(Bias)”和“激活函数(Activation)”这两个操作合并成一步执行。</li>
+<li>比如 <code>bias_swiglu_impl</code>：同时做 Bias相加 + Swish激活 + GLU门控。</li>
+<li><strong>为什么？</strong> 减少显存读写次数，大幅提升速度。</li>
+</ul>
+</li>
+<li><strong>分支 C (<code>else</code>)</strong>:<ul>
+<li>如果没有特殊优化，就用普通的 PyTorch 写法（<code>torch.chunk</code>, <code>F.silu</code> 等）。这是为了兼容性兜底的。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.3: 第二刀 (FC2)</strong></p>
+<ul>
+<li>代码：<code>self.linear_fc2(intermediate_parallel)</code></li>
+<li>逻辑：把激活后的数据投影回原来的维度。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.4: 输出</strong></p>
+<ul>
+<li>返回 <code>output</code> 和 <code>output_bias</code>。</li>
+<li>注意：Megatron 有时为了性能，不会立即把 Bias 加到结果上，而是把 Bias 单独返回，留给下一层去加（Fused Add）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📋 Task 4: 理解那些“看不懂的黑话” (高级特性)</h3>
+<p>代码里夹杂了很多奇怪的词，这里列个清单：</p>
+<ol>
+<li>
+<p><strong><code>is_expert</code> / <code>MoE</code></strong>:</p>
+<ul>
+<li>这是 <strong>Mixture of Experts (混合专家模型)</strong> 的逻辑。如果是 MoE 模型，这个 MLP 只是众多“专家”中的一个。</li>
+<li>代码里的 <code>moe_latent_size</code> 就是为了这种情况准备的。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>per_token_scale</code></strong>:</p>
+<ul>
+<li>这是为了 <strong>FP8 (8-bit 浮点数)</strong> 训练准备的。FP8 精度低，容易溢出，所以需要给每个 token 乘一个缩放系数（Scale）来保持数值稳定。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>sharded_state_dict</code> (文件底部的函数)</strong>:</p>
+<ul>
+<li><strong>这是做什么的？</strong> 保存模型权重（Checkpointing）。</li>
+<li><strong>难点</strong>：因为模型太大，被切分到了 8 张甚至更多显卡上。保存的时候，不能直接 <code>torch.save</code>。</li>
+<li><strong><code>apply_swiglu_sharded_factory</code></strong>:<ul>
+<li>SwiGLU 的权重通常是把两个矩阵拼在一起训练的。</li>
+<li>保存时，这个函数负责把这个拼起来的大张量<strong>逻辑上切开</strong>，或者处理切分后的合并，确保断点续训时权重能正确加载回多张显卡。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：如何读懂这个文件？</h3>
+<p>如果你要修改或调试这个文件，请按这个顺序思考：</p>
+<ol>
+<li><strong>我在初始化吗？</strong> 看 <code>__init__</code>，关注 <code>build_module</code> 怎么切分 Tensor Parallel。</li>
+<li><strong>我在跑数据吗？</strong> 看 <code>forward</code>。<ul>
+<li>如果你没开 Transformer Engine，也没开 Fusion，就只看最后的 <code>else</code> 分支（最标准的 PyTorch 写法）。</li>
+<li>如果你在调试性能，才需要关注中间的 <code>fused_bias_...</code> 分支。</li>
+</ul>
+</li>
+<li><strong>我在存盘吗？</strong> 看 <code>sharded_state_dict</code>，这部分通常只有在处理模型保存/加载报错时才需要细看。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这是一个<strong>支持多卡并行切分</strong>、<strong>集成了底层 CUDA 加速内核</strong>、<strong>支持 MoE 和 FP8</strong> 的 Transformer MLP 层实现。它比普通的 PyTorch <code>nn.Linear</code> + <code>nn.ReLU</code> 复杂，是因为它为了在大规模集群上跑得快，做了极致的工程优化。</p>

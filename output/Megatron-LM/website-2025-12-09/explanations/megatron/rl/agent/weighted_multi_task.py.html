@@ -1,0 +1,103 @@
+<h1>megatron/rl/agent/weighted_multi_task.py</h1>
+<p>这个文件 <code>weighted_multi_task.py</code> 的核心逻辑其实就是一个 <strong>“包工头” (Project Manager)</strong>。</p>
+<p>它的工作不是自己去生成数据，而是管理手底下的一群 <strong>“小工” (Sub-agents)</strong>，并按照你指定的 <strong>“权重” (Weights)</strong> 把任务分发给他们。</p>
+<p>为了让你更容易理解，我把理解这个代码的过程拆解成一个 <strong>TODO List</strong>，我们一步一步来勾选完成。</p>
+<hr />
+<h3>✅ Task 1: 理解核心角色 (类定义)</h3>
+<p>首先，我们要搞清楚这个脚本里定义的两个主要角色是谁。</p>
+<ul>
+<li>
+<p><strong>角色 A: <code>AgentConfig</code> (工人的简历)</strong></p>
+<ul>
+<li><strong>作用</strong>：这是一个简单的配置类，用来描述每一个“小工”的信息。</li>
+<li><strong>包含内容</strong>：<ul>
+<li><code>agent_type</code>: 这个小工是干啥的？(比如是做数学题的，还是写代码的)。</li>
+<li><code>agent_args</code>: 具体的参数配置。</li>
+<li><code>weight</code>: <strong>权重</strong>。这个最重要，决定了它要干多少活。比如权重是 2.0，另一个是 1.0，那这个小工干的活就是另一个的 2 倍。</li>
+<li><code>evaluation_only</code>: 是不是只负责考试（评估）？如果是 <code>True</code>，那平时干活（训练数据生成）时不带它玩。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>角色 B: <code>WeightedMultiTask</code> (包工头)</strong></p>
+<ul>
+<li><strong>作用</strong>：这是文件的主角。它继承了很多类 (<code>RolloutGenerator</code> 等)，说明它对外表现得像一个普通的 Agent，但在内部，它其实是在指挥别人。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 2: 入职与算账 (初始化 <code>__init__</code>)</h3>
+<p>当这个“包工头”上任时（代码中的 <code>__init__</code> 方法），它做了几件事：</p>
+<ol>
+<li><strong>收简历</strong>：接收 <code>agent_configs</code> 列表。</li>
+<li><strong>招人</strong>：根据配置实例化所有的子 Agent，存到 <code>self.agents</code> 里。</li>
+<li><strong>算比例</strong>：<ul>
+<li>它会把所有<strong>非评估</strong>（用来干活）的 Agent 的权重加起来算出总权重。</li>
+<li>然后把每个 Agent 的权重归一化（变成百分比）。</li>
+<li><em>例子</em>：Agent A 权重 1，Agent B 权重 3。总权重 4。那么 A 负责 25%，B 负责 75%。</li>
+</ul>
+</li>
+</ol>
+<h3>✅ Task 3: 派活儿的核心算法 (<code>_distribute_counts</code>)</h3>
+<p>这是这个文件里<strong>最数学</strong>也<strong>最核心</strong>的一个辅助函数。</p>
+<ul>
+<li><strong>场景</strong>：老板（外部调用者）说：“我要 100 条数据”。</li>
+<li><strong>问题</strong>：怎么把这 100 条任务分给 A (25%) 和 B (75%)？</li>
+<li><strong>逻辑</strong>：<ol>
+<li><strong>理想计算</strong>：A 应得 25 条，B 应得 75 条。这很简单。</li>
+<li><strong>处理零头</strong>：如果老板要 10 条数据呢？A 应得 2.5 条，B 应得 7.5 条。数据不能只有半条。</li>
+<li><strong>解决办法</strong>：<ul>
+<li>先取整数：A 拿 2 条，B 拿 7 条。总共 9 条。</li>
+<li>剩下 1 条给谁？代码会看谁的“小数部分”最大。B 的小数是 0.5，A 的小数是 0.5（假设这里有排序逻辑），它会把剩下的分配给最该得的人，确保总数对得上。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 4: 执行简单任务 (<code>get_reward_rollouts</code> &amp; <code>get_contrastive_rollouts</code>)</h3>
+<p>这两种任务逻辑一样，比较简单：</p>
+<ol>
+<li><strong>接单</strong>：收到请求 <code>RolloutRequest</code>，里面写了要多少个 Rollout（比如 100 个）。</li>
+<li><strong>分单</strong>：调用 Task 3 的逻辑，算出每个小工该做几个。</li>
+<li><strong>并发干活</strong>：<ul>
+<li>代码使用了 <code>asyncio.gather(*tasks)</code>。</li>
+<li>这意味着包工头对小工们喊：“大家一起开工！”</li>
+<li>A 做 A 的，B 做 B 的，同时进行，互不等待。</li>
+</ul>
+</li>
+<li><strong>交货</strong>：等所有小工都做完了，包工头把大家的结果打包成一个大列表返回。</li>
+</ol>
+<h3>✅ Task 5: 执行复杂流水线任务 (<code>get_grouped_rollouts</code>)</h3>
+<p>这是代码里<strong>最难懂</strong>的部分。</p>
+<ul>
+<li><strong>场景</strong>：这是一个<strong>生成器 (Generator)</strong>，也就是“流水线”。老板不是一次性要货，而是拿着个篮子站在流水线口，出来一个拿一个。</li>
+<li><strong>难点</strong>：如果 A 做的快，B 做的慢，或者 A 的任务多，B 的任务少，怎么保证流水线上出来的产品是<strong>混合均匀</strong>的？（不能先出来 100 个 A，再出来 100 个 B，这样训练效果不好）。</li>
+<li><strong>逻辑拆解</strong>：<ol>
+<li><strong>计算配额</strong>：算出每个 Agent 需要负责多少组数据。</li>
+<li><strong>平衡速率 (<code>agent_slots</code>)</strong>：代码计算了一个比例，用来控制从每个 Agent 拿数据的频率。</li>
+<li><strong>创建生产者</strong>：每个子 Agent 都是一个独立的流水线（Generator）。</li>
+<li><strong>混合输出 (While Loop)</strong>：<ul>
+<li>它用了一个 <code>asyncio.Queue</code> (传送带)。</li>
+<li>它启动了多个后台任务，根据计算好的比例，轮流从不同的子 Agent 那里拉取数据放到传送带上。</li>
+<li>最终 <code>yield</code> 出来的数据，就是按照权重混合好的流式数据。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 6: 考试 (<code>run_evaluation</code>)</h3>
+<p>最后是评估环节。</p>
+<ul>
+<li><strong>逻辑</strong>：评估和训练不一样。训练是大家分担工作量，而评估通常是<strong>全员参加</strong>。</li>
+<li><strong>操作</strong>：<ul>
+<li>遍历所有支持评估 (<code>EvaluationAgent</code>) 的小工。</li>
+<li>把考卷（Prompt）发给每一个人。</li>
+<li>大家一起做 (<code>asyncio.gather</code>)。</li>
+<li>收集所有人的成绩单返回。</li>
+<li><em>注意</em>：这里不进行权重的分配，因为考试通常是独立的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (一句话说明)</h3>
+<p><strong><code>WeightedMultiTask</code> 就是一个负责按比例分发任务的中间层，它让你可以把“做数学题的模型”和“写代码的模型”按 3:7 的比例混合起来进行训练或生成数据，并且支持并发加速。</strong></p>

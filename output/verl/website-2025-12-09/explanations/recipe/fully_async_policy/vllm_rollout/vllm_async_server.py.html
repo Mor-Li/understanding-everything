@@ -1,0 +1,88 @@
+<h1>recipe/fully_async_policy/vllm_rollout/vllm_async_server.py</h1>
+<p>这段代码确实涉及了<strong>异步编程（Asyncio）</strong>、<strong>分布式计算（Ray）</strong>以及<strong>大模型推理（vLLM）</strong>的结合，乍一看很复杂。</p>
+<p>简单来说，这段代码实现了一个<strong>“随时可以被叫停”的大模型推理服务</strong>。</p>
+<p>为了让你读懂它，我为你制定了一个<strong>6步走的“学习任务清单（Todo List）”</strong>。我们把这个代码想象成一个<strong>“在大公司里打工的文员”</strong>，一步步拆解它的工作。</p>
+<hr />
+<h3>📝 任务清单：读懂 <code>vllm_async_server.py</code></h3>
+<h4>✅ Task 1: 搞清楚角色的身份</h4>
+<p><strong>关注点</strong>：<code>@ray.remote</code> 和 <code>class vLLMHttpServerForPartial</code></p>
+<ul>
+<li><strong>它的身份</strong>：这个类是一个被 Ray 管理的“远程打工者”（Actor）。它运行在单独的进程甚至单独的服务器上。</li>
+<li><strong>它的核心技能</strong>：基于 <code>vLLM</code> 引擎，负责接收 Prompt（提示词），然后吐出生成的文本。</li>
+<li><strong>它的特殊之处</strong>：名字里的 <code>ForPartial</code> 暗示了它支持“部分生成”或者“中途打断”。普通的推理服务通常是一口气写完，而它支持写到一半被老板叫停。</li>
+</ul>
+<h4>✅ Task 2: 看看它是怎么“写作业”的</h4>
+<p><strong>关注点</strong>：<code>_generate_step</code> 方法</p>
+<ul>
+<li><strong>逻辑</strong>：这是真正干活的地方。<ol>
+<li><strong>准备参数</strong>：计算还能写多少字（<code>max_tokens</code>），设置采样参数（比如不重复度）。</li>
+<li><strong>处理特殊模型</strong>：看到 <code>_qwen2_5_vl...</code> 了吗？这是专门针对 Qwen2.5-VL 这个视觉模型的特殊处理（去重图片 token），你可以暂时忽略这个细节。</li>
+<li><strong>开始生成</strong>：调用 <code>self.engine.generate</code>。</li>
+<li><strong>收集结果</strong>：使用 <code>async for</code> 循环不断获取 vLLM 吐出的新字，并把结果存到 <code>self.req_output</code> 里。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 3: 核心机制——“赛跑游戏” (最重要的一步)</h4>
+<p><strong>关注点</strong>：<code>generate_for_partial</code> 方法中的 <code>asyncio.wait</code></p>
+<p>这是全篇最难懂也是最精髓的地方。普通的生成是“一直等到写完”，但这里玩了一个<strong>赛跑游戏</strong>。</p>
+<ul>
+<li><strong>比赛选手</strong>：<ol>
+<li><strong>选手 A (<code>generation_handle</code>)</strong>：负责专心写作业（调用上面的 <code>_generate_step</code>）。</li>
+<li><strong>选手 B (<code>cancel_handle</code>)</strong>：负责监听“停止信号”（等待 <code>self.cancel_event</code> 被触发）。</li>
+</ol>
+</li>
+<li><strong>裁判规则</strong>：<ul>
+<li>代码：<code>await asyncio.wait(..., return_when=asyncio.FIRST_COMPLETED)</code></li>
+<li>解释：<strong>谁先完成，就立刻结束等待！</strong></li>
+</ul>
+</li>
+<li><strong>两种结局</strong>：<ul>
+<li><strong>结局 1（正常写完）</strong>：选手 A 先跑完。说明作业写完了，没人叫停。于是代码提取结果，返回 token 和概率。</li>
+<li><strong>结局 2（被叫停了）</strong>：选手 B 先跑完。说明生成还没结束，外部就发出了“取消”信号。于是代码会取消选手 A 的任务，收拾东西返回（返回 <code>is_cancel=True</code>）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 谁在发号施令？</h4>
+<p><strong>关注点</strong>：<code>cancel</code> 和 <code>resume</code> 方法</p>
+<ul>
+<li><strong>Cancel (暂停/取消)</strong>：<ul>
+<li>老板说：“大家停手！”</li>
+<li>它把 <code>self.paused</code> 设为 <code>True</code>。</li>
+<li>最关键的是：它遍历所有正在进行的任务，触发它们的 <code>cancel_event</code>。这会让 Task 3 里的“选手 B”瞬间冲过终点，从而强制结束生成任务。</li>
+</ul>
+</li>
+<li><strong>Resume (恢复)</strong>：<ul>
+<li>老板说：“可以接新活了。”</li>
+<li>把 <code>self.paused</code> 设为 <code>False</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 善后的工作</h4>
+<p><strong>关注点</strong>：<code>generate_for_partial</code> 的后半部分</p>
+<ul>
+<li>无论是因为写完了，还是被叫停了，都需要清理现场：<ul>
+<li>如果是被叫停的（<code>generation_handle</code> 还在 <code>pend</code> 列表里），要手动 <code>task.cancel()</code> 杀掉生成任务，释放显存。</li>
+<li>清理字典里的 <code>request_id</code> 记录，防止内存泄漏。</li>
+<li>最后返回三个值：<code>token_ids</code> (生成的字), <code>log_probs</code> (概率), <code>is_cancel</code> (是不是被腰斩了)。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 组长来了</h4>
+<p><strong>关注点</strong>：<code>class FullyAsyncvLLMReplica</code></p>
+<ul>
+<li>这个类是上面那个打工者的“组长”（Replica）。</li>
+<li>它不直接干活，它负责管理一组 GPU。</li>
+<li>它的 <code>cancel</code> 和 <code>resume</code> 方法就是简单的广播：收到命令后，通知手下所有的 <code>vLLMHttpServerForPartial</code> 执行暂停或恢复。</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p><strong>场景</strong>：
+这通常用在<strong>强化学习（RL）训练</strong>中。</p>
+<p><strong>故事</strong>：
+想象你在训练 AI 玩游戏。
+1.  你让 AI 开始尝试玩一局（发起推理请求 <code>generate_for_partial</code>）。
+2.  突然，你发现这一局的数据已经够用了，或者模型参数更新了，旧的尝试没意义了。
+3.  你需要<strong>立刻</strong>让所有正在生成的 GPU 停下来，不要浪费电和时间（调用 <code>cancel</code>）。
+4.  这段代码就是为了实现这个<strong>“急刹车”</strong>功能的。</p>
+<p><strong>一句话概括</strong>：
+这是一个<strong>支持异步急刹车</strong>的 vLLM 推理服务封装，利用 Python 的 <code>asyncio</code> 竞速机制（Race），在“生成完成”和“收到取消信号”之间看谁先发生，从而实现高效的资源控制。</p>

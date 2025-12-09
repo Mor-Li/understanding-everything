@@ -1,0 +1,96 @@
+<h1>tests/functional_tests/shell_test_utils/run_ci_test.sh</h1>
+<p>这份脚本 <code>run_ci_test.sh</code> 是一个用于 <strong>CI（持续集成）测试</strong> 的“总控”脚本。它的核心目的是：<strong>准备环境 -&gt; 修改配置 -&gt; 启动模型训练 -&gt; 收集结果 -&gt; 对比结果（测试通过/失败）</strong>。</p>
+<p>你可以把它想象成一个自动化测试的“监工”。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>Task To-Do List</strong>，然后一步步给你讲解每一步在做什么。</p>
+<hr />
+<h3>📝 脚本执行 To-Do List</h3>
+<ol>
+<li><strong>[环境准备]</strong> 初始化环境，解析输入参数，检查必须的变量。</li>
+<li><strong>[配置读取与调整]</strong> 从 YAML 文件读取配置，如果是“轻量级模式”则修改配置以加速测试。</li>
+<li><strong>[循环执行]</strong> 开始测试循环（通常跑 1 次，某些测试可能跑多次）。</li>
+<li><strong>[训练启动]</strong> 根据不同的测试类型（普通训练、断点续训、一致性测试），调用底层的训练脚本。</li>
+<li><strong>[断点续训模拟]</strong> (仅针对特定测试) 如果是测试“断点续训”功能，需要模拟中断并再次启动。</li>
+<li><strong>[数据提取]</strong> 从 TensorBoard 日志中提取训练指标（Loss, 吞吐量等）。</li>
+<li><strong>[结果验证]</strong> 运行 Python 脚本（Pytest），将提取的数据与“标准答案（Golden Values）”进行对比。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解</h3>
+<h4>第一步：环境准备 (Setup)</h4>
+<p><strong>代码位置：</strong> 开头 到 <code>MANDATORY_VARS</code> 检查结束。</p>
+<ul>
+<li><strong>做什么：</strong><ul>
+<li><code>ulimit</code>: 调高系统限制（打开文件数、进程数），防止训练因为资源限制报错。</li>
+<li><strong>参数解析循环</strong>：把传入脚本的参数（如 <code>KEY=VALUE</code>）清洗干净并变成环境变量。</li>
+<li><strong>必填检查</strong>：检查 <code>MANDATORY_VARS</code> 列表里的变量（如 <code>TRAINING_SCRIPT_PATH</code>, <code>GOLDEN_VALUES_PATH</code> 等）是否都传进来了，缺一个就报错退出。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：配置读取与调整 (Config &amp; Lightweight Mode)</h4>
+<p><strong>代码位置：</strong> <code># Extract settings from params file</code> 到 <code>export RECORD_CHECKPOINTS...</code></p>
+<ul>
+<li><strong>做什么：</strong><ul>
+<li>使用 <code>yq</code> 工具读取 YAML 配置文件，确定 <code>TEST_TYPE</code>（测试类型，如普通训练、断点续训）和 <code>MODE</code>（模式，如预训练、推理）。</li>
+<li><strong>Lightweight Mode (轻量模式)</strong>：这是 CI 的关键。真正的训练可能要跑几天，CI 只需要验证代码能不能跑通。<ul>
+<li>如果开启了 <code>ENABLE_LIGHTWEIGHT_MODE</code>，脚本会<strong>原地修改</strong> YAML 配置文件。</li>
+<li>比如：把 <code>max_steps</code> 改成 2 步，或者把 <code>exit-interval</code> 改成 4 步。</li>
+<li><strong>目的</strong>：让庞大的模型只跑几秒钟就结束，只为了验证“能跑”且“收敛趋势对”。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：训练启动 (Run Training)</h4>
+<p><strong>代码位置：</strong> <code>for i in $(seq 1 $N_REPEAT); do</code> ... 这里的逻辑比较复杂，分情况讨论。</p>
+<ul>
+<li><strong>情况 A：Checkpoint Consistency (一致性测试)</strong><ul>
+<li><strong>逻辑</strong>：脚本会遍历配置文件里的多个模型参数（<code>MODEL_ARGS_1</code>, <code>MODEL_ARGS_2</code>...），循环运行多次微小的训练。</li>
+<li><strong>目的</strong>：验证修改模型参数后，梯度更新是否符合预期。</li>
+</ul>
+</li>
+<li><strong>情况 B：Standard Run (标准训练)</strong><ul>
+<li><strong>逻辑</strong>：直接调用 <code>bash .../_run_training.sh</code>。这是真正干活的地方，启动 GPU 进行计算。</li>
+<li><strong>变量控制</strong>：设置 <code>CHECKPOINT_LOAD_PATH</code>（从哪读档）和 <code>CHECKPOINT_SAVE_PATH</code>（存档去哪）。</li>
+</ul>
+</li>
+</ul>
+<h4>第四步：断点续训模拟 (Resume Logic)</h4>
+<p><strong>代码位置：</strong> 也就是 <code>if [[ "$TEST_TYPE" == "ckpt-resume" ...</code> 这一块。</p>
+<ul>
+<li><strong>背景</strong>：为了测试“训练挂了能不能接着跑”，CI 需要演戏。</li>
+<li><strong>剧本</strong>：<ol>
+<li>第一次训练正常跑完（比如跑了 100 步）。</li>
+<li>脚本删掉第 100 步的存档，假装只跑到了 50 步（修改 <code>latest_checkpointed_iteration.txt</code>）。</li>
+<li>设置 <code>RUN_NUMBER=2</code>，再次调用 <code>_run_training.sh</code>。</li>
+<li><strong>目的</strong>：验证第二次运行能不能成功加载第 50 步的存档，并继续训练。</li>
+</ol>
+</li>
+</ul>
+<h4>第五步：数据提取 (Extract Results)</h4>
+<p><strong>代码位置：</strong> <code>if [[ ${SKIP_PYTEST:-0} != 1 ...</code> 下方的 <code>uv run ... get_test_results_from_tensorboard_logs.py</code>。</p>
+<ul>
+<li><strong>做什么</strong>：训练会产生 TensorBoard 日志（二进制文件）。Python 脚本把这些日志解析出来，生成一个 JSON 文件。</li>
+<li><strong>内容</strong>：比如第 10 步的 Loss 是多少，显存占用了多少。</li>
+</ul>
+<h4>第六步：结果验证 (Verification / Pytest)</h4>
+<p><strong>代码位置：</strong> 脚本末尾的 <code>if [[ "$SLURM_NODEID" -eq 0 ]]; then ... pytest ...</code></p>
+<ul>
+<li><strong>核心逻辑</strong>：这是判卷子的时候。</li>
+<li><strong>Golden Values (标准答案)</strong>：仓库里存着一份 <code>golden_values.json</code>，里面是已知正确的 Loss 曲线。</li>
+<li><strong>Pretraining Test (预训练测试)</strong>：<ul>
+<li>运行 <code>test_pretraining_regular_pipeline.py</code>。</li>
+<li><strong>比较</strong>：把刚才提取的 JSON 和标准答案比对。如果 Loss 偏差超过阈值（比如 0.01），测试失败。</li>
+</ul>
+</li>
+<li><strong>Resume Test (续训测试)</strong>：<ul>
+<li>运行 <code>test_pretraining_resume_checkpoint_pipeline.py</code>。</li>
+<li><strong>比较</strong>：对比“第一次完整跑的 Loss”和“断点续训跑出来的 Loss”。两者应该完全一致（Bit-wise match），如果不一样，说明保存/加载存档有 Bug。</li>
+</ul>
+</li>
+<li><strong>Inference / RL Test</strong>：针对推理或强化学习运行对应的测试脚本。</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>自动化的流水线</strong>：
+1.  <strong>准备</strong>（设变量、改配置变快）
+2.  <strong>执行</strong>（跑训练，可能跑两次以测试续训）
+3.  <strong>阅卷</strong>（把跑出来的结果和标准答案比对）</p>
+<p>看不懂是因为它把很多种测试情况（普通、续训、一致性、推理、RL）都写在一个 Shell 脚本里了，通过大量的 <code>if/else</code> 来跳转逻辑。</p>

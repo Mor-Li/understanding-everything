@@ -1,0 +1,106 @@
+<h1>verl/experimental/reward/reward_manager.py</h1>
+<p>这份代码其实在实现一个 <strong>“阅卷中心”</strong>（Reward Manager）。</p>
+<p>在强化学习（RLHF）中，模型生成了回复（做完了试卷），需要有人来给它打分（Reward）。这份代码就是负责<strong>组织、分发和执行打分任务</strong>的管家。</p>
+<p>为了让你更容易理解，我把这个过程拆解成一个 <strong>任务清单 (Todo List)</strong>，分为 <strong>“经理的任务”</strong> 和 <strong>“工人的任务”</strong> 两部分。</p>
+<hr />
+<h3>角色介绍</h3>
+<ol>
+<li><strong><code>RewardLoopManager</code> (经理)</strong>: 负责统筹全局，管理资源，把一大堆试卷（数据）分发给工人。</li>
+<li><strong><code>RewardLoopWorker</code> (工人)</strong>: 负责具体干活，拿到一张试卷，算出分数，然后交回给经理。</li>
+</ol>
+<hr />
+<h3>第一阶段：经理的任务 (Manager Setup &amp; Dispatch)</h3>
+<p><strong>对应类：<code>RewardLoopManager</code></strong></p>
+<p>经理的主要职责是建立阅卷团队，并把任务分发下去。</p>
+<ul>
+<li>
+<p><strong>[Todo 1] 招聘阅卷工人 (Init Workers)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>__init__</code> -&gt; <code>_init_reward_loop_workers</code></li>
+<li><strong>解释</strong>: 经理根据配置（<code>num_workers</code>），在不同的计算节点（服务器）上启动多个 <code>RewardLoopWorker</code>（工人）。这利用了 <code>ray</code> 这个库来实现并行计算。</li>
+</ul>
+</li>
+<li>
+<p><strong>[Todo 2] 准备阅卷机器 (Setup Model Manager)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>__init__</code></li>
+<li><strong>解释</strong>: 如果打分需要用到 AI 模型（比如 Reward Model），经理会启动一个 <code>RewardModelManager</code>（可以理解为一台昂贵的自动阅卷机），并拿到它的访问地址（<code>reward_router_address</code>）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[Todo 3] 分发试卷并收集分数 (Compute Scores)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>compute_rm_score</code></li>
+<li><strong>解释</strong>:<ol>
+<li><strong>唤醒机器</strong>: 如果有 AI 阅卷机，先把它叫醒 (<code>wake_up</code>)。</li>
+<li><strong>切分试卷</strong>: 把一大批数据 (<code>DataProto</code>) 切成小块 (<code>chunks</code>)。</li>
+<li><strong>并行分发</strong>: 把这些小块分别扔给不同的工人 (<code>worker.compute_score_batch</code>) 去算分。</li>
+<li><strong>汇总成绩</strong>: 等所有工人都算完，经理把分数收集起来，整理成一个列表。</li>
+<li><strong>填表</strong>: 把分数填回到数据表格里对应的位置（处理 padding 和 mask，确保分数打在生成的最后一个 token 上）。</li>
+<li><strong>休眠机器</strong>: 阅卷结束，让 AI 机器休息 (<code>sleep</code>) 省电。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第二阶段：工人的任务 (Worker Execution)</h3>
+<p><strong>对应类：<code>RewardLoopWorker</code></strong></p>
+<p>工人是实际执行打分逻辑的地方。他们非常灵活，可以用三种方式打分。</p>
+<ul>
+<li>
+<p><strong>[Todo 1] 准备工具箱 (Init)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>_init_reward_loop_workers</code> -&gt; <code>_init_reward_fn</code></li>
+<li><strong>解释</strong>: 工人上班第一件事是拿工具。<ul>
+<li><code>input_tokenizer</code>: 用来读懂题目。</li>
+<li><code>reward_model_tokenizer</code>: 用来把题目格式化成阅卷机能懂的格式。</li>
+<li><code>reward_fn</code>: 如果是人工规则打分（比如写代码判断数学题对错），就加载这个函数。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[Todo 2] 决定用什么方式阅卷 (Compute Score Logic)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>compute_score</code></li>
+<li><strong>解释</strong>: 工人拿到试卷后，会看一眼说明书（Config），决定怎么打分：<ul>
+<li><strong>情况 A (自定义)</strong>: 如果用户给了自定义的打分脚本 -&gt; <strong>用脚本打分</strong>。</li>
+<li><strong>情况 B (AI 模型)</strong>: 如果没脚本但开启了 Reward Model -&gt; <strong>用 AI 模型打分</strong> (通常指 Discriminative RM，判别式模型)。</li>
+<li><strong>情况 C (规则)</strong>: 如果都没开 -&gt; <strong>用默认的规则代码打分</strong>。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[Todo 3] 具体的 AI 打分流程 (Preprocess &amp; Request)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>compute_score_disrm</code> 和 <code>_post_request</code></li>
+<li><strong>解释</strong>: 如果决定用 AI 打分，工人需要做以下几步：<ol>
+<li><strong>整理卷面 (<code>_preprocess_reward_inputs</code>)</strong>: 把“提示词(Prompt)”和“模型回答(Response)”拼在一起，加上特殊的对话标签（chat template），变成 AI 阅卷机能读懂的字符串。</li>
+<li><strong>打电话给阅卷机 (<code>_post_request</code>)</strong>: 工人自己不跑大模型，而是通过 HTTP 请求（打电话）把整理好的字符串发给刚才经理准备好的 AI 阅卷机（Router）。</li>
+<li><strong>支持不同引擎</strong>: 代码里适配了 <code>vllm</code> 和 <code>sglang</code> 两种推理引擎的接口。</li>
+<li><strong>拿到分数</strong>: 阅卷机返回一个概率值或者 embedding，工人把它作为分数记录下来。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：整个流程的一步步回放</h3>
+<ol>
+<li><strong>初始化</strong>: 你启动程序，<code>RewardLoopManager</code> 成立，雇佣了 8 个 <code>RewardLoopWorker</code> 分布在不同显卡上。</li>
+<li><strong>来活了</strong>: 训练过程中产生了一批数据（比如 64 条问答）。</li>
+<li><strong>分发</strong>: 经理把这 64 条数据分成 8 份，每份 8 条，扔给 8 个工人。</li>
+<li><strong>工人干活</strong>:<ul>
+<li>工人 A 拿到数据。</li>
+<li>它发现配置里写着“用 Reward Model 打分”。</li>
+<li>它把问答拼成字符串。</li>
+<li>它向 <code>http://localhost:xxxx/classify</code> 发送请求。</li>
+<li>它收到了分数：0.85 分。</li>
+</ul>
+</li>
+<li><strong>汇总</strong>: 所有工人都做完了，把结果发回给经理。</li>
+<li><strong>交付</strong>: 经理把分数整理好，交给 PPO 算法去更新模型。</li>
+</ol>
+<p><strong>核心观点</strong>: 这个文件的核心在于<strong>解耦</strong>。它把“怎么算分”（逻辑）和“怎么跑模型”（推理引擎）分开了，并且通过 Ray 实现了<strong>分布式</strong>并行打分，提高了效率。</p>

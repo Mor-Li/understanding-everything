@@ -1,0 +1,146 @@
+<h1>verl/utils/experimental/torch_functional.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到 <strong>深度学习框架底层优化（PyTorch Autograd）</strong> 和 <strong>显存优化技术</strong>。如果不是专门做底层算子优化的工程师，看不懂是非常正常的。</p>
+<p>简单来说，这段代码是为了解决 <strong>大模型训练（特别是PPO强化学习）时的显存爆炸（OOM）问题</strong>。</p>
+<p>为了让你理解，我把这个代码的解读拆解成 <strong>5个 Task</strong> 的 To-Do List，我们一步一步来攻克。</p>
+<hr />
+<h3>Task 1：理解背景 —— 为什么要写这个文件？</h3>
+<p><strong>核心痛点：词表太大，显存不够。</strong></p>
+<p>在 LLM（大语言模型）的 PPO 训练中，我们需要计算两个东西：
+1.  <strong>Token Log Probs</strong>：模型生成某个 Token 的概率对数（用于计算策略梯度）。
+2.  <strong>Entropy</strong>：模型的熵（用于防止模型过早收敛，保持探索性）。</p>
+<p><strong>标准做法是这样的：</strong>
+1.  拿到 <code>hidden_states</code> (形状假设是 <code>[Batch, Seq_Len, Hidden_Dim]</code>)。
+2.  乘以词表权重 <code>vocab_weights</code> (形状 <code>[Vocab_Size, Hidden_Dim]</code>)。
+3.  得到 <code>logits</code> (形状 <code>[Batch, Seq_Len, Vocab_Size]</code>)。</p>
+<p><strong>问题出在第 3 步：</strong>
+假设 Batch=2, Seq_Len=4096, Vocab_Size=100,000 (很多大模型词表很大)。
+<code>logits</code> 张量的大小是：$2 \times 4096 \times 100000 \times 4 \text{ bytes (float32)} \approx 3.2 \text{ GB}$。
+这还只是前向传播，反向传播需要存梯度，显存占用直接翻倍甚至更多。这只是一个中间变量，却占用了巨大的显存。</p>
+<p><strong>这个文件的解决方案：</strong>
+不要一次性算出所有的 <code>logits</code>。把长长的序列 <strong>切成小块（Chunk）</strong>，算完一块的 LogProb 和 Entropy，就扔掉 Logits，再算下一块。这就叫 <strong>Fused（融合）</strong> + <strong>Chunking（分块）</strong>。</p>
+<hr />
+<h3>Task 2：理解核心数学逻辑 —— <code>_fused_linear_for_ppo_fwd</code></h3>
+<p>这个函数是 <strong>前向传播</strong> 的核心逻辑（针对一个小块数据）。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_fused_linear_for_ppo_fwd</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 1. 计算 Logits (矩阵乘法)</span>
+    <span class="c1"># hidden_states @ vocab_weights.t() 就是把隐藏层投影到词表空间</span>
+    <span class="n">logits</span> <span class="o">=</span> <span class="p">(</span><span class="n">hidden_states</span> <span class="o">@</span> <span class="n">vocab_weights</span><span class="o">.</span><span class="n">t</span><span class="p">())</span> <span class="o">/</span> <span class="n">temperature</span>
+
+    <span class="c1"># 2. 计算概率分布</span>
+    <span class="n">probs</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>      <span class="c1"># 概率</span>
+    <span class="n">log_probs</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span> <span class="c1"># 概率的对数</span>
+
+    <span class="c1"># 3. 挑出真实 Token 的概率 (Log Prob)</span>
+    <span class="c1"># gather 是根据 input_ids (实际生成的词) 把对应的概率挑出来</span>
+    <span class="n">token_log_probs</span> <span class="o">=</span> <span class="n">log_probs</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">input_ids</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span><span class="o">.</span><span class="n">squeeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+
+    <span class="c1"># 4. 计算熵 (Entropy)</span>
+    <span class="c1"># Entropy = - sum(p * log(p))</span>
+    <span class="c1"># 代码里的写法是数学上的等价变形，为了数值稳定性</span>
+    <span class="n">entropy</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">logsumexp</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span> <span class="o">-</span> <span class="n">torch</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">probs</span> <span class="o">*</span> <span class="n">logits</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">token_log_probs</span><span class="p">,</span> <span class="n">entropy</span>
+</code></pre></div>
+
+<p><strong>这一步总结：</strong> 输入隐藏层状态，输出该状态下选中 Token 的概率和当前的熵。</p>
+<hr />
+<h3>Task 3：理解手动反向传播 —— <code>_fused_linear_for_ppo_bwd</code></h3>
+<p>这是最难懂的部分。</p>
+<p><strong>为什么要有这个函数？</strong>
+通常 PyTorch 会自动帮我们做反向传播（AutoGrad）。但是，为了省显存，我们在 Forward 过程中<strong>没有保存</strong>那个巨大的 <code>logits</code> 张量。PyTorch 默认机制找不到这个中间变量，就没法自动求导了。
+所以，我们需要 <strong>手动推导公式</strong>，告诉 PyTorch：“别管中间过程了，我直接告诉你梯度（Gradient）是多少”。</p>
+<p><strong>代码解读：</strong>
+你需要关注的是梯度的链式法则：
+1.  我们已知最终 Loss 对 <code>token_log_probs</code> 的梯度 (<code>dlog_probs</code>) 和对 <code>entropy</code> 的梯度 (<code>dentropy</code>)。
+2.  我们需要求 Loss 对 <code>logits</code> 的梯度 (<code>dlogits</code>)。
+3.  最后求 Loss 对 <code>hidden_states</code> 和 <code>vocab_weights</code> 的梯度。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_fused_linear_for_ppo_bwd</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 重新计算一遍 logits 和 probs (因为为了省显存，之前没存，现在要重算) ...</span>
+
+    <span class="n">dlogits</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># 1. log_probs 带来的梯度贡献</span>
+    <span class="k">if</span> <span class="n">dlog_probs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># 数学公式推导的结果： d(log_p) / d(logits) = one_hot - probs</span>
+        <span class="n">dlogits</span> <span class="o">+=</span> <span class="n">dlog_probs</span> <span class="o">...</span> <span class="o">*</span> <span class="p">(</span><span class="n">one_hot_input</span> <span class="o">-</span> <span class="n">probs</span><span class="p">)</span>
+
+    <span class="c1"># 2. entropy 带来的梯度贡献</span>
+    <span class="k">if</span> <span class="n">dentropy</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># 熵对 logits 的导数公式比较复杂，这里直接套用了公式</span>
+        <span class="n">dlogits</span> <span class="o">+=</span> <span class="o">...</span> 
+
+    <span class="c1"># 3. 链式法则最后一步：从 dlogits 传回到 dhidden_states 和 dvocab_weights</span>
+    <span class="n">dhidden_states</span> <span class="o">=</span> <span class="n">dlogits</span> <span class="o">@</span> <span class="n">vocab_weights</span>
+    <span class="n">dvocab_weights</span> <span class="o">=</span> <span class="n">dlogits</span><span class="o">.</span><span class="n">t</span><span class="p">()</span> <span class="o">@</span> <span class="n">hidden_states</span>
+
+    <span class="k">return</span> <span class="n">dhidden_states</span><span class="p">,</span> <span class="n">dvocab_weights</span>
+</code></pre></div>
+
+<hr />
+<h3>Task 4：理解“切香肠”战术 —— <code>FusedLinearForPPOFunction</code></h3>
+<p>这个类继承自 <code>torch.autograd.Function</code>，它是连接 PyTorch 引擎和上面两个数学函数的桥梁。它负责实施 <strong>Chunking（分块）</strong> 策略。</p>
+<p><strong>Forward (前向) 逻辑：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="o">...</span> <span class="n">chunk_size</span><span class="o">=</span><span class="mi">512</span><span class="p">):</span>
+        <span class="c1"># ... 准备工作 ...</span>
+
+        <span class="c1"># 核心循环：切香肠</span>
+        <span class="c1"># 假设序列长度 T=4096，chunk_size=512，那就循环 8 次</span>
+        <span class="k">for</span> <span class="n">chunk_start</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">):</span>
+            <span class="c1"># 1. 切出一小块数据</span>
+            <span class="c1"># 2. 扔给 Task 2 里的函数去算</span>
+            <span class="n">chunk_log_probs</span><span class="p">,</span> <span class="n">chunk_entropy</span> <span class="o">=</span> <span class="n">_fused_linear_for_ppo_fwd</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 3. 把结果存起来</span>
+            <span class="n">log_probs</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">chunk_log_probs</span>
+            <span class="n">entropy</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">chunk_entropy</span>
+
+            <span class="c1"># 注意：这里没有保存 logits！省下了巨大的显存！</span>
+
+        <span class="c1"># ... 保存必要变量给 Backward 用 ...</span>
+        <span class="k">return</span> <span class="n">log_probs</span><span class="p">,</span> <span class="n">entropy</span>
+</code></pre></div>
+
+<p><strong>Backward (反向) 逻辑：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">backward</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="n">dlog_probs</span><span class="p">,</span> <span class="n">dentropy</span><span class="p">):</span>
+        <span class="c1"># ... 准备工作 ...</span>
+
+        <span class="c1"># 核心循环：依然是切香肠，但是是反过来算梯度</span>
+        <span class="k">for</span> <span class="n">chunk_start</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">):</span>
+            <span class="c1"># 1. 切出对应时刻的梯度 dlog_probs 和 dentropy</span>
+            <span class="c1"># 2. 扔给 Task 3 里的函数去算这一小块的 dhidden</span>
+            <span class="n">h</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">_fused_linear_for_ppo_bwd</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 3. 累加梯度</span>
+            <span class="k">if</span> <span class="n">hidden_states</span><span class="o">.</span><span class="n">requires_grad</span><span class="p">:</span>
+                <span class="n">dhidden_states</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">+=</span> <span class="n">h</span>
+            <span class="k">if</span> <span class="n">vocab_weights</span><span class="o">.</span><span class="n">requires_grad</span><span class="p">:</span>
+                <span class="n">dvocab_weights</span> <span class="o">+=</span> <span class="n">v</span>
+
+        <span class="k">return</span> <span class="n">dhidden_states</span><span class="p">,</span> <span class="n">dvocab_weights</span><span class="p">,</span> <span class="o">...</span>
+</code></pre></div>
+
+<hr />
+<h3>Task 5：包装成 PyTorch 模块 —— <code>FusedLinearForPPO</code></h3>
+<p>最后这个类 <code>class FusedLinearForPPO(torch.nn.Module)</code> 最简单。
+它只是把上面那个复杂的 Function 包装成一个看起来像普通 PyTorch 层（Layer）的东西，方便用户调用。</p>
+<p>用户用法示例：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">model</span> <span class="o">=</span> <span class="n">FusedLinearForPPO</span><span class="p">(</span><span class="n">chunk_size</span><span class="o">=</span><span class="mi">512</span><span class="p">)</span>
+<span class="c1"># 就像用普通 Linear 层一样调用它，但内部会自动切块处理，不爆显存</span>
+<span class="n">log_probs</span><span class="p">,</span> <span class="n">entropy</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">vocab_weights</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>总结 (Summary)</h3>
+<p>现在你再回头看代码，应该能看懂大概了：</p>
+<ol>
+<li><strong>目的</strong>：为了在 PPO 训练大模型时，计算 LogProbs 和 Entropy <strong>不爆显存</strong>。</li>
+<li><strong>手段</strong>：<ul>
+<li><strong>Fused</strong>: 把 Linear 层和 LogSoftmax/Entropy 计算融合在一起。</li>
+<li><strong>Chunking</strong>: 把长序列切成小块（Chunk），循环处理，<strong>用时间换空间</strong>。</li>
+<li><strong>Custom Autograd</strong>: 因为不能存中间那个巨大的 Logits 矩阵，所以必须手写反向传播的梯度计算公式。</li>
+</ul>
+</li>
+</ol>
+<p>这个文件是一个非常典型的 <strong>Memory-Efficient PyTorch Operator</strong> 实现。</p>

@@ -1,0 +1,103 @@
+<h1>tests/test_utils/python_scripts/auto_reminder_github.py</h1>
+<p>这份代码其实是一个<strong>“自动催收机器人”</strong>。它的核心工作是：<strong>去 GitHub 上通过一系列复杂的逻辑，找出谁还在拖延代码审查（Code Review），然后去 Slack 上点名艾特他们。</strong></p>
+<p>为了让你容易理解，我把这个脚本想象成一个<strong>专门负责催进度的项目经理（PM）</strong>，下面是他在每次运行时手里拿的一份 <strong>Task Todo List（任务清单）</strong>。</p>
+<p>我们按照他工作的顺序，一步步来看：</p>
+<hr />
+<h3>🤖 催收机器人的任务清单 (Task To-Do List)</h3>
+<h4>1. 准备阶段：带好证件上岗</h4>
+<ul>
+<li><strong>任务：</strong> 检查背包里有没有 <code>GH_TOKEN</code> (GitHub 令牌) 和 <code>SLACK_TOKEN</code> (Slack 令牌)。</li>
+<li><strong>目的：</strong> 没这些证件，进不去 GitHub 的大门，也发不了 Slack 消息。</li>
+<li><strong>代码对应：</strong> <code>main()</code> 函数开头部分和 <code>PRReviewTracker.__init__</code>。</li>
+</ul>
+<h4>2. 圈定范围：只看最紧急的里程碑</h4>
+<ul>
+<li><strong>任务：</strong> 去仓库里看一眼所有的 <strong>Milestones（里程碑）</strong>，按截止日期排序，只挑<strong>最近的 2 个</strong>未完成的里程碑。</li>
+<li><strong>观点：</strong> 以前的旧账或者太远的未来先不管，只盯着当下的重点任务。</li>
+<li><strong>代码对应：</strong> <code>generate_reminders</code> 中的 <code>self.repo.get_milestones(...)[:2]</code>。</li>
+</ul>
+<h4>3. 筛选目标：找出卡住的 PR</h4>
+<ul>
+<li><strong>任务：</strong> 在这 2 个里程碑里，搜索所有<strong>打开的（Open）</strong> 且打上了 <strong>"Expert Review"</strong> 或 <strong>"Final Review"</strong> 标签的 PR。</li>
+<li><strong>观点：</strong> 只有打上这两个标签的 PR 才处于“正式审查阶段”，其他的草稿或未就绪的 PR 不催。</li>
+<li><strong>代码对应：</strong> <code>generate_reminders</code> 中的 <code>search_issues</code> 查询语句。</li>
+</ul>
+<h4>4. 深度分析（这是最核心的逻辑）：谁是责任人？</h4>
+<p>对每一个找到的 PR，机器人都要做以下复杂的计算：</p>
+<ul>
+<li>
+<p><strong>Task 4.1：判断审查阶段</strong></p>
+<ul>
+<li>看标签：如果有 <code>Final Review</code> 标签，就是终审阶段；否则是专家评审阶段 (<code>Expert Review</code>)。</li>
+<li><strong>代码对应：</strong> <code>get_stage</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 4.2：算算拖了多久（定优先级）</strong></p>
+<ul>
+<li>计算从打上标签到现在过了几天。</li>
+<li><strong>评级逻辑：</strong><ul>
+<li>拖了 &gt; 3 天：<strong>P0 (十万火急)</strong></li>
+<li>拖了 &gt;= 1 天：<strong>P1 (有点急)</strong></li>
+<li>刚开始：<strong>P2 (正常)</strong></li>
+</ul>
+</li>
+<li><strong>代码对应：</strong> <code>create_reminder</code> 中的 <code>priority</code> 计算。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 4.3：找出“谁还没干活”（核心算法）</strong></p>
+<ul>
+<li>这是一个减法逻辑：<strong>【所有应该看的人】 - 【已经点了 Approve 的人】 = 【该催的人】</strong>。</li>
+<li><strong>逻辑细节：</strong><ol>
+<li>先看谁已经 <code>Approved</code> 了（放进白名单）。</li>
+<li>再看谁被 <code>Requested</code>（被点名要求审查）了。</li>
+<li>如果是团队（Team）被点名，把团队里的每个人都拉出来。<ul>
+<li><em>特殊规则：</em> 如果是 <code>Expert Review</code> 阶段，排除掉核心团队（如 <code>core-adlr</code>）；如果是 <code>Final Review</code>，反过来只看核心团队。</li>
+</ul>
+</li>
+<li>还有谁点了 <code>Changes Requested</code>（提了意见但还没通过的），这些人也算“没干完活”。</li>
+<li>最后得出名单。</li>
+</ol>
+</li>
+<li><strong>兜底逻辑：</strong> 如果算出来名单是空的（大家都审完了，或者没人审），怎么办？<ul>
+<li>如果是专家审完了：通知 <strong>作者 (Author)</strong>，让他去把标签改成 <code>Final Review</code>。</li>
+<li>如果是终审完了：通知 <strong>之前的批准者</strong>，让他们去合并代码。</li>
+</ul>
+</li>
+<li><strong>代码对应：</strong> <code>get_reviewers</code> 方法。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 人肉搜索：找联系方式</h4>
+<ul>
+<li><strong>任务：</strong> 拿到那是GitHub 用户名（比如 <code>zhangsan</code>），需要找到他在 Slack 上的 ID（比如 <code>@U123456</code>），这样才能在群里艾特到他。</li>
+<li><strong>搜寻路径：</strong><ol>
+<li>先看 GitHub 个人主页有没有公开邮箱。</li>
+<li>没有的话，去翻他最近的代码提交记录（Commit Log），通常里面藏着邮箱（尤其是 <code>@nvidia.com</code> 的邮箱）。</li>
+<li>拿到邮箱后，去问 Slack API：“这个邮箱对应的用户 ID 是多少？”</li>
+</ol>
+</li>
+<li><strong>代码对应：</strong> <code>get_user_email</code> 和 <code>get_slack_user_id</code>。</li>
+</ul>
+<h4>6. 执行操作：发送通缉令</h4>
+<ul>
+<li><strong>任务：</strong> 把上面收集到的所有信息打包。<ul>
+<li>PR 链接、标题</li>
+<li>优先级 (P0/P1)</li>
+<li>拖延天数</li>
+<li><strong>Reviewers: @某某某, @某某某</strong> (直接艾特)</li>
+</ul>
+</li>
+<li><strong>动作：</strong> 通过 Webhook 把这条消息发到指定的 Slack 频道。</li>
+<li><strong>代码对应：</strong> <code>send_slack_notification</code>。</li>
+</ul>
+<hr />
+<h3>总结一下文中的核心观点</h3>
+<ol>
+<li><strong>分级催收：</strong> 不是所有 PR 都一样急，根据滞留时间（Days in stage）划分 P0/P1/P2，让大家知道先救哪个火。</li>
+<li><strong>精准打击：</strong> 不会群发骚扰所有人。它通过复杂的逻辑剔除了已经 Approve 的人，<strong>只艾特那些还没干活的人</strong>。</li>
+<li><strong>流程自动化：</strong> 它不仅催评审，还催流程流转。比如专家审完了，它会催作者去推到下一阶段（Final Review）；终审完了，它会催人去 Merge。</li>
+<li><strong>数据挖掘找人：</strong> 为了能艾特到人，它甚至会去爬取 commit 记录来反查用户邮箱，尽可能确保消息能触达本人。</li>
+</ol>
+<p>简单说：<strong>这是一个为了防止 PR 在 GitHub 上积灰，自动计算谁是瓶颈，并去 Slack 上“挂人”的自动化脚本。</strong></p>

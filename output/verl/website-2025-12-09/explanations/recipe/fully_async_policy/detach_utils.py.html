@@ -1,0 +1,80 @@
+<h1>recipe/fully_async_policy/detach_utils.py</h1>
+<p>这个文件 <code>detach_utils.py</code> 是在一个<strong>全异步（Fully Async）</strong>的强化学习（RL）训练框架中使用的工具包。</p>
+<p>简单来说，它的核心作用是<strong>“数据的后勤管理”</strong>。在异步训练中，生成数据（Rollout）和训练模型（Train）是分开跑的。这个文件负责把生成好的数据打包、清洗、统计，然后喂给训练器，同时负责把杂乱的监控指标整理成漂亮的报表。</p>
+<p>为了让你听懂，我把这个文件的逻辑拆解成一个 <strong>“流水线工人的 Task Todo List”</strong>，我们一步步来看数据是怎么流转的。</p>
+<hr />
+<h3>📋 任务清单 (Task List)</h3>
+<ol>
+<li><strong>定义包裹格式</strong>：规定生成好的数据应该用什么盒子装（<code>RolloutSample</code>）。</li>
+<li><strong>备料（生成前准备）</strong>：把原始的 Prompt 处理一下，准备发给模型去写作文（<code>prepare_single_generation_data</code>）。</li>
+<li><strong>打包与质检（生成后组装）</strong>：收到模型写好的作文后，把它们拼成一个大包裹，贴上标签，检查数据是不是“过期”了（<code>assemble_batch_from_rollout_samples</code>）。</li>
+<li><strong>写日报（指标聚合）</strong>：因为训练很快，数据点太碎，需要把一段时间的指标（比如耗时、分数）汇总成一个平均值或总和，方便汇报（<code>MetricsAggregator</code>）。</li>
+</ol>
+<hr />
+<h3>🧐 逐步讲解</h3>
+<h4>Task 1: 定义包裹格式</h4>
+<p><strong>对应代码：</strong> <code>class RolloutSample</code></p>
+<p>想象模型是一个在外跑业务的销售（Actor），训练器是总部的经理（Learner）。销售跑完业务（生成完数据）需要把结果寄回总部。
+<code>RolloutSample</code> 就是这个<strong>快递盒子的标准</strong>。</p>
+<ul>
+<li><strong>里面装了啥？</strong><ul>
+<li><code>full_batch</code>: 原始数据。</li>
+<li><code>agent_loop_output_list</code>: 模型生成的具体内容（比如对话结果）。</li>
+<li><code>param_version</code>: <strong>关键点！</strong> 这批数据是用哪个版本的模型生成的？（比如是 v1.0 还是 v1.1）。在异步训练中，这很重要，因为数据传回来时模型可能已经更新到 v2.0 了，这叫“过时数据”（Stale Data）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 备料（生成前准备）</h4>
+<p><strong>对应代码：</strong> <code>def prepare_single_generation_data(...)</code></p>
+<p>这是在模型开始写作文（生成）之前的准备工作。</p>
+<ul>
+<li><strong>做什么？</strong><ul>
+<li>它拿到原始数据，把不需要的东西（比如旧的 <code>input_ids</code>）扔掉，只保留核心 Prompt。</li>
+<li>它给数据贴上标签：<code>agent_name</code>（比如标记这是“异步工具Agent”）。</li>
+<li><strong>复制数据</strong>：如果设定 <code>n=4</code>，它会把一条 Prompt 复制 4 份，让模型对同一个问题生成 4 个不同的回答（用于后续对比好坏）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 打包与质检（生成后组装）</h4>
+<p><strong>对应代码：</strong> <code>def assemble_batch_from_rollout_samples(...)</code></p>
+<p>这是<strong>最核心</strong>的函数。现在模型已经写好了一堆作文（<code>RolloutSample</code> 列表），现在要把它们合并成一个大批次（Batch）喂给 PPO 算法去训练。</p>
+<ul>
+<li><strong>步骤详解：</strong><ol>
+<li><strong>合并（Concat）</strong>：把零散的 Sample 拼成一个大的 <code>DataProto</code>。</li>
+<li><strong>计算 Mask</strong>：算出 <code>response_mask</code>。这是告诉训练器：“前面这段是题目（Prompt），不要算 Loss；后面这段是模型写的（Response），要重点批改”。</li>
+<li><strong>统计耗时</strong>：计算 <code>processing_times</code>，看看生成花了多久，有没有超时。</li>
+<li><strong>检查“新鲜度”（关键逻辑）</strong>：<ul>
+<li>代码里有 <code>param_version_diff</code>。</li>
+<li>它会对比：<strong>生成数据时的模型版本</strong> vs <strong>当前训练器的模型版本</strong>。</li>
+<li>如果差值很大，说明这批数据是“老黄历”了。虽然异步算法允许一定程度的过时（Off-policy），但统计这个差值（Lag）对监控训练稳定性非常重要。</li>
+</ul>
+</li>
+<li><strong>打标签</strong>：把所有统计信息（耗时、版本差、工具调用次数）都写进 <code>meta_info</code>，方便后续记录到 WandB 或 TensorBoard。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 4: 写日报（指标聚合）</h4>
+<p><strong>对应代码：</strong> <code>class MetricsAggregator</code></p>
+<p>训练过程中，每一步都会产生几百个指标（比如 loss, reward, time）。如果每一步都打印，屏幕会刷屏，日志会爆炸。这个类就是个<strong>会计</strong>。</p>
+<ul>
+<li><strong>怎么做？</strong><ul>
+<li>它把多个步骤的指标先存起来。</li>
+<li><strong>根据规则合并</strong>：<ul>
+<li>如果是时间（<code>time</code>），就求和（Sum）。</li>
+<li>如果是分数（<code>reward</code>），就求平均（Avg）。</li>
+<li>如果是步数（<code>global_step</code>），就取最新值（Last）。</li>
+</ul>
+</li>
+<li><strong>计算特殊指标</strong>：比如 <code>perf/throughput</code>（吞吐量），它会用 <code>总Token数 / 总时间</code> 算出一个宏观的效率指标。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇代码讲了啥？</h3>
+<p>这篇代码是 <strong>Verl 框架中处理全异步训练数据流的中间件</strong>。</p>
+<p>它不负责“思考”（那是模型的事），也不负责“学习”（那是 PPO 算法的事）。
+<strong>它负责：</strong>
+1.  把原材料切好（Prepare）。
+2.  把做好的菜摆盘、检查有没有变质（Assemble &amp; Version Check）。
+3.  最后把餐厅的流水账算清楚（Aggregate Metrics）。</p>
+<p>之所以叫 <code>detach_utils</code>，是因为它帮助将<strong>生成过程（Rollout）</strong>从<strong>训练循环</strong>中<strong>分离（Detach）</strong>出来，让两者可以异步并行，互不等待。</p>

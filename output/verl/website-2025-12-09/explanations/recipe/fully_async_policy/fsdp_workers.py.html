@@ -1,0 +1,134 @@
+<h1>recipe/fully_async_policy/fsdp_workers.py</h1>
+<p>这份代码确实比较硬核，它属于 <strong>大规模语言模型（LLM）强化学习（RL）</strong> 的底层基础设施代码。</p>
+<p>为了让你看懂，我们需要先建立一个场景。想象你在训练一个像 ChatGPT 这样的模型（RLHF 阶段）：
+1.  <strong>Actor（演员/学生）</strong>：负责学习，它的参数（权重）会不断更新。
+2.  <strong>Rollout（推演/做题）</strong>：负责用当前的参数去生成文本，以此来评估好坏。</p>
+<p><strong>核心矛盾是</strong>：Actor 更新了参数后，Rollout 那边必须立刻同步到最新的参数，才能生成准确的数据。但因为模型太大（几十 GB），在不同的 GPU 甚至不同的机器上，同步非常麻烦。</p>
+<p>这份文件就是解决 <strong>“如何高效地把 Actor 训练好的脑子（权重），同步给负责干活的 Rollout，且支持异步和显存优化”</strong> 这个问题的。</p>
+<p>下面我列一个 <strong>学习 Task List</strong>，带你一步步拆解这份代码：</p>
+<hr />
+<h3>Task 1: 理解基础工具 —— “挖出模型”</h3>
+<p><strong>代码对应函数：</strong> <code>get_inference_model(rollout)</code></p>
+<ul>
+<li><strong>背景</strong>：在做推理（Rollout）时，我们通常使用 vLLM 这种加速引擎。vLLM 把模型包裹得很深。</li>
+<li><strong>代码逻辑</strong>：这个函数就像剥洋葱。<ul>
+<li>它检查 <code>inference_engine</code> 是哪种类型。</li>
+<li>然后一层层往下找（<code>llm_engine</code> -&gt; <code>model_executor</code>...），直到找到最底层的那个 <code>model</code> 对象。</li>
+</ul>
+</li>
+<li><strong>目的</strong>：只有找到最底层的模型对象，我们才能把新的权重塞进去。</li>
+</ul>
+<hr />
+<h3>Task 2: 核心任务 —— “权重同步”</h3>
+<p><strong>代码对应类：</strong> <code>DetachNcclSync</code> (继承自 <code>AsyncActorRolloutRefWorker</code>)</p>
+<p>这是所有工作的基石，主要解决“怎么传数据”的问题。</p>
+<ul>
+<li>
+<p><strong>待办事项 2.1：准备工作</strong></p>
+<ul>
+<li><strong>代码</strong>：<code>sync_rollout_weights</code> 函数。</li>
+<li><strong>逻辑</strong>：<ul>
+<li>如果是 <strong>Actor</strong>（发送方）：如果模型为了省显存被卸载到了 CPU（Offload），先把它加载回 GPU (<code>load_fsdp_model_to_gpu</code>)，准备发送。</li>
+<li>如果是 <strong>Rollout</strong>（接收方）：先准备好推理模型，甚至需要打补丁 (<code>patch_vllm_moe_model_weight_loader</code>) 以便接收数据。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>待办事项 2.2：广播数据 (Broadcast)</strong></p>
+<ul>
+<li><strong>代码</strong>：<code>collective.broadcast(tensor, src_rank=0, ...)</code></li>
+<li><strong>逻辑</strong>：<ul>
+<li>这里使用了 <strong>NCCL</strong>（一种 GPU 间极速通信的协议）或者 Ray 的集合通信。</li>
+<li><strong>Actor</strong> 把参数拿出来放在 <code>tensor</code> 里。</li>
+<li>通过 <code>broadcast</code>，Actor（Rank 0）把数据“喊”出来，所有的 Rollout 节点同时收到这份数据。</li>
+</ul>
+</li>
+<li><strong>比喻</strong>：老师（Actor）在讲台上念答案，所有学生（Rollout）在下面同步听写更新自己的课本。</li>
+</ul>
+</li>
+<li>
+<p><strong>待办事项 2.3：收尾</strong></p>
+<ul>
+<li><strong>逻辑</strong>：Actor 发完数据后，为了不占显存，可能又把模型踢回 CPU (<code>offload_fsdp_model_to_cpu</code>)。最后清理缓存 (<code>empty_cache</code>)。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 扮演 Actor 的角色</h3>
+<p><strong>代码对应类：</strong> <code>DetachActorWorker</code> (继承自 <code>DetachNcclSync</code>)</p>
+<p>这个类专门为“训练者”服务。</p>
+<ul>
+<li>
+<p><strong>待办事项 3.1：搞清楚自己有哪些权重</strong></p>
+<ul>
+<li><strong>代码</strong>：<code>get_actor_weights_info</code></li>
+<li><strong>逻辑</strong>：因为是 FSDP（模型被切碎了放在不同 GPU 上），需要先整理出一份清单：参数名叫什么？形状多大？数据类型是什么？</li>
+<li><strong>目的</strong>：把这份清单发给 Rollout，让对方准备好接收容器。</li>
+</ul>
+</li>
+<li>
+<p><strong>待办事项 3.2：获取实际参数数据</strong></p>
+<ul>
+<li><strong>代码</strong>：<code>_get_actor_params</code></li>
+<li><strong>逻辑</strong>：把分散在各个 GPU 上的参数碎片（Sharded）或者完整参数提取出来，准备传给 Task 2 里的同步函数。</li>
+</ul>
+</li>
+<li>
+<p><strong>待办事项 3.3：显存不够？存到 CPU 去</strong></p>
+<ul>
+<li><strong>代码</strong>：<code>save_model_to_cpu</code>, <code>restore_model_from_cpu</code>, <code>clear_cpu_model</code></li>
+<li><strong>逻辑</strong>：<ul>
+<li>训练 LLM 极其耗显存。这个 Worker 提供了把当前训练状态（Checkpoint）快速保存到内存（RAM）里的功能，而不是存硬盘。</li>
+<li>这样可以在需要腾出 GPU 显存给其他任务时，快速“休眠”和“唤醒”模型。使用了 <code>fsdp2_sharded_save_to_cpu</code> 等工具。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 扮演 Rollout 的角色</h3>
+<p><strong>代码对应类：</strong> <code>DetachAsyncRolloutWorker</code></p>
+<p>这个类专门为“推理者”服务。</p>
+<ul>
+<li>
+<p><strong>待办事项 4.1：初始化</strong></p>
+<ul>
+<li>很简单，就是继承基类。</li>
+</ul>
+</li>
+<li>
+<p><strong>待办事项 4.2：接收权重清单</strong></p>
+<ul>
+<li><strong>代码</strong>：<code>set_actor_weights_info</code></li>
+<li><strong>逻辑</strong>：Actor 在 Task 3.1 里生成的“清单”，Rollout 在这里接收并保存。</li>
+<li><strong>目的</strong>：Rollout 知道了：“哦，等会儿会有个叫 <code>layer1.weight</code> 的东西发过来，大小是 <code>4096 x 4096</code>”。这样在 Task 2 的同步过程中，它就知道怎么接收数据了。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：整个流程的一步步回放</h3>
+<p>如果把这个文件运行起来，流程是这样的：</p>
+<ol>
+<li><strong>启动</strong>：系统启动，Actor 和 Rollout 两个 Worker 就位。</li>
+<li><strong>握手 (Task 3.1 &amp; 4.2)</strong>：<ul>
+<li>Actor 说：<code>get_actor_weights_info</code>（我有这些参数，清单给你）。</li>
+<li>Rollout 说：<code>set_actor_weights_info</code>（收到清单，我准备好了）。</li>
+</ul>
+</li>
+<li><strong>训练循环开始</strong>：<ul>
+<li>Actor 训练了一会儿，参数更新了。</li>
+</ul>
+</li>
+<li><strong>同步 (Task 2)</strong>：<ul>
+<li>调用 <code>sync_rollout_weights</code>。</li>
+<li>Actor 把新参数从 GPU/CPU 拿出来。</li>
+<li>通过 NCCL 广播。</li>
+<li>Rollout 收到参数，直接塞进自己的推理引擎（vLLM）里。</li>
+</ul>
+</li>
+<li><strong>生成</strong>：Rollout 用新参数生成数据，传回给 Actor 继续训练。</li>
+<li><strong>显存优化 (Task 3.3)</strong>：如果在某个间隙 GPU 显存不够，Actor 会调用 <code>save_model_to_cpu</code> 暂时把权重扔到内存里避避风头。</li>
+</ol>
+<p><strong>一句话总结文中观点：</strong>
+这是一个为了支持 <strong>“完全异步策略（Fully Async Policy）”</strong> 而设计的组件，它利用 FSDP 和 NCCL 技术，实现了 <strong>训练（Actor）和推理（Rollout）分离</strong> 架构下的<strong>高效权重同步</strong>与<strong>显存管理</strong>。</p>

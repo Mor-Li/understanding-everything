@@ -1,0 +1,78 @@
+<h1>megatron/core/dist_checkpointing/mapping.py</h1>
+<p>这份代码确实比较抽象，因为它处理的是<strong>分布式训练中最底层、最核心的元数据管理</strong>问题。</p>
+<p>简单来说，这个文件的作用是：<strong>给分散在不同显卡（GPU）上的“碎片数据”贴上标签，告诉系统它们在“完整大图”中的位置，以便保存和读取。</strong></p>
+<p>为了让你看懂，我制定了一个 <strong>5步学习任务清单 (Todo List)</strong>，我们一步步来拆解。</p>
+<h3>📝 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>理解背景</strong>：为什么要搞这个“映射 (Mapping)”？</li>
+<li><strong>核心概念</strong>：读懂 <code>ShardedTensor</code>（分片张量）——这是主角。</li>
+<li><strong>实用工具</strong>：读懂 <code>from_rank_offsets</code> ——这是怎么自动计算位置的。</li>
+<li><strong>非张量数据</strong>：读懂 <code>ShardedObject</code> ——不仅存参数，还得存其他对象。</li>
+<li><strong>高级操作</strong>：读懂 <code>ShardedTensorFactory</code> ——变形金刚模式。</li>
+</ol>
+<hr />
+<h3>🚀 第一步：理解背景（为什么要搞这个？）</h3>
+<p>在 Megatron-LM 这种超大模型训练中，一个巨大的矩阵（比如 10000x10000）无法放进一张显卡。
+*   <strong>现状</strong>：我们把它切成 4 块，分给 4 张卡。每张卡只持有 5000x5000 的局部数据。
+*   <strong>问题</strong>：保存 Checkpoint（模型存档）时，如果只存 4 个独立的小文件，以后想改变切分方式（比如改成 8 张卡）就没法加载了。
+*   <strong>解决方案</strong>：我们需要在保存时描述清楚：“我是 Rank 0 上的数据，我的形状是 5000x5000，我在全局大矩阵里的位置是从 (0,0) 开始的”。</p>
+<p><strong>这个文件就是定义这种“自我描述”的格式的。</strong></p>
+<hr />
+<h3>🧩 第二步：核心概念 <code>ShardedTensor</code></h3>
+<p>这是代码里最重要的类（第 52 行）。它是一个数据类（dataclass），用来包装普通的 PyTorch Tensor。</p>
+<p>你可以把它想象成给 Tensor 穿了一件“马甲”，马甲上写着它的身份信息。</p>
+<p><strong>关键属性解读：</strong></p>
+<ul>
+<li><code>key</code>: 数据的名字（比如 "layer1.weight"）。</li>
+<li><code>data</code>: 当前显卡上的<strong>局部</strong>数据（比如那 5000x5000 的小块）。</li>
+<li><code>local_shape</code>: 局部形状 (5000, 5000)。</li>
+<li><code>global_shape</code>: <strong>全局</strong>形状 (10000, 10000) —— 完整的样子。</li>
+<li><code>global_offset</code>: <strong>全局偏移量</strong> —— 这一块数据在完整大图里的坐标起点。比如 (0, 0) 或者 (0, 5000)。</li>
+<li><code>replica_id</code>: 副本 ID。如果用了数据并行，多张卡存的数据是一样的，这个 ID 用来区分。</li>
+</ul>
+<p><strong>核心方法：</strong>
+*   <code>validate_metadata_integrity()</code>: 检查数据是否合法。比如：局部形状 + 偏移量 不能超过 全局形状。</p>
+<hr />
+<h3>🛠️ 第三步：实用工具 <code>from_rank_offsets</code></h3>
+<p>手动计算 <code>global_offset</code> 很累，容易算错。所以代码提供了一个类方法 <code>from_rank_offsets</code>（第 246 行）。</p>
+<p><strong>它的逻辑是这样的：</strong>
+与其告诉系统“我的偏移量是 5000”，不如告诉系统：“我是第 2 块”。</p>
+<p><strong>参数解释：</strong>
+*   <code>rank_offsets</code>: 这是一个元组 <code>(axis, axis_rank_offset, axis_fragm)</code>。
+    *   <code>axis</code>: 沿着哪个轴切的？（比如 0 是行，1 是列）。
+    *   <code>axis_fragm</code>: 这一行总共被切成了几份？（比如切成 2 份）。
+    *   <code>axis_rank_offset</code>: 我拿的是第几份？（比如我是第 1 份，从 0 开始数）。</p>
+<p><strong>举例：</strong>
+假设一个长度为 10 的向量，切成 2 份。
+*   Rank 0 拿着前 5 个。它会说：<code>axis=0, fragm=2, offset=0</code>。系统自动算出 <code>global_offset=0</code>。
+*   Rank 1 拿着后 5 个。它会说：<code>axis=0, fragm=2, offset=1</code>。系统自动算出 <code>global_offset=5</code>。</p>
+<hr />
+<h3>📦 第四步：非张量数据 <code>ShardedObject</code></h3>
+<p>模型里不只有 Tensor（矩阵），还有一些 Python 对象（比如列表、配置字典等）也需要分布式保存。</p>
+<p><code>ShardedObject</code>（第 447 行）就是为了处理这个。
+*   它和 <code>ShardedTensor</code> 很像，但它存的是普通 Python 对象。
+*   <strong>主要区别</strong>：它不能像 Tensor 那样随意切片（slice），它通常被视为一个不可分割的原子单元，或者是完全相同的副本。</p>
+<p>还有一个辅助类 <code>LocalNonpersistentObject</code>（第 432 行）：
+*   <strong>意思</strong>：告诉保存系统，“这个东西别存进硬盘，但我加载模型时，请在内存里给我生成一个默认的/空的占位符”。这用于那些运行时需要但不需要持久化的临时变量。</p>
+<hr />
+<h3>🏭 第五步：高级操作 <code>ShardedTensorFactory</code></h3>
+<p>这是最难懂的部分（第 513 行），叫“工厂模式”。</p>
+<p><strong>场景：</strong>
+有时候，你想保存的数据和你手里的 Tensor 长得不一样。
+比如，优化器（Optimizer）的状态可能为了计算效率，在内存里是扁平化（Flatten）存储的，但在保存 Checkpoint 时，你希望把它还原成原本的层级结构保存，方便以后查看。</p>
+<p><strong><code>ShardedTensorFactory</code> 的作用：</strong>
+它不直接存数据，它存的是<strong>“如何构建数据的方法”</strong>。</p>
+<ul>
+<li><code>build_fn</code>: <strong>保存时调用</strong>。把手头的怪异数据，转换成标准的 <code>ShardedTensor</code>。</li>
+<li><code>merge_fn</code>: <strong>加载时调用</strong>。把读出来的标准数据，变回你需要的那种怪异格式。</li>
+</ul>
+<p>代码最后的 <code>apply_factories</code> 和 <code>apply_factory_merges</code> 函数，就是用来在保存前和加载后执行这些转换逻辑的。</p>
+<hr />
+<h3>总结</h3>
+<p>读这个文件时，你脑子里要始终有一幅图：</p>
+<ol>
+<li><strong>大拼图（Global）</strong> 被切碎了。</li>
+<li>每张卡拿着 <strong>小碎片（Local）</strong>。</li>
+<li><strong><code>ShardedTensor</code></strong> 就是每块碎片背后的说明书，写着：“我是拼图的第几行第几列”。</li>
+<li>有了这个说明书，Megatron 就能把成百上千张显卡里的碎片，整齐地拼回一个大文件，或者从大文件里精准地把属于你的那块切给你。</li>
+</ol>

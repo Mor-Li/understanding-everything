@@ -1,0 +1,122 @@
+<h1>examples/post_training/modelopt/mmlu.py</h1>
+<p>这份代码是一个用于<strong>评估大模型能力</strong>的脚本。具体来说，它是基于 NVIDIA 的 <strong>Megatron-LM</strong> 框架，配合 <strong>ModelOpt</strong>（模型优化工具，通常涉及量化），在 <strong>MMLU</strong>（Massive Multitask Language Understanding，大规模多任务语言理解）数据集上测试模型的准确率。</p>
+<p>简单来说，就是<strong>给优化过的大模型做一套“全科高考试卷”，看看它考了多少分</strong>。</p>
+<p>为了让你更容易理解，我把整个脚本的逻辑拆解成一个 <strong>Task List (待办清单)</strong>，按执行顺序一步步给你讲：</p>
+<hr />
+<h3>📋 脚本执行流程 (Task List)</h3>
+<ol>
+<li><strong>[环境准备]</strong> 初始化 Megatron 环境并解析参数。</li>
+<li><strong>[模型搭建]</strong> 创建一个空的模型架构（骨架），为加载做准备。</li>
+<li><strong>[加载权重]</strong> 把训练好（或量化后）的模型参数加载进去。</li>
+<li><strong>[获取试题]</strong> 拿到 MMLU 考试的所有科目列表。</li>
+<li><strong>[循环考试]</strong> 针对每一个科目（如数学、历史、法律）：<ul>
+<li>5.1 下载/加载该科目的考题。</li>
+<li>5.2 <strong>[做题循环]</strong> 针对每一道题：<ul>
+<li>把题目包装成 Prompt（提示词）。</li>
+<li>让模型进行预测（生成答案）。</li>
+<li>批改作业（对比预测结果和标准答案）。</li>
+</ul>
+</li>
+<li>5.3 打印该科目的成绩。</li>
+</ul>
+</li>
+<li><strong>[统计总分]</strong> 计算所有科目的平均分。</li>
+<li><strong>[及格线检查]</strong> (可选) 如果设定了最低分要求，检查是否达标。</li>
+</ol>
+<hr />
+<h3>🔍 详细步骤解析</h3>
+<p>下面我结合代码细节，把上面的 List 展开讲讲：</p>
+<h4>1. [环境准备] 初始化与参数</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>if __name__ == "__main__":</code> 开始处, <code>add_mmlu_args</code> 函数。</li>
+<li><strong>做什么</strong>:<ul>
+<li><code>initialize_megatron</code>: 启动分布式环境（如果是多卡运行）。</li>
+<li><code>add_mmlu_args</code>: 增加一些专门针对这次考试的设置，比如 <code>--fraction</code>（只测一部分题，省时间）、<code>--no-subject-prompt</code>（提示词里不告诉模型这是什么科目）。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [模型搭建] 创建模型骨架</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>if args.init_model_with_meta_device: ...</code>, <code>model = get_model(...)</code>。</li>
+<li><strong>核心点</strong>:<ul>
+<li>这里有一个关键逻辑 <code>init_model_with_meta_device</code>。</li>
+<li><strong>通俗解释</strong>: 通常模型加载是先在 CPU 内存里建一个 FP16/BF16 的模型，再转到 GPU。但如果我们要加载一个<strong>量化模型</strong>（比如 4-bit），先建一个全精度的模型可能会把内存撑爆 (OOM)。</li>
+<li><strong>Meta Device</strong>: 这个技巧是先建立一个“虚拟”的模型（不占实际内存），等真正加载量化权重时再分配显存，极其节省资源。</li>
+</ul>
+</li>
+</ul>
+<h4>3. [加载权重] 读取 Checkpoint</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>load_modelopt_checkpoint(model, ...)</code>。</li>
+<li><strong>做什么</strong>: 使用 <code>modelopt</code> 提供的专用加载器，把经过优化（Post-Training Quantization, PTQ）的模型权重填入刚才的骨架中。</li>
+</ul>
+<h4>4. [获取试题] 拿到科目表</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>all_subjects = get_all_subjects()</code>。</li>
+<li><strong>做什么</strong>: MMLU 包含 57 个科目，涵盖 STEM、人文、社科等。代码里列出了长长的一串 list，比如 <code>college_mathematics</code> (大学数学), <code>world_religions</code> (世界宗教) 等。</li>
+</ul>
+<h4>5. [循环考试] 核心测试逻辑</h4>
+<p>这是脚本最主要的部分，代码中的 <code>for subject in all_subjects:</code> 循环。</p>
+<ul>
+<li>
+<p><strong>5.1 准备数据</strong>:</p>
+<ul>
+<li><code>load_dataset("cais/mmlu", subject, ...)</code>: 从 HuggingFace 自动下载该科目的题库。分为 <code>dev</code> (用于做 few-shot 示例) 和 <code>test</code> (正式考题)。</li>
+</ul>
+</li>
+<li>
+<p><strong>5.2 构造 Prompt (出题)</strong>:</p>
+<ul>
+<li>函数 <code>generate_prompt</code> 和 <code>format_example</code>。</li>
+<li>MMLU 是选择题。脚本会把题目格式化成这样：
+    &gt; The following are multiple choice questions about abstract algebra.
+    &gt; [这里可能放几个例题...]
+    &gt; Question: 1 + 1 = ?
+    &gt; A. 1
+    &gt; B. 2
+    &gt; C. 3
+    &gt; D. 4
+    &gt; Answer:</li>
+<li>最后留个 <code>Answer:</code> 等着模型填空。</li>
+</ul>
+</li>
+<li>
+<p><strong>5.3 模型推理 (做题)</strong>:</p>
+<ul>
+<li><code>simple_generate(unwrapped_model, ...)</code>。</li>
+<li>模型读入上面的 Prompt，生成下一个 token。我们期望它生成 "A", "B", "C" 或 "D"。</li>
+</ul>
+</li>
+<li>
+<p><strong>5.4 批改 (判分)</strong>:</p>
+<ul>
+<li><code>predict = tokenizer.batch_decode(...)</code>：把模型生成的 ID 转回文字。</li>
+<li><code>correct += [True] if predict.startswith(label) else [False]</code>：如果模型生成的第一个字母和标准答案 (<code>label</code>) 一样，算对，否则算错。</li>
+</ul>
+</li>
+<li>
+<p><strong>5.5 打印单科成绩</strong>:</p>
+<ul>
+<li>代码：<code>print("{:48}| {:.3f} | ...")</code>。</li>
+<li>输出格式类似：<code>abstract_algebra | 0.650 | 65/100</code> (科目 | 准确率 | 对了几个/总题数)。</li>
+</ul>
+</li>
+</ul>
+<h4>6. [统计总分] 计算平均分</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>avg_correct = [] ... for subject ...</code>。</li>
+<li><strong>做什么</strong>: 把所有科目做对的题加起来，除以总题数，得到一个宏观的平均准确率 (Average Accuracy)。</li>
+</ul>
+<h4>7. [及格线检查] 自动化测试验证</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>if args.lower_bound is not None: ...</code></li>
+<li><strong>做什么</strong>: 这是一个保险丝。比如你在跑自动化测试（CI/CD），你要求这个量化后的模型准确率不能低于 50% (<code>--lower-bound 0.5</code>)。如果跑出来只有 40%，脚本会报错退出 (<code>assert</code> 失败)，提醒开发者模型坏了。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是<strong>阅卷老师</strong>。
+1.  它把优化后的模型（考生）拉进考场。
+2.  发 MMLU 试卷（57个科目）。
+3.  把题目整理成模型能看懂的格式。
+4.  看模型选 A/B/C/D 准不准。
+5.  最后给出一个成绩单。</p>

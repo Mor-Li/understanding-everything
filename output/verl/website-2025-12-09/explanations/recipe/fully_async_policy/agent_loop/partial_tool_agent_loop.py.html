@@ -1,0 +1,121 @@
+<h1>recipe/fully_async_policy/agent_loop/partial_tool_agent_loop.py</h1>
+<p>这份代码确实比较抽象，因为它涉及到了<strong>强化学习（RL）训练中的异步交互</strong>，特别是“断点续传”的逻辑。</p>
+<p>简单来说，这个文件的核心功能是：<strong>定义一个可以“暂停”和“恢复”的 AI Agent（智能体）工作流。</strong></p>
+<p>普通的 Agent 是一口气跑完（提问 -&gt; 思考 -&gt; 用工具 -&gt; 再思考 -&gt; 回答）。而这个 <code>AsyncPartialToolAgentLoop</code> 允许 Agent 跑到一半停下来（比如因为训练系统需要同步参数，或者生成太慢了先切出去），下次还能接着刚才的地方继续跑。</p>
+<p>为了让你听懂，我把这个代码的逻辑拆解成一个<strong>“打工人的任务清单（To-Do List）”</strong>，然后一步步对着代码讲。</p>
+<hr />
+<h3>核心概念：Agent 的“打工”流程</h3>
+<p>想象这个 Agent 是一个负责回答问题的员工。他的工作流程被设计成了一个<strong>状态机（State Machine）</strong>。</p>
+<h4>📋 Agent 的任务 To-Do List</h4>
+<ol>
+<li><strong>检查交接班记录</strong>：我是刚来上班（从头开始），还是接着上一个人没干完的活（断点续传）？</li>
+<li><strong>进入工作循环</strong>（只要没干完，就一直循环）：<ul>
+<li><strong>状态 A (PENDING)</strong>: 准备数据，整理思路。</li>
+<li><strong>状态 B (GENERATING)</strong>: 开始写回答（核心步骤，可能写一半被叫停）。</li>
+<li><strong>状态 C (PROCESSING_TOOLS)</strong>: 如果回答里需要用工具（比如计算器），去执行工具。</li>
+<li><strong>状态 D (INTERACTING)</strong>: 如果需要跟环境交互，去交互。</li>
+<li><strong>检查打断信号</strong>: 老板（外部系统）有没有按暂停键？</li>
+</ul>
+</li>
+<li><strong>提交结果</strong>：<ul>
+<li>如果干完了：提交完整的报告。</li>
+<li>如果被暂停了：把手头的活打包（保存现场），告诉老板“我干到这儿了，下次继续”。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步代码解读</h3>
+<p>现在我们对照着上面的 To-Do List，来看看代码具体是怎么写的。</p>
+<h4>1. 检查交接班记录 (Run 函数)</h4>
+<p>代码位置：<code>async def run(...)</code></p>
+<p>这是 Agent 开始工作的入口。</p>
+<ul>
+<li><strong>代码逻辑</strong>：
+    <code>python
+    # 检查传入的参数里有没有 output，且 output 标记了 is_cancel=True
+    if output and output.extra_fields.get("is_cancel", False):
+        # 【断点续传】恢复之前的记忆（AgentData）和进度（State）
+        agent_data, state = self._restore_from_output(output)
+        logger.info(f"[PartialToolAgent] Resuming from {state.value}")
+    else:
+        # 【从头开始】初始化新的数据，状态设为 PENDING
+        agent_data = await self._init_agent_data(kwargs, param_version)
+        state = AgentState.PENDING
+        logger.info("[PartialToolAgent] Start from scratch")</code></li>
+<li><strong>大白话</strong>：看看手里有没有“未完成的草稿”。如果有，就把草稿拿出来接着写；如果没有，就拿一张白纸重新开始。</li>
+</ul>
+<h4>2. 进入工作循环 (State Machine)</h4>
+<p>代码位置：<code>async def _run_state_machine(...)</code></p>
+<p>这是一个 <code>while</code> 循环，根据当前的状态（State）决定下一步干什么。</p>
+<ul>
+<li><strong>代码逻辑</strong>：
+    ```python
+    while state != AgentState.TERMINATED: # 只要没结束
+        # 随时检查有没有被叫停（Cancellation）
+        if cancellation_event and cancellation_event.is_set():
+            return state # 立即返回当前状态，不往下走了<div class="codehilite"><pre><span></span><code><span class="c1"># 根据状态分发任务</span>
+<span class="k">if</span><span class="w"> </span><span class="n">state</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">AgentState</span><span class="o">.</span><span class="n">PENDING</span><span class="p">:</span>
+<span class="w">    </span><span class="n">state</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">await</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">_handle_pending_state</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="k">elif</span><span class="w"> </span><span class="n">state</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">AgentState</span><span class="o">.</span><span class="n">GENERATING</span><span class="p">:</span>
+<span class="w">    </span><span class="c1"># 重点：这里调用了支持“部分生成”的处理函数</span>
+<span class="w">    </span><span class="n">state</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">await</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">_handle_generating_state_partial</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="k">elif</span><span class="w"> </span><span class="n">state</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">AgentState</span><span class="o">.</span><span class="n">PROCESSING_TOOLS</span><span class="p">:</span>
+<span class="w">    </span><span class="n">state</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">await</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">_handle_processing_tools_state</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># ... 其他状态</span>
+</code></pre></div>
+
+<p><code>``
+*   **大白话**：这是一个自动调度器。如果现在是“生成中”，就去生成；如果现在是“用工具”，就去用工具。每做完一步，都会更新</code>state`，然后进入下一次循环。</p>
+</li>
+</ul>
+<h4>3. 核心动作：生成文本 (Generating with Partial Rollout)</h4>
+<p>代码位置：<code>async def _handle_generating_state_partial(...)</code></p>
+<p>这是这个文件最独特的地方。普通的 Agent 是一次性生成完，这个 Agent 允许“挤牙膏”。</p>
+<ul>
+<li><strong>代码逻辑</strong>：
+    ```python
+    if self.enable_partial_rollout:
+        # 调用推理服务器，注意这里是 generate_for_partial
+        response_ids, log_probs, is_cancel = await self.server_manager.generate_for_partial(...)<div class="codehilite"><pre><span></span><code>if is_cancel:
+    # 如果服务器说“这次先生成这么多，暂停一下”
+    # 1. 把生成的这部分拼接到记忆里
+    agent_data.prompt_ids += agent_data.response_ids
+    # 2. 状态保持为 GENERATING，表示还没写完，下次回来接着写
+    return AgentState.GENERATING
+</code></pre></div>
+
+<p><code>``
+*   **大白话**：Agent 对模型说：“你开始写吧，但允许写一半停下”。
+*   如果模型写了一段话（比如写了 50 个字），然后因为系统调度原因停了 (</code>is_cancel=True<code>)。
+*   代码会把这 50 个字存下来，然后告诉状态机：“我还在生成状态 (</code>GENERATING`)，但我先歇会儿，把控制权交出去。”</p>
+</li>
+</ul>
+<h4>4. 提交结果 (Build Output)</h4>
+<p>代码位置：<code>run</code> 函数的最后部分</p>
+<p>当状态机循环结束（无论是正常做完，还是被强制打断），都需要返回结果。</p>
+<ul>
+<li>
+<p><strong>代码逻辑</strong>：
+    <code>python
+    if state == AgentState.TERMINATED:
+        # 正常做完了，打包完整结果
+        return self._build_completed_output(agent_data, param_version)
+    else:
+        # 没做完（还是 GENERATING 或其他状态），被叫停了
+        # 打包“半成品”，标记 is_cancel=True
+        return self._build_cancelled_output(agent_data, state)</code></p>
+</li>
+<li>
+<p><strong><code>_build_cancelled_output</code> 做了啥？</strong>
+    它把当前的 <code>agent_data</code>（记忆、变量）和 <code>state</code>（当前干到哪一步了）全部塞进返回包里。这样下次调用 <code>run</code> 的时候，步骤 1 里的逻辑就能读懂这个包，实现“复活”。</p>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇代码讲了什么观点？</h3>
+<p>这篇代码实现了一种<strong>“异步、可中断、可恢复”的智能体执行策略</strong>。</p>
+<p><strong>为什么要这么做？</strong>
+在超大规模的大模型强化学习（如 PPO）中，生成过程（Rollout）非常耗时。
+1.  <strong>资源利用率</strong>：如果一个 Agent 卡在生成长文本上，系统可以先把它挂起（Partial），去处理别的更快的任务，或者同步梯度参数。
+2.  <strong>容错性</strong>：如果训练半路出问题，或者需要抢占计算资源，这种机制保证了 Agent 不用每次都从头跑，而是可以从断点继续跑，节省昂贵的计算资源。</p>
+<p><strong>一句话总结：</strong>
+这是一个给 AI 也就是 LLM 加了<strong>“存档/读档”</strong>功能的脚本，让它在生成长文本或调用复杂工具时，可以随时暂停并稍后继续。</p>

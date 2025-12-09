@@ -1,0 +1,141 @@
+<h1>tests/unit_tests/fusions/test_bias_dropout_fusion.py</h1>
+<p>完全没问题。这段代码其实是一个<strong>单元测试（Unit Test）</strong>。</p>
+<p>它的核心目的是：验证一种叫做 <strong>“Fused Bias Dropout Add”</strong> 的深度学习算子（Operator）是否写对了。</p>
+<p>为了让你听懂，我们先建立一个简单的概念：
+在深度学习（特别是 Transformer 模型）中，经常有一套连招：
+1.  <strong>Bias Add</strong>: 输入 $X$ 加上偏置 $Bias$。
+2.  <strong>Dropout</strong>: 随机扔掉一些数据（为了防止过拟合）。
+3.  <strong>Residual Add</strong>: 把结果再加回到原来的残差 $Residual$ 上。</p>
+<p>通常这是三步操作，很慢。Megatron（英伟达开发的大模型库）把这三步<strong>合并（Fuse）</strong>成了一步，为了跑得更快。</p>
+<p>这个文件的作用就是：<strong>拿“合并版（快但容易错）”和“普通版（慢但肯定对）”做对比，看看结果是不是一样。</strong></p>
+<hr />
+<h3>📝 任务清单 (Todo List)</h3>
+<p>为了看懂这个文件，我们可以把它的逻辑拆解成下面这 6 个任务：</p>
+<ul>
+<li>[ ] <strong>Task 1: 设定测试场景</strong> (我们要测什么数据类型？是在训练还是推理？)</li>
+<li>[ ] <strong>Task 2: 准备造假数据</strong> (生成输入 X, Bias, Residual)</li>
+<li>[ ] <strong>Task 3: 跑“标准答案”</strong> (用普通慢速方法算一遍，作为基准)</li>
+<li>[ ] <strong>Task 4: 跑“测试对象”</strong> (用加速合并方法算一遍)</li>
+<li>[ ] <strong>Task 5: 比对“结果”</strong> (前向传播：看算出来的数对不对)</li>
+<li>[ ] <strong>Task 6: 比对“梯度”或“内存”</strong> (反向传播：看训练时的更新对不对；或者推理时是否省内存)</li>
+</ul>
+<hr />
+<h3>🔍 逐步代码详解</h3>
+<p>现在我们按照上面的 List，一步一步把代码拆开看。</p>
+<h4>Task 1: 设定测试场景</h4>
+<div class="codehilite"><pre><span></span><code><span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;dtype&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">])</span>
+<span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;training&quot;</span><span class="p">,</span> <span class="p">[</span><span class="kc">True</span><span class="p">,</span> <span class="kc">False</span><span class="p">])</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_bias_dropout_add</span><span class="p">(</span><span class="n">dtype</span><span class="p">,</span> <span class="n">training</span><span class="p">):</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：这就像是考试的“AB卷”。</li>
+<li><code>dtype</code>: 测试两种精度，一种是普通的 <code>float32</code>，一种是省显存的 <code>bfloat16</code>。</li>
+<li><code>training</code>: 测试两种模式，<code>True</code> 代表训练模式（需要算梯度），<code>False</code> 代表推理模式（只需要结果）。</li>
+<li><strong>结论</strong>：这个测试函数会被自动运行 4 次（2种精度 x 2种模式）。</li>
+</ul>
+<h4>Task 2: 准备造假数据</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">42</span><span class="p">)</span>  <span class="c1"># 固定随机种子，保证每次生成的随机数一样</span>
+    <span class="n">device</span> <span class="o">=</span> <span class="s2">&quot;cuda&quot;</span>        <span class="c1"># 必须在 N卡 (GPU) 上跑</span>
+    <span class="n">B</span><span class="p">,</span> <span class="n">H</span> <span class="o">=</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">64</span>          <span class="c1"># B=Batch Size, H=Hidden Size (数据矩阵的大小)</span>
+
+    <span class="c1"># Initialize inputs</span>
+    <span class="c1"># x: 输入数据</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="n">training</span><span class="p">)</span>
+    <span class="c1"># residual: 残差连接的数据</span>
+    <span class="n">residual</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="n">training</span><span class="p">)</span>
+    <span class="c1"># bias: 偏置项</span>
+    <span class="n">bias</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">H</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：做饭得先买菜。这里生成了三个随机的张量（矩阵），用来模拟真实模型中的数据。</li>
+<li><code>requires_grad=training</code>: 如果是训练模式，告诉 PyTorch 这里的变量需要计算导数（梯度）。</li>
+</ul>
+<h4>Task 3: 跑“标准答案” (Reference)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># Run un-fused as reference</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">42</span><span class="p">)</span> <span class="c1"># 再次重置种子，确保 dropout 的随机行为和下面一致</span>
+
+    <span class="c1"># fused=False -&gt; 这里的 False 很关键，代表使用普通的、未合并的慢速方法</span>
+    <span class="n">ref_fn</span> <span class="o">=</span> <span class="n">get_bias_dropout_add</span><span class="p">(</span><span class="n">training</span><span class="o">=</span><span class="n">training</span><span class="p">,</span> <span class="n">fused</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+    <span class="c1"># 复制一份数据给标准答案用 (.clone().detach())，防止干扰原始数据</span>
+    <span class="n">x_ref</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="n">training</span><span class="p">)</span>
+    <span class="n">residual_ref</span> <span class="o">=</span> <span class="n">residual</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="n">training</span><span class="p">)</span>
+
+    <span class="c1"># 算出结果。prob=0.0 意思是 dropout 概率为0（不扔数据），方便对比数值</span>
+    <span class="n">out_ref</span> <span class="o">=</span> <span class="n">ref_fn</span><span class="p">((</span><span class="n">x_ref</span><span class="p">,</span> <span class="n">bias</span><span class="p">),</span> <span class="n">residual_ref</span><span class="p">,</span> <span class="n">prob</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：这是对照组。我们调用 <code>get_bias_dropout_add</code> 但明确说 <code>fused=False</code>。这就像是用计算器算一遍数学题，我们默认这个结果是绝对正确的。</li>
+</ul>
+<h4>Task 4: 跑“测试对象” (Fused)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># Run fused</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">42</span><span class="p">)</span> <span class="c1"># 再次重置种子</span>
+
+    <span class="c1"># fused=True -&gt; 这里的 True 是核心，代表使用 Megatron 优化的合并算子</span>
+    <span class="n">fused_fn</span> <span class="o">=</span> <span class="n">get_bias_dropout_add</span><span class="p">(</span><span class="n">training</span><span class="o">=</span><span class="n">training</span><span class="p">,</span> <span class="n">fused</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+    <span class="c1"># 同样复制一份数据</span>
+    <span class="n">x_fused</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="n">training</span><span class="p">)</span>
+    <span class="n">residual_fused</span> <span class="o">=</span> <span class="n">residual</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="n">training</span><span class="p">)</span>
+
+    <span class="c1"># 算出结果</span>
+    <span class="n">out_fused</span> <span class="o">=</span> <span class="n">fused_fn</span><span class="p">((</span><span class="n">x_fused</span><span class="p">,</span> <span class="n">bias</span><span class="p">),</span> <span class="n">residual_fused</span><span class="p">,</span> <span class="n">prob</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：这是实验组。这次我们开挂了（<code>fused=True</code>），用优化的方法再算一遍。</li>
+</ul>
+<h4>Task 5: 比对“结果” (Forward Check)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 定义允许的误差范围。float32 精度高，误差要很小(1e-6)；bfloat16 精度低，误差可以大点(1e-2)</span>
+    <span class="n">tols</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">rtol</span><span class="o">=</span><span class="mf">1e-6</span><span class="p">,</span> <span class="n">atol</span><span class="o">=</span><span class="mf">1e-6</span><span class="p">)</span> <span class="k">if</span> <span class="n">dtype</span> <span class="ow">is</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span> <span class="k">else</span> <span class="nb">dict</span><span class="p">(</span><span class="n">rtol</span><span class="o">=</span><span class="mf">2e-2</span><span class="p">,</span> <span class="n">atol</span><span class="o">=</span><span class="mf">1e-2</span><span class="p">)</span>
+
+    <span class="k">assert</span> <span class="n">out_fused</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">out_ref</span><span class="o">.</span><span class="n">dtype</span> <span class="c1"># 检查数据类型变没变</span>
+    <span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">out_fused</span><span class="p">,</span> <span class="n">out_ref</span><span class="p">,</span> <span class="o">**</span><span class="n">tols</span><span class="p">)</span> <span class="c1"># 检查数值是否足够接近</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：检查作业。对比“计算器算出的结果”和“心算的结果”。<code>torch.allclose</code> 意思是：只要两个结果非常非常接近（允许一点点浮点数误差），就算通过。</li>
+</ul>
+<h4>Task 6: 比对“梯度”或“内存”</h4>
+<p>这里分了两种情况：</p>
+<p><strong>情况 A: 如果是训练模式 (if training)</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">if</span> <span class="n">training</span><span class="p">:</span>
+        <span class="c1"># 生成一个随机的梯度信号</span>
+        <span class="n">grad</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn_like</span><span class="p">(</span><span class="n">out_ref</span><span class="p">)</span>
+
+        <span class="c1"># 让标准答案反向传播</span>
+        <span class="n">out_ref</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">grad</span><span class="p">)</span>
+        <span class="c1"># 让测试对象反向传播</span>
+        <span class="n">out_fused</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">grad</span><span class="p">)</span>
+
+        <span class="c1"># 对比 x 的梯度是否一致</span>
+        <span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">x_ref</span><span class="o">.</span><span class="n">grad</span><span class="p">,</span> <span class="n">x_fused</span><span class="o">.</span><span class="n">grad</span><span class="p">,</span> <span class="o">**</span><span class="n">tols</span><span class="p">)</span>
+        <span class="c1"># 对比 residual 的梯度是否一致</span>
+        <span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">residual_ref</span><span class="o">.</span><span class="n">grad</span><span class="p">,</span> <span class="n">residual_fused</span><span class="o">.</span><span class="n">grad</span><span class="p">,</span> <span class="o">**</span><span class="n">tols</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：训练不仅要算结果，还要算“怎么改能变好”（即梯度）。这里验证优化的算子算出来的梯度，和普通算子算出来的梯度是不是一样的。如果不一样，模型训练就会练歪。</li>
+</ul>
+<p><strong>情况 B: 如果是推理模式 (else)</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># In‑place check for inference</span>
+        <span class="c1"># 检查是否复用了内存地址</span>
+        <span class="k">assert</span> <span class="n">out_fused</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()</span> <span class="o">==</span> <span class="n">x_fused</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()</span>
+        <span class="c1"># 检查值是否正确</span>
+        <span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">out_fused</span><span class="p">,</span> <span class="n">x_fused</span><span class="p">,</span> <span class="o">**</span><span class="n">tols</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：推理模式下，我们希望省内存。Megatron 的优化算子会做“原地修改”（In-place），直接把结果写在输入 <code>x</code> 的内存里，不申请新内存。</li>
+<li><code>data_ptr()</code>：这是内存地址的指针。如果输出的地址等于输入的地址，说明成功实现了原地修改，省了显存。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇代码就是在说：</p>
+<blockquote>
+<p>“喂，PyTorch，我写了一个加速版的 <code>Bias+Dropout+Add</code> 算子。我分别用 float32 和 bfloat16，在训练和推理模式下都试了一遍。我保证我的计算结果和官方慢速版的一模一样，梯度也是对的，而且推理时我还更省内存！”</p>
+</blockquote>

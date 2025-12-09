@@ -1,0 +1,105 @@
+<h1>megatron/core/dist_checkpointing/validation.py</h1>
+<p>这份代码 <code>validation.py</code> 的核心作用是充当 <strong>“安检员”</strong> 和 <strong>“协调员”</strong>。</p>
+<p>在分布式训练（Megatron-LM）中，模型非常大，被切分（Sharding）存储在不同的 GPU 上。当你加载或保存模型时，非常容易出错（比如切分方式对不上、参数名字变了、文件损坏了）。</p>
+<p>这个文件就是用来<strong>检查</strong>这一切是否正常的。</p>
+<p>为了让你看懂，我把这个文件的逻辑拆解成一个 <strong>“加载模型时的任务清单 (To-Do List)”</strong>。想象一下，系统正在尝试加载一个巨大的模型，它必须按顺序完成以下检查步骤：</p>
+<hr />
+<h3>📋 任务清单：分布式模型加载的“安检”流程</h3>
+<h4>✅ Task 1: 检查“仓库”和“工具” (Check Strategy)</h4>
+<p><strong>目标</strong>：确认存档文件存在，且我们有正确的工具来打开它。</p>
+<ul>
+<li><strong>逻辑</strong>：<ol>
+<li>用户给的路径（<code>checkpoint_dir</code>）存在吗？</li>
+<li>这是一个合法的分布式 Checkpoint 吗（有没有 <code>config</code> 文件）？</li>
+<li>用什么策略（Strategy）去读它？是 <code>TorchDist</code> 还是 <code>Zarr</code>？如果不指定，就用默认的。</li>
+</ol>
+</li>
+<li><strong>对应代码</strong>：<ul>
+<li><code>verify_checkpoint_and_load_strategy(...)</code>: 这是入口，负责确认路径和加载策略。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 检查“购物清单”是否匹配 (Strict Handling)</h4>
+<p><strong>目标</strong>：对比“我现在需要的参数”和“存档里有的参数”。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li><strong>我需要的 (Model State Dict)</strong> vs <strong>存档里的 (Checkpoint State Dict)</strong>。</li>
+<li>会有两种不匹配的情况：<ol>
+<li><strong>Missing Keys (缺货)</strong>：我要加载 <code>layer_1.weight</code>，但存档里没有。</li>
+<li><strong>Unexpected Keys (多余)</strong>：存档里有 <code>layer_99.weight</code>，但我现在的模型不需要。</li>
+</ol>
+</li>
+<li><strong>严格程度 (Strictness)</strong>：这里定义了一个枚举 <code>StrictHandling</code>，决定怎么处理这些不匹配：<ul>
+<li><code>RAISE_ALL</code>: 有任何不一样就报错（最严）。</li>
+<li><code>LOG_ALL</code>: 只是记录警告，继续加载。</li>
+<li><code>ASSUME_OK_UNEXPECTED</code>: 假设多余的没事，忽略缺失检查（为了速度）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>对应代码</strong>：<ul>
+<li><code>class StrictHandling(Enum)</code>: 定义不同的严格等级。</li>
+<li><code>_determine_missing_and_unexpected_keys(...)</code>: 真正去对比集合差异的函数。</li>
+<li><code>validate_integrity_and_strict_load(...)</code>: 总控函数，根据严格等级决定是报错还是忽略。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 检查“拼图”是否完整 (Sharding Integrity)</h4>
+<p><strong>目标</strong>：这是分布式训练最关键的一步。确认所有 GPU 手里的碎片（Shards）能不能拼成一个完整的张量。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>假设一个大矩阵被切分到了 4 张显卡上。</li>
+<li><strong>Rank 0 (主节点)</strong> 会把所有显卡上的元数据（Metadata，不是真实数据，只是形状信息）收集起来。</li>
+<li><strong>检查 1 (覆盖)</strong>：这 4 块碎片拼起来，是不是正好等于原图的大小？有没有缺一块？</li>
+<li><strong>检查 2 (重叠)</strong>：这 4 块碎片有没有重叠？（通常不应该重叠）。</li>
+<li>如果拼图拼不上，说明切分逻辑有问题，必须报错。</li>
+</ul>
+</li>
+<li><strong>对应代码</strong>：<ul>
+<li><code>determine_global_metadata(...)</code>: 收集所有显卡的信息（使用 <code>all_gather</code>）。</li>
+<li><code>validate_sharding_integrity(...)</code>: 核心校验逻辑。</li>
+<li><code>_validate_sharding_for_key(...)</code>: 针对某一个具体的 Tensor，检查它的所有碎片是否合法。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 检查“公共广播”是否一致 (Common State Validation)</h4>
+<p><strong>目标</strong>：有些数据不是切分的，而是所有显卡都应该一模一样的（比如 <code>global_step</code> 步数，或者优化器的某些配置）。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>Rank 0 把自己手里的公共数据广播给所有人。</li>
+<li>其他 Rank 拿 Rank 0 的数据跟自己的比。</li>
+<li>如果不一致（比如 Rank 0 说是第 100 步，Rank 1 说是第 90 步），这就出大问题了，记录警告。</li>
+</ul>
+</li>
+<li><strong>对应代码</strong>：<ul>
+<li><code>_validate_common_state_dict(...)</code>: 执行这个广播和对比的过程。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🔍 总结：这个文件讲了什么观点？</h3>
+<p>这个文件并不在讲算法原理，而是在讲<strong>工程健壮性 (Robustness)</strong>。它的核心观点是：</p>
+<ol>
+<li><strong>分布式加载很脆弱</strong>：因为涉及多卡、多文件、切分逻辑，很容易出现“看似加载成功，实则数据错位”的情况。</li>
+<li><strong>元数据 (Metadata) 先行</strong>：在加载真正的庞大权重数据之前，先交换轻量级的元数据（形状、Key名字），把所有错误都在加载前拦截下来。</li>
+<li><strong>灵活的严格度</strong>：根据用户的需求（是调试还是生产），允许不同程度的“容错”（StrictHandling）。</li>
+</ol>
+<h3>💡 举个例子帮助理解</h3>
+<p>假设你要加载一个模型：</p>
+<ol>
+<li><strong>Task 1</strong>: 程序先看文件夹 <code>checkpoint/iter_1000</code> 在不在。在的话，准备好读取器。</li>
+<li><strong>Task 3 (先做全局检查)</strong>:<ul>
+<li>显卡 A 说：我有 <code>Layer1</code> 的左半部分。</li>
+<li>显卡 B 说：我有 <code>Layer1</code> 的右半部分。</li>
+<li><code>validate_sharding_integrity</code> 说：好，左右拼起来是完整的，通过！</li>
+<li><em>(如果显卡 B 说我有 Layer1 的中间部分，那左+中 != 完整，就会报错)</em>。</li>
+</ul>
+</li>
+<li><strong>Task 2</strong>:<ul>
+<li>模型代码说：我需要 <code>Layer1</code> 和 <code>Layer2</code>。</li>
+<li>存档说：我有 <code>Layer1</code> 和 <code>Layer3</code>。</li>
+<li><code>StrictHandling</code> 说：等等，<code>Layer2</code> 缺失，<code>Layer3</code> 多余。如果你设置了 <code>RAISE_ALL</code>，我就报错停止；如果你设置了 <code>LOG_ALL</code>，我就警告你，然后只加载 <code>Layer1</code>。</li>
+</ul>
+</li>
+</ol>
+<p>这就是 <code>validation.py</code> 的全部工作。</p>

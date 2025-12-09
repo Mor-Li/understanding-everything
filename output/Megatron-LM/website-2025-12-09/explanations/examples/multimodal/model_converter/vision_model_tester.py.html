@@ -1,0 +1,87 @@
+<h1>examples/multimodal/model_converter/vision_model_tester.py</h1>
+<p>这份代码其实是一个<strong>“验算脚本”</strong>（Verification Script）。</p>
+<p>简单来说，它的核心目的是：<strong>验证 NVIDIA Megatron (MCore) 版本的视觉模型，算出来的结果和 Hugging Face (HF) 原版模型的标准结果是否一致。</strong></p>
+<p>因为将模型迁移到 NVIDIA Megatron 框架（为了大规模并行训练）时，代码结构变了，很容易写出 Bug。这个脚本就是用来确保：“我改写后的模型，数学上是对的。”</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>4步走的 Task List（任务清单）</strong>，我们一步步来看它是怎么完成这个任务的。</p>
+<hr />
+<h3>📋 Task List: 验证模型正确性的四个步骤</h3>
+<ol>
+<li><strong>Task 1: 准备并运行 Megatron (MCore) 版本的模型</strong><ul>
+<li>目标：加载转换后的 NVIDIA 版本模型，给它一张“假图片”，算出结果 A。</li>
+</ul>
+</li>
+<li><strong>Task 2: 准备并运行 Hugging Face (HF) 版本的模型</strong><ul>
+<li>目标：加载原版的 Hugging Face 模型，给它同一张“假图片”，算出结果 B。</li>
+</ul>
+</li>
+<li><strong>Task 3: 统一输入数据</strong><ul>
+<li>目标：确保 A 和 B 吃进去的数据（Input）是完全一模一样的（这里用的是全 1 的矩阵）。</li>
+</ul>
+</li>
+<li><strong>Task 4: 找茬（对比结果）</strong><ul>
+<li>目标：计算 <code>A - B</code>。如果差值非常小（接近 0），说明转换成功；如果差值很大，说明代码写错了。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 详细步骤代码解读</h3>
+<p>下面我按照上面的清单，把代码拆开来讲：</p>
+<h4>Task 1: 运行 Megatron (MCore) 版本</h4>
+<p>对应代码函数：<code>run_mcore_vision(model_path)</code></p>
+<p>这一步最复杂，因为 Megatron 是个重型框架，启动它需要很多配置。</p>
+<ul>
+<li><strong>伪造启动参数</strong>：
+    代码里有一大段 <code>sys.argv = ["ignore_me.py", "--micro-batch-size=1", ...]</code>。<ul>
+<li><strong>为什么？</strong> Megatron 通常是通过命令行启动的。这个脚本为了在 Python 内部直接跑，手动“捏造”了一堆命令行参数（比如层数、隐藏层大小、并行数量 TP=8 等）。</li>
+<li><strong>关键点</strong>：<code>--vision-model-type=internvit</code> 说明它测的是 InternViT 这个视觉模型。</li>
+</ul>
+</li>
+<li><strong>初始化框架</strong>：
+    <code>initialize_megatron(...)</code>：启动 NVIDIA 的分布式环境。</li>
+<li><strong>加载模型</strong>：
+    <code>model = get_model(...)</code>：构建模型结构。
+    <code>load_checkpoint(...)</code>：把训练好的权重（Checkpoint）加载进去。</li>
+<li><strong>计算</strong>：
+    <code>output = vision_model(images)</code>：用 MCore 模型跑一遍前向传播，拿到 <strong>Result A</strong>。</li>
+</ul>
+<h4>Task 2: 运行 Hugging Face (HF) 版本</h4>
+<p>对应代码函数：<code>run_hf_vision(model_name)</code></p>
+<p>这一步很简单，就是标准的 Transformers 库用法。</p>
+<ul>
+<li><strong>加载模型</strong>：
+    <code>AutoModel.from_pretrained(...)</code>：直接从 Hugging Face 加载原版模型。这被视为“标准答案”。</li>
+<li><strong>计算</strong>：
+    <code>outputs = model(images, ...)</code>：用 HF 模型跑一遍，拿到 <strong>Result B</strong>。</li>
+</ul>
+<h4>Task 3: 统一输入 (在两个函数中都出现了)</h4>
+<p>为了公平对比，输入必须完全一样。</p>
+<ul>
+<li><strong>代码</strong>：
+    <code>python
+    images = torch.ones((1, 3, 448, 448), dtype=torch.bfloat16, device="cuda")</code></li>
+<li><strong>解释</strong>：它没有读取真实的猫猫狗狗图片，而是直接创建了一个 <code>1x3x448x448</code> 的张量，里面的数值<strong>全都是 1</strong>。</li>
+<li><strong>为什么？</strong> 只要输入固定，如果模型逻辑一致，输出也必须固定。用全 1 矩阵简单且排除数据预处理的干扰。</li>
+</ul>
+<h4>Task 4: 找茬 (对比验证)</h4>
+<p>对应代码函数：<code>main(...)</code></p>
+<p>这是裁判员入场的时候。</p>
+<ul>
+<li><strong>获取结果</strong>：
+    <code>python
+    mcore = run_mcore_vision(mcore_model) # 拿到 Result A
+    hf = run_hf_vision(hf_model)          # 拿到 Result B</code></li>
+<li><strong>计算差值</strong>：
+    <code>python
+    diff = (mcore - hf).abs() # 绝对值差
+    mean_diff = diff.mean().item() # 平均误差
+    max_diff = diff.max().item()   # 最大误差</code></li>
+<li><strong>判断合格</strong>：
+    <code>python
+    print(f"mean diff {mean_diff}, max diff {max_diff}")
+    assert mean_diff &lt; 0.1  # 如果平均误差小于 0.1，通过
+    assert max_diff &lt; 50    # 如果最大误差小于 50，通过
+    print("lgtm")           # LGTM = Looks Good To Me (看起来没问题)</code></li>
+</ul>
+<h3>💡 总结</h3>
+<p>这个脚本是一个<strong>“对齐测试”</strong>。</p>
+<p>这就好比你抄了学霸的作业（把 HF 模型改成 Megatron 模型），为了确定没抄错，你拿了一道题（全 1 的图片），先看学霸的答案是多少，再看你算出来的答案是多少。如果两个答案几乎一样，屏幕就会打印 <strong>"lgtm"</strong>，表示你的模型转换成功，可以使用了。</p>

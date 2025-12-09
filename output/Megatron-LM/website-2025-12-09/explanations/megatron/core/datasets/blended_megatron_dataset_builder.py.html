@@ -1,0 +1,83 @@
+<h1>megatron/core/datasets/blended_megatron_dataset_builder.py</h1>
+<p>这份代码看起来确实很复杂，因为它要处理<strong>大规模分布式训练</strong>中的数据混合（Blending）、切分（Splitting）以及多GPU之间的同步问题。</p>
+<p>你可以把这个 <code>BlendedMegatronDatasetBuilder</code> 想象成一个 <strong>“超级自助餐总厨”</strong>。他的任务是根据复杂的菜谱（Config），从不同的仓库（原始数据文件）里取食材，按比例混合，最后端出三盘菜：<strong>训练集（Train）、验证集（Validation）、测试集（Test）</strong>。</p>
+<p>为了让你听懂，我把这个代码的执行逻辑拆解成一个 <strong>Task List（任务清单）</strong>。</p>
+<hr />
+<h3>📋 Task List：总厨的每日工作流程</h3>
+<h4>Task 1: 接单与核对菜谱 (<code>__init__</code>)</h4>
+<p><strong>目标</strong>：确定我们要造什么样的据集，并检查配置是否合法。
+*   <strong>动作</strong>：
+    *   拿到 <code>config</code>（配方）：比如“我们要混合 Wikipedia (30%) 和 CommonCrawl (70%)”。
+    *   拿到 <code>sizes</code>（分量）：比如“训练集要吃 10亿个token，验证集要 100万”。
+    *   <strong>检查逻辑</strong>：如果用户没规定每个数据集的权重（weights），也没规定总大小（size），那就报错（没办法做饭）。</p>
+<h4>Task 2: 决定混合策略 (<code>build</code> -&gt; <code>_build_blended_dataset_splits</code>)</h4>
+<p><strong>目标</strong>：决定是“一锅乱炖”还是“分盘单炒”。
+*   <strong>分支 A（Global Blend）</strong>：训练、验证、测试都用同一种混合比例（比如都是 3:7）。
+*   <strong>分支 B（Blend Per Split）</strong>：训练集按 3:7 混，但验证集只用 Wikipedia。
+*   <strong>动作</strong>：
+    *   如果是 <strong>Mock</strong>（模拟数据）：直接造假数据，跳过后面步骤（用于测试代码跑不跑得通）。
+    *   如果是 <strong>Blend</strong>（混合）：计算每个原始文件需要取多少数据。</p>
+<h4>Task 3: 计算食材用量 (<code>_get_size_per_split_per_dataset</code>)</h4>
+<p><strong>目标</strong>：根据权重（Weights）和总需求量（Total Size），算出每个原始文件具体要读多少。
+*   <strong>举例</strong>：总共要 100个样本，权重是 [0.3, 0.7]。
+*   <strong>计算</strong>：文件A取 30个，文件B取 70个。
+*   <strong>缓冲（Surplus）</strong>：为了保险，代码里会多取一点点（比如多取 1%），防止最后不够用。</p>
+<h4>Task 4: 并行处理食材 (<code>_build_megatron_datasets_parallel</code>)</h4>
+<p><strong>目标</strong>：从硬盘读取原始数据文件，建立索引。这一步最慢，所以要开多线程。
+*   <strong>多线程（ThreadPool）</strong>：同时派好几个帮厨去处理不同的数据文件（Wikipedia, CC, Github代码...）。
+*   <strong>动作</strong>：调用 <code>_build_megatron_dataset_splits</code> 来处理单个文件。</p>
+<h4>Task 5: 关键！多卡同步与防撞车 (<code>build_generic_dataset</code> / Rank 0 Logic)</h4>
+<p><strong>目标</strong>：在分布式训练中，防止几百张显卡同时去写同一个缓存文件（Index Cache），导致文件损坏。
+*   <strong>Rank 0 先行</strong>：
+    *   如果是 <strong>Rank 0</strong>（主进程）：你先干活！去读取数据、生成索引文件、写入硬盘缓存。
+    *   如果是 <strong>其他 Rank</strong>：你们先等着（<code>torch.distributed.barrier()</code>），别动。
+*   <strong>其他 Rank 跟进</strong>：
+    *   等 Rank 0 说“我搞定了，缓存写好了”，其他 Rank 再去加载刚才生成的缓存文件（这时候就很快了，因为不用重新计算）。</p>
+<h4>Task 6: 摆盘与组装 (<code>BlendedDataset</code>)</h4>
+<p><strong>目标</strong>：把处理好的单个数据集（MidLevelDataset）打包成最终的混合数据集（TopLevelDataset）。
+*   <strong>动作</strong>：
+    *   如果只有一个来源：直接上菜。
+    *   如果有多个来源：创建一个 <code>BlendedDataset</code> 对象。这个对象里存了一个索引映射表，比如：第1个样本来自Wiki，第2个来自CC，第3个来自Wiki...以此类推，严格遵守权重比例。</p>
+<hr />
+<h3>🔍 代码中的关键点对应（中英对照）</h3>
+<ol>
+<li>
+<p><strong><code>build()</code></strong>:</p>
+<ul>
+<li>这是总入口。它会调用 <code>_build_blended_dataset_splits</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_build_blended_dataset_splits()</code></strong>:</p>
+<ul>
+<li>这里面有两个大 <code>if/else</code>。</li>
+<li><code>if self.config.blend:</code> 对应 Task 2 的“一锅乱炖”（所有 split 混合比例相同）。</li>
+<li><code>else:</code> 对应 Task 2 的“分盘单炒”（每个 split 有独立的混合配置）。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_build_megatron_datasets_parallel()</code></strong>:</p>
+<ul>
+<li>这里用了 <code>ThreadPoolExecutor</code>。</li>
+<li>你会看到 <code>if rank == 0: ... barrier() ... if rank != 0:</code> 的结构。这就是 Task 5 说的“Rank 0 先行，其他人排队”，为了生成缓存文件时不冲突。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_build_megatron_dataset_splits()</code></strong>:</p>
+<ul>
+<li>这是最脏最累的活。它负责处理<strong>单个</strong>原始文件。</li>
+<li>它会计算 <code>split_indices</code>（切分索引），比如这个文件的前 90% 给训练，中间 5% 给验证，最后 5% 给测试。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>BlendedDataset</code> vs <code>MegatronDataset</code></strong>:</p>
+<ul>
+<li><strong>MegatronDataset (MidLevel)</strong>: 基础食材。比如纯粹的 Wikipedia 数据。</li>
+<li><strong>BlendedDataset (TopLevel)</strong>: 最终的拼盘。它内部包含了多个 MegatronDataset，并负责在训练时按比例随机抽取。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>配置解析 -&gt; 计算每个文件要取多少 -&gt; (Rank 0 先做索引 -&gt; 其他人加载索引) -&gt; 多线程构建基础数据集 -&gt; 按照权重混合打包 -&gt; 返回给训练器。</strong></p>
+<p>之所以看不懂，是因为它把“多线程加速”和“分布式同步（Rank 0 check）”的代码逻辑交织在了一起。你只要记住<strong>Rank 0 是为了写缓存</strong>，<strong>多线程是为了读文件快</strong>，逻辑就通了。</p>

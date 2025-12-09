@@ -1,0 +1,109 @@
+<h1>examples/tuning/32b/qwen2-32b_grpo-lora_4_h100_fsdp_vllm.sh</h1>
+<p>这份脚本看起来确实非常复杂，因为它涉及到<strong>大模型（LLM）的强化学习训练（RLHF/RL）</strong>，而且是用了一个非常前沿的框架（VeRL）来训练一个很大的模型（Qwen2.5-32B）。</p>
+<p>为了让你看懂，我们把这个脚本想象成<strong>“训练一个超级实习生（AI）做数学题”</strong>的项目计划书。</p>
+<p>我们将这个复杂的脚本拆解成 <strong>6个待办事项（To-Do List）</strong>，一步步带你过一遍。</p>
+<hr />
+<h3>📝 Task 1: 准备考场和资源 (环境配置)</h3>
+<p>在开始训练之前，必须先定好用多少显卡，以及日志记在哪里。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7  # 指定用哪几张显卡
+    export WANDB_...                             # 设置云端监控日记 (WandB)
+    MODEL_PATH=Qwen/Qwen2.5-32B-Instruct         # 指定要训练的“大脑”原版是谁</code></li>
+<li><strong>白话解释：</strong><ol>
+<li>我们要用 8 张显卡（0-7）。</li>
+<li>训练过程的监控数据（比如准确率涨没涨）上传到 WandB 网站。</li>
+<li>我们的底座模型是通义千问 32B 版本。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>📝 Task 2: 制定刷题计划 (算力与Batch分配)</h3>
+<p>这一段看起来全是数学计算，其实是在决定<strong>“一次让AI做多少道题”</strong>。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    nproc_per_gpu=45       # 注释里那些 32√ 64× 是工程师在试探显存极限
+    nnodes=1               # 用几台服务器（1台）
+    ngpu_per_node=4        # 每组训练用几张卡
+    total_procs=...        # 算出总共并行的进程数</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>因为 32B 的模型很大，显存很贵。这里工程师经过多次测试（注释里的 <code>46x</code> 表示失败，<code>45x</code> 还没测，<code>44√</code> 表示成功），决定每个 GPU 处理多少数据流。</li>
+<li>这部分主要是为了<strong>把显卡塞满，但又不撑爆</strong>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 Task 3: 选定教材和教学法 (算法与数据)</h3>
+<p>告诉系统我们要用什么方法训练，用什么书教。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    python3 -m verl.trainer.main_ppo \
+        algorithm.adv_estimator=grpo \          # 重点！使用 GRPO 算法
+        data.train_files=data/gsm8k/train.parquet \ # 教材：GSM8K（小学数学题）
+        data.max_prompt_length=512 \            # 题目最长多长
+        data.max_response_length=1024 \         # 回答最长多长</code></li>
+<li><strong>白话解释：</strong><ul>
+<li><strong>算法 (GRPO)</strong>：这是目前最火的算法（DeepSeek-R1 同款思路）。它不像传统的 PPO 需要一个额外的“评判模型（Critic）”那么费显存，而是通过“小组赛”的方式来评估好坏。</li>
+<li><strong>数据</strong>：用 GSM8K 数据集，专门训练 AI 做数学应用题。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 Task 4: 给大脑做微创手术 (LoRA设置)</h3>
+<p>32B 的模型太大了，如果全参数训练（每个脑细胞都改），显存根本不够。所以要用 <strong>LoRA</strong>。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    actor_rollout_ref.model.lora_rank=32 \      # LoRA 的秩（大小）
+    actor_rollout_ref.model.target_modules=all-linear \ # 所有线性层都加 LoRA
+    actor_rollout_ref.actor.optim.lr=3e-5 \     # 学习率（学得有多快）</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>我们不修改模型原本的 320 亿个参数，而是在旁边挂一个“小本子”（LoRA），只训练这个小本子。</li>
+<li><code>rank=32</code> 决定了这个小本子的厚度。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 Task 5: 解决“脑子太大”的问题 (显存优化与并行)</h3>
+<p>这是脚本里最长、最难懂的部分。因为 32B 模型跑在一个节点上非常吃力，需要各种黑科技来省显存。</p>
+<ul>
+<li>
+<p><strong>代码对应：</strong>
+    ```bash
+    # 1. 既然用了 LoRA，就把本来要存显存里的参数，暂时卸载到内存(CPU)里
+    actor_rollout_ref.actor.fsdp_config.param_offload=True
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True</p>
+<h1>2. 推理（做题）时的切分</h1>
+<p>actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
+actor_rollout_ref.rollout.name=vllm \
+```
+*   <strong>白话解释：</strong>
+*   <strong>Offload (卸载)</strong>：显卡存不下的时候，把暂时不用的参数扔到主机的内存条里，要用再拿回来（用速度换空间）。
+*   <strong>Tensor Parallel (TP=4)</strong>：模型太大，一张卡装不下。把模型横着切成 4 份，4 张显卡合力才能运行这个模型。
+*   <strong>vLLM</strong>：这是一个超快的推理引擎。训练时，AI 需要先自己做题（Rollout），我们用 vLLM 让它做题做得快一点。</p>
+</li>
+</ul>
+<hr />
+<h3>📝 Task 6: 考试与奖惩 (强化学习流程)</h3>
+<p>最后定义 AI 怎么通过做题来变强。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    actor_rollout_ref.rollout.n=5 \             # 对每道题，让 AI 生成 5 个不同答案
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \ # 别改太猛了，要和原模型保持一定距离
+    trainer.save_freq=20 \                      # 每 20 步存个档</code></li>
+<li><strong>白话解释：</strong><ul>
+<li><strong>GRPO 的核心逻辑</strong>：给 AI 一道数学题，让它生成 5 个解法 (<code>n=5</code>)。</li>
+<li>然后对比这 5 个解法，对的奖励，错的惩罚。</li>
+<li><strong>KL Loss</strong>：这是为了防止 AI 为了拿高分“走火入魔”（比如输出乱码骗分），强行要求它说话的方式不能偏离原版模型太远。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个脚本在干嘛？</h3>
+<p>一句话总结：
+<strong>这个脚本配置了 4 张 H100 显卡（虽然写了8张卡，但并行逻辑是4卡一组），使用 LoRA 省显存技术，配合 vLLM 加速引擎，用 GRPO 算法（DeepSeek 同款），在 GSM8K 数学题库上，训练 Qwen-32B 模型，让它的数学能力更强。</strong></p>
+<p>如果你要运行它，最核心的瓶颈在于<strong>显存</strong>，所以脚本里充满了各种 <code>offload</code>（卸载到内存）和 <code>parallel_size</code>（切分模型）的配置。</p>

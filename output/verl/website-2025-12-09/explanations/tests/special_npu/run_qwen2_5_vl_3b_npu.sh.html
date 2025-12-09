@@ -1,0 +1,115 @@
+<h1>tests/special_npu/run_qwen2_5_vl_3b_npu.sh</h1>
+<p>这份脚本确实看起来很复杂，因为它涉及到了<strong>大模型微调（Fine-tuning）</strong>中最前沿、最复杂的领域：<strong>强化学习（RLHF/PPO）</strong>，而且还是在<strong>国产华为昇腾 NPU</strong> 硬件上运行的。</p>
+<p>为了让你听懂，我们把运行这个脚本想象成<strong>“训练一个学生（AI模型）做几何题”</strong>的过程。</p>
+<p>我为你列了一个 <strong>“训练任务清单 (To-Do List)”</strong>，我们按顺序一步步把脚本里的代码对应到这个清单里：</p>
+<hr />
+<h3>任务清单：训练 Qwen2.5-VL 模型做几何题</h3>
+<h4>1. 准备考场环境 (硬件与基础设置)</h4>
+<p>在开始训练前，必须配置好硬件环境，尤其是针对华为 NPU 的特殊设置。</p>
+<ul>
+<li><strong>脚本代码：</strong>
+    <code>bash
+    export VLLM_ASCEND_ENABLE_NZ=0
+    export USE_OPTIMIZED_MODEL=0
+    trainer.device=npu
+    trainer.n_gpus_per_node=8</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>这是告诉机器：“我们要用华为昇腾 NPU 芯片（Ascend），不要用英伟达 GPU。”</li>
+<li><code>USE_OPTIMIZED_MODEL=0</code>：意思是“关掉某些为了推理加速的优化”，因为我们在做训练，稳定性比速度更重要，防止训练出错。</li>
+<li>我们一共动用了 <strong>8张 NPU 卡</strong> 来跑这个任务。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 选定“考生” (指定模型)</h4>
+<p>我们要训练哪个模型？</p>
+<ul>
+<li><strong>脚本代码：</strong>
+    <code>bash
+    MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-VL-3B-Instruct}</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>选定的考生是 <strong>Qwen2.5-VL-3B</strong>。</li>
+<li><strong>VL</strong> 代表 Vision-Language（视觉语言），说明这个模型既能看图也能写字。</li>
+<li><strong>3B</strong> 代表它是一个比较小巧的模型（30亿参数），适合练手或资源受限的情况。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 准备“教材”和“题库” (数据加载)</h4>
+<p>训练需要数据，这里用的是什么数据？</p>
+<ul>
+<li><strong>脚本代码：</strong>
+    <code>bash
+    data.train_files=$HOME/data/geo3k/train.parquet
+    data.image_key=images</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>用的是 <strong>geo3k</strong> 数据集。看名字就知道，这是关于<strong>几何题（Geometry）</strong>的数据。</li>
+<li>因为几何题有图，所以专门指定了 <code>image_key=images</code>，告诉模型要注意看图。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 制定“教学大纲” (算法选择 GRPO)</h4>
+<p>这是最核心的部分。我们要用什么方法教它？</p>
+<ul>
+<li><strong>脚本代码：</strong>
+    <code>bash
+    python3 -m verl.trainer.main_ppo
+    algorithm.adv_estimator=grpo</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>虽然命令里写着 <code>main_ppo</code>，但核心参数 <code>grpo</code> 暴露了它的真实身份。</li>
+<li><strong>GRPO (Group Relative Policy Optimization)</strong>：这是最近非常火（DeepSeek-R1 同款思路）的一种强化学习方法。</li>
+<li><strong>简单理解</strong>：老师（算法）不直接告诉学生标准答案，而是让学生对一道题生成好几个答案，然后在一组答案里比较，告诉学生“这个比那个好”，让学生自己领悟怎么思考。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 安排“分身”协作 (Actor, Rollout, Ref)</h4>
+<p>在强化学习中，模型需要扮演三个角色，脚本里有一大堆 <code>actor_rollout_ref</code> 的配置，就是在分配这三个角色的工作：</p>
+<ul>
+<li><strong>角色 A：Actor (学生本人)</strong><ul>
+<li><strong>代码</strong>：<code>actor_rollout_ref.actor.optim.lr=1e-6</code></li>
+<li><strong>解释</strong>：这是正在学习的模型。<code>lr=1e-6</code> 是学习率，意思是“学慢点，别步子太大扯着蛋”。</li>
+</ul>
+</li>
+<li><strong>角色 B：Rollout (答题机器)</strong><ul>
+<li><strong>代码</strong>：<code>actor_rollout_ref.rollout.name=$ENGINE</code> (vllm)</li>
+<li><strong>解释</strong>：为了加快训练，我们用一个专门的推理引擎（vLLM）来快速生成答案（刷题）。</li>
+</ul>
+</li>
+<li><strong>角色 C：Reference (过去的自己)</strong><ul>
+<li><strong>代码</strong>：<code>actor_rollout_ref.ref...</code></li>
+<li><strong>解释</strong>：这是一个完全不训练的模型副本。它的作用是作为对照组，防止学生学“飘”了（比如为了拿高分开始胡言乱语）。如果学生现在的回答和原来的回答差别太大，会受到惩罚（KL Loss）。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 资源分配与切分 (并行策略)</h4>
+<p>3B 的模型虽然不大，但在 NPU 上跑也需要规划内存。</p>
+<ul>
+<li><strong>脚本代码：</strong>
+    <code>bash
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6</code></li>
+<li><strong>白话解释：</strong><ul>
+<li><code>tensor_model_parallel_size=2</code>：把模型切成两半，分别放在两张卡上跑（TP=2）。这通常是因为单张卡显存不够，或者为了跑得更快。</li>
+<li><code>utilization=0.6</code>：告诉程序，“只准用 60% 的显存”，剩下的留给其他操作，防止爆显存（OOM）。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 设定“考试时间” (训练时长)</h4>
+<ul>
+<li><strong>脚本代码：</strong>
+    <code>bash
+    trainer.total_epochs=1
+    trainer.total_training_steps=1</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>这显然是一个<strong>测试脚本</strong>，不是正式训练。</li>
+<li>因为它只跑 <strong>1个 Epoch</strong>（把书看一遍），甚至只跑 <strong>1个 Step</strong>（只做一次更新）。</li>
+<li>目的：用来验证“这套代码能不能在 NPU 上跑通”，而不是真的要把模型练好。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这脚本到底是干嘛的？</h3>
+<p>用一句话概括：
+<strong>“这是一个在 8张华为 NPU 卡上，利用 GRPO 强化学习算法，对 Qwen2.5-VL（视觉模型）进行极短时间（测试级）几何题训练的启动脚本。”</strong></p>
+<p>如果你是开发者，你的 Todo 是：
+1.  确保你有 8 张华为 Ascend NPU 卡。
+2.  确保 <code>$HOME/data/geo3k</code> 下面有数据。
+3.  运行这个脚本，看它能不能不报错地跑完那 1 个 Step。如果跑完了，说明环境配置成功。</p>

@@ -1,0 +1,93 @@
+<h1>tests/single_controller/test_high_level_scheduling_api.py</h1>
+<p>这段代码看起来确实充满了技术术语（Ray, Actor, WorkerGroup, ResourcePool），如果不了解背景很容易晕。</p>
+<p>其实，这是一份<strong>测试代码</strong>（Test Case）。它的核心目的是验证：<strong>在一个有多张显卡（GPU）的机器上，我能不能灵活地把这些显卡分配给不同的AI模型去使用？</strong></p>
+<p>为了让你听懂，我们把<strong>显卡（GPU）</strong>想象成<strong>办公室里的工位</strong>，把<strong>AI模型（Actor, Critic等）</strong>想象成<strong>不同的项目组</strong>。</p>
+<p>下面我列一个 <strong>“小白理解任务清单” (Todo List)</strong>，带你一步步拆解这段代码在干什么。</p>
+<hr />
+<h3>📋 任务清单：理解高层调度 API 测试</h3>
+<h4>✅ Task 0: 搞懂背景设定 (Context)</h4>
+<p>在这一行代码的背景（RLHF，强化学习训练大模型）中，通常有四个“项目组”需要干活：
+1.  <strong>Actor</strong>: 主角模型（负责生成回答）。
+2.  <strong>Critic</strong>: 评论家模型（负责打分）。
+3.  <strong>RM (Reward Model)</strong>: 奖励模型。
+4.  <strong>Ref (Reference Model)</strong>: 参考模型。</p>
+<p><strong>代码的目标</strong>：测试一个叫 <code>verl</code> 的系统，看它能不能帮我们管好这四个组，给它们分工位（GPU）。</p>
+<h4>✅ Task 1: 定义“打工人” (The Worker)</h4>
+<p>代码开头定义了一个 <code>TestActor</code> 类。
+*   <strong>代码行为</strong>：<code>class TestActor(Worker)...</code>
+*   <strong>通俗解释</strong>：这是在定义一个标准的“打工人”。它的主要技能很简单，就是被问到“你在哪？”时，它能回答“我在几号工位（显卡）上”。
+*   <strong>目的</strong>：用来测试分配是不是成功了。</p>
+<h4>✅ Task 2: 测试场景一 —— “全员共享大办公室”</h4>
+<p>代码进入 <code>test()</code> 函数的第一部分：<code>test single-node-no-partition</code>。</p>
+<ol>
+<li>
+<p><strong>创建资源池</strong>：</p>
+<ul>
+<li><code>resource_pool = RayResourcePool([8], use_gpu=True)</code></li>
+<li><strong>解释</strong>：系统圈出了一块地，里面有 <strong>8个工位（GPU）</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>创建项目组</strong>：</p>
+<ul>
+<li>代码连续创建了 <code>actor_wg</code>, <code>critic_wg</code>, <code>rm_wg</code>, <code>ref_wg</code>。</li>
+<li><strong>关键点</strong>：注意看，它们初始化时用的都是同一个 <code>resource_pool</code>。</li>
+<li><strong>解释</strong>：这四个组（Actor, Critic, RM, Ref）都登记在同一个拥有8个工位的大办公室名下。</li>
+</ul>
+</li>
+<li>
+<p><strong>验证分配 (Assert)</strong>：</p>
+<ul>
+<li><code>assert actor_wg... == [0, 1, ... 7]</code></li>
+<li><strong>解释</strong>：老板（测试程序）去问 Actor 组：“你们占了哪些工位？” 回答：“0到7号”。</li>
+<li>老板又去问 RM 组：“你们占了哪些？” 回答：“也是0到7号”。</li>
+<li><strong>结论</strong>：这证明了<strong>资源是可以复用的</strong>。在实际运行时，可能是Actor先用这8张卡训练一会，然后Critic再用这8张卡。大家轮流坐这8个位置。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 3: 中场休息 (Cleanup)</h4>
+<p>代码中间有一堆 <code>del</code> 和 <code>time.sleep(5)</code>。
+*   <strong>解释</strong>：测试完场景一，要把刚才的“打工人”都解雇，把占用的“工位”释放出来，打扫干净，防止影响下一个测试。</p>
+<h4>✅ Task 4: 测试场景二 —— “拆分与合并” (核心难点)</h4>
+<p>这是代码最精彩的部分：<code>test single-node-multi-partition</code>。
+有时候我们不想轮流用，想把办公室隔断开来用。</p>
+<ol>
+<li>
+<p><strong>创建小资源池</strong>：</p>
+<ul>
+<li><code>rm_resource_pool = ... [4]</code> (名为 RM池)</li>
+<li><code>ref_resource_pool = ... [4]</code> (名为 Ref池)</li>
+<li><strong>解释</strong>：把8个工位劈开。前4个给 RM池，后4个给 Ref池。</li>
+</ul>
+</li>
+<li>
+<p><strong>合并大资源池</strong>：</p>
+<ul>
+<li><code>total_resource_pool = merge_resource_pool(rm..., ref...)</code></li>
+<li><strong>解释</strong>：虽然物理上劈开了，但在逻辑上，我们把这两个小池子拼起来，还能叫它“总池子”（共8个工位）。</li>
+</ul>
+</li>
+<li>
+<p><strong>分配工位</strong>：</p>
+<ul>
+<li><code>actor_wg</code> 和 <code>critic_wg</code> 使用 <code>total_resource_pool</code> (总池)。</li>
+<li><code>rm_wg</code> 使用 <code>rm_resource_pool</code> (RM池)。</li>
+<li><code>ref_wg</code> 使用 <code>ref_resource_pool</code> (Ref池)。</li>
+</ul>
+</li>
+<li>
+<p><strong>最终验证 (Assert)</strong>：</p>
+<ul>
+<li><strong>Actor/Critic 说</strong>：“我看到了 0,1,2,3,4,5,6,7” (因为它们用了总池，视野是全局的)。</li>
+<li><strong>RM 说</strong>：“我只看到了 0,1,2,3” (它被限制在前半截)。</li>
+<li><strong>Ref 说</strong>：“我只看到了 4,5,6,7” (它被限制在后半截)。</li>
+</ul>
+</li>
+</ol>
+<h3>🎯 总结：这代码到底讲了啥观点？</h3>
+<p>这段代码并没有讲大道理，它是在<strong>验证一个功能</strong>。它证明了 <code>verl</code> 这个系统的调度器具备以下能力：</p>
+<ol>
+<li><strong>灵活性</strong>：既可以让所有模型<strong>独占</strong>所有显卡（分时复用），也可以把显卡<strong>切分</strong>给不同的模型同时使用。</li>
+<li><strong>视图一致性</strong>：最厉害的是那个 <code>merge</code>（合并）功能。它能让大模型（Actor）看到完整的8张卡，同时让小模型（RM/Ref）只看到属于自己的4张卡，而且<strong>卡号没有乱</strong>（Ref 知道自己用的是 4-7 号，而不是假的 0-3 号）。</li>
+</ol>
+<p><strong>一句话概括</strong>：这还是一个<strong>显卡分蛋糕</strong>的测试，验证了既能“整个蛋糕轮流吃”，也能“切开蛋糕分着吃”，还能“把切开的蛋糕拼回去假装是完整的”。</p>

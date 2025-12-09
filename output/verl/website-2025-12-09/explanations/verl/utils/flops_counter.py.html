@@ -1,0 +1,82 @@
+<h1>verl/utils/flops_counter.py</h1>
+<p>这份代码其实就是一个 <strong>“AI 训练速度计算器”</strong>。</p>
+<p>它的核心目的是：<strong>算出你当前的训练实际上有多快（每秒进行了多少次浮点运算），并跟硬件的理论极限去对比，看看有没有偷懒。</strong></p>
+<p>为了让你听懂，我们把“训练模型”比作“<strong>搬砖</strong>”。
+*   <strong>FLOPS (每秒浮点运算次数)</strong> = <strong>搬砖的速度</strong>。
+*   <strong>GPU (显卡)</strong> = <strong>搬砖工人</strong>。
+*   <strong>Model (模型参数)</strong> = <strong>砖头的重量和数量</strong>。
+*   <strong>Token (数据)</strong> = <strong>要搬运的距离</strong>。</p>
+<p>下面我列一个 <strong>Task List (任务清单)</strong>，带你一步步构建这个计算器的逻辑：</p>
+<hr />
+<h3>Task 1: 搞清楚工人的理论极限 (查询硬件规格)</h3>
+<p><strong>代码对应函数：</strong> <code>get_device_flops(unit="T")</code></p>
+<p>首先，我们需要知道你用的显卡（工人）理论上最快能干多快。
+*   <strong>逻辑</strong>：代码里写死了一张查表单。它会检测你的显卡名字（比如 A100, H100, RTX 3070 Ti）。
+*   <strong>例子</strong>：
+    *   如果是 <code>H100</code>，代码返回 <code>989e12</code> (989 TFLOPS)。
+    *   如果是 <code>A100</code>，代码返回 <code>312e12</code> (312 TFLOPS)。
+    *   如果是 <code>CPU</code>，它给了一个大概的数字。
+*   <strong>目的</strong>：这就是“满分”是多少。</p>
+<h3>Task 2: 搞清楚你要搬多少砖 (计算计算量)</h3>
+<p><strong>代码对应类：</strong> <code>FlopsCounter</code> 及其 <code>_estimate_*_flops</code> 方法</p>
+<p>这是代码最核心、也是数学最复杂的部分。我们需要算出<strong>处理这一批数据，到底需要做多少次加减乘除运算</strong>。</p>
+<p>这个计算公式通常遵循一个通用法则：<strong>计算量 ≈ 6 × 模型参数量 × 数据量(Token数)</strong>。
+*   为什么是 6？
+    *   前向传播（算预测结果）：2次运算（1次乘法+1次加法）。
+    *   反向传播（算梯度）：4次运算（对权重的梯度 + 对输入的梯度）。
+    *   合计 2 + 4 = 6。</p>
+<p>代码中根据不同的模型（Llama, Qwen, DeepSeek），计算“模型参数量”的方式不同：</p>
+<h4>Sub-Task 2.1: 估算普通稠密模型 (Dense Model)</h4>
+<p><strong>代码对应：</strong> <code>_estimate_qwen2_flops</code> (也用于 Llama, Mistral 等)
+*   <strong>逻辑</strong>：
+    1.  <strong>算 MLP 层参数</strong>：<code>hidden_size * intermediate_size * 3</code> (因为有升维、降维、门控)。
+    2.  <strong>算 Attention 层参数</strong>：<code>Q, K, V, O</code> 四个矩阵的参数。
+    3.  <strong>算总参数量 (N)</strong>：把上面加起来 × 层数。
+    4.  <strong>算计算量</strong>：<code>6 * N * tokens_sum</code>。
+    5.  <strong>额外加上 Attention 的计算</strong>：<code>12 * seqlen^2 * ...</code> (这部分跟序列长度的平方成正比)。</p>
+<h4>Sub-Task 2.2: 估算混合专家模型 (MoE Model)</h4>
+<p><strong>代码对应：</strong> <code>_estimate_deepseek_v3_flops</code> 或 <code>_estimate_qwen2_moe_flops</code>
+*   <strong>难点</strong>：MoE 模型有“专家”概念。虽然总参数很大，但处理每个 Token 时，只有几个“专家”在工作。
+*   <strong>逻辑</strong>：
+    *   计算 FLOPS 时，<strong>不能用总参数量</strong>，而要用 <strong>“激活参数量”</strong>。
+    *   代码里会用到 <code>num_experts_per_tok</code> (每个 token 选几个专家) 来计算实际参与运算的参数量。
+    *   DeepSeek V3 还有特殊的 MSA (多头潜在注意力) 和共享专家逻辑，代码里把这些特殊的参数加法都写进去了。</p>
+<h3>Task 3: 汇总并计算速度 (除以时间)</h3>
+<p><strong>代码对应：</strong> <code>estimate_flops(self, batch_seqlens, delta_time)</code></p>
+<p>现在我们有了总计算量（搬砖总量）和花费的时间（<code>delta_time</code>）。</p>
+<ul>
+<li><strong>输入</strong>：<ul>
+<li><code>batch_seqlens</code>: 这一批数据里每个句子的长度（比如 [1024, 512, ...]）。</li>
+<li><code>delta_time</code>: 处理这批数据花了多少秒。</li>
+</ul>
+</li>
+<li><strong>计算</strong>：<ol>
+<li><code>tokens_sum</code> = 把所有句子长度加起来。</li>
+<li><code>estimated_flops</code> = (Sub-Task 2 算出的总运算次数) / <code>delta_time</code>。</li>
+<li>转换为 TFLOPS (除以 1e12)。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 4: 输出对比结果</h3>
+<p><strong>代码对应：</strong> <code>estimate_flops</code> 的返回值</p>
+<p>最后，这个函数返回两个数：
+1.  <code>estimated_flops</code> (你实际跑出来的速度，比如 150 TFLOPS)。
+2.  <code>promised_flops</code> (Task 1 里查到的硬件理论速度，比如 A100 是 312 TFLOPS)。</p>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>想象你是一个包工头（训练框架开发者）：</p>
+<ol>
+<li><strong><code>__init__</code></strong>: 你看了一眼图纸，确定是盖什么楼（是 Llama 还是 DeepSeek），如果是 DeepSeek 就拿 DeepSeek 的算法算砖头。</li>
+<li><strong><code>get_device_flops</code></strong>: 你看了一眼工人是施瓦辛格（H100）还是普通人（3070 Ti），记下他的体力上限。</li>
+<li><strong><code>estimate_flops</code></strong>: 工人搬完了一车砖。<ul>
+<li>你数了数砖头（Token数）。</li>
+<li>你按图纸算了算这车砖需要搬运的距离（模型参数计算量）。</li>
+<li>你掐表看了看时间（Delta time）。</li>
+<li><strong>得出结论</strong>：刚才这波操作，速度相当于每秒搬了多少次。</li>
+</ul>
+</li>
+</ol>
+<p><strong>最终用途：</strong>
+通常在这个库 (<code>verl</code> - 一个强化学习库) 训练过程中，会在进度条上显示 <strong>MFU (Model FLOPS Utilization)</strong>。
+公式是：<code>实际速度 / 理论速度</code>。
+如果算出来只有 20%，说明代码写得烂或者通信太慢；如果能到 50%-60%，说明训练效率很高。</p>

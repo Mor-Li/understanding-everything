@@ -1,0 +1,64 @@
+<h1>recipe/r1/main_eval.py</h1>
+<p>这份代码其实就是一个<strong>“自动阅卷机”</strong>。</p>
+<p>它的核心观点是：<strong>因为要评估的数据量很大（可能有几万条模型生成的回答），单线程跑太慢了，所以我们要用多进程并行（Ray）来给每一条回答打分，最后按题目类型汇总平均分。</strong></p>
+<p>为了让你彻底看懂，我把你（作为程序的执行者）的任务拆解成一个 <strong>Task List (待办清单)</strong>。我们一步步勾选，你就明白它在干啥了。</p>
+<hr />
+<h3>📋 任务清单：构建一个并行评估系统</h3>
+<h4>✅ Task 1: 准备“试卷”和“答案” (数据加载)</h4>
+<p><strong>代码位置：</strong> <code>main</code> 函数的前几行。
+<strong>逻辑解读：</strong>
+你要阅卷，首先得有卷子。
+1.  <strong>读取配置</strong> (<code>@hydra.main</code>)：弄清楚这次要评测哪个文件，用什么标准。
+2.  <strong>搬运数据</strong> (<code>copy_to_local</code>)：把数据文件从远程存储（比如S3或HDFS）拉到本地，方便读取。
+3.  <strong>打开文件</strong> (<code>pd.read_parquet</code>)：读取这个 Parquet 格式的大表格。
+    *   表格里主要有三列关键信息：
+        *   <code>responses</code>: 模型生成的回答（考生的答案）。
+        *   <code>data_sources</code>: 数据的来源（比如是数学题、代码题还是闲聊题）。
+        *   <code>reward_model_data</code>: 包含标准答案（Ground Truth）的信息。</p>
+<h4>✅ Task 2: 制定“评分规则” (定义打分逻辑)</h4>
+<p><strong>代码位置：</strong> <code>@ray.remote def process_item(...)</code> 函数。
+<strong>逻辑解读：</strong>
+这是阅卷的核心逻辑，但这里不仅定义了逻辑，还加了一个魔法 <code>ray.remote</code>。
+1.  <strong>定义单个任务</strong>：这个函数只负责<strong>改一份卷子</strong>。
+2.  <strong>获取打分器</strong> (<code>get_custom_reward_fn</code>)：根据配置加载打分函数（可能是比对字符串，也可能是用另一个AI打分）。
+3.  <strong>打分</strong> (<code>reward_fn(...)</code>)：拿着“模型回答”和“标准答案”进行比对，算出一个分数。
+4.  <strong>返回结果</strong>：把这道题的“来源（Subject）”和“分数（Score）”传回去。</p>
+<blockquote>
+<p><strong>注意</strong>：<code>@ray.remote</code> 的意思是告诉电脑：“这个函数我要发给很多个CPU核心同时做，不要一个个排队做。”</p>
+</blockquote>
+<h4>✅ Task 3: 雇佣“阅卷团队”并分发任务 (并行计算初始化)</h4>
+<p><strong>代码位置：</strong> <code>main</code> 函数中间部分 (<code>ray.init</code>, <code>remote_tasks</code> 列表推导式)。
+<strong>逻辑解读：</strong>
+只有你一个人改几万份卷子会累死，所以你要摇人。
+1.  <strong>启动引擎</strong> (<code>ray.init</code>): 启动 Ray 分布式计算框架（相当于把阅卷大厅的门打开，叫所有阅卷老师进来）。
+2.  <strong>分发试卷</strong> (<code>remote_tasks = [...]</code>):
+    *   这是一个循环。
+    *   代码把每一行数据（题目、回答、答案）打包成一个任务，扔进 <code>process_item.remote(...)</code>。
+    *   <strong>关键点</strong>：这里并不会等待任务完成，而是瞬间把几万个任务单据发出去，让 Ray 在后台疯狂计算。</p>
+<h4>✅ Task 4: 监控进度并回收“成绩单” (异步收集结果)</h4>
+<p><strong>代码位置：</strong> <code>with tqdm(...) as pbar:</code> 那个 <code>while</code> 循环。
+<strong>逻辑解读：</strong>
+你作为监考官，坐在讲台上等结果。
+1.  <strong>等待完成</strong> (<code>ray.wait</code>): 你不需要一直盯着每一个老师，你只需要问 Ray：“有哪些卷子改完了？”
+2.  <strong>获取结果</strong> (<code>ray.get</code>): 拿到改完的卷子的结果（科目和分数）。
+3.  <strong>分类记录</strong> (<code>data_source_reward</code>): 拿个小本本记下来。
+    *   如果是“数学题”，就把分数记在数学栏。
+    *   如果是“代码题”，记在代码栏。
+4.  <strong>更新进度条</strong> (<code>pbar.update</code>): 告诉用户现在改了多少了。</p>
+<h4>✅ Task 5: 算总账 (计算平均分并输出)</h4>
+<p><strong>代码位置：</strong> 最后几行 (<code>np.mean</code>, <code>print</code>).
+<strong>逻辑解读：</strong>
+卷子全改完了，该出报告了。
+1.  <strong>计算平均分</strong>：遍历刚才的小本本，算出每个科目（data_source）的平均分。
+    *   比如：<code>test_score/math</code>: 85.5 分
+    *   <code>test_score/coding</code>: 92.0 分
+2.  <strong>打印报告</strong>：把最终的字典 <code>metric_dict</code> 打印出来。</p>
+<hr />
+<h3>总结文中的核心观点</h3>
+<p>这段代码其实就在讲一件事：</p>
+<p><strong>“如何利用 Ray 框架，对大规模的模型生成数据进行离线（Offline）的、基于Ground Truth（标准答案）的并行化打分，并按数据类别统计平均分。”</strong></p>
+<ul>
+<li><strong>输入</strong>：包含生成结果和标准答案的大表。</li>
+<li><strong>处理</strong>：拆分成单条数据 -&gt; 并行打分。</li>
+<li><strong>输出</strong>：各类别数据的平均得分。</li>
+</ul>

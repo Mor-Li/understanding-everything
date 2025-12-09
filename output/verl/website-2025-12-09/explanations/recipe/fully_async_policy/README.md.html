@@ -1,0 +1,68 @@
+<h1>recipe/fully_async_policy/README.md</h1>
+<p>这份文档主要介绍了一种名为 <strong>Fully Async Policy Trainer（全异步策略训练器）</strong> 的新技术方案。它的核心目的是<strong>在不降低模型效果的前提下，大幅提升大模型强化学习（RLHF/PPO）的训练速度。</strong></p>
+<p>为了让你听懂，我把阅读这份文档的任务拆解成一个 <strong>“理解清单 (Todo List)”</strong>。我们像剥洋葱一样，一层一层把它的核心观点剥开。</p>
+<hr />
+<h3>✅ Task 1：理解背景——为什么要改？(痛点是什么)</h3>
+<p>首先，你要明白传统的训练方式（文档里叫 <code>Colocate</code> 或 <code>Synchronous</code>）有什么问题。</p>
+<ul>
+<li><strong>旧模式（接力赛）：</strong> 所有的 GPU 先一起做“生成数据”（Rollout），做完了停下来，再一起做“模型训练”（Train）。</li>
+<li><strong>问题：</strong><ul>
+<li><strong>资源浪费：</strong> 生成的时候，管训练的计算单元在发呆；训练的时候，管生成的显存在发呆。</li>
+<li><strong>长尾效应（Long-tail）：</strong> 就像考试一样，只要有一个学生（GPU）没做完题（生成慢了），全班（所有GPU）都要等它交卷才能开始讲课（训练）。这导致效率极低。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 2：理解核心方案——“分家”与“并行”</h3>
+<p>文档提出的解决方案是 <code>Fully Async Policy</code>。</p>
+<ul>
+<li><strong>观点：</strong> 把 GPU 资源拆分成两拨，各干各的。<ul>
+<li><strong>Rollouter（生成组）：</strong> 专门负责写作业（生成数据样本）。</li>
+<li><strong>Trainer（训练组）：</strong> 专门负责批改作业并升级大脑（训练模型）。</li>
+</ul>
+</li>
+<li><strong>好处：</strong> 两拨人同时干活，谁也不等谁。训练组在训练的时候，生成组已经在写下一批作业了。这就是文档里提到的 <strong>Resource Isolation（资源隔离）</strong> 和 <strong>Parallel Generation and Training（并行生成与训练）</strong>。</li>
+</ul>
+<h3>✅ Task 3：理解“流水线”作业——Streaming（流式）</h3>
+<p>以前是攒够一大堆数据再打包发给训练组，现在变了。</p>
+<ul>
+<li><strong>观点：</strong> 只要生成组写完<strong>一个</strong>样本，马上丢进一个“篮子”（MessageQueue），训练组随时从篮子里拿。</li>
+<li><strong>术语：</strong> 文档里叫 <code>Stream Inference and Training</code>。</li>
+<li><strong>好处：</strong> 就像回转寿司一样，做多少吃多少，数据流动更平滑，减少了等待一大批数据凑齐的时间。</li>
+</ul>
+<h3>✅ Task 4：理解关键难点——“新鲜度”与“异步” (Staleness)</h3>
+<p>既然两拨人各干各的，就会出现一个问题：<strong>生成组用的模型版本，可能比训练组正在更新的版本旧。</strong></p>
+<ul>
+<li><strong>观点：</strong> 以前严格要求必须用最新的大脑生成数据（On-policy）。现在为了快，允许用<strong>稍微旧一点点</strong>的大脑生成的数据来训练。</li>
+<li><strong>控制方法：</strong> 文档里提到了一个参数 <code>staleness_threshold</code>（陈旧度阈值）。<ul>
+<li>如果是 0，就是严格同步（慢）。</li>
+<li>如果大于 0，就是允许一定的异步（快，但要控制度，太旧的数据会把模型练坏）。</li>
+</ul>
+</li>
+<li><strong>结论：</strong> 实验证明，只要控制好这个度，训练效果几乎不受影响，但速度快很多。</li>
+</ul>
+<h3>✅ Task 5：理解终极优化——Partial Rollout（部分生成）</h3>
+<p>这是文档里非常厉害的一个技术点。</p>
+<ul>
+<li><strong>场景：</strong> 训练组喊：“我要更新参数了，生成组把手里的活停一下，同步一下新参数！”</li>
+<li><strong>旧做法：</strong> 生成组如果正在写一个很长的回复，必须要把这个回复写完，或者直接扔掉，才能去同步参数。这又在浪费时间。</li>
+<li><strong>新观点（Partial Rollout）：</strong> 生成组可以说：“好，我写到一半，先<strong>暂停（Sleep）</strong>，把现场存起来。等同步完新参数，我再<strong>恢复（Resume）</strong>接着往下写。”</li>
+<li><strong>好处：</strong> 彻底消灭了“等别人干完活”的时间，效率拉满。</li>
+</ul>
+<h3>✅ Task 6：看结果——真的有用吗？</h3>
+<p>文档最后列了一大堆表格，其实就讲了两个事：</p>
+<ol>
+<li><strong>速度飞快：</strong> 在 128 张 GPU 的大规模训练下，速度提升了 <strong>2.35倍 到 2.67倍</strong>。</li>
+<li><strong>效果没崩：</strong> 模型的准确率（Acc）和原来的慢速训练方式基本持平。</li>
+</ol>
+<hr />
+<h3>总结：这份文档讲了什么？</h3>
+<p>如果用一句话概括：
+<strong>这篇文档教你如何通过把“做题”和“改题”的 GPU 分开，让它们同时干活，并且允许偶尔用一点点旧题，甚至允许做题做到一半暂停去更新脑子，从而让大模型训练速度翻倍。</strong></p>
+<h3>💡 你的下一步 Action List (如果在这个项目里)：</h3>
+<p>如果你需要运行这个代码，按照文档的 <code>Usage</code> 部分：
+1.  <strong>分资源：</strong> 决定多少卡做 Trainer，多少卡做 Rollouter（建议根据监控调整，哪边闲就减哪边的卡）。
+2.  <strong>设模式：</strong> 推荐使用 <strong>Mode 4</strong>（异步流式 + 部分生成），即设置：
+    *   <code>trigger_parameter_sync_step &gt;= 1</code>
+    *   <code>staleness_threshold &gt; 0</code> (比如 0.5)
+    *   <code>partial_rollout = True</code>
+3.  <strong>跑脚本：</strong> 参考文档里的 <code>Quick Start</code> 脚本运行即可。</p>

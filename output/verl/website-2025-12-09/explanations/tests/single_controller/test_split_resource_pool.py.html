@@ -1,0 +1,109 @@
+<h1>tests/single_controller/test_split_resource_pool.py</h1>
+<p>这份代码是一个<strong>测试文件</strong>，主要用来测试 <code>verl</code> 框架中关于 <strong>“分布式资源池分割 (Split Resource Pool)”</strong> 的功能。</p>
+<p>简单来说，它的核心目的是验证：<strong>如果我们有一大堆 GPU（比如8张），能不能按需把它们切分成几个不同的小组，并且让每个小组独立工作，互不干扰？</strong></p>
+<p>为了让你听懂，我把这个过程想象成<strong>包工头分派任务</strong>。</p>
+<hr />
+<h3>📋 任务清单 (Task List)</h3>
+<p>要读懂这个文件，我们可以把它的逻辑拆解成下面这个 <strong>Todo List</strong>，代码就是按这个顺序执行的：</p>
+<ol>
+<li><strong>定义工人 (Define Actor)</strong>: 先定义一个“工人”类，告诉它有了 GPU 之后该干什么（做简单的加法运算，报出自己的工号）。</li>
+<li><strong>圈地盘 (Init Global Pool)</strong>: 模拟我们手头一共有多少计算资源（比如一共 8 张 GPU）。</li>
+<li><strong>切蛋糕 (Split Pool)</strong>: 这是测试的核心。把这 8 张 GPU 切分成不同的小组（比如 4+4，或者 2+6）。</li>
+<li><strong>派工 (Assign Workers)</strong>: 把“工人”放进切好的小组里，组建“施工队”（WorkerGroup）。</li>
+<li><strong>验货 (Verify)</strong>: 让每个施工队干活（运行 <code>add</code> 函数），检查结果对不对。如果结果对了，说明资源切分成功，大家没拿错 GPU。</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<h4>第一步：定义工人 (<code>class Actor</code>)</h4>
+<p>代码最上面定义的 <code>Actor</code> 类，就是“工人”。</p>
+<ul>
+<li><strong>身份卡 (<code>worker_id</code>)</strong>: 每个工人有个 ID。</li>
+<li><strong>初始化 (<code>__init__</code>)</strong>: 工人启动时，会初始化分布式环境（<code>torch.distributed</code>）。这就像工人进场后，领取对讲机，确认自己是队里的第几号（<code>rank</code>）。</li>
+<li><strong>干活 (<code>add</code>)</strong>:<ul>
+<li>逻辑是：<code>数据 + 自己的Rank + 自己的Worker_ID</code>。</li>
+<li><strong>为什么要这么算？</strong> 为了验证！如果结果里体现了正确的 Rank 和 ID，就说明这个工人被正确分配到了指定的位置。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：测试场景一 —— 平均切分 (<code>test_split_resource_pool_with_split_size</code>)</h4>
+<p>这是最简单的测试。</p>
+<ol>
+<li><strong>圈地盘</strong>: <code>RayResourcePool(process_on_nodes=[4, 4])</code>。<ul>
+<li>意思模拟有 2 台机器，每台 4 张卡，一共 8 张 GPU。</li>
+</ul>
+</li>
+<li><strong>切蛋糕</strong>: <code>split_resource_pool(..., split_size=4)</code>。<ul>
+<li>把 8 张卡，按每份 4 张切。结果就是切成两份：<code>Pool_1</code> (4张) 和 <code>Pool_2</code> (4张)。</li>
+</ul>
+</li>
+<li><strong>派工</strong>:<ul>
+<li>队伍1 (<code>actor_worker_1</code>) 只有 ID=0 的工人，用 <code>Pool_1</code>。</li>
+<li>队伍2 (<code>actor_worker_2</code>) 只有 ID=100 的工人，用 <code>Pool_2</code>。</li>
+</ul>
+</li>
+<li><strong>验货</strong>:<ul>
+<li><code>assert actor_worker_1.world_size == 4</code>: 确认队伍1有4个人。</li>
+<li><code>assert actor_output_1...</code>: 检查输出。<ul>
+<li>队伍1的 Rank 是 0, 1, 2, 3。ID是0。</li>
+<li>结果应该是 <code>0+0, 0+1, 0+2, 0+3</code> (因为数据是0)。</li>
+</ul>
+</li>
+<li><code>assert actor_output_2...</code>:<ul>
+<li>队伍2的 Rank 也是 0, 1, 2, 3 (因为它是独立的新队伍)。ID是100。</li>
+<li>结果应该是 <code>100+0, 100+1, 100+2, 100+3</code>。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论</strong>: 这个测试证明资源池可以被平均切分，且两个新队伍独立编号。</p>
+<h4>第三步：测试场景二 —— 不均匀切分 (<code>test_split_resource_pool_with_split_size_list</code>)</h4>
+<p>这次稍微复杂一点。</p>
+<ol>
+<li><strong>圈地盘</strong>: 模拟 4 台机器，每台 2 张卡（总共还是 8 张）。</li>
+<li><strong>切蛋糕</strong>: <code>split_size=[2, 6]</code>。<ul>
+<li>我要第一份是 2 张卡，第二份是 6 张卡。</li>
+</ul>
+</li>
+<li><strong>验货</strong>:<ul>
+<li>队伍1 (<code>world_size</code> 应该是 2) -&gt; 结果验证 Rank 0-1。</li>
+<li>队伍2 (<code>world_size</code> 应该是 6) -&gt; 结果验证 Rank 0-5。</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论</strong>: 证明系统支持把资源切成大小不一的碎片。</p>
+<h4>第四步：测试场景三 —— 跨节点切分 (<code>test_split_resource_pool_with_split_size_list_cross_nodes</code>)</h4>
+<p>这个测试是为了验证“物理位置不影响逻辑切分”。</p>
+<ol>
+<li><strong>圈地盘</strong>: 2 台机器，每台 4 张卡（物理上是 4+4）。</li>
+<li><strong>切蛋糕</strong>: <code>split_size=[2, 6]</code>。<ul>
+<li>注意！第一台机器有4张卡，但我只要2张给队伍1。</li>
+<li>剩下的2张（来自机器1）+ 4张（来自机器2）要组合成队伍2。</li>
+</ul>
+</li>
+<li><strong>重点</strong>: <code>split_resource_pool</code> 这个函数非常聪明，它会自动处理这种跨机器的拼接。</li>
+<li><strong>验货</strong>: 结果和场景二一样，队伍1拿2个，队伍2拿6个。</li>
+</ol>
+<p><strong>结论</strong>: 证明即使 GPU 分布在不同机器上，代码也能把它们“逻辑上”拼成一个组。</p>
+<h4>第五步：测试场景四 —— 连环切分 (<code>test_split_resource_pool_with_split_twice</code>)</h4>
+<p>这是终极测试：切完了还能再切吗？</p>
+<ol>
+<li><strong>第一次切</strong>: 把 8 张卡切成 <code>[2, 4, 2]</code> 三份 (分别叫 <code>rp_1</code>, <code>rp_2</code>, <code>rp_3</code>)。</li>
+<li><strong>第二次切</strong>: 把中间那份 <code>rp_2</code> (4张卡)，再切成 4 份，每份 1 张 (<code>split_size=1</code>)。</li>
+<li><strong>最终状态</strong>:<ul>
+<li><code>rp_1</code>: 2张</li>
+<li><code>rp_2</code> 变成了 -&gt; 1张, 1张, 1张, 1张</li>
+<li><code>rp_3</code>: 2张</li>
+<li>一共 6 个小队伍。</li>
+</ul>
+</li>
+<li><strong>验货</strong>: 循环检查这 6 个队伍的 <code>world_size</code> 和计算结果。</li>
+</ol>
+<p><strong>结论</strong>: 证明资源池支持递归切分（套娃式切分）。</p>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这个文件虽然看起来代码很多，但其实就在讲一件事：</p>
+<p><strong>Verl 框架里的 <code>split_resource_pool</code> 函数非常强大。不管你有多少 GPU，不管它们物理上插在哪台机器上，你都可以随意地把它们切分成任意大小的“逻辑小组”，分配给不同的 AI 模型或任务去使用。</strong></p>
+<p>所有的 <code>assert</code> 语句都是为了确保：
+1.  切出来的小组人数对不对（GPU数量）。
+2.  切出来的小组里，每个人的编号（Rank）是不是从 0 开始重新算的。</p>

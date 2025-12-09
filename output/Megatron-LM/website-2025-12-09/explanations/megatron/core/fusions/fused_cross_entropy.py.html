@@ -1,0 +1,131 @@
+<h1>megatron/core/fusions/fused_cross_entropy.py</h1>
+<p>这份代码确实非常硬核，它属于 <strong>Megatron-Core</strong>，是 NVIDIA 用来训练像 GPT-3/GPT-4 这样超大模型的底层核心库。</p>
+<p>这段代码解决的核心问题是：<strong>当词表（Vocabulary）非常大（比如 5万、10万个词），导致输出层的矩阵无法塞进单个 GPU 时，如何跨多个 GPU 高效地计算交叉熵损失（Cross Entropy Loss）。</strong></p>
+<p>为了让你听懂，我们把这个复杂的任务拆解成一个 <strong>学习清单（To-Do List）</strong>。我们不直接看代码，而是按照逻辑一步步构建这个功能。</p>
+<hr />
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 理解背景 —— 什么是 "Vocab Parallel"（词表并行）？</h4>
+<ul>
+<li><strong>场景</strong>：假设你的模型要预测下一个词，词表有 100 个词（0-99）。</li>
+<li><strong>问题</strong>：显存不够。</li>
+<li><strong>方案</strong>：你有 2 个 GPU。<ul>
+<li><strong>GPU 0</strong> 负责计算词 ID 0-49 的得分（Logits）。</li>
+<li><strong>GPU 1</strong> 负责计算词 ID 50-99 的得分（Logits）。</li>
+</ul>
+</li>
+<li><strong>现状</strong>：代码中的 <code>vocab_parallel_logits</code> 就是这种切分后的数据。每个 GPU 手里只有<strong>一部分</strong>词的得分。</li>
+</ul>
+<h4>✅ Task 2: 理解数学难点 —— Softmax 的数值稳定性</h4>
+<ul>
+<li>计算 Loss 前必须做 Softmax：$P_i = \frac{e^{x_i}}{\sum e^{x_j}}$。</li>
+<li><strong>难点</strong>：如果 $x_i$ 很大（比如 1000），$e^{1000}$ 会导致计算机溢出（NaN）。</li>
+<li><strong>技巧</strong>：所有数减去最大值。$\frac{e^{x_i - max}}{\sum e^{x_j - max}}$。结果不变，但数值安全了。</li>
+<li><strong>代码对应</strong>：这就是为什么代码里到处都在算 <code>logits_max</code>。</li>
+</ul>
+<h4>✅ Task 3: 前向传播 Step 1 —— 寻找全局最大值</h4>
+<ul>
+<li><strong>问题</strong>：GPU 0 知道它那部分的 Max，GPU 1 知道它的 Max。但我们需要<strong>全局</strong> Max。</li>
+<li><strong>动作</strong>：<ol>
+<li>每个 GPU 算出自己的 Max。</li>
+<li>大家“开个会”（通信），互相比一下，拿出最大的那个。</li>
+</ol>
+</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>calculate_logits_max</code>: 算自己的。</li>
+<li><code>torch.distributed.all_reduce(..., op=MAX)</code>: 开会比大小。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 前向传播 Step 2 —— 谁拿着正确答案？(Target Masking)</h4>
+<ul>
+<li><strong>场景</strong>：假设正确答案（Target）是单词 ID "42"。</li>
+<li><strong>逻辑</strong>：<ul>
+<li>GPU 0 (管 0-49) 说：“42 在我这！我要把它的得分拿出来算 Loss。”</li>
+<li>GPU 1 (管 50-99) 说：“42 不在我这，我只需要帮忙算分母（Sum Exp）就行。”</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>calculate_predicted_logits</code>: 这个函数就是在判断“正确答案是不是在我这个 GPU 上”。如果在了，就把那个得分（predicted logit）挑出来。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 前向传播 Step 3 —— 计算分母与通信优化</h4>
+<ul>
+<li><strong>问题</strong>：Softmax 的分母是 $\sum e^{x_i}$。<ul>
+<li>GPU 0 算出前一半的 $e^x$ 之和。</li>
+<li>GPU 1 算出后一半的 $e^x$ 之和。</li>
+<li>需要把它们加起来得到全局的总和。</li>
+</ul>
+</li>
+<li><strong>优化技巧（Fusion）</strong>：本来我们需要传两次数据（一次传“正确答案的得分”，一次传“分母总和”）。代码里把这两个数拼起来（<code>torch.cat</code>），只做一次通信（AllReduce），省时间。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>predicted_logits_sum_exp_logits</code>: 把分子相关项和分母相关项拼在一起。</li>
+<li><code>torch.distributed.all_reduce(..., op=SUM)</code>: 开会做加法。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 前向传播 Step 4 —— 算最终 Loss</h4>
+<ul>
+<li><strong>逻辑</strong>：拿到全局的 Max、全局的分母 Sum、以及正确答案的 Logit 后，就可以套公式算 Loss 了。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>calculate_cross_entropy_loss</code>: 纯数学计算。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 7: 为什么要有 <code>@jit_fuser</code>？</h4>
+<ul>
+<li><strong>原因</strong>：PyTorch 原生代码是一行一行执行的（启动内核 -&gt; 读内存 -&gt; 计算 -&gt; 写内存）。这对于简单的加减乘除来说太慢了。</li>
+<li><strong>JIT Fusion</strong>：这个装饰器会把函数里的加减乘除“融合”成一个 C++ 内核（Kernel），一次性执行完，极大减少读写内存的次数。</li>
+</ul>
+<hr />
+<h3>🧐 逐段代码“翻译”</h3>
+<p>现在我们带着上面的理解，再看代码就清晰了：</p>
+<h4>1. <code>calculate_logits_max</code></h4>
+<div class="codehilite"><pre><span></span><code><span class="nd">@jit_fuser</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">calculate_logits_max</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 目的：算出当前 GPU 上这部分 logits 的最大值。</span>
+    <span class="c1"># 为后续 Softmax 防溢出做准备。</span>
+    <span class="k">return</span> <span class="n">vocab_parallel_logits</span><span class="p">,</span> <span class="n">logits_max</span>
+</code></pre></div>
+
+<h4>2. <code>calculate_predicted_logits</code></h4>
+<div class="codehilite"><pre><span></span><code><span class="nd">@jit_fuser</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">calculate_predicted_logits</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 目的：</span>
+    <span class="c1"># 1. 算出 e^(x - max) 用于分母。</span>
+    <span class="c1"># 2. 看看 Target（正确答案）是不是在这个 GPU 上。</span>
+    <span class="c1"># 3. 如果在，把那个特定的 logit 拿出来。</span>
+
+    <span class="c1"># 这里有个骚操作：把 &quot;predicted_logits&quot; (分子部分) 和 &quot;sum_exp_logits&quot; (分母部分) </span>
+    <span class="c1"># 拼成一个 Tensor。为什么要拼？为了下面只做一次网络通信。</span>
+    <span class="n">predicted_logits_sum_exp_logits</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">((</span><span class="n">predicted_logits</span><span class="p">,</span> <span class="n">sum_exp_logits</span><span class="p">))</span>
+
+    <span class="k">return</span> <span class="o">...</span><span class="p">,</span> <span class="n">predicted_logits_sum_exp_logits</span><span class="p">,</span> <span class="o">...</span>
+</code></pre></div>
+
+<h4>3. <code>calculate_cross_entropy_loss</code></h4>
+<div class="codehilite"><pre><span></span><code><span class="nd">@jit_fuser</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">calculate_cross_entropy_loss</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 目的：把刚才拼起来的 Tensor 拆开。</span>
+    <span class="c1"># 然后套 Cross Entropy 公式： Loss = log(Sum(exp)) - Target_Logit</span>
+    <span class="n">split_val</span> <span class="o">=</span> <span class="n">predicted_logits_sum_exp_logits</span><span class="o">.</span><span class="n">size</span><span class="p">()[</span><span class="mi">0</span><span class="p">]</span> <span class="o">//</span> <span class="mi">2</span>
+    <span class="n">predicted_logits</span><span class="p">,</span> <span class="n">sum_exp_logits</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># ... 计算 loss ...</span>
+    <span class="k">return</span> <span class="n">exp_logits</span><span class="p">,</span> <span class="n">loss</span>
+</code></pre></div>
+
+<h4>4. <code>_VocabParallelCrossEntropy</code> (核心主控类)</h4>
+<p>这是最关键的类，继承自 <code>torch.autograd.Function</code>，说明它是<strong>手动实现反向传播</strong>的。</p>
+<p><strong>Forward (前向传播):</strong>
+1.  <code>calculate_logits_max</code>: 算局部最大值。
+2.  <code>all_reduce(MAX)</code>: <strong>通信</strong>，拿到全局最大值。
+3.  <code>calculate_predicted_logits</code>: 算局部 sum(exp) 和提取 target logit。
+4.  <code>all_reduce(SUM)</code>: <strong>通信</strong>，拿到全局 sum(exp) 和全局 target logit（因为之前拼起来了，所以一次通信搞定）。
+5.  <code>calculate_cross_entropy_loss</code>: 算最终 Loss。
+6.  <code>save_for_backward</code>: 把 Softmax 的结果存下来，反向传播要用。</p>
+<p><strong>Backward (反向传播):</strong>
+1.  <code>calculate_gradients</code>: 根据保存的 Softmax 结果和 Loss 的梯度，算出输入的梯度。
+    *   公式逻辑：Softmax 的梯度通常是 $(P - Y)$，这里就是手动算这个。</p>
+<h3>总结</h3>
+<p>这个文件的作用是：<strong>在词表被切分到多个 GPU 的情况下，利用 JIT 编译加速数学运算，利用手动拼凑 Tensor 减少网络通信次数，从而极其高效地计算交叉熵损失。</strong></p>

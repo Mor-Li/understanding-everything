@@ -1,0 +1,52 @@
+<h1>examples/grpo_trainer/run_qwen3-235b_megatron_96gb.sh</h1>
+<p>这份脚本确实看起来非常复杂，因为它是在配置一个<strong>极大规模（235B参数）</strong>的大模型训练任务。</p>
+<p>简单来说，这个脚本是一个<strong>项目经理</strong>，它在指挥一大群服务器（GPU集群）协同工作，使用 <strong>GRPO 强化学习算法</strong> 来训练 <strong>Qwen3-235B</strong> 模型，目的是让模型通过做数学题（AIME/DAPO数据集）变得更聪明。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“任务清单 (Todo List)”</strong>，我们一步一步来看这个脚本到底在安排什么工作。</p>
+<hr />
+<h3>📋 任务清单：训练 Qwen-235B 的五步走</h3>
+<h4>✅ Task 1: 施工现场准备 (环境配置)</h4>
+<p><strong>代码位置：</strong> 开头几行 (<code>export ...</code>, <code>pip install ...</code>)
+<strong>解读：</strong>
+在大规模训练开始前，必须统一所有机器的环境。
+*   <strong>设置环境变量：</strong> 比如 <code>CUDA_DEVICE_MAX_CONNECTIONS</code> 和 <code>VLLM_USE_V1</code>，这是在告诉 GPU 驱动和推理引擎（vLLM）如何通信和工作。
+*   <strong>安装特定零件：</strong> <code>pip3 install ... mbridge</code>。这行命令强制要求所有机器安装 <code>mbridge</code> 这个库，它是用来连接 Megatron（训练框架）和 vLLM（推理框架）的桥梁。</p>
+<h4>✅ Task 2: 制定由于模型太大而必须做的“切割方案” (并行策略)</h4>
+<p><strong>代码位置：</strong> 中间部分 (<code>gen_tp=8</code>, <code>train_tp=4</code>, <code>train_pp=8</code>, <code>EP=4</code>, <code>offload=True</code>)
+<strong>解读：</strong>
+这是脚本里最硬核的部分。Qwen-235B 模型太大了，单张显卡甚至单台机器根本装不下。脚本制定了如何把模型“切碎”放进不同的显卡里：
+*   <strong>TP (Tensor Parallel) = 4:</strong> 把每一层的矩阵运算切成4份，4张卡一起算。
+*   <strong>PP (Pipeline Parallel) = 8:</strong> 把模型的层切成8段，像流水线一样，第1组卡算完传给第2组...直到第8组。
+*   <strong>EP (Expert Parallel) = 4:</strong> 因为 Qwen 是 MoE（混合专家）模型，这表示把“专家”模块分摊到4组设备上。
+*   <strong>Offload = True:</strong> 显存还是不够用？那就把优化器状态和部分参数<strong>卸载</strong>到 CPU 的内存里（虽然慢点，但能跑起来）。</p>
+<h4>✅ Task 3: 设定教学大纲 (算法与超参)</h4>
+<p><strong>代码位置：</strong> 变量定义区 (<code>adv_estimator=grpo</code>, <code>max_prompt_length</code>, <code>train_prompt_bsz</code>)
+<strong>解读：</strong>
+这里定义了怎么教模型：
+*   <strong>算法：</strong> <code>adv_estimator=grpo</code>。使用的是 <strong>GRPO</strong> (Group Relative Policy Optimization) 算法。这是一种比 PPO 更省资源的强化学习算法（DeepSeek-R1 也就是用的这种思路）。
+*   <strong>课本长度：</strong> <code>max_prompt_length</code> (题目长度) 和 <code>max_response_length</code> (答案长度) 都设得很大，允许模型进行长链条推理。
+*   <strong>批量大小：</strong> <code>train_prompt_bsz=32</code>，一次让模型看32道题。</p>
+<h4>✅ Task 4: 指定教材和参考书 (数据与路径)</h4>
+<p><strong>代码位置：</strong> <code>MODEL_PATH</code>, <code>TRAIN_FILE</code>, <code>TEST_FILE</code>
+<strong>解读：</strong>
+*   <strong>基础模型：</strong> 从 <code>$RAY_DATA_HOME/models/Qwen3-235B-A22B</code> 加载预训练好的模型。
+*   <strong>习题集：</strong> 训练用 <code>dapo-math-17k</code>（数学题），测试用 <code>aime-2024</code>（竞赛题）。</p>
+<h4>✅ Task 5: 启动总指挥 (执行 Python 命令)</h4>
+<p><strong>代码位置：</strong> 最后那一大段 <code>python3 -m verl.trainer.main_ppo ...</code>
+<strong>解读：</strong>
+这是真正的“启动按钮”。它运行 <code>verl</code> 框架的训练程序。
+你会看到后面跟了无数个 <code>--config</code> 参数，这其实是在<strong>手动覆盖默认配置</strong>。
+*   <strong>Actor/Rollout/Ref:</strong> 强化学习通常有三个角色：演员(Actor-生成答案)、环境交互(Rollout-用vLLM加速生成)、参考模型(Ref-防止跑偏)。
+*   <strong>Megatron Config:</strong> 这里面有大量的 <code>override_transformer_config</code>，都是为了开启各种底层加速技术（如 Flash Attention, Fused Kernels），为了让这个庞然大物能跑得稍微快一点。</p>
+<hr />
+<h3>💡 总结：这个脚本的核心逻辑</h3>
+<p>如果你要用一句话概括这个文件：</p>
+<blockquote>
+<p><strong>这是一个配置脚本，它使用 <code>verl</code> 框架，结合 <code>Megatron</code> 的混合并行技术（TP/PP/EP）和 <code>vLLM</code> 的推理加速，在多台服务器上对 235B 参数的 Qwen MoE 模型进行 GRPO 强化学习数学训练。</strong></p>
+</blockquote>
+<h3>🧐 你的 Todo List (如果你要运行它)</h3>
+<ol>
+<li><strong>数机器：</strong> 脚本里写 <code>NNODES=4</code>，你需要至少4台高性能服务器（每台通常8张H100/A100）。</li>
+<li><strong>下数据：</strong> 确保 <code>MODEL_PATH</code> 和 <code>TRAIN_FILE</code> 指向的路径里真的有模型文件和数据文件。</li>
+<li><strong>装环境：</strong> 确保所有节点都装好了 <code>verl</code>, <code>megatron</code>, <code>vLLM</code> 和脚本里提到的 <code>mbridge</code>。</li>
+<li><strong>跑脚本：</strong> 直接运行这个 <code>.sh</code> 文件，然后盯着日志看有没有报错（通常这种大规模训练，网络通信和显存很容易报错）。</li>
+</ol>

@@ -1,0 +1,66 @@
+<h1>tests/unit_tests/transformer/test_multi_token_prediction.py</h1>
+<p>这份代码其实是一个<strong>测试文件</strong>（Unit Test），属于 NVIDIA 的 <strong>Megatron-Core</strong> 项目。它的目的是用来验证一个叫 <strong>"多Token预测" (Multi-Token Prediction, MTP)</strong> 的功能模块是否工作正常。</p>
+<p>简单来说，普通的语言模型一次只预测<strong>下一个</strong>词。而 MTP 技术让模型一次性预测<strong>未来多个</strong>词（比如同时预测第2个、第3个词），以此来提高训练效率或模型能力。</p>
+<p>为了让你听懂，我把这个测试文件拆解成一个 <strong>“产品质检员的任务清单 (Todo List)”</strong>。想象你就是这个质检员，你需要一步步检查这个新功能是否合格。</p>
+<hr />
+<h3>📋 质检员任务清单 (MTP 功能验收)</h3>
+<p>这是一个逐渐深入的检查流程，从“能不能装上”到“算得对不对”，再到“能不能在大规模集群上跑”。</p>
+<h4>✅ Task 1: 检查零件是否完整 (基础构建测试)</h4>
+<p><strong>目标</strong>：确认代码能不能把 MTP 模块（积木）搭建起来，且规格正确。
+*   <strong>对应代码</strong>：<code>TestMultiTokenPredictionLayer</code> 类中的 <code>test_constructor...</code>
+*   <strong>检查点</strong>：
+    1.  如果不使用加速引擎（TE），能不能把层（Layer）造出来？
+    2.  如果使用 Transformer Engine (TE) 加速，能不能造出来？
+    3.  造出来的层，里面的参数（权重）数量对不对？
+    4.  如果把模型切分成多份（Tensor Parallel, TP），每份的大小是不是符合预期？</p>
+<h4>✅ Task 2: 检查数据存储是否正常 (分布式存储测试)</h4>
+<p><strong>目标</strong>：在大规模训练中，模型会被切碎放在不同 GPU 上。我们要确保存储时，系统知道怎么把这些碎片管理好。
+*   <strong>对应代码</strong>：<code>test_sharded_state_dict</code>
+*   <strong>检查点</strong>：
+    1.  当开启张量并行（TP）或上下文并行（CP）时，MTP 模块的参数（如 <code>enorm</code>, <code>eh_proj</code>）是否都能在分片字典里找到？
+    2.  确保保存模型时不会丢参数。</p>
+<h4>✅ Task 3: 核心功能测试 (前向与反向传播 &amp; 断点续训)</h4>
+<p><strong>目标</strong>：这是最关键的一步。输入数据，看能不能算出结果，能不能算出梯度，以及中途存盘重启后结果是否一致。
+*   <strong>对应代码</strong>：<code>test_forward_backward</code>
+*   <strong>检查点</strong>：
+    1.  <strong>基准测试</strong>：先跑一遍模型，记录下输出结果和 Loss（误差）。
+    2.  <strong>存盘测试</strong>：把训练到一半的模型保存成 Checkpoint（检查点）。
+    3.  <strong>变形加载</strong>：改变并行策略（比如原本用1张卡，现在改用2张卡并行），重新加载刚才的 Checkpoint。
+    4.  <strong>一致性对比</strong>：加载后的模型，再次输入同样的数据，输出结果必须和基准测试<strong>完全一致</strong>（误差在允许范围内）。
+    5.  <strong>梯度检查</strong>：反向传播后，确保每个参数都算出了梯度（main_grad）。</p>
+<h4>✅ Task 4: 高级性能特性测试 (FP8 与 混合精度)</h4>
+<p><strong>目标</strong>：验证这个模块能不能配合最新的加速技术（如 FP8 低精度计算）一起工作。
+*   <strong>对应代码</strong>：<code>test_fp8_support</code>
+*   <strong>检查点</strong>：
+    1.  开启 FP8（8位浮点数）模式。
+    2.  数据跑进去，能不能正常出来？
+    3.  出来的结果是不是标准的 float32 格式（为了计算 Loss）？
+    4.  能不能正常反向传播？</p>
+<h4>✅ Task 5: 变长数据处理测试 (Packed Sequences)</h4>
+<p><strong>目标</strong>：为了省时间，训练时通常把几句短话拼成一条长数据（Packed Sequence）。MTP 必须能处理这种拼凑的数据，不能把第一句话的结尾预测到第二句话的开头去。
+*   <strong>对应代码</strong>：<code>test_packed_sequences</code>
+*   <strong>检查点</strong>：
+    1.  把几段不同长度的话拼在一起。
+    2.  输入模型，确认输出形状是对的。
+    3.  确认 Loss 计算逻辑能识别出这是几段不同的话。</p>
+<h4>✅ Task 6: 核心数学逻辑验证 (Roll Tensor)</h4>
+<p><strong>目标</strong>：MTP 需要预测未来的 Token，这涉及到数据的“错位移动”（Shift/Roll）。比如预测 t+2，就需要把数据往后挪两位。在多卡并行（CP）时，数据分布在不同卡上，这个“挪动”非常复杂。
+*   <strong>对应代码</strong>：<code>test_roll_tensor_with_packed_sequences</code>
+*   <strong>检查点</strong>：
+    1.  <strong>单卡情况</strong>：数据挪位后，原本不该有的位置（比如句子边界）是否被正确填零？
+    2.  <strong>多卡情况 (CP)</strong>：当一条长数据被切分到两张卡上时，在这个跨卡挪动数据的过程中，卡0的尾部数据能不能正确传到卡1的头部？结果是否和数学预期一致？</p>
+<h4>✅ Task 7: 监控与日志测试 (Logging Helper)</h4>
+<p><strong>目标</strong>：确保训练过程中的 Loss（误差）能被正确记录下来，方便画图表。
+*   <strong>对应代码</strong>：<code>TestMTPLossLoggingHelper</code>
+*   <strong>检查点</strong>：
+    1.  能不能把每一层的 Loss 存进追踪器（Tracker）？
+    2.  能不能把追踪器里的数据写进 WandB 或 TensorBoard（可视化工具）？
+    3.  写完之后，追踪器有没有被清空，准备记录下一轮？</p>
+<hr />
+<h3>总结</h3>
+<p>这篇代码不是在<strong>讲</strong>观点，而是在<strong>验证</strong>事实。它通过一系列严密的实验，确保 NVIDIA Megatron-Core 里的 <strong>MTP（多Token预测）</strong> 模块：
+1.  <strong>结构正确</strong>（能建起来）。
+2.  <strong>计算正确</strong>（结果对，梯度有）。
+3.  <strong>支持分布式</strong>（多卡切分、跨卡通信没由于）。
+4.  <strong>支持高级特性</strong>（FP8、拼凑数据）。
+5.  <strong>鲁棒性强</strong>（存盘、改配置加载后结果不变）。</p>

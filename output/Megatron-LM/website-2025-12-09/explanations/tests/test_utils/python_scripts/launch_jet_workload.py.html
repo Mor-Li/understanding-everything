@@ -1,0 +1,131 @@
+<h1>tests/test_utils/python_scripts/launch_jet_workload.py</h1>
+<p>这个脚本 <code>launch_jet_workload.py</code> 的核心作用是充当一个 <strong>“远程任务指挥官”</strong>。</p>
+<p>简单来说，它的工作是：<strong>把一个 AI 训练任务（Workload）打包，发送到 NVIDIA 内部的计算集群（JET 平台）上去运行，然后守在那里等结果，下载日志，分析是真失败还是假失败（硬件故障），最后汇报结果。</strong></p>
+<p>为了让你看懂，我把它做的事情拆解成一个 <strong>To-Do List</strong>，然后详细讲解每一步的观点和逻辑。</p>
+<hr />
+<h3>📋 脚本任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>准备阶段</strong>：接收命令行参数，读取配置文件，确定这到底是个什么类型的测试（单元测试？发布测试？）。</li>
+<li><strong>提交任务 (Submit)</strong>：把任务配置好，发送给远程集群（JET），并拿到一个任务 ID。</li>
+<li><strong>监控等待 (Monitor)</strong>：脚本不退出，而是每隔一分钟问一下集群：“跑完了吗？”，直到任务结束。</li>
+<li><strong>下载证据 (Download)</strong>：任务跑完后，把远程机器上的日志（logs）下载到本地。</li>
+<li><strong>取证分析 (Analyze)</strong>：读取日志内容，判断任务是成功还是失败。</li>
+<li><strong>判决 (Judge)</strong>：<ul>
+<li>如果是 <strong>硬件/网络抽风</strong>（Flaky Failure）：不怪代码，<strong>重试</strong>。</li>
+<li>如果是 <strong>代码逻辑错误</strong>：报错退出。</li>
+<li>如果是 <strong>性能不达标</strong>：换个节点 <strong>重试</strong>。</li>
+</ul>
+</li>
+<li><strong>汇报 (Report)</strong>：把测试结果（成功/失败、耗时）发送到数据看板（Dashboard）。</li>
+</ol>
+<hr />
+<h3>🧐 详细步骤与观点解析</h3>
+<p>下面我顺着代码逻辑，给你一步步讲讲它里面的“观点”和操作。</p>
+<h4>第一步：准备与定性 (Main Function Start)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>main</code> 函数开头。</li>
+<li><strong>操作</strong>：使用 <code>click</code> 库解析你输入的参数（比如跑什么模型、用什么集群）。</li>
+<li><strong>核心逻辑</strong>：<ul>
+<li>它会去读 <code>model_config.yaml</code>。</li>
+<li><strong>观点</strong>：<strong>“先搞清楚身份”</strong>。如果配置文件里写了 <code>TEST_TYPE</code>，那就按那个类型走；没写就是 <code>unit_test</code>（单元测试）。不同类型的测试，后面“判决”的标准不一样。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：进入重试循环 (The Retry Loop)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>while True and n_attempts &lt; 9 ...</code></li>
+<li><strong>核心逻辑</strong>：整个后续流程被包在一个巨大的 <code>while</code> 循环里。</li>
+<li><strong>观点</strong>：<strong>“硬件是不可靠的”</strong>。<ul>
+<li>在大规模集群跑 AI 训练，网络波动、GPU 掉卡、ECC 校验错误是常态。</li>
+<li>所以脚本预设了：<strong>如果失败了，我有权最多重试 9 次</strong>，直到排除硬件干扰，测出代码的真本事。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：发射任务 (Launch and Wait)</h4>
+<ul>
+<li><strong>代码位置</strong>：调用 <code>launch_and_wait_for_completion</code> 函数。</li>
+<li><strong>操作</strong>：<ol>
+<li>使用 <code>recipe_parser</code> 生成任务清单。</li>
+<li>调用 <code>jetclient</code>（NVIDIA 内部工具）把任务提交上去。</li>
+<li><strong>观点</strong>：<strong>“死磕到底”</strong>。提交可能会网络超时，或者集群繁忙。代码里写了 <code>while n_submission_attempts &lt; 3</code>，提交失败了就睡一会再试，绝不轻言放弃。</li>
+<li>提交成功后，脚本进入 <code>pipeline.wait()</code>，像个监工一样盯着远程任务，直到它状态变成 <code>SUCCESS</code> 或 <code>FAILED</code>。</li>
+</ol>
+</li>
+</ul>
+<h4>第三步：下载与解析日志 (Download Assets)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>download_job_assets</code> 和 <code>extract_..._to_string</code> 函数。</li>
+<li><strong>操作</strong>：<ul>
+<li>任务结束了，必须看日志。脚本会把远程的 <code>std*.log</code> 下载下来。</li>
+<li>它专门提取了 <strong>所有 GPU (Rank)</strong> 的日志和 <strong>主进程 (Main Rank)</strong> 的日志。</li>
+</ul>
+</li>
+<li><strong>观点</strong>：<strong>“没有日志就没有真相”</strong>。如果下载失败，它也会重试下载（<code>n_download_attempt</code>），防止因为网络差导致不知道测试结果。</li>
+</ul>
+<h4>第四步：核心判决逻辑 (The Judgment - 最关键的部分)</h4>
+<p>这是脚本最“智能”的地方，它需要根据日志内容决定下一步干啥。</p>
+<p><strong>1. 它是“玄学”失败吗？ (Flaky Failure)</strong>
+*   <strong>代码位置</strong>：<code>is_flaky_failure</code> 函数。
+*   <strong>操作</strong>：它在日志里搜索一大堆关键词，比如：
+    *   <code>NCCL operations have failed</code> (通信库崩了)
+    *   <code>uncorrectable ECC error</code> (显卡显存坏了)
+    *   <code>Segmentation fault</code> (段错误，通常是底层库问题)
+    *   <code>Connection reset</code> (网络断了)
+*   <strong>观点</strong>：<strong>“如果是这些报错，不是代码写的烂，是运气不好。”</strong>
+    *   如果检测到这些词，脚本会打印 <code>Detected flaky failure, attempt restart</code>，然后<strong>增加计数器，回到循环开头重试</strong>。</p>
+<p><strong>2. 它是不同类型的测试吗？</strong></p>
+<ul>
+<li>
+<p><strong>如果是 <code>unit_test</code> (单元测试)</strong>：</p>
+<ul>
+<li>成功就退出。</li>
+<li>失败了且不是玄学失败，就报错退出。</li>
+<li>失败了但是是玄学失败，重试。</li>
+</ul>
+</li>
+<li>
+<p><strong>如果是 <code>release</code> (发布测试)</strong>：</p>
+<ul>
+<li>这种测试通常跑很久。它会检查日志里有没有 <code>StopIteration</code> 或 <code>finished</code> 字样。</li>
+<li>如果有，说明跑完了，成功退出。</li>
+<li>如果作业状态是 FAILED，重试。</li>
+</ul>
+</li>
+<li>
+<p><strong>如果是其他 (功能测试/性能测试)</strong>：</p>
+<ul>
+<li><strong>成功时</strong>：调用 <code>telemetrics_and_exit</code> 发送“成功”信号给大盘，然后退出。</li>
+<li><strong>失败时</strong>：<ul>
+<li>先看是不是玄学失败（是就重试）。</li>
+<li>再看是不是 <strong>“非确定性” (Non-determinism)</strong> 问题。比如日志里说 <code>Throughput is slower than expected</code>（吞吐量太低）。</li>
+<li><strong>观点</strong>：<strong>“这台机器可能太慢了，换一台试试”</strong>。如果发现性能不达标但程序没崩（Exit Code 0），它会认为这台节点有问题，重试（<code>n_nondeterminism_attemps</code>）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>第五步：汇报与退出 (Telemetrics)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>telemetrics_and_exit</code>。</li>
+<li><strong>操作</strong>：<ul>
+<li>把 <code>pipeline_id</code>, <code>success</code>, <code>duration</code> (耗时) 打包成 JSON。</li>
+<li>发给 <code>DASHBOARD_ENDPOINT</code>。</li>
+</ul>
+</li>
+<li><strong>观点</strong>：<strong>“数据驱动”</strong>。不管跑得怎么样，都要留下记录，方便后续统计 CI 的通过率和性能趋势。</li>
+</ul>
+<hr />
+<h3>总结：这段代码在讲什么故事？</h3>
+<p>这段代码是一个<strong>极度缺乏安全感的监工</strong>。</p>
+<ol>
+<li>它接到命令去远方（集群）盖房子（跑模型）。</li>
+<li>它知道路途凶险（提交可能失败），所以随身带了锦囊（重试机制）。</li>
+<li>房子盖完（任务结束）后，它不轻信结果，必须亲自把监控录像（日志）拿回来看。</li>
+<li>如果房子塌了，它会像侦探一样分析原因：<ul>
+<li>如果是地震（ECC错误/NCCL超时），它就换个地方重盖（Retry）。</li>
+<li>如果是地基不稳（性能太慢），它也换个地方重盖。</li>
+<li>如果是图纸画错了（代码Bug），它才承认失败，打电话汇报（Dashboard），然后下班。</li>
+</ul>
+</li>
+</ol>
+<p>看懂这个逻辑，你就完全掌握这个脚本了。</p>

@@ -1,0 +1,116 @@
+<h1>tools/checkpoint/saver_legacy.py</h1>
+<p>这个文件 <code>tools/checkpoint/saver_legacy.py</code> 是 <strong>NVIDIA Megatron-LM</strong> 项目中用于<strong>保存模型检查点（Checkpoint）</strong>的一个核心脚本。</p>
+<p>简单来说，它的角色是一个<strong>“打包工”</strong>。它的上游有一个“供货商”（Loader，负责读取原始模型权重，比如从 HuggingFace 读取），通过一个队列（Queue）把数据传给这个脚本。这个脚本负责把这些数据<strong>切分</strong>（根据并行策略）、<strong>组装</strong>进 Megatron 的模型结构，最后<strong>保存</strong>成文件。</p>
+<p>为了让你看懂，我把这个脚本的工作流程拆解成一个 <strong>To-Do List（任务清单）</strong>。</p>
+<hr />
+<h3>📋 脚本任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>准备环境</strong>：加载 Megatron 的工具包，准备好干活的工具。</li>
+<li><strong>接收订单（配置）</strong>：从队列里读取模型的元数据（Metadata），比如几层、多大、要切分成几份（并行度）。</li>
+<li><strong>伪造现场（Mocking）</strong>：假装自己是一个正在运行的分布式训练环境（即使是在单机上运行转换），初始化参数。</li>
+<li><strong>搭建骨架</strong>：根据配置，创建空的 Megatron 模型对象（此时里面是随机参数）。</li>
+<li><strong>处理词表（Embeddings）</strong>：接收词向量权重，按需切分，填入模型。</li>
+<li><strong>循环组装层（Layers）</strong>：一层一层地接收 Transformer 层的权重（Attention, MLP），切分后填入模型。</li>
+<li><strong>收尾工作（Post-process）</strong>：处理最后的 LayerNorm 和输出层。</li>
+<li><strong>打包封箱（Save）</strong>：把填好权重的模型保存到硬盘上。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细讲解</h3>
+<p>下面我按照代码的执行顺序，一步步给你讲它在干嘛：</p>
+<h4>第一步：准备环境与接收订单</h4>
+<p>代码位置：<code>def save_checkpoint(queue, args):</code> 开头部分。</p>
+<ul>
+<li><strong>动作</strong>：脚本启动，尝试导入 <code>megatron</code> 的核心库。如果找不到路径就会报错退出。</li>
+<li><strong>关键点</strong>：<code>md = queue_get()</code>。<ul>
+<li>它从队列里拿到的第一个东西是 <code>md</code> (Metadata)。这就像是<strong>装箱单</strong>。里面写着：这个模型有多少层（<code>num_layers</code>）、隐藏层多大（<code>hidden_size</code>）、原来的并行度是多少。</li>
+<li>它还会检查用户想把模型切分成几份（<code>target_tensor_parallel_size</code>）。如果没说，就默认是 1。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：伪造现场 (Fake Arguments)</h4>
+<p>代码位置：<code>sys.argv = ['script.py', ...]</code> 这一大段。</p>
+<ul>
+<li><strong>背景</strong>：Megatron 是一个复杂的训练框架，它通常依赖命令行参数（arguments）来初始化全局变量。</li>
+<li><strong>动作</strong>：因为我们现在是在运行一个转换脚本，而不是真的在训练，所以脚本<strong>手动构造了一堆命令行参数</strong>。<ul>
+<li>它把从 <code>md</code> 里读到的参数（层数、头数、序列长度等）塞进 <code>sys.argv</code>。</li>
+<li><strong>目的</strong>：骗过 Megatron 的初始化函数 <code>parse_args()</code>，让它以为自己是在正常启动训练，从而正确设置全局配置。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：搭建模型骨架</h4>
+<p>代码位置：<code>model_provider = ...</code> 和 <code>get_models(...)</code>。</p>
+<ul>
+<li><strong>动作</strong>：<ul>
+<li>根据模型类型（GPT 或 BERT），确定用哪个模型构建器。</li>
+<li>调用 <code>get_models</code> 创建模型实例。</li>
+<li><strong>关键点</strong>：这里涉及到了 <strong>Tensor Parallel (TP)</strong> 和 <strong>Pipeline Parallel (PP)</strong>。<ul>
+<li>如果是 PP（流水线并行），模型会被切成几段，每一段放在不同的“虚拟设备”上。脚本会根据 <code>args.target_pipeline_parallel_size</code> 来决定当前处理的是模型的哪一部分。</li>
+<li>此时创建的模型，里面的权重是随机初始化的，是空的躯壳。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>第四步：处理 Embeddings (词嵌入)</h4>
+<p>代码位置：<code>embeddings_msg = queue_get("embeddings")</code>。</p>
+<ul>
+<li><strong>动作</strong>：<ol>
+<li>从队列接收 <code>word embeddings</code> 和 <code>position embeddings</code>。</li>
+<li><strong>处理 Padding</strong>：如果目标词表大小比原始的大，它会给词向量补零（Pad）；如果小了，就截断。</li>
+<li><strong>切分 (Chunking)</strong>：<code>torch.chunk(..., args.target_tensor_parallel_size, dim=0)</code>。<ul>
+<li>这是<strong>张量并行 (TP)</strong> 的核心。如果 TP=2，它会把巨大的词向量表横着切成两半，分别给两个模型分片。</li>
+</ul>
+</li>
+<li><strong>填入</strong>：把切好的权重 <code>.copy_()</code> 到模型里。</li>
+</ol>
+</li>
+</ul>
+<h4>第五步：循环组装 Transformer 层 (核心工作)</h4>
+<p>代码位置：<code>for layer in range(...):</code> 循环块。</p>
+<ul>
+<li>
+<p><strong>动作</strong>：这是一个大循环，遍历每一层 Transformer。</p>
+<ol>
+<li><strong>接收</strong>：<code>msg = queue_get(...)</code>。拿到这一层的所有权重（Input Norm, QKV, Dense, MLP 等）。</li>
+<li><strong>切分 (Splitting)</strong>：<ul>
+<li><strong>QKV (Query/Key/Value)</strong>：通常按行切（<code>dim=0</code>）。</li>
+<li><strong>Dense (输出投影)</strong>：通常按列切（<code>dim=1</code>）。</li>
+<li><strong>MLP (前馈网络)</strong>：同样需要根据 TP 大小把大矩阵切成小块。</li>
+</ul>
+</li>
+<li><strong>填入</strong>：遍历每一个 TP 分片（<code>for tp_rank in ...</code>），把切好的小块权重塞进对应的 <code>models[tp_rank]</code> 里。</li>
+</ol>
+<blockquote>
+<p><strong>比喻</strong>：就像把一个大蛋糕（权重矩阵）切成几块，分给不同的人（GPU Rank）。</p>
+</blockquote>
+</li>
+</ul>
+<h4>第六步：收尾工作 (Final Norm &amp; Heads)</h4>
+<p>代码位置：<code>if post_process:</code> 块。</p>
+<ul>
+<li><strong>动作</strong>：处理模型最后剩下的部分。<ul>
+<li><strong>Final Norm</strong>：最后的归一化层。</li>
+<li><strong>Output Layer</strong>：最后的输出层（把隐向量转回词表概率）。同样需要切分。</li>
+<li><strong>Pooler / LM Head</strong>：如果是 BERT 可能会有 Pooler，如果是 GPT 会有 LM Head。</li>
+</ul>
+</li>
+<li>逻辑和前面一样：接收 -&gt; 切分 -&gt; 填入。</li>
+</ul>
+<h4>第七步：打包封箱 (Save Checkpoint)</h4>
+<p>代码位置：最后的 <code>for tp_rank in range(...): save_checkpoint(...)</code>。</p>
+<ul>
+<li><strong>动作</strong>：<ul>
+<li>现在内存里的 <code>models</code> 列表已经填满了正确的权重。</li>
+<li>脚本遍历每一个 TP Rank（分片）。</li>
+<li>设置伪造的分布式环境（<code>fake_tp_group</code>），假装自己是第 N 号 GPU。</li>
+<li>调用 <code>save_checkpoint</code> 函数，把这个分片的模型保存为文件（通常是 <code>mp_rank_00/model_optim_rng.pt</code> 这种格式）。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这段代码就是一个<strong>“搬运+切割”</strong>的流水线。</p>
+<ol>
+<li><strong>搬运</strong>：从 Queue 里拿原始数据。</li>
+<li><strong>切割</strong>：根据你想要的并行度（TP/PP），把大矩阵切成小矩阵。</li>
+<li><strong>保存</strong>：存成 Megatron 能识别的分布式 checkpoint 格式，以便后续加载进行训练或推理。</li>
+</ol>

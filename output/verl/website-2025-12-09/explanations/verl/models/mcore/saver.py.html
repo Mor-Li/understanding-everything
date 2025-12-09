@@ -1,0 +1,140 @@
+<h1>verl/models/mcore/saver.py</h1>
+<p>这份代码的核心功能非常明确：<strong>将分散在多个 GPU 上（分布式训练中）的模型参数，“拼凑”回一个完整的模型权重文件（State Dict），以便保存或转换格式（例如转回 Hugging Face 格式）。</strong></p>
+<p>在 Megatron-Core (mcore) 的训练中，模型是被“切碎”的：
+*   有的层在 GPU A，有的在 GPU B (<strong>流水线并行 PP</strong>)。
+*   同一个矩阵（比如 $W_q$）被切开，一半在 GPU C，一半在 GPU D (<strong>张量并行 TP</strong>)。</p>
+<p><strong>Rank 0</strong>（主进程）就像是一个<strong>拼图的组装者</strong>，它需要指挥所有 GPU 把手里的碎片交出来，然后拼成一张完整的图。</p>
+<p>下面我为你列一个 <strong>Task Todo List</strong>，并逐步讲解代码是如何执行这个流程的。</p>
+<hr />
+<h3>核心任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>环境与身份确认 (Setup &amp; Identification)</strong><ul>
+<li>确认当前进程是谁（Rank ID）？</li>
+<li>确认模型切分的情况（TP 是多少？PP 是多少？）。</li>
+</ul>
+</li>
+<li><strong>建立“藏宝图” (Mapping)</strong><ul>
+<li>计算每一层（Layer 0, Layer 1...）到底存放在哪一个 PP 阶段的 GPU 上。</li>
+</ul>
+</li>
+<li><strong>准备“收集工具” (Helper Functions)</strong><ul>
+<li>定义如何收集完整张量（直接拿）。</li>
+<li>定义如何收集被切碎的张量（拿回来后拼接）。</li>
+<li>定义特殊层的拼接逻辑（比如 QKV 注意力层、MLP 的 Gate/Up 层）。</li>
+</ul>
+</li>
+<li><strong>收集第一块拼图：词嵌入 (Embeddings)</strong><ul>
+<li>从对应的 GPU 收集 <code>word_embeddings</code> 并拼接。</li>
+</ul>
+</li>
+<li><strong>循环收集中间层 (Transformer Layers Loop)</strong><ul>
+<li>遍历每一层（0 到 N）。</li>
+<li>收集 Layer Norms。</li>
+<li>收集 Attention 权重（Q, K, V 及其 Bias）。</li>
+<li>收集 MLP 权重（Gate, Up, Down Proj）。</li>
+</ul>
+</li>
+<li><strong>收集最后一块拼图：输出层 (Final Norm &amp; Head)</strong><ul>
+<li>收集最终的 LayerNorm。</li>
+<li>收集 LM Head（输出层）。</li>
+</ul>
+</li>
+<li><strong>格式转换与收尾 (Finalize)</strong><ul>
+<li>统一数据类型（如转为 float32 或 bfloat16）。</li>
+<li>返回完整的 <code>state_dict</code> 给 Rank 0，其他进程返回空。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步详细讲解 (Step-by-Step Walkthrough)</h3>
+<h4>1. 环境与身份确认 (Setup &amp; Identification)</h4>
+<p>代码入口是 <code>merge_megatron_ckpt_gptmodel</code>。
+*   <strong>观点</strong>：在分布式训练中，每个 GPU 只知道自己那一小块数据。
+*   <strong>动作</strong>：
+    *   获取 <code>pp_size</code> (流水线并行大小), <code>tp_size</code> (张量并行大小)。
+    *   <code>unwrap_model</code>：把模型外面的包装纸（DDP wrapper 等）剥掉，露出原始的层结构。
+    *   <strong>关键点</strong>：只有 <code>dist.get_rank() == 0</code> (主进程) 最终会拿到数据，但<strong>所有进程必须同时运行这段代码</strong>，因为它们需要配合发送数据（<code>dist.broadcast</code>）。</p>
+<h4>2. 建立“藏宝图” (Mapping)</h4>
+<p>对应函数：<code>_megatron_calc_layer_map(config)</code>。
+*   <strong>观点</strong>：如果开了流水线并行（PP），Layer 0-3 可能在 GPU 0 上，Layer 4-7 在 GPU 1 上。Rank 0 需要知道去哪里“要”数据。
+*   <strong>动作</strong>：生成一个字典 <code>layer_map</code>。
+    *   输入：全局 Layer ID (比如第 32 层)。
+    *   输出：<code>(pp_rank, virtual_pp_rank, local_layer_idx)</code>。即：“第 32 层在 第 3 号流水线 GPU 上，它是该 GPU 里的第 2 层”。</p>
+<h4>3. 准备“收集工具” (Helper Functions)</h4>
+<p>代码中定义了几个内部函数（闭包），这是最复杂的部分：</p>
+<ul>
+<li>
+<p><strong><code>_broadcast_tensor</code> (简单搬运)</strong>：</p>
+<ul>
+<li>用于 LayerNorm 这种没有被切分的参数。</li>
+<li>逻辑：源 GPU 发送 shape -&gt; Rank 0 准备空 buffer -&gt; 源 GPU 发送数据 -&gt; Rank 0 存入字典。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_broadcast_tp_shard_tensor</code> (拼接搬运)</strong>：</p>
+<ul>
+<li>用于 Embeddings, Output Layer, Dense 层。</li>
+<li>逻辑：这些层被 <strong>张量并行 (TP)</strong> 切分了。Rank 0 需要从 TP 组内的每一个 GPU (0, 1, 2...) 收集切片，然后用 <code>torch.concat</code> 沿着指定维度（行或列）拼起来。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_broadcast_tp_shard_tensor_qkv</code> (高难度拼接)</strong>：</p>
+<ul>
+<li><strong>痛点</strong>：Attention 的 Q, K, V 权重通常被合并存储在一个大矩阵里，而且为了并行计算，它们在 GPU 上的切分方式很复杂（特别是有了 Grouped Query Attention / GQA 之后）。</li>
+<li><strong>动作</strong>：从各个 TP GPU 收集数据后，代码里有一大段逻辑（<code>q_part</code>, <code>k_part</code>, <code>v_part</code>）专门用来把混在一起的数据拆开，重新理顺顺序，最后拼成标准的 <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_broadcast_tp_shard_tensor_gate_up</code> (MLP 拼接)</strong>：</p>
+<ul>
+<li>类似 QKV，很多模型（如 LLaMA/Mixtral）使用 SwiGLU，把 <code>Gate</code> 和 <code>Up</code> 两个投影层合并存储。这里负责把它们拆开并正确拼接。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 收集词嵌入 (Embeddings)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>if dp_rank == 0 and cp_rank == 0: ... collecting embeddings...</code></li>
+<li><strong>操作</strong>：调用 <code>_broadcast_tp_shard_tensor</code>。</li>
+<li><strong>逻辑</strong>：词表很大（比如 10万词），通常被切分到不同 GPU 上。这里把它们收集回来拼成完整的 <code>[vocab_size, hidden_size]</code> 矩阵。</li>
+</ul>
+<h4>5. 循环收集中间层 (The Main Loop)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>for layer in range(config.num_hidden_layers):</code></li>
+<li><strong>逻辑</strong>：<ol>
+<li>查表：用 <code>layer_map</code> 查出这一层在哪个 <code>src_pp_rank</code>（源 GPU）。</li>
+<li><strong>Input LayerNorm</strong>：直接搬运。</li>
+<li><strong>Attention (Q/K/V)</strong>：调用 <code>_broadcast_tp_shard_tensor_qkv</code>。这里把分散的 QKV 权重拼成完整的形状。</li>
+<li><strong>Attention Output (o_proj)</strong>：调用 <code>_broadcast_tp_shard_tensor</code>，注意这里是 <code>concat_dim=1</code>（列拼接），因为这是 Row Parallel Linear 的反向操作。</li>
+<li><strong>Post Attention LayerNorm</strong>：直接搬运。</li>
+<li><strong>MLP (Gate/Up/Down)</strong>：<ul>
+<li>Gate/Up 使用 <code>_broadcast_tp_shard_tensor_gate_up</code> 处理。</li>
+<li>Down 使用普通拼接。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>6. 收集输出层 (Final Norm &amp; Head)</h4>
+<ul>
+<li><strong>代码位置</strong>：循环结束后。</li>
+<li><strong>操作</strong>：<ul>
+<li><code>final_layernorm</code>：通常在最后一个 PP 阶段的 GPU 上。</li>
+<li><code>lm_head</code> (输出层)：也是 TP 切分的，需要拼接。</li>
+<li><em>注意</em>：如果配置了 <code>tie_word_embeddings</code>（输入输出共享权重），则跳过这一步，直接复用前面的 Embeddings。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 格式转换与收尾</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>if torch.distributed.get_rank() == 0: ...</code></li>
+<li><strong>操作</strong>：<ul>
+<li>Rank 0 检查收集到的数据类型是否符合 <code>dtype</code> 要求（例如转成 fp32 保存以防溢出，或者 fp16 省空间）。</li>
+<li>打印耗时。</li>
+<li>返回 <code>state_dict</code>。</li>
+<li><strong>非 Rank 0 进程</strong>：返回一个空字典，它们的任务完成了。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：<strong>反向切分</strong>。
+怎么切的（TP行切、TP列切、PP分层），我就怎么逆向操作（TP行拼、TP列拼、PP按层找），最终还原出单机版的模型权重。</p>

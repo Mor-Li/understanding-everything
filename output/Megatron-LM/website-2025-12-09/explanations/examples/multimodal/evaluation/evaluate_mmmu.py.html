@@ -1,0 +1,74 @@
+<h1>examples/multimodal/evaluation/evaluate_mmmu.py</h1>
+<p>这份代码其实就是一个<strong>“自动阅卷机”</strong>。</p>
+<p>它的核心工作流程是：把模型生成的（乱七八糟的）回答收集起来，整理成标准格式，然后交给一个“官方打分器”去算分，最后告诉你得了多少分。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>Task Todo List（任务清单）</strong>，我们可以想象这是你在处理一场考试的阅卷工作：</p>
+<h3>📋 阅卷任务清单 (Task To-Do List)</h3>
+<ol>
+<li>
+<p><strong>[准备阶段] 收集考卷</strong></p>
+<ul>
+<li><strong>现实逻辑</strong>：模型（考生）可能把答案写在一个大文件里，也可能因为并行计算写在了好几个小文件里。你需要把它们全找出来。</li>
+<li><strong>对应代码</strong>：<code>get_input_output_paths</code></li>
+</ul>
+</li>
+<li>
+<p><strong>[整理阶段] 清洗答案 (最繁琐的一步)</strong></p>
+<ul>
+<li><strong>现实逻辑</strong>：模型回答问题时废话很多（比如“我认为答案是 \boxed{A}”）。你需要把核心答案（比如“A”）提取出来。而且，还需要把所有考生的答案整理成一张干净的 Excel 表（JSON格式），左边是题目ID，右边是答案。</li>
+<li><strong>对应代码</strong>：<code>extract_answer</code> 和 <code>convert_to_mmmu_format</code></li>
+</ul>
+</li>
+<li>
+<p><strong>[评分阶段] 呼叫“官方阅卷组”</strong></p>
+<ul>
+<li><strong>现实逻辑</strong>：你自己不知道正确答案，也不想自己写评分逻辑。于是你直接调用（subprocess）了 MMMU 官方提供的评分脚本，把整理好的答案扔给它，让它去算分。</li>
+<li><strong>对应代码</strong>：<code>mmmu_eval</code> 中的 <code>subprocess.run(...)</code></li>
+</ul>
+</li>
+<li>
+<p><strong>[汇报阶段] 偷看分数并汇报</strong></p>
+<ul>
+<li><strong>现实逻辑</strong>：官方阅卷组算完分后，会在屏幕上打印一大堆日志。你需要用放大镜（正则表达式）在这些日志里找到写着“Overall Accuracy”（总准确率）的那一行数字，提取出来并打印在屏幕上。</li>
+<li><strong>对应代码</strong>：<code>mmmu_eval</code> 中的 <code>re.search(...)</code></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 详细步骤讲解 (Step-by-Step)</h3>
+<p>现在我们对应代码，一步一步看它是怎么完成上面这4个任务的：</p>
+<h4>第一步：收集考卷 (<code>get_input_output_paths</code>)</h4>
+<p>模型生成的结果通常叫 <code>prediction</code>。
+*   <strong>代码逻辑</strong>：函数检查 <code>input_path</code>。如果是一个具体文件，就用它；如果是一个目录或者通配符（比如 <code>part-*</code>），它就用 <code>glob</code> 把所有碎片文件都找出来。
+*   <strong>目的</strong>：确保不管模型怎么跑的，我们都能拿到所有的输出数据。</p>
+<h4>第二步：清洗并格式化 (<code>convert_to_mmmu_format</code>)</h4>
+<p>这是代码里最长的一部分，因为它要处理脏数据。
+*   <strong>读取</strong>：它逐行读取模型生成的 <code>.jsonl</code> 文件。
+*   <strong>提取 (<code>extract_answer</code>)</strong>：
+    *   模型可能会输出 <code>\answer{A}</code> 或者 <code>\boxed{A}</code>，或者 <code>Answer: A</code>。
+    *   这个函数用<strong>正则表达式</strong>把花括号里的内容抠出来，只保留干净的答案。
+*   <strong>选择题处理</strong>：如果是选择题，它还会调用 <code>parse_multi_choice_response</code>（来自外部工具库）来确定模型到底选了 A、B、C 还是 D。
+*   <strong>保存</strong>：最后，它把清洗后的数据保存为一个新的 JSON 文件，格式大概是：<code>{"题目ID_001": "A", "题目ID_002": "dog"}</code>。这是官方评分脚本要求的格式。</p>
+<h4>第三步：外包评分 (<code>mmmu_eval</code>)</h4>
+<p>这一步很有趣，作者<strong>并没有</strong>在这个文件里写评分逻辑（比如 <code>if pred == label</code>）。
+*   <strong>代码逻辑</strong>：
+    <code>python
+    subprocess.run([
+        "python",
+        "examples/multimodal/MMMU/mmmu/main_eval_only.py",  # &lt;--- 它是去运行另一个脚本！
+        "--output_path", result_file,
+        "--answer_path", groundtruth_path,
+    ], ...)</code>
+*   <strong>解释</strong>：它就像在命令行里敲了一个命令，启动了 MMMU 官方仓库里的 <code>main_eval_only.py</code>。它把刚才清洗好的文件（<code>result_file</code>）和标准答案（<code>groundtruth_path</code>）传给那个脚本。</p>
+<h4>第四步：抓取分数 (<code>mmmu_eval</code> 后半部分)</h4>
+<p>官方脚本运行完，会把结果打印在终端（Stdout）里，而不是直接返回变量。
+*   <strong>代码逻辑</strong>：
+    <code>python
+    m = re.search("'Overall': {'num': \d+, 'acc': (\d.\d+)}", output.stdout)
+    return float(m.group(1)) * 100.0</code>
+*   <strong>解释</strong>：它在打印出来的一大堆文字里，寻找类似 <code>'Overall': {'num': 100, 'acc': 0.45}</code> 这样的字眼。找到 <code>0.45</code> 后，乘以 100，得到 45.0 分，这就是最终的准确率。</p>
+<h3>总结</h3>
+<p>这个脚本本身<strong>不负责做题</strong>（那是模型的事），也<strong>不负责制定评分标准</strong>（那是官方脚本的事）。</p>
+<p>它只是一个<strong>中间人（Broker）</strong>：
+1.  把模型的“脏”输出<strong>洗干净</strong>。
+2.  <strong>递给</strong>官方评分器。
+3.  把最后的分数<strong>拿回来</strong>告诉你。</p>

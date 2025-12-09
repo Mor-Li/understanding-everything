@@ -1,0 +1,107 @@
+<h1>megatron/core/inference/inference_request.py</h1>
+<p>这份代码文件 <code>inference_request.py</code> 定义了 <strong>Megatron 框架在进行推理（Inference）时，由于用户请求（Request）所需要的所有数据结构</strong>。</p>
+<p>简单来说，当你要让 AI 模型说话时，你需要打包一个“包裹”，里面装着你的问题、你想要的参数（比如生成的长度、随机度），以及后来模型生成出的答案。这个文件就是定义这个“包裹”长什么样的。</p>
+<p>为了让你看懂，我把理解这份代码的过程拆解成一个 <strong>“处理 AI 请求的 6 个任务清单 (Todo List)”</strong>，我们一步步来看。</p>
+<hr />
+<h3>✅ Task 1: 准备基础工具 (数据的打包与解包)</h3>
+<p>在分布式系统中，PyTorch 的 Tensor（张量，即数据矩阵）不能直接在网络上传输，必须转换成字节流（Bytes）。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>serialize_tensor</code> 和 <code>deserialize_tensor</code> 函数。</li>
+<li><strong>功能：</strong><ul>
+<li><code>serialize</code>：把 Tensor 变成二进制数据（方便存盘或发给别的机器）。</li>
+<li><code>deserialize</code>：把二进制数据变回 Tensor（方便计算）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 定义一张标准的“点餐单” (基础请求)</h3>
+<p>这是最核心的部分。想象你在餐厅点餐，服务员需要一张单子，上面写着桌号、菜名、忌口。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>class InferenceRequest</code> (数据类)</li>
+<li><strong>核心字段解读：</strong><ul>
+<li><strong>输入部分：</strong><ul>
+<li><code>request_id</code>: 订单号，唯一标识。</li>
+<li><code>prompt</code>: 你的提问（提示词）。</li>
+<li><code>prompt_tokens</code>: 提问转换成的数字列表。</li>
+<li><code>sampling_params</code>: 怎么生成？（比如温度 Temperature、Top-k 等参数）。</li>
+</ul>
+</li>
+<li><strong>输出部分：</strong><ul>
+<li><code>generated_text</code>: AI 生成的文本。</li>
+<li><code>generated_tokens</code>: AI 生成的数字列表。</li>
+<li><code>generated_log_probs</code>: 生成的概率（用于分析模型多有把握）。</li>
+</ul>
+</li>
+<li><strong>状态部分：</strong><ul>
+<li><code>status</code>: 这是一个枚举 <code>Status</code> (排队中、生成中、完成、失败)。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 应对更复杂的“动态”场景 (动态请求)</h3>
+<p>基础的请求不够用。现在的 AI 推理引擎（如 vLLM 或 Megatron-Core）支持 <strong>Continuous Batching（连续批处理）</strong>。这意味着请求可能会被拆分、暂停、或者分块处理。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>class DynamicInferenceRequest</code> (继承自 <code>InferenceRequest</code>)</li>
+<li><strong>新增功能：</strong><ul>
+<li><strong>生命周期追踪 (<code>events</code>)：</strong> 记录这个请求何时被添加(ADD)、何时暂停(PAUSE)、何时出错(ERROR)。这对于调试延迟非常重要。</li>
+<li><strong>分块预填充 (<code>remaining_prompt_tokens</code>)：</strong> 如果你的提示词特别长（比如一本书），显存一次装不下，就需要分块处理（Chunked Prefill）。这个字段记录还剩多少没处理。</li>
+<li><strong>元数据追踪 (<code>tracked_metadata</code>)：</strong> 这是一个高级功能，用于把 CPU 上的参数（如 temperature）同步到 GPU 上，以便模型计算时使用。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 记录请求的“一生” (事件日志)</h3>
+<p>为了监控系统的健康状况，我们需要知道每个请求在每个时间点发生了什么。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>class DynamicInferenceEvent</code> 和 <code>DynamicInferenceEventType</code></li>
+<li><strong>功能：</strong><ul>
+<li>这就好比物流信息的“时间轴”：<code>[10:00] 下单</code> -&gt; <code>[10:01] 打包</code> -&gt; <code>[10:05] 发货</code>。</li>
+<li>代码里定义了：<code>ADD</code> (加入), <code>PAUSE</code> (暂停), <code>FINISH</code> (完成), <code>FAIL</code> (失败) 等事件类型。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 处理“暂停”与“继续” (请求记录与合并)</h3>
+<p>这是文件中最复杂、也最精妙的逻辑。
+<strong>场景：</strong> 显存不够了，系统决定先把你的请求“挂起 (Suspend)”，等一会资源空出来再“恢复 (Resume)”。
+但在计算机看来，恢复后的请求其实是一个“新请求”（把之前的输出当成了新的输入）。我们需要一个东西把这断断续续的过程串起来。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>class DynamicInferenceRequestRecord</code></li>
+<li><strong>核心逻辑：</strong><ul>
+<li><code>requests: list</code>: 这是一个列表。如果你被暂停了 3 次，这里面就会存 3 个 <code>DynamicInferenceRequest</code> 对象。</li>
+<li><strong><code>suspend()</code> (暂停方法):</strong><ol>
+<li>把当前生成的 Token 拼接到 Prompt 后面（变成新的 Prompt）。</li>
+<li>计算还需要生成多少个 Token。</li>
+<li>创建一个<strong>新</strong>的 Request 对象放入列表，准备下一次运行。</li>
+</ol>
+</li>
+<li><strong><code>merge()</code> (合并方法):</strong><ol>
+<li>当一切都结束后，用户只想要一个完整的结果。</li>
+<li>这个方法把列表中所有片段的 <code>generated_text</code> 拼在一起，把所有的 <code>events</code> 合并，返回一个看起来像从未中断过的完整 <code>Request</code> 对象。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 6: 给 AI 加上眼睛 (多模态支持)</h3>
+<p>最后，如果模型不仅能看字，还能看图（VLM, Vision-Language Model），“点餐单”就需要升级。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>class VLMInferenceRequest</code></li>
+<li><strong>新增字段：</strong><ul>
+<li><code>imgs</code>: 图片的 Tensor 数据。</li>
+<li><code>num_tiles</code>: 图片被切成了多少块（现在的多模态模型常把大图切成小块处理）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就在讲一个故事：</p>
+<ol>
+<li><strong><code>InferenceRequest</code></strong>: 一个普通的问答订单。</li>
+<li><strong><code>DynamicInferenceRequest</code></strong>: 一个高级订单，支持分段处理，带详细日志。</li>
+<li><strong><code>DynamicInferenceRequestRecord</code></strong>: 一个订单夹，专门处理那些因为系统忙碌而被暂停、又恢复的订单，最后负责把碎片拼成完整的答案。</li>
+<li><strong><code>VLMInferenceRequest</code></strong>: 带图片的订单。</li>
+</ol>

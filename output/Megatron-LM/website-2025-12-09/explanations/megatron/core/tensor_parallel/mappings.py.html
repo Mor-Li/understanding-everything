@@ -1,0 +1,90 @@
+<h1>megatron/core/tensor_parallel/mappings.py</h1>
+<p>这份代码确实非常抽象，因为它处理的是深度学习中最底层的<strong>分布式通信原语</strong>。简单来说，它是 Megatron-Core 框架中<strong>张量并行 (Tensor Parallelism, TP)</strong> 和 <strong>序列并行 (Sequence Parallelism, SP)</strong> 的交通指挥官。</p>
+<p>它的核心作用是：<strong>定义数据在多张显卡之间如何“切分”和“合并”，并自动处理反向传播时的梯度流动。</strong></p>
+<p>为了让你读懂它，我为你列了一个 <strong>“学习任务清单 (Todo List)”</strong>，我们将代码拆解为 5 个步骤来消化。</p>
+<hr />
+<h3>任务清单 (Todo List)</h3>
+<h4>✅ Task 1: 理解核心背景 —— 为什么要切分？</h4>
+<p><strong>背景：</strong> 模型太大了，一张显卡放不下。我们需要把一个巨大的矩阵（Tensor）切成小块，分给不同的显卡算。
+<strong>核心问题：</strong>
+1.  <strong>切 (Split/Scatter)</strong>：怎么把大矩阵切开分给别人？
+2.  <strong>合 (Gather)</strong>：算完怎么把大家的结果拼回来？
+3.  <strong>加 (Reduce)</strong>：怎么把大家算出的部分结果加在一起？</p>
+<h4>✅ Task 2: 掌握 4 个基础“乐高积木” (底层函数)</h4>
+<p>代码开头定义了一堆以 <code>_</code> 开头的函数（如 <code>_reduce</code>, <code>_split_along_last_dim</code> 等）。这些是纯粹的搬运工。</p>
+<ul>
+<li><strong><code>_reduce(input_, group)</code></strong>:<ul>
+<li><strong>动作</strong>：大家手里都有一个数，把所有人的数加起来，然后每个人都拿到这个总和。</li>
+<li><strong>场景</strong>：比如大家分别算了神经网络的一部分输出，最后需要加在一起得到最终结果。</li>
+</ul>
+</li>
+<li><strong><code>_split_along_last_dim</code> / <code>_split_along_first_dim</code></strong>:<ul>
+<li><strong>动作</strong>：切蛋糕。把一个完整的 Tensor 按照“最后一个维度”或“第一个维度”切开，当前显卡只保留属于自己的那一块。</li>
+</ul>
+</li>
+<li><strong><code>_gather_along_last_dim</code> / <code>_gather_along_first_dim</code></strong>:<ul>
+<li><strong>动作</strong>：拼蛋糕。每个人手里有一块小 Tensor，大家把它们拼在一起，变成一个完整的 Tensor。</li>
+</ul>
+</li>
+<li><strong><code>_reduce_scatter...</code></strong>:<ul>
+<li><strong>动作</strong>：先加和，再切分。这是最高效的操作之一。它等同于“先 Reduce 再 Scatter”，但一步到位。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 理解“镜像效应” (最难也是最关键的一步)</h4>
+<p>这是这个文件的灵魂。你会看到很多类继承自 <code>torch.autograd.Function</code>（如 <code>class _CopyToModelParallelRegion</code>）。</p>
+<p><strong>为什么要写成类？</strong>
+因为在深度学习中，<strong>前向传播 (Forward)</strong> 和 <strong>反向传播 (Backward)</strong> 的数据流动方向通常是<strong>相反</strong>的。</p>
+<ul>
+<li><strong>规则</strong>：如果你在前向传播时把数据“切开”了，那么在反向传播算梯度时，你通常需要把梯度“拼回来”。</li>
+<li><strong>代码解读示例</strong> (<code>_GatherFromModelParallelRegion</code> 类):<ul>
+<li><strong>Forward (前向)</strong>: 调用 <code>_gather_along_last_dim</code>。意思是我把大家的结果拼成一个大矩阵。</li>
+<li><strong>Backward (反向)</strong>: 调用 <code>_split_along_last_dim</code>。意思是反向传回来的梯度是一个大矩阵的梯度，我得把它切开，分回给各个显卡。</li>
+</ul>
+</li>
+</ul>
+<p><strong>总结这个规律：</strong>
+*   Forward 是 <strong>Gather</strong> (拼) &lt;--&gt; Backward 就是 <strong>Split</strong> (切)。
+*   Forward 是 <strong>Split</strong> (切) &lt;--&gt; Backward 就是 <strong>Gather</strong> (拼)。
+*   Forward 是 <strong>Copy</strong> (复制) &lt;--&gt; Backward 就是 <strong>Reduce</strong> (求和)。</p>
+<h4>✅ Task 4: 区分两种并行模式 (TP vs SP)</h4>
+<p>代码里有两组主要的 Wrapper 函数，分别对应两种并行策略：</p>
+<p><strong>1. 张量并行 (Tensor Parallel, TP)</strong>
+*   <strong>关注点</strong>：切分模型的<strong>隐藏层维度 (Hidden Dim)</strong>。
+*   <strong>关键函数</strong>：
+    *   <code>copy_to_tensor_model_parallel_region</code>:
+        *   前向：把输入复制一份给所有卡（不做切分）。
+        *   反向：把所有卡的梯度加起来 (All-Reduce)。
+    *   <code>reduce_from_tensor_model_parallel_region</code>:
+        *   前向：把所有卡的结果加起来 (All-Reduce)。
+        *   反向：把梯度复制给所有卡。
+    *   <em>用途</em>：通常用于 Linear 层的输入和输出处理。</p>
+<p><strong>2. 序列并行 (Sequence Parallel, SP)</strong>
+*   <strong>关注点</strong>：切分<strong>序列长度 (Sequence Length)</strong>（即句子的长度）。这是为了省显存，因为 Transformer 的中间激活值很大。
+*   <strong>关键函数</strong>：
+    *   <code>scatter_to_sequence_parallel_region</code>:
+        *   前向：按第0维（序列维）切分数据。
+        *   反向：拼回来 (Gather)。
+    *   <code>gather_from_sequence_parallel_region</code>:
+        *   前向：按第0维拼起来 (Gather)，变成完整的句子。
+        *   反向：切开 (Reduce-Scatter)。注意这里有个优化，如果梯度不需要保留全量，直接用 Reduce-Scatter 既求和又切分，节省显存。</p>
+<h4>✅ Task 5: 进阶 —— All-to-All (全交换)</h4>
+<p>最后那部分 <code>_AllToAll</code> 以及 <code>all_to_all_sp2hp</code> 是更高级的玩法。</p>
+<ul>
+<li><strong>场景</strong>：当你需要改变切分的方式时。</li>
+<li><strong>sp2hp (Sequence Parallel to Hidden Parallel)</strong>:<ul>
+<li>数据原本是按“句子长度”切分的（每张卡拿一部分字）。</li>
+<li>现在要变成按“隐藏层特征”切分（每张卡拿所有字，但只拿特征的一部分）。</li>
+<li>这就需要大家互相交换手中的数据块，这就是 <code>All-to-All</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：如何一句话看懂这个文件？</h3>
+<p><strong><code>mappings.py</code> 是一本“翻译字典”。</strong></p>
+<ul>
+<li>当你在写 Megatron 模型代码时，你只需要调用 <code>copy_to_tensor_model_parallel_region(x)</code>。</li>
+<li>这个文件会在<strong>前向传播</strong>时帮你把数据推到正确的显卡上。</li>
+<li>最重要的是，它会在<strong>反向传播</strong>时，自动帮你把梯度以正确的数学方式（切分、求和、拼接）传回给上一层，确保数学上的正确性。</li>
+</ul>
+<p>如果没有这个文件，你需要手动在每一层写 <code>if rank == 0: ... else ...</code> 并且手动管理梯度的合并，那将是灾难性的。</p>

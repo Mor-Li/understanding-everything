@@ -1,0 +1,55 @@
+<h1>megatron/post_training/docs/distillation.md</h1>
+<p>这份文档其实是一份 <strong>操作指南</strong>，主题是<strong>如何在 Megatron-LM 框架中进行“知识蒸馏”（Knowledge Distillation）</strong>。</p>
+<p>简单来说，<strong>知识蒸馏</strong>就是让一个已经训练好的“大模型”（老师/Teacher），去指导一个“小模型”（学生/Student）进行学习。这样小模型可以学到大模型的精华，变得更聪明，但体积依然很小，运行更快。</p>
+<p>为了让你更容易理解，我把文档内容拆解成了一个 <strong>6步走的 To-Do List（任务清单）</strong>。你可以按照这个顺序来理解和执行。</p>
+<hr />
+<h3>📋 知识蒸馏任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 准备工作 (Prerequisites)</h4>
+<p><strong>目标</strong>：凑齐所有需要的原料和工具。
+<strong>文档要点</strong>：
+1.  <strong>安装软件</strong>：你必须安装 <a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA Model Optimizer</a> 这个库，它是核心工具。
+2.  <strong>准备模型</strong>：
+    *   <strong>老师模型 (Teacher)</strong>：一个训练好的大模型的权重文件。
+    *   <strong>学生模型 (Student)</strong>：一个小模型的权重（也可以从零开始训练，不强求有权重）。
+3.  <strong>准备数据</strong>：分词器 (Tokenizer) 和训练数据集 (Dataset)。</p>
+<h4>✅ Task 2: 搞定“老师”的配置文件 (Teacher Checkpoint Format)</h4>
+<p><strong>目标</strong>：让系统知道老师模型长什么样（几层、多宽等）。
+<strong>文档要点</strong>：
+*   <strong>痛点</strong>：Megatron 默认生成的检查点（Checkpoint）里没有 ModelOpt 能读懂的配置文件。
+*   <strong>行动</strong>：你需要<strong>手动</strong>创建一个名为 <code>model_config.yaml</code> 的文件。
+*   <strong>格式</strong>：必须是 <strong>NeMo</strong> 风格的格式（不是 Megatron 原生的参数名）。
+*   <strong>位置</strong>：把这个文件放到老师模型权重的根目录下。
+    *   <em>注意：这个文件里的参数会覆盖掉学生模型的参数，专门用来构建老师模型。</em></p>
+<h4>✅ Task 3: 编写“蒸馏规则”配置 (Distillation Config Format)</h4>
+<p><strong>目标</strong>：告诉系统怎么“教”。比如是只学最后的答案，还是连中间的思考过程也要学？
+<strong>文档要点</strong>：
+你需要写一个新的 YAML 配置文件，里面包含以下关键字段：
+*   <code>logit_layers</code>: <strong>(必填)</strong> 指定老师和学生模型的输出层名字。这是为了对比最后的答案（Logits）。
+*   <code>intermediate_layer_pairs</code>: <strong>(选填)</strong> 指定中间层的对应关系。比如让学生的第1层去模仿老师的第1层。
+*   <code>skip_lm_loss</code>: <strong>(开关)</strong> <code>true</code> 或 <code>false</code>。是否跳过原始的语言模型损失？（即：是只听老师的，还是也要看标准答案？）
+*   <code>kd_loss_scale</code>: <strong>(系数)</strong> 蒸馏损失的权重。如果既听老师的又看标准答案，这个系数决定听老师的比重。</p>
+<h4>✅ Task 4: 启动训练 (Training)</h4>
+<p><strong>目标</strong>：运行代码开始蒸馏。
+<strong>文档要点</strong>：
+使用 <code>pretrain_gpt.py</code> 脚本，但要加上几个特定的参数：
+1.  <code>--kd-teacher-load &lt;路径&gt;</code>: 告诉代码老师模型的权重在哪里。
+2.  <code>--kd-distill-cfg &lt;路径&gt;</code>: 传入你在 Task 3 中写的蒸馏规则配置文件。
+3.  <code>--export-te-mcore-model</code>: 必须加这个标记。
+4.  <em>(可选)</em> <code>--export-kd-teacher-ckpt-format</code>: 如果老师和学生的模型格式不一样，用这个参数区分。</p>
+<h4>✅ Task 5: 理解背后的原理 (API and Design)</h4>
+<p><strong>目标</strong>：知道代码底层发生了什么（Debug时有用）。
+<strong>文档要点</strong>：
+*   代码使用了一个叫 <code>DistillationModel</code> 的包装器，把“学生”和“老师”包在一起。
+*   <strong>默认算法</strong>：
+    *   最后的输出（Logits）对比使用 <strong>KL散度 (KL-Divergence)</strong>。
+    *   中间层（Intermediate）对比使用 <strong>余弦相似度 (Cosine-Similarity)</strong>。</p>
+<h4>✅ Task 6: 避坑指南 (Restrictions &amp; Known Issues)</h4>
+<p><strong>目标</strong>：了解什么能做，什么不能做，以及已知的问题。
+<strong>文档要点</strong>：
+1.  <strong>不支持</strong>：Interleaved Pipeline Parallel（交错式流水线并行）。
+2.  <strong>仅支持</strong>：Megatron-Core 版本的模型（旧版 Legacy Megatron 不行）。
+3.  <strong>已知 Bug 1 (内存泄漏)</strong>：如果开启 <code>--manual-gc</code>（手动垃圾回收），可能会有内存泄漏导致 OOM（内存溢出）。
+4.  <strong>已知 Bug 2 (速度慢)</strong>：目前的 CUDA 内核有问题，加上老师模型后，学生模型的前向传播（Forward）速度会变慢，整体训练时间可能比预期<strong>增加 40%</strong>。</p>
+<hr />
+<h3>总结</h3>
+<p>这篇文档就是在教你：<strong>装好 ModelOpt 库 -&gt; 手写老师的 NeMo 格式配置 -&gt; 写蒸馏规则配置 -&gt; 用带特殊参数的命令启动训练</strong>。同时警告你：<strong>不要用交错流水线，且要有心理准备训练会变慢。</strong></p>

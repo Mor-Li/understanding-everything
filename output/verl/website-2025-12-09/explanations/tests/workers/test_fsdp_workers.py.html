@@ -1,0 +1,49 @@
+<h1>tests/workers/test_fsdp_workers.py</h1>
+<p>这份代码其实是一个<strong>测试文件</strong>（Unit Test）。它的核心目的是验证一个叫 <code>ActorRolloutRefWorker</code> 的组件是否够“聪明”。</p>
+<p>具体来说，它在测试：<strong>在强化学习（RLHF）训练中，我们能不能给“参考模型（Ref）”指定一个和“训练模型（Actor）”完全不同的模型权重？如果不指定，它会不会自动变回默认值？</strong></p>
+<p>为了让你看懂，我把这段代码拆解成一个<strong>任务清单（Todo List）</strong>，带你一步步走完这个测试流程：</p>
+<hr />
+<h3>✅ 任务清单：验证“参考模型”的加载逻辑</h3>
+<h4>第一步：搭建“假”的分布式环境</h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>os.environ["RANK"] = "0"</code> ... <code>os.environ["MASTER_PORT"] = "8888"</code>
+*   <strong>解读：</strong> 因为这个代码是跑在多卡训练框架（FSDP）下的，通常需要很多显卡。但在测试里，我们不想真调动集群。
+*   <strong>观点：</strong> 先假装我们就在本机（127.0.0.1），只有一张卡（WORLD_SIZE=1），把环境骗过去，让代码能跑起来。</p>
+</blockquote>
+<h4>第二步：准备两个“替身”模型路径</h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>actor_model_path = ...0.5B...</code> 和 <code>ref_model_path = ...1.5B...</code>
+*   <strong>解读：</strong> 这里定义了两个路径。
+    *   <strong>Actor (主角)：</strong> 用的是 Qwen 0.5B（小模型）。
+    *   <strong>Ref (参考对象)：</strong> 用的是 Qwen 1.5B（大模型）。
+*   <strong>观点：</strong> 在强化学习中，有时候我们希望用一个更强的模型（1.5B）作为参考，来指导小模型（0.5B）训练。测试就是要验证这种“大小配”行不行得通。</p>
+</blockquote>
+<h4>第三步：写配置单 (Config)</h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>config_str = ...</code> 和 <code>OmegaConf.create</code>
+*   <strong>解读：</strong> 这里手写了一个配置表。
+    *   <code>model.path</code>: 指定主角是 0.5B。
+    *   <code>ref.model.path</code>: 指定参考对象是 1.5B。
+*   <strong>观点：</strong> 这是一个关键设置。我们在配置里明确告诉程序：“主角用小的，参考用大的”。</p>
+</blockquote>
+<h4>第四步：测试场景 A —— 指定了不同模型</h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>actor_rollout_ref_worker = ...</code> 到 <code>assert model_config.hidden_size == 1536</code>
+*   <strong>动作：</strong> 启动 Worker，并告诉它“你是负责 Ref（参考模型）的”。
+*   <strong>验证（Assert）：</strong> 程序加载完模型后，我们要检查这个模型的“腰围”（hidden_size）。
+    *   Qwen 1.5B 的腰围是 <strong>1536</strong>。
+    *   Qwen 0.5B 的腰围是 <strong>896</strong>。
+*   <strong>结论：</strong> 代码检查发现 <code>hidden_size == 1536</code>。这意味着：<strong>系统成功加载了那个更大的 1.5B 模型作为参考，而不是默认的小模型。</strong> 测试通过！</p>
+</blockquote>
+<h4>第五步：测试场景 B —— 没指定模型（回退机制）</h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>dict_conf["ref"]["model"] = None</code> 到 <code>assert model_config.hidden_size == 896</code>
+*   <strong>动作：</strong> 我们故意搞破坏，把配置单里 <code>ref</code> 的模型路径删掉（设为 <code>None</code>）。然后重新启动 Worker。
+*   <strong>验证（Assert）：</strong> 再次检查模型的“腰围”。
+*   <strong>结论：</strong> 代码检查发现 <code>hidden_size == 896</code>。这意味着：<strong>当我不告诉系统用什么做参考时，系统很聪明地直接复用了主角（Actor, 0.5B）的配置。</strong> 测试通过！</p>
+</blockquote>
+<hr />
+<h3>总结一下文中的核心观点</h3>
+<p>这段代码虽然看起来复杂，其实就在讲一件事：</p>
+<p><strong>“我们的训练系统很灵活：你可以让 Actor 和 Ref 用不一样的模型（比如一大一小），也可以让它们用一样的。如果你不特意指定，我就默认让它们一样。”</strong></p>
+<p>这个测试就是为了确保这个“灵活切换”的功能没有被写出 Bug。</p>

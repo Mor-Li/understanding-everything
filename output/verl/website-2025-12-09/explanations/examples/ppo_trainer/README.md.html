@@ -1,0 +1,92 @@
+<h1>examples/ppo_trainer/README.md</h1>
+<p>这份文档介绍的是 <strong>PPO (Proximal Policy Optimization)</strong>，这是目前大语言模型（LLM）进行“强化学习”（RLHF）时最主流的算法。</p>
+<p>因为涉及很多强化学习的术语，直接看确实像天书。为了让你读懂，我把阅读这份文档的任务拆解成一个 <strong>6步走的 Todo List</strong>。我们把训练模型想象成 <strong>“教学生（模型）写作文”</strong> 的过程。</p>
+<hr />
+<h3>✅ Task 1: 理解核心角色 (对应 "Key Components")</h3>
+<p><strong>目标</strong>：搞懂 PPO 里面最重要的两个角色是谁，以及它们和以前的方法有什么不同。</p>
+<ul>
+<li><strong>原文概念</strong>：Actor-Critic Architecture (演员-评论家架构)。</li>
+<li><strong>通俗解释</strong>：<ul>
+<li><strong>Actor (演员/学生)</strong>：就是你要训练的大模型。它的任务是根据提示词（Prompt）写出答案。</li>
+<li><strong>Critic (评论家/老师)</strong>：这是 PPO 特有的辅助模型（其他算法如 GRPO 可能不需要这个）。它的任务不是写作文，而是<strong>打分</strong>。它负责预测“Actor 现在的表现大概能得多少分”。</li>
+</ul>
+</li>
+<li><strong>为什么需要 Critic？</strong>：为了让训练更稳。老师（Critic）先给个预估分，如果学生（Actor）实际表现比预估好，就大力奖励；如果比预估差，就惩罚。这比单纯看最终结果要学得更快。</li>
+</ul>
+<h3>✅ Task 2: 理解 PPO 的“必杀技” (对应 "Proximal..." &amp; "Clipped Surrogate Objective")</h3>
+<p><strong>目标</strong>：明白为什么 PPO 比以前的算法（如 REINFORCE）好。</p>
+<ul>
+<li><strong>原文痛点</strong>：Traditional methods suffer from instability due to large policy updates. (传统方法因为步子迈太大，容易扯着蛋/训练崩了)。</li>
+<li><strong>PPO 的必杀技</strong>：<strong>Clipped Surrogate Objective (截断的代理目标)</strong>。</li>
+<li><strong>通俗解释</strong>：<ul>
+<li>以前的算法，如果发现某个写法好，就会疯狂修改参数去迎合，结果改过头了，模型反而变傻了。</li>
+<li><strong>PPO (Clip)</strong>：它加了一个“限制器”。如果一次修改的幅度超过了某个范围（比如 20%），就强制<strong>截断（Clip）</strong>，不让它改那么多。</li>
+<li><strong>结论</strong>：PPO 是一种“稳中求进”的算法，不求一次突变，但求步步为营。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 3: 搞懂数据是怎么喂进去的 (对应 "Configuration" 前半部分)</h3>
+<p><strong>目标</strong>：看懂那些复杂的 Batch Size 参数。</p>
+<ul>
+<li><strong><code>data.train_batch_size</code> (大批次)</strong>：<ul>
+<li><strong>解释</strong>：这是最外层的循环。比如一次性发 1024 个题目给模型做，生成一堆数据（Prompt + Response）。</li>
+</ul>
+</li>
+<li><strong><code>ppo_mini_batch_size</code> (小批次)</strong>：<ul>
+<li><strong>解释</strong>：PPO 更新参数时，吃不下那 1024 个数据。需要切碎，比如每次只吃 64 个数据来算梯度。</li>
+</ul>
+</li>
+<li><strong><code>ppo_epochs</code> (学习轮数)</strong>：<ul>
+<li><strong>解释</strong>：这 1024 个题目生成的数据，不能只看一遍。要反复看 3-5 遍（Epochs），把里面的知识榨干，再进行下一轮 1024 个题目。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 4: 关键参数微调 (对应 "Configuration" 后半部分)</h3>
+<p><strong>目标</strong>：理解几个影响训练质量的数学参数。</p>
+<ul>
+<li><strong><code>actor.clip_ratio</code> (默认 0.2)</strong>：<ul>
+<li><strong>解释</strong>：这就是 Task 2 里说的“限制范围”。0.2 意味着允许模型参数更新带来的概率变化在 $\pm 20\%$ 之间。超过就被切掉。</li>
+</ul>
+</li>
+<li><strong><code>algorithm.gamma</code> &amp; <code>algorithm.lam</code></strong>：<ul>
+<li><strong>解释</strong>：这是计算“优势（Advantage）”用的。简单说就是决定模型是“短视”（只看这一步好不好）还是“远视”（看长远的累积收益）。通常不需要大改。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 5: 防止模型“学坏” (对应 "Advanced Extensions - KL Divergence Control")</h3>
+<p><strong>目标</strong>：这是 RLHF 中极重要的一环。防止模型为了高分开始胡言乱语。</p>
+<ul>
+<li><strong>问题背景</strong>：如果奖励模型（Reward Model）喜欢某种特定的词（比如赞美之词），模型可能会学会不管问什么都疯狂输出赞美之词。这叫 <strong>Reward Hacking</strong>。</li>
+<li><strong>解决方案</strong>：<strong>KL Divergence (KL 散度)</strong>。<ul>
+<li>我们要保留一个<strong>原始模型（Reference Policy）</strong>作为参照物。</li>
+<li>如果训练中的模型（Actor）输出的句子，和原始模型差别太远（KL 散度过大），就说明它“走火入魔”了。</li>
+</ul>
+</li>
+<li><strong>文档中的两种做法</strong>：<ol>
+<li><strong><code>use_kl_in_reward</code></strong>：直接扣分。如果偏离太远，奖励分减去一个惩罚值。</li>
+<li><strong><code>use_kl_loss</code></strong>：算进 Loss 函数里。在更新参数时，强行把模型往回拉一拉。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 6: 高级技巧与实战 (对应 "Dual-clip PPO" &amp; "Reference Example")</h3>
+<p><strong>目标</strong>：了解进阶优化和怎么运行。</p>
+<ul>
+<li><strong>Dual-clip PPO</strong>：<ul>
+<li><strong>解释</strong>：这是 PPO 的一个升级版（通常用于 PPO-max）。当模型表现很差（Advantage &lt; 0）时，为了防止它被过度修正（把概率降得太低导致没法翻身），加了第二层保护锁（Lower bound）。</li>
+</ul>
+</li>
+<li><strong>运行脚本</strong>：<ul>
+<li>文档最后给出的 <code>bash run_gemma.sh</code> 是实际运行代码。</li>
+<li>你看里面的 <code>critic.model.path</code> 和 <code>actor_rollout_ref.model.path</code> 是一样的，说明刚开始 Actor 和 Critic 用的是同一个预训练模型（比如 Qwen2.5），然后分头训练。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结你现在对这篇文档的认知：</h3>
+<ol>
+<li><strong>PPO 是啥？</strong> 一个稳健的、带“老师（Critic）”和“学生（Actor）”的训练方法。</li>
+<li><strong>核心机制？</strong> 用 Clip（截断）防止学生步子迈太大。</li>
+<li><strong>KL 控制是啥？</strong> 防止学生为了拿高分而忘记了怎么正常说话（保持和原模型不要差太远）。</li>
+<li><strong>Batch Size？</strong> 也就是把题目分批次喂给学生消化的过程。</li>
+</ol>
+<p>现在你可以试着再回过头看一遍文档，应该就能对应上这些概念了。</p>

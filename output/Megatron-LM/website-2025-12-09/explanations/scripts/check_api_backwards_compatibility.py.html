@@ -1,0 +1,87 @@
+<h1>scripts/check_api_backwards_compatibility.py</h1>
+<p>没问题，这个脚本写得比较专业，用了很多 Python 的高级特性（比如 AST 分析工具 Griffe），所以乍一看确实容易晕。</p>
+<p>简单来说，这是一个<strong>自动化的“找茬”工具</strong>。它的目的是检查你现在的代码（新版）和以前的代码（旧版/基线）相比，有没有<strong>破坏性的修改（Breaking Changes）</strong>，从而防止你发布的更新导致用户的代码跑不起来。</p>
+<p>我们可以把这个脚本的工作流程想象成一个<strong>质检员的任务清单（To-Do List）</strong>。</p>
+<p>下面是这位“质检员”一步步执行的任务列表：</p>
+<hr />
+<h3>📋 质检员任务清单 (To-Do List)</h3>
+<h4>第一阶段：准备工作</h4>
+<ol>
+<li><strong>🧰 检查工具箱 (<code>import griffe</code>)</strong><ul>
+<li>检查是否安装了 <code>griffe</code> 这个库。这是核心工具，专门用来分析 Python 代码结构的。没装就报错退出。</li>
+</ul>
+</li>
+<li><strong>📝 设定免责条款 (<code>EXEMPT_DECORATORS</code>)</strong><ul>
+<li>规定哪些代码是可以随便改的。脚本里定义了三个“免死金牌”：<ul>
+<li><code>@internal_api</code> (内部使用的 API)</li>
+<li><code>@experimental_api</code> (实验性 API)</li>
+<li><code>@deprecated</code> (已弃用的 API)</li>
+</ul>
+</li>
+<li>如果代码头上顶着这三个装饰器，改坏了也不算违规。</li>
+</ul>
+</li>
+<li><strong>🙈 设定忽略规则 (<code>IGNORED_BREAKAGE_KINDS</code>)</strong><ul>
+<li>有些改动虽然也是改动，但无关紧要。比如把 <code>VERSION = "1.0"</code> 改成 <code>VERSION = "2.0"</code>（变量值改变），这种不算破坏 API，要忽略掉。</li>
+</ul>
+</li>
+</ol>
+<h4>第二阶段：加载代码</h4>
+<ol>
+<li><strong>📦 获取旧版代码 (Baseline)</strong><ul>
+<li>根据命令行参数 <code>--baseline</code>（比如 <code>core_v0.14.0</code>），去 Git 仓库里把那个版本的代码结构读取出来，存到内存里。</li>
+</ul>
+</li>
+<li><strong>🆕 获取新版代码 (Current)</strong><ul>
+<li>读取你当前工作目录下的代码（或者指定的 <code>--current</code> 分支），这是你要检查的对象。</li>
+</ul>
+</li>
+</ol>
+<h4>第三阶段：寻找“特权”阶级 (Filtering)</h4>
+<ol>
+<li><strong>🔍 扫描豁免名单 (<code>get_filtered_paths</code>)</strong><ul>
+<li><strong>这是脚本最关键的逻辑之一。</strong></li>
+<li>质检员会遍历<strong>新版代码</strong>里的每一个类、函数、方法。</li>
+<li><strong>任务：</strong> 检查它们有没有顶着“免死金牌”（那三个装饰器）。</li>
+<li><strong>结果：</strong> 生成一个 <code>filtered_paths</code> 列表（白名单）。比如 <code>megatron.core.某内部函数</code>，如果它在白名单里，后面就算改得面目全非也不管。</li>
+</ul>
+</li>
+</ol>
+<h4>第四阶段：找茬与审判 (Comparing &amp; Reporting)</h4>
+<ol>
+<li><strong>⚔️ 全面对比 (<code>griffe.find_breaking_changes</code>)</strong><ul>
+<li>让 <code>griffe</code> 自动对比旧版和新版。</li>
+<li>它会列出<strong>所有</strong>不兼容的修改（比如函数参数变了、公开的类删除了）。</li>
+<li>此时得到的是一个“嫌疑人列表” (<code>all_changes</code>)。</li>
+</ul>
+</li>
+<li><strong>⚖️ 筛选嫌疑人 (<code>should_skip_change</code>)</strong><ul>
+<li>遍历上面的“嫌疑人列表”，逐个核对：<ul>
+<li><strong>情况 A：</strong> 这个改动是“变量值改变”这种被忽略的类型吗？ -&gt; 是，放过。</li>
+<li><strong>情况 B：</strong> 这个被改动的代码，名字在第 6 步生成的“白名单”里吗？ -&gt; 是，放过。</li>
+<li><strong>情况 C：</strong> 这个被改动的代码，它的父级（比如类）在“白名单”里吗？ -&gt; 是，放过。</li>
+</ul>
+</li>
+<li>只有<strong>不满足</strong>以上条件的，才会被定罪为“破坏性修改”。</li>
+</ul>
+</li>
+<li><strong>📢 最终宣判 (<code>main</code> 结尾)</strong><ul>
+<li>如果最后剩下的“罪犯”数量为 0：<ul>
+<li>✅ 输出：<code>No breaking changes detected!</code>，脚本成功退出（exit 0）。</li>
+</ul>
+</li>
+<li>如果有“罪犯”：<ul>
+<li>❌ 输出：具体的破坏性修改列表（比如 <code>Object: megatron.core.xxx</code> 发生了什么变动）。</li>
+<li>脚本报错退出（exit 1），这通常会打断 CI/CD 流程，阻止代码合并。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结一下它的核心观点</h3>
+<ol>
+<li><strong>API 兼容性很重要</strong>：不能随便改函数签名（参数、返回值），否则下游用户升级库的时候代码会挂。</li>
+<li><strong>但这不绝对</strong>：开发者需要灵活性，所以引入了<strong>装饰器机制</strong>。</li>
+<li><strong>显式声明</strong>：如果你明确标记了某个函数是 <code>internal</code>（内部用的）或者 <code>experimental</code>（实验性的），那你就可以随便改，不算破坏兼容性。这个脚本就是用来<strong>强制执行</strong>这一约定的。</li>
+</ol>

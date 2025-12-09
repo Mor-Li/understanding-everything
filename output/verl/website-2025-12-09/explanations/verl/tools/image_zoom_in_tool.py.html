@@ -1,0 +1,102 @@
+<h1>verl/tools/image_zoom_in_tool.py</h1>
+<p>这个文件写得确实比较“硬核”，因为它不仅涉及<strong>图像处理</strong>，还涉及<strong>并发控制（多线程/分布式）</strong>。</p>
+<p>为了让你更容易理解，我们可以把这个代码想象成<strong>“开设一个负责把照片局部放大的照相馆”</strong>。</p>
+<p>我为你列了一个 <strong>Task To-Do List（任务清单）</strong>，我们按照这个清单，一步一步把这个照相馆搭建起来，你就能看懂代码在干什么了。</p>
+<hr />
+<h3>任务清单：构建一个智能图片放大工具</h3>
+<h4>✅ Task 1: 招聘门卫和管理排队 (流控与并发)</h4>
+<p><strong>代码位置：</strong> <code>TokenBucketWorker</code>, <code>VisualExecutionWorker</code>, <code>init_visual_execution_pool</code></p>
+<ul>
+<li><strong>背景：</strong> 照相馆生意太好，如果一秒钟来一万个人，修图师傅会累死（服务器崩溃）。</li>
+<li><strong>做法：</strong><ul>
+<li><strong><code>TokenBucketWorker</code> (令牌桶工人)：</strong> 这是一个发号员。桶里有一定数量的“令牌”（比如每秒10个）。你想修图，得先拿个号。没号了？你就得等。</li>
+<li><strong><code>VisualExecutionWorker</code> (视觉执行工人)：</strong> 这是实际干活的修图师傅。他在干活前，会先问发号员要个号，干完活就把号还回去。</li>
+<li><strong><code>ray</code>：</strong> 代码里到处都是 <code>@ray.remote</code>，这是一个 Python 的库，专门用来搞分布式计算的。你可以理解为它能帮你把这些工人都安排在不同的房间（进程/节点）里并行工作，互不打架。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 定义服务项目 (工具初始化)</h4>
+<p><strong>代码位置：</strong> <code>ImageZoomInTool</code> 类的 <code>__init__</code> 和 <code>get_openai_tool_schema</code></p>
+<ul>
+<li><strong>背景：</strong> 照相馆开张了，得告诉客户我们提供什么服务，接受什么参数。</li>
+<li><strong>做法：</strong><ul>
+<li><strong>Schema (说明书)：</strong> 代码里写了一大段 JSON 格式的描述。意思是告诉 AI（调用者）：<ul>
+<li>我是个“放大镜工具” (<code>image_zoom_in_tool</code>)。</li>
+<li>你需要给我一个<strong>边界框</strong> (<code>bbox_2d</code>)，格式是 <code>[x1, y1, x2, y2]</code>（左上角和右下角坐标）。</li>
+<li>你还可以告诉我这个东西叫什么标签 (<code>label</code>)。</li>
+</ul>
+</li>
+<li><strong>初始化：</strong> 启动时，顺便把 Task 1 里的那些“修图师傅”和“发号员”都雇佣好，准备接单。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 接待客户并收图 (创建会话)</h4>
+<p><strong>代码位置：</strong> <code>ImageZoomInTool</code> 类的 <code>create</code> 方法</p>
+<ul>
+<li><strong>背景：</strong> 客户来了，手里拿着一张照片（可能是个网址，也可能是个文件路径）。</li>
+<li><strong>做法：</strong><ul>
+<li><strong>收图：</strong> <code>fetch_image</code> 函数把图片下载下来或者加载到内存里。</li>
+<li><strong>存图：</strong> 给这个客户一个唯一的号码 (<code>instance_id</code>)，把他的图存在柜子 (<code>_instance_dict</code>) 里。这样后面修图时才知道是修哪张图。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 审核客户的要求 (坐标校验)</h4>
+<p><strong>代码位置：</strong> <code>ImageZoomInTool</code> 类的 <code>_validate_bbox</code></p>
+<ul>
+<li><strong>背景：</strong> 客户说：“我要放大这张图的坐标 <code>[100, 100, 50, 50]</code>”。等等，右边的坐标比左边还小？这不符合物理规律。</li>
+<li><strong>做法：</strong><ul>
+<li>检查坐标是否合法（左 &lt; 右，上 &lt; 下）。</li>
+<li>检查框是不是太扁或者太细（长宽比不能太离谱）。</li>
+<li>如果框的大小是 0，那也没法修，直接报错。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 智能调整 (核心逻辑：Resize)</h4>
+<p><strong>代码位置：</strong> <code>ImageZoomInTool</code> 类的 <code>_maybe_resize_bbox</code> <strong>(这是全篇最复杂的逻辑)</strong></p>
+<ul>
+<li><strong>背景：</strong> 客户想看清一只蚂蚁，但他画的框只有 5x5 像素。AI 模型有时候看不清这么小的图 (<code>MIN_DIMENSION = 28</code>)。</li>
+<li><strong>做法：</strong><ol>
+<li><strong>限制范围：</strong> 先确保客户画的框没跑出图片外面去。</li>
+<li><strong>检查大小：</strong> 如果框太小（小于 28像素），我们得帮客户<strong>自动扩大</strong>这个框。</li>
+<li><strong>中心扩散：</strong> 以客户画的框为中心，向四周扩大，直到满足最小尺寸要求。</li>
+<li><strong>边界保护：</strong> 扩大时不能超出图片边界。如果到了图片边缘，就往回缩一点，保证框是完整的。</li>
+<li><em>目的：确保截出来的图足够清晰，AI 能看懂。</em></li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 6: 动剪刀 (执行裁剪)</h4>
+<p><strong>代码位置：</strong> <code>ImageZoomInTool</code> 类的 <code>execute</code> 方法</p>
+<ul>
+<li><strong>背景：</strong> 一切准备就绪，开始干活。</li>
+<li><strong>做法：</strong><ol>
+<li>从柜子里拿出 Task 3 存的那张图。</li>
+<li>拿到 Task 5 计算好的最终坐标。</li>
+<li><strong><code>image.crop(resized_bbox)</code></strong>：这是真正的动作，用剪刀把那一块切下来。</li>
+<li><strong>返回结果：</strong> 把切下来的小图 (<code>ToolResponse</code>) 交给客户，并告诉他：“搞定了，这是你要的区域”。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 7: 打扫卫生 (资源释放)</h4>
+<p><strong>代码位置：</strong> <code>ImageZoomInTool</code> 类的 <code>release</code> 方法</p>
+<ul>
+<li><strong>背景：</strong> 客户走了，照片还在内存里占地方。</li>
+<li><strong>做法：</strong><ul>
+<li>根据 ID，把柜子里的照片删掉，释放内存空间。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下</h3>
+<p>这篇代码其实就是写了一个<strong>给 AI 用的放大镜插件</strong>。</p>
+<ol>
+<li><strong>AI 说</strong>：“我想看这张图里 <code>[x,y,x,y]</code> 这个位置的细节。”</li>
+<li><strong>代码</strong>：<ul>
+<li>先看看忙不忙（Ray 限流）。</li>
+<li>把图拿来。</li>
+<li>算一下这个位置对不对，太小了就帮你把框弄大点。</li>
+<li>咔嚓一剪刀。</li>
+<li>把剪下来的图还给 AI。</li>
+</ul>
+</li>
+</ol>
+<p>现在你再回头看代码，关注 <code>_maybe_resize_bbox</code>（怎么算坐标）和 <code>execute</code>（怎么剪图），应该就清晰多了。</p>

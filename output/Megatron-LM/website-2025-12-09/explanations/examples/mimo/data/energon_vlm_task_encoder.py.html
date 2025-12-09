@@ -1,0 +1,108 @@
+<h1>examples/mimo/data/energon_vlm_task_encoder.py</h1>
+<p>这份代码确实比较硬核，它属于 <strong>Megatron-Energon</strong> 框架的一部分，专门用来处理 <strong>VLM（视觉语言模型，如 LLaVA）</strong> 的数据预处理。</p>
+<p>简单来说，它的作用是：<strong>把原始的“图片+对话文本”，加工成模型训练时 GPU 能看懂的“数字张量（Tensors）”。</strong></p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>“数据加工流水线”</strong> 的 Task Todo List。我们一步一步来完成这个任务。</p>
+<hr />
+<h3>📋 任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>准备阶段</strong>：搞清楚我们要训练什么模型（LLaVA 还是 Video-LLaVA）。</li>
+<li><strong>文本装修 (Prompt Engineering)</strong>：把原始对话变成模型能读懂的格式。</li>
+<li><strong>单样本加工 (Encoding)</strong>：最核心的步骤。<ul>
+<li>图片处理：变尺寸、归一化。</li>
+<li>文本处理：变成 Token ID。</li>
+<li><strong>制作考卷 (Labels)</strong>：决定模型该学习哪些词（这是最难懂的部分）。</li>
+</ul>
+</li>
+<li><strong>打包发货 (Batching)</strong>：把多个样本捆在一起，处理长短不一的问题（Padding）。</li>
+<li><strong>最终输出</strong>：整理成模型输入所需的字典格式。</li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>1. 准备阶段：我们要训练啥？</h4>
+<p><strong>代码对应：</strong> <code>ModelType</code> 枚举类 和 <code>__init__</code></p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">ModelType</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+    <span class="n">LLAVA_VLM</span> <span class="o">=</span> <span class="s2">&quot;llava_vlm&quot;</span>        <span class="c1"># 处理单张图片</span>
+    <span class="n">VIDEO_LLAVA_VLM</span> <span class="o">=</span> <span class="s2">&quot;video_llava_vlm&quot;</span> <span class="c1"># 处理视频</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：首先定义任务类型。你是要教模型看图说话，还是看视频说话？</li>
+<li><strong>动作</strong>：初始化 <code>VLMTaskEncoder</code>，加载 HuggingFace 的 <code>processor</code>（它是处理图片和文字的工具箱）。</li>
+</ul>
+<h4>2. 文本装修：把对话变成格式化字符串</h4>
+<p><strong>代码对应：</strong> <code>apply_prompt_template</code> 方法
+*   <strong>原始数据</strong>：
+    *   User: "这张图里有什么？"
+    *   Bot: "一只猫。"
+*   <strong>模型不懂这种结构</strong>。模型需要像写剧本一样的格式。
+*   <strong>代码逻辑</strong>：
+    1.  遍历对话，加上 <code>role</code>（角色标签）。
+    2.  如果配置了 <code>system prompt</code>（比如“你是一个乐于助人的助手”），插在最前面。
+    3.  使用 <code>self.processor.apply_chat_template</code> 把这些拼成一个长字符串。
+*   <strong>结果可能变成</strong>：
+    <code>"&lt;System&gt;... &lt;User&gt; &lt;image_placeholder&gt; 这张图里有什么？ &lt;Assistant&gt; 一只猫。"</code></p>
+<h4>3. 单样本加工 (Encoding)：核心中的核心</h4>
+<p><strong>代码对应：</strong> <code>encode_sample</code> 方法</p>
+<p>这是整个文件最重要的地方，它做了三件事：</p>
+<p><strong>A. 图片和文本数字化</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">(</span><span class="n">images</span><span class="o">=...</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="n">prompt</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>调用 HuggingFace 的工具，把图片转成像素矩阵（Pixel Values），把刚才装修好的文本转成数字列表（Input IDs）。</li>
+</ul>
+<p><strong>B. 寻找答案在哪里 (<code>_find_pattern_indices</code>)</strong>
+*   <strong>为什么要找？</strong> 在训练模型时，我们<strong>不希望</strong>模型去学习“用户问了什么”（因为这是已知的），我们只希望模型学习“怎么回答”。
+*   <strong>逻辑</strong>：代码会在整个长句子的 Token 序列中，搜索“答案文本”出现的位置（Start Index 和 End Index）。</p>
+<p><strong>C. 制作“考卷” (Labels &amp; Loss Mask)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">inputs</span><span class="p">[</span><span class="s2">&quot;labels&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full_like</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">fill_value</span><span class="o">=-</span><span class="mi">100</span><span class="p">)</span> <span class="c1"># 先把所有地方都填成 -100（意思是忽略，不考试）</span>
+<span class="o">...</span>
+<span class="n">inputs</span><span class="p">[</span><span class="s2">&quot;labels&quot;</span><span class="p">][</span><span class="n">s_idx</span><span class="p">:</span><span class="n">e_idx</span><span class="p">]</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">][</span><span class="n">s_idx</span><span class="p">:</span><span class="n">e_idx</span><span class="p">]</span> <span class="c1"># 只把“答案”部分填进去</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：<strong>掩码策略 (Masking)</strong>。<ul>
+<li><code>input_ids</code>（给模型看的）：<code>&lt;User&gt; 问句 &lt;Assistant&gt; 回答</code></li>
+<li><code>labels</code>（计算误差用的）：<code>[-100, -100, ..., 答案的ID, ...]</code></li>
+<li><strong>Shift-by-one</strong>：代码最后做了 <code>inputs["labels"] = inputs["labels"][1:]</code>。这是因为预测第 N 个词是基于前 N-1 个词。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 打包发货 (Batching)：解决长短不一</h4>
+<p><strong>代码对应：</strong> <code>batch</code> 方法 和 <code>KEY_PROCESSORS</code> 字典</p>
+<ul>
+<li><strong>问题</strong>：一个 Batch 里有 8 个样本。<ul>
+<li>样本 A 的对话很短（10 个词）。</li>
+<li>样本 B 的对话很长（100 个词）。</li>
+<li>GPU 需要整齐的矩阵，不能参差不齐。</li>
+</ul>
+</li>
+<li><strong>解决方案 (<code>PaddingProcessor</code>)</strong>：<ul>
+<li>找出最长的那个。</li>
+<li>把短的样本后面补 0（Padding），直到大家一样长。</li>
+<li>对于 Labels，补 -100（这样计算 Loss 时会自动忽略补位的部分）。</li>
+</ul>
+</li>
+<li><strong>图片处理 (<code>StackProcessor</code>)</strong>：把 8 张图片叠在一起，变成 <code>[8, 3, 336, 336]</code> 的形状。</li>
+</ul>
+<h4>5. 最终输出：整理格式</h4>
+<p><strong>代码对应：</strong> <code>encode_batch</code> -&gt; <code>encode_batch_vlm_clip_llava</code></p>
+<ul>
+<li><strong>动作</strong>：把刚才处理好的 <code>input_ids</code>, <code>labels</code>, <code>pixel_values</code> 塞到一个大字典里。</li>
+<li><strong>细节</strong>：生成 <code>position_ids</code>（告诉模型每个词是第几个词）。</li>
+<li><strong>结果</strong>：这个字典就是直接喂给 Megatron 模型进行一次训练迭代（Iteration）的数据。</li>
+</ul>
+<hr />
+<h3>总结：这个文件讲了什么？</h3>
+<p>这个文件就是一个<strong>高级的“翻译官”</strong>。</p>
+<ol>
+<li>它拿着原始的图文数据。</li>
+<li>它把文字排版好。</li>
+<li>它把<strong>用户说的话</strong>和<strong>机器要学的话</strong>区分开（通过 Label Masking）。</li>
+<li>它把所有数据对齐、打包。</li>
+<li>最后交给模型去“吃”。</li>
+</ol>
+<p><strong>如果你要修改代码：</strong>
+*   如果你想改对话格式（比如加特殊的 System Prompt），看 <strong>Task 2</strong>。
+*   如果你发现模型训练时 Loss 不对，或者没有学会回答，检查 <strong>Task 3</strong> 的 Label 掩码逻辑。
+*   如果你引入了新的数据类型（比如音频），你需要修改 <strong>Task 4</strong> 的 Processor。</p>

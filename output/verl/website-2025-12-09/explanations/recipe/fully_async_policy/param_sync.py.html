@@ -1,0 +1,137 @@
+<h1>recipe/fully_async_policy/param_sync.py</h1>
+<p>这份代码确实涉及到了<strong>分布式系统</strong>和<strong>深度学习训练</strong>的核心概念，如果对 Ray 框架不熟悉，读起来会非常晦涩。</p>
+<p>别担心，我们用一个<strong>“大厨带徒弟”</strong>的比喻来理解这件事。</p>
+<h3>核心背景：我们在做什么？</h3>
+<p>在一个大型 AI 训练系统中（比如训练 ChatGPT 这种）：
+1.  <strong>Trainer (Actor/Teacher)</strong>: 是<strong>大厨</strong>。他在后厨不断尝试新配方，更新菜谱（更新模型参数/权重）。
+2.  <strong>Rollouter (Student)</strong>: 是<strong>徒弟</strong>。他在前厅负责按菜谱做菜给客人吃（生成数据/采样），然后把客人的反馈（数据）告诉大厨。</p>
+<p><strong>这个文件的代码 (<code>ParameterSynchronizer</code>) 就是一个“传令兵”。</strong>
+他的工作只有一个：<strong>把大厨最新研究出来的菜谱（模型参数），快速、准确地同步给前厅的徒弟。</strong></p>
+<hr />
+<h3>📋 传令兵的 Todo List (任务清单)</h3>
+<p>为了完成“送菜谱”这个工作，这个传令兵需要按顺序完成以下 4 个阶段的任务：</p>
+<ol>
+<li><strong>Task 1: 入职与认人 (初始化)</strong><ul>
+<li>搞清楚谁是大厨？谁是徒弟？</li>
+<li>搞清楚菜谱长什么样（模型结构）？</li>
+</ul>
+</li>
+<li><strong>Task 2: 架设专线电话 (建立通信组)</strong><ul>
+<li>因为菜谱太厚了（模型太大），靠喊是不行的。需要在大厨和徒弟之间拉一条光纤（GPU 显存直连）。</li>
+</ul>
+</li>
+<li><strong>Task 3: 执行同步 (核心工作)</strong><ul>
+<li>这是个精细活：叫停徒弟 -&gt; 传新菜谱 -&gt; 确认收到 -&gt; 让徒弟继续干活。</li>
+</ul>
+</li>
+<li><strong>Task 4: 确认与收尾</strong><ul>
+<li>确保徒弟真的拿到新菜谱并开始工作了。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步讲解：代码是如何对应这些 Task 的</h3>
+<h4>Task 1: 入职与认人 (Initialization)</h4>
+<p>代码中的 <code>__init__</code> 和 <code>_init_weights_info</code> 部分。</p>
+<ul>
+<li><strong>你的困惑点可能在于</strong>：<code>wg</code> 是什么？<ul>
+<li><code>wg</code> = <strong>Worker Group</strong>。因为模型太大，一个大厨（GPU）装不下，可能是一组大厨（多卡）在训练。徒弟也是一组人。</li>
+</ul>
+</li>
+<li><strong>代码解读</strong>：
+    ```python
+    def <strong>init</strong>(self, config, trainer, rollouter, mq):
+        # 1. 记下老板是谁
+        self.trainer = trainer      # 大厨
+        self.rollouter = rollouter  # 徒弟<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 2. 获取他们的具体工作小组 (Worker Group)
+self.actor_wg = ray.get(trainer.get_actor_wg.remote())
+self.rollout_wg = ray.get(rollouter.get_rollout_wg.remote())
+
+<span class="gh">#</span> 3. 搞清楚菜谱格式 (Weights Info)
+self._init_weights_info()
+</code></pre></div>
+
+<p>```
+*   <strong>白话</strong>：传令兵说：“好，我知道去哪拿参数（Trainer），送给谁（Rollouter）了。”</p>
+</li>
+</ul>
+<h4>Task 2: 架设专线电话 (Setup Communication)</h4>
+<p>代码中的 <code>_init_sync_group</code> 部分。</p>
+<ul>
+<li><strong>你的困惑点可能在于</strong>：<code>collective</code> 和 <code>NCCL</code> 是什么？<ul>
+<li>模型参数非常大（几十 GB），如果通过普通的 CPU 内存拷贝，速度慢得像蜗牛。</li>
+<li><strong>NCCL</strong> 是 NVIDIA 搞的一种技术，让显卡之间直接传数据，不过 CPU，速度极快。</li>
+</ul>
+</li>
+<li><strong>代码解读</strong>：
+    ```python
+    def _init_sync_group(self):
+        # 把大厨的人(actor workers) 和 徒弟的人(rollout workers) 加到一个列表里
+        actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 创建一个“群组”，让他们的显卡可以直接通信
+collective.create_collective_group(
+    actor_rollout_workers,
+    ...,
+    backend=get_nccl_backend(), # 使用 NCCL 高速后端
+    group_name=self.sync_group_name # 群名叫 &quot;actor_rollout&quot;
+)
+</code></pre></div>
+
+<p>```
+*   <strong>白话</strong>：传令兵说：“为了传得快，我把大厨和徒弟的电脑连上了高速局域网。”</p>
+</li>
+</ul>
+<h4>Task 3: 执行同步 (Sync Weights - 最重要的一步)</h4>
+<p>代码中的 <code>sync_weights</code> 部分。这是一个流程控制。</p>
+<ul>
+<li><strong>流程解读</strong>：<ol>
+<li><strong>暂停 (Pause)</strong>: <code>ray.get(self.rollouter.pause.remote())</code><ul>
+<li><em>为什么？</em> 你不能在徒弟炒菜炒一半的时候换菜谱，会出人命的（数据错乱）。必须先让他停手。</li>
+</ul>
+</li>
+<li><strong>更新公告板</strong>: <code>self.mq_client.update_param_version_sync(version)</code><ul>
+<li>告诉系统：“现在是第 5 版菜谱了”。</li>
+</ul>
+</li>
+<li><strong>高速传输</strong>: 
+    <code>python
+    self.actor_wg.sync_rollout_weights() 
+    ray.get(self.rollout_wg.sync_rollout_weights())</code><ul>
+<li>这是真正发生“魔法”的地方。通过刚才架设的 NCCL 专线，参数瞬间从 Trainer 复制到了 Rollouter。</li>
+</ul>
+</li>
+<li><strong>异步重启</strong>: 
+    <code>python
+    # 告诉徒弟：你的版本号变了，可能需要验证一下(validate)
+    self.wait_last_update = self.rollouter.update_param_version.remote(...)
+    # 告诉徒弟：干活吧 (Resume)
+    self.wait_last_resume = self.rollouter.resume.remote(...)</code></li>
+<li><strong>白话</strong>：传令兵喊：“徒弟停手！大厨，传数据！...传完了。徒弟，这是新版本号，继续干活！”</li>
+</ol>
+</li>
+</ul>
+<h4>Task 4: 确认与收尾 (Wait)</h4>
+<p>代码中的 <code>wait_last_valid</code> 部分。</p>
+<ul>
+<li><strong>你的困惑点可能在于</strong>：为什么前面是 <code>remote()</code> 这里要 <code>get()</code>？<ul>
+<li><code>remote()</code> 是“异步”的，意思是“我发个短信让你做，我自己先走了”。</li>
+<li><code>sync_weights</code> 里发了重启命令就溜了（为了不阻塞主线程）。</li>
+<li>但有时候我们需要确认徒弟真的重启成功了，所以用 <code>wait_last_valid</code> 来检查短信回执。</li>
+</ul>
+</li>
+<li><strong>代码解读</strong>：
+    <code>python
+    def wait_last_valid(self):
+        # 检查之前的“更新版本”和“重启”任务是否完成
+        if self.wait_last_update:
+            ray.get(self.wait_last_update) # 阻塞等待，直到完成
+        if self.wait_last_resume:
+            ray.get(self.wait_last_resume)</code></li>
+</ul>
+<h3>总结</h3>
+<p>这个文件 <code>param_sync.py</code> 实际上就是一个<strong>“以太网交换机”</strong>的管理员。</p>
+<ol>
+<li>它不负责训练（那是 Trainer 的事）。</li>
+<li>它不负责生成数据（那是 Rollouter 的事）。</li>
+<li>它只负责：<strong>在 Trainer 练出新模型后，让 Rollouter 停下来，用最快的方式（NCCL）把新模型塞给 Rollouter，然后让它继续跑。</strong></li>
+</ol>
+<p>之所以代码看起来复杂，是因为它用了 <code>Ray</code> 这个分布式框架来管理多台机器上的多个 GPU 进程。</p>

@@ -1,0 +1,111 @@
+<h1>megatron/core/inference/batch_dimensions_utils.py</h1>
+<p>这份代码看起来很复杂，但其实它只解决<strong>一个核心问题</strong>：</p>
+<p><strong>如何在变长的 LLM 推理（Inference）请求中，配合 CUDA Graph 这种需要“固定形状”的技术？</strong></p>
+<p>为了让你读懂，我制定了一个 <strong>6步走的“学习任务清单” (Todo List)</strong>。请按照这个顺序，一步步解锁文中的观点。</p>
+<hr />
+<h3>✅ Task 01: 理解背景概念（Prefill vs Decode）</h3>
+<p>在看代码前，必须先懂 LLM 推理的两种状态。代码里的 <code>prefill</code> 和 <code>decode</code> 是核心变量。</p>
+<ul>
+<li><strong>Prefill (预填充/首token阶段):</strong> 用户刚发来一段话（Prompt），模型需要一次性处理这一大段话。<ul>
+<li><em>特点：</em> Token 数量多，计算量大。</li>
+</ul>
+</li>
+<li><strong>Decode (解码/生成阶段):</strong> 模型已经读完了 Prompt，现在一个字一个字地往外吐。<ul>
+<li><em>特点：</em> 每次只处理 1 个 Token，但可能有很多个并发请求同时在生成。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>代码对应：</strong>
+<code>InferenceBatchDimensions</code> 类中的属性：
+*   <code>prefill_req_count</code>: 有多少个新来的请求（正在做 Prefill）。
+*   <code>decode_req_count</code>: 有多少个正在生成的请求（正在做 Decode）。
+*   <code>token_count</code>: 这一批次里，所有人加起来一共要处理多少个 Token。</p>
+</blockquote>
+<hr />
+<h3>✅ Task 02: 理解痛点（为什么要写这个文件？）</h3>
+<p>GPU 很快，但 CPU 启动 GPU 任务（Kernel Launch）会有开销。为了极致加速，NVIDIA 有个技术叫 <strong>CUDA Graph</strong>。</p>
+<ul>
+<li><strong>CUDA Graph 的毛病：</strong> 它像是一个“定死的模具”。你录制时设定输入是 "Batch=4, Length=1024"，运行时输入就必须<strong>刚好</strong>是这个形状。</li>
+<li><strong>现实的麻烦：</strong> 真实推理请求是动态的。一会儿来 1 个请求，一会儿来 5 个；有的长，有的短。</li>
+<li><strong>解决方案：</strong> 预先造好几个“标准尺寸的箱子”（CUDA Graph Presets）。比如造一个“能装4人”的箱子。如果来了3个人，也用这个箱子，剩下的位置空着（Padding）。</li>
+</ul>
+<blockquote>
+<p><strong>代码对应：</strong>
+这个文件的目的就是<strong>自动计算我们要造哪些尺寸的箱子</strong>，以及<strong>运行时如何挑选箱子</strong>。</p>
+</blockquote>
+<hr />
+<h3>✅ Task 03: 研读 <code>InferenceBatchDimensions</code> 类</h3>
+<p>把这个类想象成一个<strong>“规格说明书”</strong>。</p>
+<ul>
+<li><strong>它的作用：</strong> 描述一个 Batch 的形状。</li>
+<li><strong>核心方法 <code>is_applicable_for_batch_dim</code>：</strong><ul>
+<li>这是在问：<strong>“我这个标准箱子，能装下你手里这批真实的请求吗？”</strong></li>
+<li><em>逻辑：</em> 如果箱子的 Token 容量 &gt;= 真实 Token，且箱子的请求位 &gt;= 真实请求数，那就说明“装得下”。</li>
+</ul>
+</li>
+<li><strong>核心方法 <code>is_valid</code>：</strong><ul>
+<li>这是在检查：<strong>“这个规格合法吗？”</strong></li>
+<li>比如：请求数不能是负数；Token 总数不能小于请求数（因为每个请求至少占 1 个 Token）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 04: 研读 <code>CUDAGraphBatchDimensionBuilder</code> 的前半部分</h3>
+<p>这个类是<strong>“箱子制造工厂”</strong>。</p>
+<ul>
+<li><strong>核心逻辑 <code>generate_cuda_graph_batch_dimensions_list</code>：</strong><ul>
+<li>我们不可能为每一种情况都造个 CUDA Graph（那样显存就爆了）。</li>
+<li>我们需要<strong>离散化</strong>（Discretization）。</li>
+<li>比如最大支持 1000 个 Token，我们可能只造 [1000, 752, 504, 256] 这几种容量的箱子。</li>
+</ul>
+</li>
+<li><strong>代码细节 <code>_calculate_cuda_graph_token_counts</code>：</strong><ul>
+<li>这里面的数学运算（<code>math.ceil</code>, <code>CUDA_GRAPH_ROUNDER</code>）都是为了<strong>对齐</strong>。</li>
+<li>显卡喜欢 8 的倍数，或者 TP (Tensor Parallel) 的倍数。这个函数就是把数字修整成显卡喜欢的“整数”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 05: 理解“三种箱子”的策略</h3>
+<p>在 <code>generate_...</code> 函数中，代码根据不同的场景，制造了三种类型的箱子：</p>
+<ol>
+<li><strong>Decode Only (纯生成):</strong><ul>
+<li>假设没有新请求进来，全是正在生成的。</li>
+<li><em>箱子形状：</em> <code>prefill=0</code>, <code>decode=N</code>。</li>
+</ul>
+</li>
+<li><strong>Mixed (混合模式):</strong><ul>
+<li>这也是最复杂的。既有新来的（Prefill），也有正在生成的（Decode）。</li>
+<li><em>箱子形状：</em> <code>prefill=K</code>, <code>decode=M</code>。</li>
+<li>代码里会尝试把显存填满，计算如果我有 <code>size</code> 这么多 Token 预算，能塞进多少个 Prefill 和 Decode 请求。</li>
+</ul>
+</li>
+<li><strong>Prefill Only (纯预填充):</strong><ul>
+<li><em>箱子形状：</em> <code>prefill=N</code>, <code>decode=0</code>。</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>代码目的：</strong> 生成一个列表 <code>cuda_graph_batch_dimensions_list</code>，里面存了几十种不同大小、不同比例的 <code>InferenceBatchDimensions</code> 对象（预设箱子）。</p>
+</blockquote>
+<hr />
+<h3>✅ Task 06: 研读 <code>match_graph_config</code>（运行时的匹配）</h3>
+<p>这是最后一步。现在模型跑起来了，来了一批真实数据。</p>
+<ul>
+<li><strong>输入：</strong> <code>real_batch_dim</code> (刚才来了3个请求，共500 token)。</li>
+<li><strong>输入：</strong> <code>cuda_graph_batch_dimensions_list</code> (我们仓库里预存的一堆箱子)。</li>
+<li><strong>逻辑：</strong><ol>
+<li><strong>筛选：</strong> 找出所有“能装下”真实数据的箱子（调用 Task 03 里的 <code>is_applicable</code>）。</li>
+<li><strong>择优：</strong> 在能装下的箱子里，选一个<strong>最小</strong>的（浪费最少的）。代码里用了 <code>min()</code>，因为 <code>InferenceBatchDimensions</code> 定义了比较规则。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>你看不懂是因为它把数学计算和业务逻辑混在一起了。简单来说，这个文件的逻辑流是：</p>
+<ol>
+<li><strong>定义规格</strong> (<code>InferenceBatchDimensions</code>)：一个 Batch 有多少 Token，多少个 Prefill/Decode 请求。</li>
+<li><strong>生产预设</strong> (<code>Builder</code>): 根据显卡显存和并行度，算出几十个“标准规格”备用（为了适配 CUDA Graph）。</li>
+<li><strong>运行时匹配</strong> (<code>match</code>): 每次推理时，拿实际的负载去套用这些“标准规格”，找到最合适的那个去执行。</li>
+</ol>

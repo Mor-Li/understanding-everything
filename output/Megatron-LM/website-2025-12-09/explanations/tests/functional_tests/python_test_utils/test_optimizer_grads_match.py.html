@@ -1,0 +1,63 @@
+<h1>tests/functional_tests/python_test_utils/test_optimizer_grads_match.py</h1>
+<p>这份代码确实包含了很多底层细节，特别是涉及到<strong>分布式训练（Distributed Training）</strong>、<strong>数值精度（Numerical Precision）</strong>以及<strong>张量并行（Tensor Parallelism）</strong>的处理。</p>
+<p>简单来说，这个脚本的<strong>核心目的</strong>是：
+<strong>验证在不同的训练配置下（比如不同的GPU数量、不同的并行策略），模型计算出的“梯度（Gradients）”是否一致。</strong></p>
+<p>因为直接对比梯度很难（梯度通常在反向传播后就被清空或更新了），这个脚本利用了一个技巧：<strong>对比优化器状态（Optimizer State）</strong>。如果我们将Adam优化器的参数设为特定值（b1=0, b2=0），优化器里存的状态实际上就等同于梯度。</p>
+<p>为了让你更容易理解，我把它拆解成一个<strong>Task Todo List</strong>，按照代码执行的逻辑一步步给你讲：</p>
+<hr />
+<h3>📋 任务清单：如何验证两个模型的训练结果是否一致？</h3>
+<h4>Task 1: 读取数据 (Loading Checkpoints)</h4>
+<p><strong>代码对应：</strong> <code>load_dist_checkpoint_pt</code>, <code>FileSystemReader</code>
+*   <strong>目标</strong>：从硬盘上读取两个（或多个）不同的检查点文件（Checkpoints）。
+*   <strong>难点</strong>：现在的模型很大，存盘时不是存成一个大文件，而是碎成很多小文件（Sharded）。
+*   <strong>操作</strong>：
+    1.  使用 <code>FileSystemReader</code> 读取元数据（Metadata），看看有哪些张量（Tensors）。
+    2.  创建一个空的“占位符”字典。
+    3.  把分散在磁盘上的数据加载进来。</p>
+<h4>Task 2: 筛选目标 (Filtering)</h4>
+<p><strong>代码对应：</strong> <code>_filter_optimizer_tensors</code>
+*   <strong>目标</strong>：我们不关心模型的权重（Weights），只关心优化器的状态。
+*   <strong>操作</strong>：
+    1.  遍历所有加载进来的数据。
+    2.  只保留名字里带有 <code>optimizer.</code> 且包含 <code>.exp_avg.</code> 的张量。
+    *   <em>解释</em>：<code>exp_avg</code> 是 Adam 优化器的一阶动量。如果在训练前设置 beta1=0，这个值<strong>数学上就等于梯度</strong>。</p>
+<h4>Task 3: 统一形状 (Unsharding &amp; Reshaping)</h4>
+<p><strong>代码对应：</strong> <code>unshard_row_parallel_state</code>, <code>_assert_optimizer_tensors_equal</code> (中间的 reshape 逻辑)
+*   <strong>目标</strong>：这是最麻烦的一步。如果 Checkpoint A 是单卡训练的，Checkpoint B 是 2卡张量并行（TP）训练的，它们的张量形状会不一样！
+    *   比如：单卡是一个 <code>[100, 100]</code> 的矩阵，双卡TP可能被切成了两个 <code>[100, 50]</code> 或者 <code>[50, 100]</code>。
+*   <strong>操作</strong>：
+    1.  对比两个张量的形状。如果不一样，说明发生了切片（Sharding）。
+    2.  根据层的类型（比如是 <code>RowParallel</code> 还是普通的层），尝试把切碎的张量“拼”回去，或者把完整的张量“切”开，让它们形状对齐。
+    3.  代码里的 <code>unshard_row_parallel_state</code> 就是专门处理行并行（Row Parallel）线性层的拼接逻辑。</p>
+<h4>Task 4: 定义“相等”的标准 (Math &amp; Error Bounds)</h4>
+<p><strong>代码对应：</strong> <code>_fro_norm</code>, <code>relative_grad_diff</code>, <code>expected_rel_bound</code>, <code>check_gradient</code>
+*   <strong>目标</strong>：计算机里的浮点数计算是有误差的（BF16, FP32）。两个梯度不可能完全由 0.00000000 等于 0.00000000。我们需要一个科学的“容忍度”。
+*   <strong>操作</strong>：
+    1.  <strong>计算相对误差</strong> (<code>relative_grad_diff</code>)：计算两个张量的差异幅度，除以原本张量的大小。公式类似：$|A - B| / |B|$。
+    2.  <strong>计算理论允许误差</strong> (<code>expected_rel_bound</code>)：代码引用了一篇论文（ArXiv 2506.09280），根据神经网络的<strong>层数深度</strong> (<code>l</code>) 和<strong>数据类型</strong> (<code>dtype</code>，如 BF16)，计算出一个动态的允许误差阈值。层数越深，允许的误差积累通常越大。
+    3.  <strong>判断</strong> (<code>check_gradient</code>)：如果 <code>实际误差 &lt;= 理论允许误差</code>，则通过测试。</p>
+<h4>Task 5: 执行对比 (Comparison &amp; Assertion)</h4>
+<p><strong>代码对应：</strong> <code>assert_grads_close</code>, <code>_assert_optimizer_tensors_equal</code>
+*   <strong>目标</strong>：挨个检查每一个参数的梯度。
+*   <strong>操作</strong>：
+    1.  遍历每一个参数名（Key）。
+    2.  如果形状不匹配，先做 Task 3 的整形。
+    3.  如果数值全为 0，跳过（或者是警告）。
+    4.  调用 Task 4 的数学公式进行校验。
+    5.  如果校验失败（误差太大），代码还会尝试把数据 <code>torch.roll</code>（错位）一下再比一次，看看是不是因为数据存错位了。
+    6.  最后，如果一切正常，打印 "Optimizer tensors match"。</p>
+<h4>Task 6: 主流程 (Main Loop)</h4>
+<p><strong>代码对应：</strong> <code>test_optimizer_states_match</code>, <code>main</code>
+*   <strong>操作</strong>：
+    1.  用户在命令行输入：<code>python script.py checkpoint_folder_1 checkpoint_folder_2</code>。
+    2.  脚本把第一个文件夹当作“标准答案”（Base）。
+    3.  把后面的文件夹依次拿来和标准答案对比。
+    4.  只要有一个张量对不上，程序就报错（Raise AssertionError）。</p>
+<hr />
+<h3>总结</h3>
+<p>这个脚本是一个<strong>高精度的自动化测试工具</strong>。</p>
+<ul>
+<li><strong>场景</strong>：你开发了一个新的分布式训练框架，或者修改了模型结构（比如加了 Tensor Parallel）。</li>
+<li><strong>问题</strong>：你怎么知道你的修改没有把梯度的数学计算搞错？</li>
+<li><strong>解法</strong>：跑一步训练，存下 Checkpoint。用这个脚本对比“单卡基准跑”和“多卡并行跑”的结果。如果脚本通过，说明你的并行策略在数学上是正确的，没有引入额外的计算错误。</li>
+</ul>

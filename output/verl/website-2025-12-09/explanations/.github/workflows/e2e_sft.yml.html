@@ -1,0 +1,120 @@
+<h1>.github/workflows/e2e_sft.yml</h1>
+<p>这份文件 <code>e2e_sft.yml</code> 是一个 <strong>GitHub Actions 的自动化工作流配置文件</strong>。</p>
+<p>简单来说，它的作用是：<strong>每当有人修改了代码（特别是涉及到 SFT 训练相关的代码）并提交后，系统会自动租一台强大的 GPU 机器，跑一遍所有的 SFT（有监督微调）训练流程，确保新代码没有把旧功能搞坏。</strong></p>
+<p>为了让你听懂，我把这个文件想象成一个<strong>“测试机器人”的【任务清单 (Todo List)】</strong>。</p>
+<hr />
+<h3>🤖 机器人的任务清单 (Todo List)</h3>
+<p>这个流程可以分为三个大阶段：<strong>准备环境 -&gt; 执行测试 -&gt; 打扫战场</strong>。</p>
+<h4>第一阶段：准备工作 (Setup)</h4>
+<ol>
+<li><strong>[检查触发条件]</strong>：只有当代码推送到 <code>main</code> 分支，或者有人提交 PR 修改了 SFT 相关的核心代码（排除了无关文档和示例）时，才接单。</li>
+<li><strong>[租用机器]</strong>：去云端（Volcengine）申请一台高性能的 8卡 L20 GPU 服务器（因为训练大模型需要很强的算力，GitHub 免费的机器跑不动）。</li>
+</ol>
+<h4>第二阶段：核心测试 (E2E SFT Tasks)</h4>
+<p>机器到位后，机器人登录上去，开始按顺序执行以下操作：
+1.  <strong>[下载代码]</strong>：把仓库里的代码拉下来。
+2.  <strong>[安装环境]</strong>：安装 Python 依赖库（<code>peft</code> 等）和当前项目的代码。
+3.  <strong>[准备数据]</strong>：下载并处理 <code>GSM8K</code> 数据集（这是一个常用的数学推理数据集，用来测试模型变聪明了没）。
+4.  <strong>[测试 1：标准训练]</strong>：用 8 张显卡跑一次标准的 SFT 训练。
+5.  <strong>[测试 2：去 Padding 训练]</strong>：关掉 Padding（填充）功能跑一次，看能不能正常运行。
+6.  <strong>[测试 3：序列并行]</strong>：开启“序列并行 (Sequence Parallelism)”功能跑一次（这是为了省显存的技术）。
+7.  <strong>[测试 4：数值核对]</strong>：对比“序列并行”和“默认模式”算出来的 Loss（误差）是不是一模一样。如果不一样，说明代码有 Bug。
+8.  <strong>[测试 5：Liger Kernel]</strong>：开启 Liger 优化（一种加速技术）跑一次。
+9.  <strong>[测试 6：LoRA 训练]</strong>：不全量微调，而是用 LoRA（一种轻量级微调技术）跑一次。
+10. <strong>[测试 7：断点续训]</strong>：先跑几步停下，然后从存档点（Checkpoint）恢复训练，确保“存档/读档”功能没坏。
+11. <strong>[测试 8：多轮对话]</strong>：准备多轮对话数据，测试模型能不能处理连续对话（Multi-turn）。</p>
+<h4>第三阶段：收尾 (Cleanup)</h4>
+<ol>
+<li><strong>[销毁机器]</strong>：不管测试成功还是失败，最后都要把刚才租的那台昂贵的 GPU 机器退掉，帮老板省钱。</li>
+</ol>
+<hr />
+<h3>📝 逐步详细解读（对应文件代码）</h3>
+<p>现在我们对照代码，一步步看它是怎么写的：</p>
+<h4>1. 顶部注释 (Tests layout / Workflow layout)</h4>
+<p>这部分全是 <code>#</code> 开头的注释，是写给开发者看的文档。
+*   它解释了 <code>tests/</code> 文件夹下的目录结构。
+*   解释了 <code>special_e2e</code> 是专门放“端到端测试”的地方。
+*   解释了哪些测试跑在 CPU 上，哪些跑在 GPU 上。</p>
+<h4>2. 触发规则 (on: ...)</h4>
+<div class="codehilite"><pre><span></span><code><span class="nt">on</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">push</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">...</span>
+<span class="w">  </span><span class="nt">pull_request</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">paths</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;**/*.py&quot;</span><span class="w">           </span><span class="c1"># 只要改了 .py 文件就触发</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;!examples/**&quot;</span><span class="w">       </span><span class="c1"># 但如果只改了 examples 里的东西，不触发</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;!tests/**&quot;</span><span class="w">          </span><span class="c1"># 改了测试代码本身，通常不触发（除非是下面列出的）</span>
+<span class="w">      </span><span class="c1"># ... (后面列出了一堆例外情况，意思是：虽然我排除了 tests，但如果改了 e2e_sft.yml 本身或者核心训练代码，还是要触发)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：为了节省昂贵的 GPU 资源，不要一点小改动（比如改个文档）就跑测试。只有改动了核心逻辑才跑。</li>
+</ul>
+<h4>3. 环境变量 (env)</h4>
+<div class="codehilite"><pre><span></span><code><span class="nt">env</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">IMAGE</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;verl-ci-cn-beijing...&quot;</span><span class="w"> </span><span class="c1"># 指定了测试用的 Docker 镜像</span>
+</code></pre></div>
+
+<ul>
+<li>定义了运行环境的基础镜像和 API 地址。</li>
+</ul>
+<h4>4. 任务一：Setup (jobs: setup)</h4>
+<div class="codehilite"><pre><span></span><code><span class="nt">jobs</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">setup</span><span class="p">:</span>
+<span class="w">    </span><span class="c1"># ...</span>
+<span class="w">    </span><span class="nt">steps</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">uses</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">volcengine/vemlp-github-runner@v1</span><span class="w"> </span>
+<span class="w">        </span><span class="nt">with</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;create&quot;</span><span class="w"> </span><span class="c1"># 动作：创建机器</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这是一个自托管 Runner（Self-hosted Runner）的动态创建过程。它调用火山引擎的接口开了一台机器。</li>
+</ul>
+<h4>5. 任务二：核心测试 (e2e_sft)</h4>
+<p>这是最长的一段。
+*   <code>needs: setup</code>: 必须等 setup 任务完成了才能开始。
+*   <code>runs-on</code>: 指定在刚才创建的那台机器上跑。</p>
+<p><strong>具体的步骤 (Steps):</strong></p>
+<ul>
+<li>
+<p><strong>安装依赖</strong>:
+    <code>yaml
+    pip3 install peft
+    pip3 install --no-deps -e .[test,gpu]</code>
+    安装项目本身和测试工具。</p>
+</li>
+<li>
+<p><strong>准备数据</strong>:
+    <code>yaml
+    python3 examples/data_preprocess/gsm8k.py ...</code>
+    处理 GSM8K 数据集。</p>
+</li>
+<li>
+<p><strong>各种花式训练测试</strong>:
+    你会看到很多类似的块，比如：
+    ```yaml</p>
+<ul>
+<li>name: Running GSM8K E2E training tests ...
+  run: |
+    ray stop --force  # 先杀掉之前的进程，保证环境干净
+    bash tests/special_e2e/sft/run_sft.sh # 运行测试脚本
+<code>``
+这里通过设置不同的环境变量（如</code>RM_PAD=False<code>,</code>SP_SIZE=2<code>,</code>LORA_RANK=32<code>）来测试同一个脚本</code>run_sft.sh` 的不同功能分支。</li>
+<li><strong>观点</strong>：通过复用同一个 Shell 脚本，配合不同的环境变量，覆盖了该框架支持的多种核心特性（LoRA, 序列并行, 断点续训等）。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 任务三：清理 (cleanup)</h4>
+<div class="codehilite"><pre><span></span><code><span class="nt">cleanup</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">if</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">always()</span><span class="w"> </span><span class="c1"># 哪怕上面的测试挂了，这一步也必须执行！</span>
+<span class="w">  </span><span class="nt">steps</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">uses</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">volcengine/vemlp-github-runner@v1</span>
+<span class="w">      </span><span class="nt">with</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;destroy&quot;</span><span class="w"> </span><span class="c1"># 动作：销毁机器</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：资源回收至关重要，防止因为测试失败导致机器一直开着扣费。</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件就是一个<strong>全自动的质检员</strong>。它列出了所有 <code>Verl</code> 这个框架支持的 SFT 训练模式，每次代码更新都挨个跑一遍，确保开发者没有因为修改一个功能而意外破坏了另一个功能。</p>

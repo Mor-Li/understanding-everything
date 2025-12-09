@@ -1,0 +1,144 @@
+<h1>tests/models/test_transformers_ulysses.py</h1>
+<p>这份代码是一个 <strong>单元测试（Unit Test）</strong> 文件。</p>
+<p>简单来说，它的目的是：<strong>验证一种叫 "Ulysses" 的并行技术是否正确。</strong></p>
+<p>为了让你看懂，我们先不用代码术语，用一个生活中的例子：
+假设你要读一本超级厚的书（长序列数据），一个人读太慢（显存不够）。
+1.  <strong>普通方法</strong>：一个人硬读。
+2.  <strong>Ulysses方法</strong>：把书撕成 8 份，分给 8 个人同时读。读完后，大家把心得汇总起来。</p>
+<p>这个测试文件的作用就是：<strong>对比“8个人分着读”的结果，和“1个人硬读”的结果，是否完全一致。</strong> 如果一致，说明这个并行技术是可靠的。</p>
+<p>下面我列一个 <strong>Task Todo List</strong>，带你一步步拆解代码的执行流程。</p>
+<hr />
+<h3>Task Todo List：验证 Ulysses 并行算法</h3>
+<h4>1. 准备阶段 (Setup)</h4>
+<ul>
+<li>[ ] <strong>Task 1.1: 定义测试配置</strong><ul>
+<li>决定要测试哪些模型（Llama, Qwen2 等）。</li>
+<li>决定要把数据切成几份（<code>sp_size</code>，即 Sequence Parallel size）。</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 1.2: 初始化分布式环境</strong><ul>
+<li>模拟多张显卡的环境（比如 8 张卡）。</li>
+<li>创建通信网格（Device Mesh），规定哪几张卡是一组。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 模型与数据准备 (Preparation)</h4>
+<ul>
+<li>[ ] <strong>Task 2.1: 加载并“魔改”模型</strong><ul>
+<li>加载标准的 HuggingFace 模型。</li>
+<li><strong>关键步骤</strong>：使用 <code>apply_monkey_patch</code> 给模型“打补丁”。这相当于给普通模型强行植入“分块读取”的能力。</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 2.2: 制造假数据</strong><ul>
+<li>随机生成一些 <code>input_ids</code>（文本）和 <code>attention_mask</code>。</li>
+<li>处理数据：去除无效的填充（Padding），把数据压缩成紧凑格式（这是 Flash Attention 需要的格式）。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 核心测试流程 (Core Logic)</h4>
+<ul>
+<li>[ ] <strong>Task 3.1: 运行 Ulysses 并行模式 (Path A)</strong><ul>
+<li><strong>切分</strong>：把长长的数据切成小段，分发给不同的 GPU。</li>
+<li><strong>计算</strong>：每张 GPU 算自己那一小段。</li>
+<li><strong>合并</strong>：把大家算出来的结果（Logits）拼回去，还原成完整结果。</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 3.2: 运行普通单卡模式 (Path B)</strong><ul>
+<li>不切分数据，直接用完整数据在本地跑一遍模型（作为标准答案）。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 验证与收尾 (Validation)</h4>
+<ul>
+<li>[ ] <strong>Task 4.1: 对比前向传播（Forward）结果</strong><ul>
+<li>比较 Path A 和 Path B 输出的数值是否一样。</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 4.2: 对比反向传播（Backward/Gradient）结果</strong><ul>
+<li>让两个结果都进行 <code>backward()</code> 计算梯度。</li>
+<li>检查模型权重的梯度是否一致（确保训练时更新也是对的）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>详细代码对应讲解</h3>
+<p>现在我们结合代码，一步步看它是怎么实现上面的 Todo List 的。</p>
+<h4>Task 1: 准备配置与环境</h4>
+<p>代码位置：<code>test_configs</code> 函数 和 <code>_hf_casual_fwd_bwd</code> 开头。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 定义要测 Llama 和 Qwen2，sp_size=8 意味着把序列切成8份</span>
+<span class="n">configs</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="n">SequenceParallelConfig</span><span class="p">(</span><span class="n">LlamaConfig</span><span class="p">(</span><span class="o">...</span><span class="p">),</span> <span class="n">sp_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span> <span class="o">...</span><span class="p">),</span>
+    <span class="o">...</span>
+<span class="p">]</span>
+
+<span class="c1"># 初始化分布式网格</span>
+<span class="c1"># dp_size: 数据并行大小, sp_size: 序列并行大小</span>
+<span class="n">ulysses_device_mesh</span> <span class="o">=</span> <span class="n">init_device_mesh</span><span class="p">(</span>
+    <span class="n">device_type</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">,</span> <span class="n">mesh_shape</span><span class="o">=</span><span class="p">(</span><span class="n">dp_size</span><span class="p">,</span> <span class="n">sp_size</span><span class="p">),</span> <span class="n">mesh_dim_names</span><span class="o">=</span><span class="p">(</span><span class="s2">&quot;dp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">)</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这里确立了测试的基调，必须在多卡环境下才能跑。</li>
+</ul>
+<h4>Task 2: 模型“魔改” (Monkey Patch)</h4>
+<p>代码位置：<code>_hf_casual_fwd_bwd</code> 内部。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_config</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># 重点在这里！</span>
+<span class="n">apply_monkey_patch</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">sp_size</span><span class="p">)</span> 
+<span class="n">sync_model_parameters_global</span><span class="p">(</span><span class="n">model</span><span class="p">)</span> <span class="c1"># 保证所有卡上的初始权重一模一样</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：普通的 HuggingFace 模型不懂怎么做 Ulysses 并行。<code>apply_monkey_patch</code> 是这个库的核心魔法，它替换了模型内部的 Attention 计算逻辑，让它支持分布式计算。</li>
+</ul>
+<h4>Task 3: 运行 Ulysses 模式 (切分 -&gt; 计算 -&gt; 合并)</h4>
+<p>这是文件中最难懂的部分，对应代码块 <code>1. perform ulysses forward</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 切分 (Slice)</span>
+<span class="c1"># ulysses_pad_and_slice_inputs 会把长序列切断。</span>
+<span class="c1"># 比如长度 128，sp_size=4，每张卡只拿到 32 个 token。</span>
+<span class="n">input_ids_rmpad_sliced</span><span class="p">,</span> <span class="o">...</span> <span class="o">=</span> <span class="n">ulysses_pad_and_slice_inputs</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 2. 计算 (Compute)</span>
+<span class="c1"># 每张卡只算自己那一部分 input</span>
+<span class="n">logits_split_in_seq</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">input_ids_rmpad_sliced</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">logits</span> 
+
+<span class="c1"># 3. 合并 (Gather)</span>
+<span class="c1"># gather_outputs_and_unpad 会通过网络通信（AllGather），</span>
+<span class="c1"># 把大家手里的结果拼成一个完整的 logits_full。</span>
+<span class="n">logits_full</span> <span class="o">=</span> <span class="n">gather_outputs_and_unpad</span><span class="p">(</span><span class="n">logits_split_in_seq</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>Task 4: 运行普通模式 (标准答案)</h4>
+<p>对应代码块 <code>2. perform normal forward</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">#以此为界，关闭并行组，假装自己是单卡</span>
+<span class="n">set_ulysses_sequence_parallel_group</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
+
+<span class="c1"># 复制一份完整的模型和数据</span>
+<span class="n">model_no_sp</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+<span class="n">input_ids_full</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="n">input_ids_rmpad</span><span class="p">)</span>
+
+<span class="c1"># 直接跑完整数据，不切分</span>
+<span class="n">logits_rmpad_local</span> <span class="o">=</span> <span class="n">model_no_sp</span><span class="p">(</span><span class="n">input_ids_full</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">logits</span>
+</code></pre></div>
+
+<h4>Task 5: 对比验证 (Check)</h4>
+<p>对应代码块 <code>3. check the gradients</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 验证输出值（Logits）是否接近</span>
+<span class="c1"># mean_local 是普通跑的，mean_full 是切分跑合并后的</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">assert_close</span><span class="p">(</span><span class="n">mean_local</span><span class="p">,</span> <span class="n">mean_full</span><span class="p">,</span> <span class="n">rtol</span><span class="o">=</span><span class="mf">1e-2</span><span class="p">,</span> <span class="n">atol</span><span class="o">=</span><span class="mf">1e-5</span><span class="p">)</span>
+
+<span class="c1"># 验证梯度（Gradients）</span>
+<span class="n">mean_full</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>  <span class="c1"># 并行版反向传播</span>
+<span class="n">mean_local</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span> <span class="c1"># 普通版反向传播</span>
+
+<span class="n">grad</span> <span class="o">=</span> <span class="n">model</span><span class="o">...</span><span class="n">weight</span><span class="o">.</span><span class="n">grad</span>
+<span class="n">grad_full</span> <span class="o">=</span> <span class="n">model_no_sp</span><span class="o">...</span><span class="n">weight</span><span class="o">.</span><span class="n">grad</span>
+
+<span class="c1"># 如果梯度也一样，说明这个并行技术完全等价于单卡训练，测试通过！</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">assert_close</span><span class="p">(</span><span class="n">grad</span><span class="p">,</span> <span class="n">grad_full</span><span class="p">,</span> <span class="n">rtol</span><span class="o">=</span><span class="mf">1e-2</span><span class="p">,</span> <span class="n">atol</span><span class="o">=</span><span class="mf">1e-3</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这篇文章（代码）讲的核心观点是：
+<strong>我们在 <code>verl</code> 库里实现了一个叫 Ulysses 的序列并行功能。为了证明它是对的，我写了这个脚本，让它和普通的单卡运行结果做“找不同”。如果输出结果和梯度更新都一样，就证明我们的实现没问题。</strong></p>

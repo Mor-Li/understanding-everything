@@ -1,0 +1,74 @@
+<h1>verl/tools/utils/search_r1_like_utils.py</h1>
+<p>这份代码其实就是一个<strong>“联网搜索工具”</strong>的底层实现。</p>
+<p>简单来说，它的作用是：<strong>把AI想要查询的问题打包好，发送给一个搜索引擎服务器，然后把搜回来的结果整理好，再还给AI。</strong></p>
+<p>为了让你彻底看懂，我为你制定了一个<strong>5步走的 Task List（学习任务清单）</strong>。我们一步一步来拆解这个文件。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 01: 理解核心目标</strong> —— 搞清楚这个脚本到底是干嘛的？</li>
+<li><strong>Task 02: 核心功能分析 (<code>call_search_api</code>)</strong> —— 它是怎么发请求的？</li>
+<li><strong>Task 03: 容错机制分析 (Retry Logic)</strong> —— 网络不好怎么办？</li>
+<li><strong>Task 04: 数据清洗 (<code>_passages2string</code>)</strong> —— 搜回来的乱码怎么变人话？</li>
+<li><strong>Task 05: 流程总管 (<code>perform_single_search_batch</code>)</strong> —— 最终对外提供什么服务？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 01: 理解核心目标</h4>
+<p><strong>观点：</strong> 这是一个“中介”脚本。
+*   <strong>输入：</strong> 一堆问题（Query List）和一个搜索引擎的网址（URL）。
+*   <strong>输出：</strong> 搜索到的文本内容（Result）和这次搜索的详细信息（Metadata）。
+*   <strong>背景：</strong> 文件名里有 <code>r1_like</code>，通常指类似 DeepSeek-R1 这种带有推理能力的模型，它们需要联网搜索来验证或获取信息。</p>
+<hr />
+<h4>✅ Task 02: 核心功能分析 (<code>call_search_api</code>)</h4>
+<p><strong>观点：</strong> 这是一个负责“打电话”的底层函数。</p>
+<p>请看代码中的 <code>call_search_api</code> 函数：
+*   <strong>生成身份证：</strong> <code>request_id = str(uuid.uuid4())</code>。它给每一次搜索请求都生成一个唯一的 ID，方便在日志（Log）里追踪，万一出错了知道是哪次请求。
+*   <strong>打包包裹：</strong> <code>payload = {"queries": query_list, ...}</code>。它把你的问题打包成 JSON 格式，准备发给服务器。
+*   <strong>发送请求：</strong> <code>requests.post(...)</code>。这是 Python 最常用的网络请求库，相当于在浏览器里敲回车，向远程服务器发起搜索。</p>
+<hr />
+<h4>✅ Task 03: 容错机制分析 (Retry Logic)</h4>
+<p><strong>观点：</strong> 网络是不可靠的，所以要有“重试”机制。</p>
+<p>在 <code>call_search_api</code> 里有一个巨大的 <code>for attempt in range(MAX_RETRIES):</code> 循环，这就是重试逻辑：
+1.  <strong>遇到服务器崩溃（5xx错误）：</strong>
+    *   代码：<code>if response.status_code in [500, 502, 503, 504]:</code>
+    *   解释：如果搜索引擎服务器挂了或超时，不要立刻报错，而是休息一会儿再试。
+2.  <strong>遇到断网或超时（Connection/Timeout Error）：</strong>
+    *   代码：<code>except requests.exceptions.ConnectionError</code> 等。
+    *   解释：如果网线断了，也休息一会儿再试。
+3.  <strong>退避策略（Backoff）：</strong>
+    *   代码：<code>time.sleep(delay)</code>。
+    *   解释：第一次失败等 1秒，第二次等 2秒... 这叫“指数退避”，防止把服务器彻底冲垮。
+4.  <strong>彻底放弃：</strong>
+    *   如果试了 <code>MAX_RETRIES</code> (10次) 还是不行，才会返回 <code>None</code> 和错误信息。</p>
+<hr />
+<h4>✅ Task 04: 数据清洗 (<code>_passages2string</code>)</h4>
+<p><strong>观点：</strong> 搜回来的原始数据是给机器看的，我们需要把它变成给模型看的格式。</p>
+<p>请看 <code>_passages2string</code> 函数：
+*   <strong>原始数据：</strong> 搜索引擎返回的 JSON 可能很复杂，包含各种 ID、分数等。
+*   <strong>清洗过程：</strong>
+    *   它遍历每一个搜索结果 (<code>doc_item</code>)。
+    *   提取标题 (<code>title</code>) 和正文 (<code>text</code>)。
+    *   拼接到一起：<code>f"Doc {idx + 1} (Title: {title})\n{text}\n\n"</code>。
+*   <strong>结果：</strong> 把复杂的 JSON 变成了一段干净的、带编号的字符串，方便 LLM（大模型）阅读。</p>
+<hr />
+<h4>✅ Task 05: 流程总管 (<code>perform_single_search_batch</code>)</h4>
+<p><strong>观点：</strong> 这是外部程序真正调用的“经理”，它管理并发和最终结果。</p>
+<p>请看 <code>perform_single_search_batch</code> 函数：
+1.  <strong>并发控制（Semaphore）：</strong>
+    *   代码：<code>if concurrent_semaphore: with concurrent_semaphore:</code>
+    *   解释：这是一个“红绿灯”。如果同时有几百个线程都要搜索，这个信号量会控制同时并发的数量，防止把机器卡死。
+2.  <strong>调用底层：</strong> 它内部调用了上面说的 <code>call_search_api</code>。
+3.  <strong>结果包装：</strong>
+    *   如果成功：调用 <code>_passages2string</code> 格式化文本，状态设为 <code>success</code>。
+    *   如果失败：生成一个包含错误信息的 JSON，状态设为 <code>api_error</code>。
+    *   如果没结果：状态设为 <code>no_results</code>。
+4.  <strong>返回值：</strong> 它返回两个东西：
+    *   <code>result_text</code>: 最终给 AI 看的字符串（JSON格式）。
+    *   <code>metadata</code>: 给程序员看的日志数据（比如搜到了多少条、花了多久、有没有报错）。</p>
+<hr />
+<h3>📝 总结 (Summary)</h3>
+<p>你可以把这个文件想象成一个<strong>外卖小哥</strong>：
+1.  <strong><code>perform_single_search_batch</code> (外卖站长)</strong>：接收订单，控制派单速度（Semaphore），最后把餐（结果）和发票（Metadata）交给客户。
+2.  <strong><code>call_search_api</code> (骑手)</strong>：负责跑腿。如果商家没做完或者路不通（报错），他会等待并重试几次（Retry），实在不行才告诉站长“取不到餐”。
+3.  <strong><code>_passages2string</code> (打包员)</strong>：把商家乱七八糟的饭菜，整整齐齐地装进盒子里，贴上标签（格式化文本），方便客户吃。</p>
+<p>现在再回头看代码，是不是清晰多了？</p>

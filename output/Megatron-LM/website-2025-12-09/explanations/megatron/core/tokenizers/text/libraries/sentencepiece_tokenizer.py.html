@@ -1,0 +1,78 @@
+<h1>megatron/core/tokenizers/text/libraries/sentencepiece_tokenizer.py</h1>
+<p>这个文件 <code>sentencepiece_tokenizer.py</code> 的核心作用是：<strong>给 Megatron（一个大模型训练框架）提供一个“翻译官”，让它能使用 Google 的 SentencePiece 工具来处理文本。</strong></p>
+<p>因为它要兼容老版本的代码（Legacy）又要支持新特性，所以里面写了很多“如果...就...”的判断逻辑，显得很乱。</p>
+<p>我们可以把编写这个类的过程想象成一个 <strong>“项目开发 Todo List”</strong>。为了完成这个“翻译官”，我们需要按顺序完成以下 6 个任务：</p>
+<hr />
+<h3>📋 任务清单 (Task List)</h3>
+<h4>✅ Task 1: 搭建基础设施 (初始化与加载)</h4>
+<p><strong>目标</strong>：确保只有安装了工具才能用，并把模型文件加载进来。</p>
+<ul>
+<li><strong>检查工具</strong>：代码开头用 <code>try...except</code> 检查你有没有安装 <code>sentencepiece</code> 库。没装就报错。</li>
+<li><strong>加载模型 (<code>__init__</code>)</strong>：<ul>
+<li>读取 <code>tokenizer_path</code>（你的 <code>.model</code> 文件路径）。</li>
+<li>创建一个 <code>sentencepiece.SentencePieceProcessor</code> 对象（这是 Google 原生的处理器）。</li>
+<li><strong>设定模式</strong>：这里有一个关键开关 <code>legacy</code> (是否兼容旧版)。<ul>
+<li>如果是 <code>legacy=True</code>，允许我们在 Python 代码里手动强行添加一些特殊词（比如 <code>[MASK]</code>, <code>[CLS]</code>）。</li>
+<li>如果是 <code>legacy=False</code> (新版)，则完全听命于 <code>.model</code> 文件，不再允许手动加词。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 处理“特殊的空格” (Whitespace Hack)</h4>
+<p><strong>目标</strong>：防止 SentencePiece 自作聪明把多余的空格吞掉。</p>
+<ul>
+<li><strong>背景</strong>：SentencePiece 有时会把 "hello  world" (两个空格) 变成 "hello world" (一个空格)。但在某些代码生成任务中，空格数量很重要。</li>
+<li><strong>解决方案</strong>：<ul>
+<li>定义了一个奇怪的字符 <code>self.extra_space_token = '☯'</code>。</li>
+<li>设置了一个开关 <code>ignore_extra_whitespaces</code>。如果你不想忽略多余空格，代码会在处理前先把空格替换成这个 <code>☯</code>，处理完再换回来，或者通过它来保留位置。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 核心功能 —— 文本转数字 (Encoding)</h4>
+<p><strong>目标</strong>：把人类语言 <code>"Hello world"</code> 变成机器能懂的列表 <code>[123, 456]</code>。
+<strong>代码对应</strong>：<code>text_to_ids</code> 和 <code>_text_to_ids</code></p>
+<ul>
+<li><strong>第一步 (空格处理)</strong>：如果开启了保留空格，先把空格变成 <code>☯</code>。</li>
+<li><strong>第二步 (分情况处理)</strong>：<ul>
+<li><strong>情况 A (Legacy 旧模式)</strong>：这是代码最乱的地方。它不能直接丢给 SentencePiece，因为它必须先手动扫描文本，找出我们在 Python 里定义的特殊词（如 <code>[CLS]</code>）。<ul>
+<li><em>逻辑</em>：扫描字符串 -&gt; 找到特殊词 -&gt; 切割字符串 -&gt; 普通部分给 SentencePiece 算 ID，特殊词直接查表换 ID -&gt; 拼接到一起。</li>
+</ul>
+</li>
+<li><strong>情况 B (新模式)</strong>：非常简单，直接调用 <code>self.tokenizer.encode_as_ids(text)</code>，全权交给 Google 的库处理。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 核心功能 —— 数字转文本 (Decoding)</h4>
+<p><strong>目标</strong>：把机器吐出来的 <code>[123, 456]</code> 变回 <code>"Hello world"</code>。
+<strong>代码对应</strong>：<code>ids_to_text</code></p>
+<ul>
+<li>同样分情况：<ul>
+<li><strong>旧模式</strong>：遍历 ID 列表，如果是特殊 ID（比如我们手动加的 <code>[MASK]</code>），就查表找回字符串；如果是普通 ID，就攒着一起丢给 SentencePiece 解码。</li>
+<li><strong>新模式</strong>：直接调用 <code>self.tokenizer.decode_ids(ids)</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 核心功能 —— 文本切词 (Tokenizing)</h4>
+<p><strong>目标</strong>：不转数字，只切分。把 <code>"Hello world"</code> 变成 <code>["Hello", " world"]</code>。
+<strong>代码对应</strong>：<code>text_to_tokens</code></p>
+<ul>
+<li>逻辑和 Task 3 几乎一样，只是输出的不是数字 ID，而是切分后的字符串片段（tokens）。</li>
+<li>这里也有一个针对 Chat Template（对话模板）的小补丁：如果发现特殊 token（比如 <code>[INST]</code>）后面紧跟着 SentencePiece 的分隔符（<code>▁</code>），代码会把这个分隔符删掉，防止出现多余的空隙。</li>
+</ul>
+<h4>✅ Task 6: 提供“字典”查询服务 (Properties)</h4>
+<p><strong>目标</strong>：外部代码经常问：“哪个数字代表句子的结尾？”、“总共有多少个词？”。</p>
+<ul>
+<li><strong><code>vocab_size</code></strong>: 词表大小。如果是 Legacy 模式，大小 = 原模型大小 + 手动添加的特殊词数量。</li>
+<li><strong><code>eos_id</code>, <code>bos_id</code>, <code>pad_id</code></strong>: 返回代表“结束”、“开始”、“填充”的数字 ID。</li>
+<li><strong><code>add_special_tokens</code></strong>: 这是一个仅在 Legacy 模式下有用的功能，用来往词表末尾追加新词。</li>
+</ul>
+<hr />
+<h3>总结一下 (Executive Summary)</h3>
+<p>这段代码其实就是给 <strong>Google SentencePiece</strong> 包了一层壳。</p>
+<ol>
+<li><strong>如果你用 <code>legacy=False</code> (推荐)</strong>：这代码 90% 的逻辑都不跑，它基本就是直接透传调用 <code>sentencepiece</code> 库，非常干净。</li>
+<li><strong>如果你用 <code>legacy=True</code></strong>：它会激活一套复杂的<strong>“手动拼接逻辑”</strong>，让你能在 Python 层强行插入特殊 Token，并处理由此带来的编解码麻烦。</li>
+<li><strong>关于空格</strong>：它加了一层用 <code>☯</code> 符号保护多余空格的逻辑，防止分词器合并空格。</li>
+</ol>
+<p>你看不懂的大部分复杂逻辑（那些 <code>while 1</code> 循环、<code>indices</code> 查找），都是为了兼容 <strong>Legacy 模式</strong> 下手动处理特殊 Token 搞出来的。</p>

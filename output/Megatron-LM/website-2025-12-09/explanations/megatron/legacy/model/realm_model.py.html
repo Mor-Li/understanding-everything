@@ -1,0 +1,105 @@
+<h1>megatron/legacy/model/realm_model.py</h1>
+<p>这份代码确实涉及了很多术语，如果你不了解 <strong>REALM</strong> 或 <strong>ICT (Inverse Cloze Task)</strong> 的背景，看起来会非常晕。</p>
+<p>简单来说，这段代码是为了训练一个<strong>“搜索引擎”</strong>的核心组件。它的目的是让模型学会判断：“这句话（Query）”和“这段文本（Block）”是不是匹配的。</p>
+<p>为了让你看懂，我把阅读这份代码拆解成一个 <strong>“造车”的 Task List</strong>，我们一步步来完成这个任务。</p>
+<hr />
+<h3>Task List: 打造一个智能检索模型</h3>
+<h4>✅ Step 1: 理解核心目标 (Context)</h4>
+<ul>
+<li><strong>目标</strong>：我们需要一个模型，能把一段文字变成一个向量（一串数字）。</li>
+<li><strong>用途</strong>：如果两个向量靠得近，说明这段文字和那个问题是相关的。</li>
+<li><strong>方法</strong>：我们需要两个 BERT 模型，一个负责读“问题”（Query），一个负责读“答案/文章片段”（Block）。这在学术上叫“双塔模型”（Dual Encoder）。</li>
+<li><strong>术语翻译</strong>：<ul>
+<li><strong>ICT</strong>: Inverse Cloze Task（一种训练任务，给你一句话，让你猜它出自哪段文章）。</li>
+<li><strong>IR</strong>: Information Retrieval（信息检索，就是搜索）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Step 2: 制造基本零件 (<code>IREncoderBertModel</code>)</h4>
+<p>我们先看代码最下面的类 <code>IREncoderBertModel</code>。这是基础零件，不管是处理问题的模型，还是处理文章的模型，本质都是这个东西。</p>
+<ul>
+<li><strong>它的构造</strong>：<ol>
+<li><strong><code>language_model</code></strong>: 这是一个标准的 BERT 模型。它负责读懂文字，输出一大堆特征。</li>
+<li><strong><code>ict_head</code></strong>: 这是一个线性层（Linear Layer）。BERT 输出的特征维度很高（比如 1024 维），这个头把它压缩到一个指定的维度（比如 128 维），方便计算和存储。</li>
+</ol>
+</li>
+<li><strong>它的工作流程 (<code>forward</code>)</strong>：<ol>
+<li>输入文字 (<code>input_ids</code>)。</li>
+<li>BERT 处理，拿到 <code>pooled_output</code>（整句话的浓缩特征）。</li>
+<li><code>ict_head</code> 处理，输出 <code>ict_logits</code>（最终的向量）。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>一句话总结 Step 2</strong>：这是一个改装过的 BERT，专门用来把文字变成紧凑的向量。</p>
+</blockquote>
+<hr />
+<h4>✅ Step 3: 组装整机 (<code>ICTBertModel</code>)</h4>
+<p>现在看代码中间的核心类 <code>ICTBertModel</code>。这是真正的总指挥，它把 Step 2 里的零件组装起来。</p>
+<ul>
+<li>
+<p><strong>它的构造 (<code>__init__</code>)</strong>：</p>
+<ul>
+<li>它实例化了<strong>两个</strong> <code>IREncoderBertModel</code>：<ol>
+<li><strong><code>query_model</code></strong>: 专门用来把“问题”变成向量。</li>
+<li><strong><code>block_model</code></strong>: 专门用来把“文章片段”变成向量。</li>
+</ol>
+</li>
+<li><em>代码细节</em>：你可以通过参数 <code>only_query_model</code> 或 <code>only_block_model</code> 来决定只用其中一半（比如只在搜索的时候用），但在训练时通常两个都要。</li>
+</ul>
+</li>
+<li>
+<p><strong>它的工作流程 (<code>forward</code>)</strong>：</p>
+<ul>
+<li>接收两组输入：一组是问题 (<code>query_tokens</code>)，一组是文章 (<code>block_tokens</code>)。</li>
+<li>调用 <code>embed_query</code> -&gt; 算出问题的向量。</li>
+<li>调用 <code>embed_block</code> -&gt; 算出文章的向量。</li>
+<li><strong>输出</strong>：两个向量。后续的程序会计算这两个向量像不像（点积），越像得分越高。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>一句话总结 Step 3</strong>：这是一个包含“左脑”（处理问题）和“右脑”（处理文章）的双塔系统。</p>
+</blockquote>
+<hr />
+<h4>✅ Step 4: 启动与初始化 (<code>general_ict_model_provider</code> &amp; <code>init_state_dict_from_bert</code>)</h4>
+<p>车造好了，得插钥匙启动，还得加满油（加载预训练参数）。</p>
+<ul>
+<li>
+<p><strong><code>general_ict_model_provider</code></strong>:</p>
+<ul>
+<li>这是一个工厂函数。外部程序调用它，它就根据配置（参数 <code>args</code>）把上面的 <code>ICTBertModel</code> 创建出来并返回。</li>
+<li>它会检查是否支持并行（这里代码写死了只支持单卡并行，防止逻辑过于复杂）。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>init_state_dict_from_bert</code> (在 <code>ICTBertModel</code> 里)</strong>:</p>
+<ul>
+<li><strong>关键点</strong>：我们不想从零开始训练。这个函数的作用是读取一个现成的、普通的 BERT 检查点文件。</li>
+<li><strong>复制操作</strong>：它把普通 BERT 的参数，<strong>同时复制给</strong> <code>query_model</code> 和 <code>block_model</code>。</li>
+<li><strong>意义</strong>：这就好比你有两个双胞胎实习生，刚开始让他们都继承同样的知识，然后在后续的 ICT 训练中，他们会分别进化，一个擅长提问，一个擅长回答。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Step 5: 存档与读档 (Save &amp; Load)</h4>
+<p>最后是关于 <code>state_dict</code> 的那些函数。</p>
+<ul>
+<li><strong><code>state_dict_for_save_checkpoint</code></strong>:<ul>
+<li>保存模型时，它会把 <code>query_model</code> 和 <code>block_model</code> 的参数分别打包，打上标签（key），存到一个大字典里。</li>
+</ul>
+</li>
+<li><strong><code>load_state_dict</code></strong>:<ul>
+<li>加载模型时，它根据标签，把参数分别填回给两个子模型。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结回顾</h3>
+<p>如果你再看一遍代码，脑海里应该有这样一个画面：</p>
+<ol>
+<li><strong><code>IREncoderBertModel</code></strong> 是一个<strong>转换器</strong>：文字进去 -&gt; BERT -&gt; 压缩 -&gt; 向量出来。</li>
+<li><strong><code>ICTBertModel</code></strong> 是一个<strong>比较器</strong>：它手里拿两个转换器，左手拿问题，右手拿答案，分别算出向量，丢给外面去计算匹配度。</li>
+<li><strong><code>realm_model.py</code></strong> 这个文件就是定义了这个“比较器”的图纸。</li>
+</ol>

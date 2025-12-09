@@ -1,0 +1,103 @@
+<h1>tools/checkpoint/schema_core.py</h1>
+<p>这份代码乍一看确实很抽象，全是字符串拼接。但其实它的核心逻辑非常简单：<strong>它就是一本“字典”或“地图”</strong>。</p>
+<p>它的作用是告诉程序：当我们保存或加载模型权重（Checkpoint）时，<strong>逻辑上的名字</strong>（比如“第一层的注意力机制权重”）对应到<strong>实际代码中的变量名</strong>（比如 <code>language_model.encoder.layers.0...</code>）到底是什么。</p>
+<p>为了让你读懂，我为你制定了一个 <strong>Task List（学习任务清单）</strong>，我们将分 5 步来攻克它。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1：理解背景</strong> —— 为什么要写这个文件？（解决“名字对不上”的问题）</li>
+<li><strong>Task 2：宏观架构 (<code>CoreSchema</code>)</strong> —— 搞清楚一个 Transformer 模型由哪几大块组成。</li>
+<li><strong>Task 3：微观细节 (<code>CoreLocalSchema</code>)</strong> —— 传统的 Transformer 层内部长什么样？</li>
+<li><strong>Task 4：特殊优化 (<code>CoreTESchema</code>)</strong> —— NVIDIA 的加速库（TE）把名字改成了什么样？</li>
+<li><strong>Task 5：总管 (<code>get_model_schema</code>)</strong> —— 如何根据配置自动选择正确的“地图”？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1: 理解背景 —— 这里的“Schema”是什么？</h4>
+<p>想象一下，你搬家了。
+*   旧房子里，你的袜子放在“卧室 -&gt; 衣柜 -&gt; 第三层抽屉”。
+*   新房子里，袜子要放在“衣帽间 -&gt; 袜子篮”。</p>
+<p>如果你要搬运东西，你需要一张<strong>对照表</strong>。</p>
+<p>在深度学习模型中，<strong>Schema (模式)</strong> 就是这张对照表。
+*   左边是<strong>抽象的标准名</strong>（比如 <code>self_attn_qkv_weight</code>）。
+*   右边是<strong>具体的变量路径</strong>（比如 <code>self_attention.linear_qkv.weight</code>）。</p>
+<p>这个文件的目的，就是定义这些路径，方便在不同模型结构（比如 GPT vs BERT，或者普通版 vs 加速版）之间转换或保存权重。</p>
+<hr />
+<h4>✅ Task 2: 宏观架构 —— <code>CoreSchema</code> 类</h4>
+<p>请看代码中的 <code>CoreSchema</code> 类。这是所有模型的“父类”，它定义了模型的最外层骨架。</p>
+<p>不管是 GPT 还是 BERT，它们都有以下共同点，代码里是这样映射的：</p>
+<ol>
+<li><strong>Embeddings (地基)</strong>:<ul>
+<li><code>pos</code>: 位置编码 (<code>position_embeddings</code>)</li>
+<li><code>word</code>: 词向量 (<code>word_embeddings</code>)</li>
+</ul>
+</li>
+<li><strong>Layers (楼层)</strong>:<ul>
+<li><code>layer_prefix</code>: 这里用到了 <code>get_core_transformer_block_key</code>。<ul>
+<li>如果是 <strong>GPT</strong>，核心层叫 <code>decoder</code>。</li>
+<li>如果是 <strong>BERT</strong>，核心层叫 <code>encoder</code>。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>Final Norm (屋顶)</strong>:<ul>
+<li>模型最后的一层归一化层 (<code>final_layernorm</code>)。</li>
+</ul>
+</li>
+<li><strong>Heads (门面)</strong>:<ul>
+<li><code>lm_head</code>: 语言模型头（用来预测下一个词）。</li>
+<li><code>binary_head</code>: 二分类头（BERT 用来预测下一句是否连贯）。</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结</strong>：<code>CoreSchema</code> 负责生成模型最外层的变量路径字符串。它使用了 <code>prefix</code>（前缀），这就像文件路径一样，比如 <code>model.language_model.</code>。</p>
+<hr />
+<h4>✅ Task 3: 微观细节 —— <code>CoreLocalSchema</code> 类</h4>
+<p>现在我们走进每一层楼（Transformer Layer）内部看看。
+<code>CoreLocalSchema</code> 代表的是<strong>“本地（Local）”</strong>实现，也就是最标准的、没有经过特殊黑科技优化的 PyTorch 实现。</p>
+<p>一个标准的 Transformer 层包含两个房间：
+1.  <strong>Self Attention (自注意力机制)</strong>
+2.  <strong>MLP (多层感知机/前馈网络)</strong></p>
+<p>看代码中的字典：
+*   <strong>Attention 部分</strong>:
+    *   <code>self_attn_norm</code>: 归一化层，对应 <code>input_layernorm</code>。
+    *   <code>self_attn_qkv</code>: 计算 Q、K、V 的线性层，对应 <code>self_attention.linear_qkv</code>。
+    *   <code>self_attn_proj</code>: 输出投影层，对应 <code>self_attention.linear_proj</code>。
+*   <strong>MLP 部分</strong>:
+    *   <code>mlp_norm</code>: 归一化层，对应 <code>pre_mlp_layernorm</code>。
+    *   <code>mlp_fc1</code>: 第一层全连接，对应 <code>mlp.linear_fc1</code>。
+    *   <code>mlp_fc2</code>: 第二层全连接，对应 <code>mlp.linear_fc2</code>。</p>
+<p><strong>总结</strong>：这个类告诉程序，标准版的 Transformer 层里，权重变量都叫什么名字。</p>
+<hr />
+<h4>✅ Task 4: 特殊优化 —— <code>CoreTESchema</code> 类</h4>
+<p>这里是难点，也是这个文件的核心价值。
+<strong>TE</strong> 代表 <strong>Transformer Engine</strong>，这是 NVIDIA 推出的一个加速库。</p>
+<p>为了加速，TE 做了一个操作叫 <strong>"Fusion" (融合)</strong>。
+它把“归一化层 (LayerNorm)”和“线性层 (Linear)”融合在一起计算了。</p>
+<p><strong>这就导致变量改名了！</strong>
+对比一下 <code>CoreLocalSchema</code> 和 <code>CoreTESchema</code>：</p>
+<ul>
+<li><strong>普通版 (Local)</strong>:<ul>
+<li>归一化层是独立的：<code>input_layernorm.weight</code></li>
+</ul>
+</li>
+<li><strong>加速版 (TE)</strong>:<ul>
+<li>归一化层变成了 Linear 层的一个属性：<code>self_attention.linear_qkv.layer_norm_weight</code></li>
+</ul>
+</li>
+</ul>
+<p><strong>总结</strong>：<code>CoreTESchema</code> 专门处理使用了 NVIDIA Transformer Engine 的模型，因为它的变量层级结构变了（Norm 被吃进 Linear 里了）。</p>
+<p><em>注：代码里还有一个 <code>CoreMoETESchema</code>，那是更高级的“混合专家模型 (MoE)”。原理一样，只是它把 MLP 层拆成了很多个“专家 (Experts)”，代码里用 <code>for</code> 循环生成了 <code>expert_0</code>, <code>expert_1</code>... 的路径。</em></p>
+<hr />
+<h4>✅ Task 5: 总管 —— <code>get_model_schema</code> 函数</h4>
+<p>最后看文件底部的 <code>get_model_schema</code> 函数。这是给外部调用的接口。</p>
+<p>它的逻辑是：
+1.  <strong>你是 MoE (混合专家) 模型吗？</strong>
+    *   是 -&gt; 返回 <code>CoreMoETESchema</code>。
+2.  <strong>你不是 MoE，那你的底层实现是什么？</strong>
+    *   是普通 PyTorch (<code>local</code>) -&gt; 返回 <code>CoreLocalSchema</code>。
+    *   是 NVIDIA 加速版 (<code>transformer_engine</code>) -&gt; 返回 <code>CoreTESchema</code>。</p>
+<p>它还接收 <code>model_type</code> ("GPT" 或 "BERT") 来决定是用 <code>decoder</code> 还是 <code>encoder</code> 命名。</p>
+<hr />
+<h3>💡 一句话总结</h3>
+<p>这个脚本是一个<strong>“路径生成器”</strong>。它根据你使用的模型架构（GPT/BERT）和底层实现方式（普通/NVIDIA加速/MoE），自动拼凑出模型中每一个权重参数的<strong>准确变量名路径</strong>，确保保存和加载模型时能找到正确的位置。</p>

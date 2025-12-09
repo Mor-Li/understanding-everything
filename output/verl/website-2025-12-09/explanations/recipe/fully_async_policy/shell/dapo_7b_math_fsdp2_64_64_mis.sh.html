@@ -1,0 +1,53 @@
+<h1>recipe/fully_async_policy/shell/dapo_7b_math_fsdp2_64_64_mis.sh</h1>
+<p>这份脚本实际上是一个<strong>大规模分布式强化学习（RLHF）训练配置单</strong>。它的核心目的是训练一个擅长做数学题的大模型（Qwen2.5-Math-7B）。</p>
+<p>这份脚本不仅是“训练”，它采用了一种比较前沿的<strong>全异步架构（Fully Async）</strong>。为了让你看懂，我把它拆解成一个<strong>“项目经理的 To-Do List”</strong>，每一项任务对应脚本里的一个核心观点或配置模块。</p>
+<hr />
+<h3>📋 任务清单：构建一个全异步数学大模型训练系统</h3>
+<h4>✅ Task 1：准备基础设施（地基）</h4>
+<p><strong>脚本观点：</strong> 训练大模型需要庞大的算力，必须用集群管理工具。
+*   <strong>要做的事：</strong>
+    *   启动 <strong>Ray</strong> 集群（分布式计算框架）。
+    *   指定文件路径：模型用 <code>Qwen2.5-Math-7B</code>，训练数据用 <code>dapo-math-17k</code>（数学题库），测试数据用 <code>aime-2024</code>（数学竞赛题）。
+    *   <strong>代码对应：</strong> <code>RAY_ADDRESS</code>, <code>MODEL_PATH</code>, <code>TRAIN_FILE</code>。</p>
+<h4>✅ Task 2：设计“产线分离”架构（核心观点）</h4>
+<p><strong>脚本观点：</strong> 传统的“生成数据 -&gt; 训练”串行模式太慢了。我们要把“做题（Rollout）”和“学习（Train）”彻底分开，让它们同时跑。
+*   <strong>要做的事：</strong>
+    *   把 GPU 资源分成两拨：一拨专门负责<strong>做题</strong>（Rollout Worker），一拨专门负责<strong>更新参数</strong>（Train Worker）。
+    *   <strong>代码对应：</strong>
+        *   <code>rollout_mode="async"</code>：开启异步模式。
+        *   <code>NNODES_ROLLOUT=8</code> vs <code>NNODES_TRAIN=8</code>：8个节点专门做推理，8个节点专门训练。
+        *   <code>rollout_name="vllm"</code>：做题那边用 vLLM 加速，因为它推理快。</p>
+<h4>✅ Task 3：定义“学习方法”（算法）</h4>
+<p><strong>脚本观点：</strong> 我们不直接用标准的 PPO，而是用一种基于组的相对策略优化（GRPO/DAPO），且不需要传统的 KL 散度惩罚。
+*   <strong>要做的事：</strong>
+    *   设定算法为 <code>grpo</code>（Group Relative Policy Optimization）。
+    *   关掉 KL 惩罚（<code>kl_coef=0.0</code>），让模型更自由地探索解题步骤。
+    *   <strong>代码对应：</strong> <code>adv_estimator=grpo</code>, <code>use_kl_in_reward=False</code>。</p>
+<h4>✅ Task 4：应对“超长思维链”（数学题特供）</h4>
+<p><strong>脚本观点：</strong> 数学题需要写很长的步骤（CoT），模型必须要能吐出很长的内容而不爆显存。
+*   <strong>要做的事：</strong>
+    *   允许模型输入 2k token，输出由原来的几千扩展到 <strong>28k token</strong>（<code>max_response_length</code>）。
+    *   开启 <code>enable_overlong_buffer</code>，防止生成的答案太长直接导致程序崩溃。
+    *   <strong>代码对应：</strong> <code>max_response_length=$((1024 * 28))</code>, <code>overlong_buffer_len</code>。</p>
+<h4>✅ Task 5：解决“时差”问题（异步训练的难点）</h4>
+<p><strong>脚本观点：</strong> 因为“做题”和“学习”是分开跑的，训练端拿到的数据可能是几分钟前旧模型生成的（Staleness/过时）。如果不修正，模型会练坏。
+*   <strong>要做的事：</strong>
+    *   设置“过时容忍度”：<code>staleness_threshold=0.5</code>，太旧的数据直接丢掉。
+    *   使用数学修正手段：<strong>重要性采样（IS）</strong> 和 <strong>拒绝采样（RS）</strong>。这就像是给旧数据打补丁，告诉现在的模型：“虽然这是旧脑子想出来的，但修正一下还能用。”
+    *   <strong>代码对应：</strong> <code>rollout_is=geometric</code>, <code>rollout_rs=geometric</code>, <code>async_training</code> 板块。</p>
+<h4>✅ Task 6：压榨硬件性能（显存优化）</h4>
+<p><strong>脚本观点：</strong> 7B 模型加上 30k 的长度，单卡绝对放不下。必须把模型切碎了放。
+*   <strong>要做的事：</strong>
+    *   <strong>FSDP (Fully Sharded Data Parallel)</strong>：把模型参数切碎放在不同显卡里。
+    *   <strong>Sequence Parallel (SP)</strong>：把长文本（30k token）切碎，大家一起算。
+    *   <strong>代码对应：</strong> <code>fsdp_size=8</code>, <code>sp_size=4</code>, <code>gen_tp=4</code> (推理时的张量并行)。</p>
+<hr />
+<h3>总结：这脚本到底在干嘛？</h3>
+<p>简单来说，这个脚本在指挥一个<strong>庞大的 AI 工厂</strong>：</p>
+<ol>
+<li><strong>车间 A (Rollout)</strong>：一大堆 GPU 疯狂地做数学题，写出长达数万字的解题步骤。</li>
+<li><strong>车间 B (Train)</strong>：另一大堆 GPU 拿着车间 A 的作业进行学习。</li>
+<li><strong>传送带 (Async)</strong>：车间 A 和 B 不用互相等，通过异步队列传输数据。</li>
+<li><strong>质检员 (Correction)</strong>：因为车间 B 升级很快，车间 A 的作业可能过时了，脚本里配置了一堆复杂的数学公式（IS/RS）来修正这些“过时作业”的价值，确保训练不跑偏。</li>
+</ol>
+<p>这就是 <strong>DAPO (Decoupled Asynchronous Policy Optimization)</strong> 的核心逻辑：<strong>解耦、异步、修正</strong>。</p>

@@ -1,0 +1,94 @@
+<h1>recipe/genrm_remote/run_genrm_remote.sh</h1>
+<p>这份代码确实包含了很多术语，对于刚接触大模型强化学习（RLHF）的人来说，看起来就像天书。</p>
+<p>简单来说，这是一个 <strong>Shell 脚本</strong>，它的目的是<strong>启动一个 AI 模型的训练任务</strong>。</p>
+<p>这个任务的核心逻辑是：<strong>“让一个模型（学生）做数学题，然后通过另一个模型（老师）来给它打分，从而让学生模型变得更聪明。”</strong></p>
+<p>为了让你看懂，我把你（作为操作者）需要理解的逻辑拆解成一个 <strong>To-Do List（任务清单）</strong>。我们按顺序一步步来：</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<h4>✅ 第一步：准备“判卷老师” (启动 Server)</h4>
+<p><strong>（对应代码最上方的注释部分）</strong></p>
+<p>在训练开始前，你需要一个专门的模型来充当“裁判”或“奖励模型”（Reward Model）。
+*   <strong>代码位置：</strong> <code># vllm server</code> 下面的那行被注释掉的命令。
+*   <strong>你要做什么：</strong> 脚本告诉你，在运行下面的训练命令之前，你得先在后台运行这个命令。
+*   <strong>含义：</strong> 它启动了一个 <code>vllm</code> 服务，加载了一个叫 <code>verl-team/GenRM-CI-Test-1.5B</code> 的模型。
+    *   <strong>通俗解释：</strong> 你得先把老师请进教室，让他坐在那里准备改卷子。这个老师就是 GenRM（Generative Reward Model，生成式奖励模型）。</p>
+<h4>✅ 第二步：指定“学生”和“教材” (配置训练参数)</h4>
+<p><strong>（对应 <code>python3 -m verl.trainer.main_ppo</code> 后面的一大堆参数）</strong></p>
+<p>现在要开始训练了。这一步是告诉程序，谁来学？学什么？</p>
+<ul>
+<li>
+<p><strong>指定教材 (Data)：</strong></p>
+<ul>
+<li><code>data.train_files=...gsm8k...</code>: 使用 GSM8K 数据集（这是一套经典的小学数学应用题）。</li>
+<li><strong>通俗解释：</strong> 今天这节课，我们专门做数学应用题。</li>
+</ul>
+</li>
+<li>
+<p><strong>指定学生 (Actor/Model)：</strong></p>
+<ul>
+<li><code>actor_rollout_ref.model.path=Qwen/Qwen2.5-3B-Instruct</code>: 我们要训练的基础模型是 Qwen2.5-3B。</li>
+<li><strong>通俗解释：</strong> 今天的学生是“千问 3B”这个模型。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 第三步：设定“考试规则” (配置生成与算法)</h4>
+<p><strong>（对应 <code>actor_rollout_ref</code> 和 <code>algorithm</code> 部分）</strong></p>
+<ul>
+<li>
+<p><strong>生成方式 (Rollout)：</strong></p>
+<ul>
+<li><code>actor_rollout_ref.rollout.name=vllm</code>: 使用 vLLM 引擎来加速生成答案。</li>
+<li><code>actor_rollout_ref.rollout.n=8</code>: 针对每一道题，让学生一次性生成 8 个不同的解题过程。</li>
+<li><strong>通俗解释：</strong> 遇到一道题，学生要尝试写出 8 种解法，看看哪种能得分。</li>
+</ul>
+</li>
+<li>
+<p><strong>学习算法 (Algorithm)：</strong></p>
+<ul>
+<li><code>algorithm.adv_estimator=grpo</code>: 使用 <strong>GRPO</strong> 算法（Group Relative Policy Optimization）。</li>
+<li><strong>通俗解释：</strong> 这是一种最近很火的训练方法（DeepSeek-R1 也就是用的这种思路）。简单说就是：不跟标准答案比，而是让这 8 个解法互相比较，谁写得好谁就受奖励，谁写得烂谁就受惩罚。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 第四步：连接“老师”进行打分 (配置奖励函数)</h4>
+<p><strong>（对应 <code>reward_model</code> 和 <code>custom_reward_function</code> 部分）</strong></p>
+<p>这是这个脚本最特殊的地方（也是文件名 <code>genrm_remote</code> 的由来）。</p>
+<ul>
+<li><strong>代码逻辑：</strong><ul>
+<li><code>custom_reward_function.path=recipe/genrm_remote/reward_function.py</code>: 指定了一个自定义的 Python 脚本来计算分数。</li>
+<li><strong>通俗解释：</strong> 虽然学生在做题，但怎么判断对错呢？这里指定了一个“打分器”。结合第一步，这个打分器会把学生的答案发送给那个“远程的老师（Server）”，老师看一眼，给个分，然后传回来。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 第五步：安排“教室资源” (配置 Trainer)</h4>
+<p><strong>（对应 <code>trainer</code> 部分）</strong></p>
+<p>最后是关于硬件和进度的设置。</p>
+<ul>
+<li><strong>硬件分配：</strong><ul>
+<li><code>CUDA_VISIBLE_DEVICES=4,5,6,7</code>: 这次训练使用第 4、5、6、7 号显卡（共4张）。</li>
+<li><code>trainer.n_gpus_per_node=4</code>: 告诉程序我用了4张卡。</li>
+</ul>
+</li>
+<li><strong>课程进度：</strong><ul>
+<li><code>trainer.total_epochs=10</code>: 总共要把这些题学 10 轮。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这脚本到底在干嘛？</h3>
+<p>把上面的 List 串起来，这个脚本在讲这样一个故事：</p>
+<blockquote>
+<p>“嗨，电脑！</p>
+<p>请使用 <strong>4张显卡 (GPU 4-7)</strong>，
+运行一个 <strong>PPO/GRPO 强化学习</strong> 任务。</p>
+<p>我们的<strong>学生</strong>是 <code>Qwen2.5-3B</code>，
+让他做 <strong>GSM8K 数学题</strong>。</p>
+<p>每次做题，让学生<strong>生成 8 个答案</strong>。
+然后，把这些答案发给那个<strong>远程在线的裁判模型 (GenRM Server)</strong> 去打分。</p>
+<p>根据分数，用 <strong>GRPO 算法</strong> 更新学生的大脑，让他下次数学题做得更好。</p>
+<p>整个过程重复 <strong>10 轮</strong>。”</p>
+</blockquote>
+<p><strong>你现在只需要关注：</strong>
+1.  <strong>第一步的注释</strong>（如果你不先启动那个 Server，运行这个脚本会报错，因为它找不到打分的人）。
+2.  <strong>GPU 编号</strong>（确保你机器上有这些卡）。
+3.  <strong>模型路径</strong>（确保你下载了 Qwen 和 GenRM 模型）。</p>

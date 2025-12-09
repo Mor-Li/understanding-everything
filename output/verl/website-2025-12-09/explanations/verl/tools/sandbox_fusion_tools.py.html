@@ -1,0 +1,114 @@
+<h1>verl/tools/sandbox_fusion_tools.py</h1>
+<p>这份代码实现了一个<strong>基于 Ray 框架的、带有速率限制（Rate Limit）的代码执行工具</strong>。</p>
+<p>简单来说，它的作用是：<strong>允许 AI 模型写出代码，并通过这个工具把代码发送到一个安全的沙盒环境（Sandbox Fusion）中运行，最后把运行结果（比如打印的文字或报错）返回给 AI。</strong></p>
+<p>为了让你更容易理解，我把它拆解成一个<strong>Task Todo List（任务清单）</strong>，模拟这个工具从“启动”到“执行任务”的全过程。</p>
+<hr />
+<h3>核心任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>[基础设施搭建]</strong>：招聘一群“工人”（Worker）并设置“限流器”（防止请求太多把沙盒冲垮）。</li>
+<li><strong>[工具初始化]</strong>：配置工具，告诉它沙盒服务器的地址在哪里，内存限制是多少。</li>
+<li><strong>[会话创建]</strong>：当 AI 开始一段新的对话或任务时，给它分配一个唯一的 ID（身份证）。</li>
+<li><strong>[执行代码]</strong>：接收 AI 写的代码 -&gt; 排队 -&gt; 发送到沙盒 -&gt; 获取运行结果 -&gt; 返回给 AI。</li>
+<li><strong>[清理现场]</strong>：任务结束后，删除临时数据。</li>
+</ol>
+<hr />
+<h3>详细步骤解析</h3>
+<p>下面我按照上面的清单，一步步给你讲代码里是怎么实现的：</p>
+<h4>1. [基础设施搭建] 设置限流和工人池</h4>
+<p>这部分代码主要利用 <code>ray</code>（一个分布式计算框架）来管理并发。</p>
+<ul>
+<li>
+<p><strong>Task 1.1: 制作“限流器” (<code>TokenBucketWorker</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>class TokenBucketWorker</code></li>
+<li><strong>解释</strong>: 想象这是一个银行的取号机。<code>rate_limit</code> 是窗口数量。</li>
+<li><code>acquire()</code>: 领号。如果号发完了，后面的任务就得等着（信号量机制）。</li>
+<li><code>release()</code>: 办完业务，把号还回去，让下一个人能领。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 1.2: 制作“执行工人” (<code>ExecutionWorker</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>class ExecutionWorker</code></li>
+<li><strong>解释</strong>: 这是真正负责干活的人。</li>
+<li>它在干活前 (<code>execute</code> 方法里)，会先去 <code>TokenBucketWorker</code> 那里领个号 (<code>acquire</code>)。</li>
+<li>利用 <code>with ExitStack()...callback</code>: 确保不管活干得怎么样，最后都会把号还回去 (<code>release</code>)。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 1.3: 组建团队 (<code>init_execution_pool</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>def init_execution_pool(...)</code></li>
+<li><strong>解释</strong>: 这个函数负责启动 <code>num_workers</code> 个 <code>ExecutionWorker</code>，让它们待命。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [工具初始化] 配置 SandboxFusionTool</h4>
+<p>这是主类 <code>SandboxFusionTool</code> 的构造阶段。</p>
+<ul>
+<li><strong>Task 2.1: 读取配置 (<code>__init__</code>)</strong><ul>
+<li><strong>代码位置</strong>: <code>SandboxFusionTool.__init__</code></li>
+<li><strong>解释</strong>:<ul>
+<li>它读取配置文件 <code>config</code>。</li>
+<li><code>sandbox_fusion_url</code>: 沙盒服务器的网址（代码真正运行的地方）。</li>
+<li><code>num_workers</code>: 雇佣多少个工人。</li>
+<li>最后调用 <code>init_execution_pool</code> 把工人团队建好。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>3. [会话创建] 准备一次交互</h4>
+<p>当 AI 需要开始使用工具时调用。</p>
+<ul>
+<li><strong>Task 3.1: 创建实例 (<code>create</code>)</strong><ul>
+<li><strong>代码位置</strong>: <code>async def create(...)</code></li>
+<li><strong>解释</strong>:<ul>
+<li>生成一个 <code>instance_id</code> (如果没传的话就随机生成一个 UUID)。</li>
+<li>在 <code>self._instance_dict</code> 里开辟一块空间，准备记录这次任务的数据。</li>
+<li>这就好比你去网吧，老板给你开了一台机子，记录下你的卡号。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>4. [执行代码] 核心业务逻辑</h4>
+<p>这是最关键的一步，AI 传入代码，工具返回结果。</p>
+<ul>
+<li>
+<p><strong>Task 4.1: 接收请求 (<code>execute</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>async def execute(...)</code></li>
+<li><strong>解释</strong>:<ul>
+<li>从参数里提取 <code>code</code> (代码), <code>timeout</code> (超时时间), <code>language</code> (编程语言)。</li>
+<li>调用 <code>self.execution_pool.execute.remote(...)</code>：把任务派发给远程的“工人”。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 4.2: 实际运行 (<code>execute_code</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>def execute_code(...)</code></li>
+<li><strong>解释</strong>:<ul>
+<li>这是“工人”具体执行的逻辑。</li>
+<li>它调用了一个外部辅助函数 <code>_process_single_case</code>（虽然文件里没写具体实现，但这是用来发 HTTP 请求给沙盒服务器的）。</li>
+<li><strong>获取结果</strong>: 如果沙盒运行完成 (<code>Finished</code>)，它把标准输出 (<code>stdout</code>) 和错误输出 (<code>stderr</code>) 拼起来。</li>
+<li><strong>封装</strong>: 把结果包装成 <code>ToolResponse</code> 返回。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>5. [清理现场]</h4>
+<p>任务结束。</p>
+<ul>
+<li><strong>Task 5.1: 释放资源 (<code>release</code>)</strong><ul>
+<li><strong>代码位置</strong>: <code>async def release(...)</code></li>
+<li><strong>解释</strong>: 从字典 <code>_instance_dict</code> 中删除这个 <code>instance_id</code> 的记录，防止内存泄漏。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p><strong>这个文件的核心逻辑就是：</strong>
+为了防止太多的代码执行请求把沙盒服务器打挂，它在中间加了一层 <strong>Ray Actor 池</strong> 来做<strong>限流（Rate Limiting）</strong>和<strong>并发管理</strong>。<code>SandboxFusionTool</code> 只是一个中间人，负责把 AI 的代码接过来，通过限流机制，转发给远程的沙盒服务运行，再把结果拿回来。</p>

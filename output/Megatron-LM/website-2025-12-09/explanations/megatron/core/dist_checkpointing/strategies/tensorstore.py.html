@@ -1,0 +1,117 @@
+<h1>megatron/core/dist_checkpointing/strategies/tensorstore.py</h1>
+<p>没问题，这份代码确实涉及了很多分布式训练和底层文件I/O的概念，初看会觉得很绕。</p>
+<p>我们可以把理解这份代码的过程想象成<strong>“如何把一个巨大的拼图（模型参数）从硬盘上的仓库（Zarr文件）搬运并组装到每个人的手中（GPU显存）”</strong>。</p>
+<p>我为你设计了一个由浅入深的 <strong>Task List (学习清单)</strong>，一共 5 个任务。完成这 5 步，你就能完全掌握这份代码的逻辑。</p>
+<hr />
+<h3>📋 学习清单 (Task Todo List)</h3>
+<ul>
+<li>[ ] <strong>Task 1: 理解背景与工具</strong> (为什么要用 TensorStore 和 Zarr？)</li>
+<li>[ ] <strong>Task 2: 环境检查与注册</strong> (代码是如何保证安全的？)</li>
+<li>[ ] <strong>Task 3: 核心策略类</strong> (搬运工的“指挥官”是谁？)</li>
+<li>[ ] <strong>Task 4: 读取数据的核心动作</strong> (如何只读取属于我的那一小块数据？)</li>
+<li>[ ] <strong>Task 5: 容错处理</strong> (如果拼图大小对不上怎么办？)</li>
+</ul>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 理解背景与工具</h4>
+<p><strong>概念：</strong>
+在大模型训练（Megatron）中，模型参数非常大，无法存成一个单一文件。我们需要把参数<strong>切分（Sharding）</strong>。
+*   <strong>Zarr:</strong> 一种存储格式，专门用来存这种切分好的大数组（类似文件夹里有很多小块文件）。
+*   <strong>TensorStore:</strong> Google 开发的一个库，用来<strong>高效读取</strong>这些 Zarr 格式的数据。它的特点是支持并发、支持只读取数组的一小部分（切片读取）。</p>
+<p><strong>代码对应：</strong>
+文件开头的注释说明了这一点：</p>
+<blockquote>
+<p><code>Strategies using TensorStore to load and save Zarr arrays.</code>
+(使用 TensorStore 来加载和保存 Zarr 数组的策略。)</p>
+</blockquote>
+<hr />
+<h4>Task 2: 环境检查与注册</h4>
+<p><strong>问题：</strong> 如果用户的电脑没装 <code>tensorstore</code> 库怎么办？程序会直接崩吗？</p>
+<p><strong>代码逻辑：</strong>
+1.  <strong>安全导入：</strong> 代码用 <code>try...except</code> 包裹了导入语句。如果没有安装 <code>tensorstore</code>，它就创建一个假的 <code>MagicMock</code> 对象，并设置 <code>HAVE_TENSORSTORE = False</code>。这样代码能跑起来，直到你真正调用加载功能时才会报错。
+2.  <strong>注册策略：</strong> <code>register_default_tensorstore_strategies</code> 函数告诉 Megatron 系统：“嘿，我会一种叫 <code>zarr</code> 的加载方式，如果配置文件里写了用 zarr，就来找我。”</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">try</span><span class="p">:</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">tensorstore</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">ts</span>
+    <span class="n">HAVE_TENSORSTORE</span> <span class="o">=</span> <span class="kc">True</span>
+<span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
+    <span class="c1"># 如果没装，就假装装了，防止报错，直到真正用的时候</span>
+    <span class="n">ts</span> <span class="o">=</span> <span class="n">MagicMock</span><span class="p">()</span>
+    <span class="n">HAVE_TENSORSTORE</span> <span class="o">=</span> <span class="kc">False</span>
+</code></pre></div>
+
+<hr />
+<h4>Task 3: 核心策略类 (指挥官)</h4>
+<p><strong>角色：</strong> <code>TensorStoreLoadShardedStrategy</code> 类。
+这是这个文件的核心类。它继承自 <code>LoadShardedStrategy</code>，专门负责加载任务。</p>
+<p><strong>关键方法：<code>load(...)</code></strong>
+这是指挥官下达命令的地方。
+1.  它接收一个 <code>sharded_state_dict</code>（这是一个清单，记录了模型里有哪些参数，每个参数该去哪）。
+2.  它定义了一个 <code>load_fn</code>（加载函数），告诉系统：<strong>“对清单里的每一个参数，都执行这个 <code>_load_from_array</code> 操作。”</strong>
+3.  <code>load_directly_on_device</code>: 这是一个开关。如果开启，数据直接从硬盘读到 GPU；否则先读到 CPU 内存再转过去。</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">load</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">sharded_state_dict</span><span class="p">,</span> <span class="n">checkpoint_dir</span><span class="p">):</span>
+    <span class="c1"># ... 省略路径处理 ...</span>
+    <span class="n">load_fn</span> <span class="o">=</span> <span class="n">partial</span><span class="p">(</span>
+        <span class="n">_load_from_array</span><span class="p">,</span> <span class="c1"># 具体的干活函数</span>
+        <span class="n">checkpoint_dir</span><span class="o">=</span><span class="n">checkpoint_dir</span><span class="p">,</span>
+        <span class="n">load_directly_on_device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">load_directly_on_device</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="c1"># 对字典里的每一个参数，都执行 load_fn</span>
+    <span class="n">dict_list_map_inplace</span><span class="p">(</span><span class="n">load_fn</span><span class="p">,</span> <span class="n">sharded_state_dict</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">sharded_state_dict</span>
+</code></pre></div>
+
+<hr />
+<h4>Task 4: 读取数据的核心动作 (干活的工人)</h4>
+<p><strong>角色：</strong> <code>_load_regular_chunk</code> 和 <code>open_ts_array</code> 函数。
+这是最硬核的部分。假设现在的任务是：读取 <code>Layer1.weight</code> 这个参数。</p>
+<p><strong>步骤分解：</strong>
+1.  <strong>打开文件 (<code>open_ts_array</code>):</strong>
+    使用 <code>tensorstore.open</code> 打开硬盘上的 Zarr 文件。这只是打开了句柄，还没开始读数据。
+2.  <strong>计算切片 (<code>sharded_tensor.global_slice()</code>):</strong>
+    在分布式训练中，每个 GPU 只需要参数的一部分。这里计算出<strong>当前 GPU 需要读取哪一部分</strong>（比如：第 0 到 100 行）。
+3.  <strong>读取数据 (<code>arr[slice].read()</code>):</strong>
+    利用 TensorStore 的能力，<strong>只从硬盘读取刚才计算出的那一小块切片</strong>。这比读取整个文件再切分要快得多，也省内存。</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_load_regular_chunk</span><span class="p">(</span><span class="n">sharded_tensor</span><span class="p">,</span> <span class="n">checkpoint_dir</span><span class="p">):</span>
+    <span class="c1"># 1. 打开硬盘上的数组文件</span>
+    <span class="n">arr</span> <span class="o">=</span> <span class="n">open_ts_array</span><span class="p">(</span><span class="n">checkpoint_dir</span> <span class="o">/</span> <span class="n">sharded_tensor</span><span class="o">.</span><span class="n">key</span><span class="p">)</span>
+
+    <span class="c1"># 2. 拿到属于当前 GPU 的切片范围 (global_slice)</span>
+    <span class="c1"># 3. 读取数据 (arr[...].read())</span>
+    <span class="k">if</span> <span class="n">sharded_tensor</span><span class="o">.</span><span class="n">global_shape</span> <span class="o">==</span> <span class="n">arr</span><span class="o">.</span><span class="n">shape</span><span class="p">:</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">arr</span><span class="p">[</span><span class="n">sharded_tensor</span><span class="o">.</span><span class="n">global_slice</span><span class="p">()]</span><span class="o">.</span><span class="n">read</span><span class="p">()</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
+    <span class="c1"># ...</span>
+    <span class="k">return</span> <span class="n">x</span>
+</code></pre></div>
+
+<hr />
+<h4>Task 5: 容错处理 (如果拼图不对劲)</h4>
+<p><strong>问题：</strong> 假设硬盘上存的参数形状是 <code>(100, 100)</code>，但代码里期望加载的形状是 <code>(90, 100)</code>（可能因为模型结构微调了）。</p>
+<p><strong>解决方案：</strong> <code>merge_global_slice_with_shape</code>。
+如果不做处理，直接读取可能会越界报错。这个函数的作用是<strong>求交集</strong>。
+*   如果我想读 <code>0-100</code> 行，但文件只有 <code>90</code> 行，它会自动把切片改成 <code>0-90</code> 行，防止程序崩溃。
+*   这就是代码中 <code>elif sharded_tensor.allow_shape_mismatch:</code> 分支在做的事情。</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">merge_global_slice_with_shape</span><span class="p">(</span><span class="n">global_slice</span><span class="p">,</span> <span class="n">actual_shape</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span>
+    <span class="c1"># 确保读取范围不超过文件实际的大小</span>
+    <span class="c1"># ... (逻辑就是把 stop 限制在 dim_size 以内)</span>
+</code></pre></div>
+
+<hr />
+<h3>总结 (Summary)</h3>
+<p>现在回头看这个文件，它的逻辑链条是：</p>
+<ol>
+<li><strong>注册</strong>：告诉 Megatron 我能用 TensorStore 读 Zarr 文件。</li>
+<li><strong>指挥 (<code>load</code>)</strong>：遍历模型所有参数，准备加载。</li>
+<li><strong>执行 (<code>_load_regular_chunk</code>)</strong>：<ul>
+<li>打开文件。</li>
+<li>算出当前 GPU 需要哪一块数据。</li>
+<li>(可选) 检查形状是否匹配，如果不匹配就截断读取。</li>
+<li>调用 TensorStore 真正的读取数据。</li>
+</ul>
+</li>
+<li><strong>落位</strong>：把读出来的 NumPy 数组转换成 PyTorch Tensor，放到显存里。</li>
+</ol>
+<p>这样讲是不是清晰多了？如果对其中某一个具体的函数实现细节（比如 <code>postprocess_numpy_array</code> 做了啥）还有疑问，可以继续问我。</p>

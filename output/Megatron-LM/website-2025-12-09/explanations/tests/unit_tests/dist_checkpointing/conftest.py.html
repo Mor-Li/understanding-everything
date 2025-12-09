@@ -1,0 +1,88 @@
+<h1>tests/unit_tests/dist_checkpointing/conftest.py</h1>
+<p>这份代码确实比较晦涩，因为它不是“业务代码”（比如怎么训练模型），而是<strong>测试配置代码</strong>。它是写给 <code>pytest</code>（一个 Python 测试框架）看的“幕后剧本”。</p>
+<p>为了让你读懂，我们可以把这个文件的作用想象成<strong>“为一场考试（测试）布置考场”</strong>。</p>
+<p>我们可以把解读这个文件分解为 <strong>4 个 ToDo 任务</strong>，由浅入深：</p>
+<hr />
+<h3>Task 1: 搞清楚“我是谁，我在哪” (文件定位)</h3>
+<p><strong>目标</strong>：理解 <code>conftest.py</code> 是干嘛的。</p>
+<ul>
+<li><strong>解读</strong>：<ul>
+<li>这个文件名叫 <code>conftest.py</code>。在 <code>pytest</code> 框架中，这是一个特殊文件。</li>
+<li><strong>观点</strong>：它是一个<strong>“考场管理员”</strong>。它里面定义的函数（Fixtures）会自动被同一目录下的其他测试文件共用。</li>
+<li><strong>作用</strong>：你不需要在每个测试文件里都写一遍“如何初始化环境”，全写在这里就行了。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 2: 处理“没人来考试”的尴尬 (异常处理)</h3>
+<p><strong>目标</strong>：理解 <code>pytest_sessionfinish</code> 函数。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>python
+    def pytest_sessionfinish(session, exitstatus):
+        if exitstatus == 5:
+            session.exitstatus = 0</code></li>
+<li><strong>解读</strong>：<ul>
+<li>在 <code>pytest</code> 中，如果没有收集到任何测试用例（比如过滤条件太严，导致找不到测试），它通常会报错并返回状态码 <code>5</code>。</li>
+<li><strong>观点</strong>：这个函数说：“如果最后发现没啥可测的（状态码是5），别报错，当成正常结束（状态码改为0）”。</li>
+<li><strong>通俗比喻</strong>：如果今天没人来考试，监考老师不要报警，直接关灯下班就行。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 给每个班级发草稿纸 (临时目录)</h3>
+<p><strong>目标</strong>：理解 <code>tmp_dir_per_class</code> 函数。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>python
+    @pytest.fixture(scope="class")
+    def tmp_dir_per_class(tmp_path_factory):
+        return tmp_path_factory.mktemp("data")</code></li>
+<li><strong>解读</strong>：<ul>
+<li><code>@pytest.fixture</code>：这是一个“夹具”或“准备工作”。</li>
+<li><code>scope="class"</code>：意思是这个准备工作，<strong>每个测试类（Class）只做一次</strong>。</li>
+<li><strong>观点</strong>：测试保存模型时需要写文件。为了不把电脑弄脏，这里创建了一个<strong>临时的文件夹</strong> (<code>tmp_path_factory</code>)。</li>
+<li><strong>通俗比喻</strong>：给每个来考试的班级发一叠全新的草稿纸，考完试（测试结束）系统会自动回收销毁，保证考场干净。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 制定考试规则 (核心逻辑：Mock与策略)</h3>
+<p><strong>目标</strong>：理解 <code>set_default_dist_ckpt_strategy</code> 函数（这是全篇最难也是最重要的地方）。</p>
+<p>这是一个这就好比在考试前，广播里宣布：“今天的考试，所有人都必须用2B铅笔，不能用圆珠笔”。</p>
+<p>我们将这个函数拆解为三步：</p>
+<h4>4.1 关闭复杂功能</h4>
+<ul>
+<li><strong>代码</strong>：<code>MultiStorageClientFeature.disable()</code></li>
+<li><strong>观点</strong>：<code>MultiStorageClient</code> 是处理复杂存储（比如同时存到云端和本地）的功能。</li>
+<li><strong>解读</strong>：为了单元测试简单、稳定，<strong>强制关闭</strong>这个高级功能。咱们只测核心逻辑，不测复杂的云存储。</li>
+</ul>
+<h4>4.2 偷梁换柱 (Mocking)</h4>
+<ul>
+<li>
+<p><strong>代码</strong>：
+    ```python
+    def get_pyt_dist_save_sharded_strategy():
+        return get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)</p>
+<p>with mock.patch(..., new=get_pyt_dist_save_sharded_strategy):
+    yield
+<code>``
+*   **背景**：Megatron 训练大模型时，保存模型（Checkpointing）有很多种策略（比如 Zarr, Torch, TensorStore 等）。
+*   **观点**：这个测试不想让系统随机选，或者根据配置选。它要**强制**使用</code>torch_dist<code>(PyTorch 分布式保存) 这种策略。
+*   **手段 (Mock)**：
+*   它用</code>mock.patch<code>拦截了系统原本的</code>get_default_save_sharded_strategy<code>函数。
+*   它把原本的函数**替换**成了自己写的</code>get_pyt_dist_save_sharded_strategy<code>。
+*   在这个替换的函数里，硬编码返回了</code>torch_dist` 策略。
+*   <strong>通俗比喻</strong>：就像考试时，把考生的“如意算盘”没收了，发给每个人一个计算器，强制大家只能用这个计算器做题，以确保测试结果的一致性。</p>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>把这 4 个 Task 合起来，这个文件的完整逻辑是：</p>
+<ol>
+<li><strong>我是管理员</strong> (<code>conftest.py</code>)。</li>
+<li><strong>如果不小心没找到测试，别报错</strong> (<code>pytest_sessionfinish</code>)。</li>
+<li><strong>给每个测试类准备一个干净的临时文件夹写文件</strong> (<code>tmp_dir_per_class</code>)。</li>
+<li><strong>在整个测试期间，强制规定：</strong> 不要用复杂的云存储功能，并且保存模型时，必须假装（Mock）系统默认策略就是 <code>torch_dist</code> (<code>set_default_dist_ckpt_strategy</code>)。</li>
+</ol>
+<p>这样，后续在这个目录下的所有测试代码，都会在一个<strong>干净、规则统一、且被简化</strong>的环境中运行。</p>

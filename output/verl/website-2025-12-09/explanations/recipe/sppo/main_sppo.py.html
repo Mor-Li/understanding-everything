@@ -1,0 +1,59 @@
+<h1>recipe/sppo/main_sppo.py</h1>
+<p>这份代码确实看起来有点“劝退”，因为它涉及到<strong>分布式计算（Ray）</strong>、<strong>配置管理（Hydra）</strong>以及<strong>强化学习（RL）</strong>的工程架构。</p>
+<p>简单来说，这是一个<strong>启动脚本（Launcher）</strong>。它的作用不是“做具体的数学计算”，而是像一个<strong>工头</strong>，负责把人（计算资源）、工具（模型）、规则（算法配置）都凑齐，然后喊“开工”。</p>
+<p>为了帮你理解，我把这个脚本做的事情拆解成一个 <strong>Task Todo List</strong>，我们一步一步把这个“工头”要做的事情勾选掉。</p>
+<hr />
+<h3>📝 SPPO 训练启动清单 (Task List)</h3>
+<p>想象你要组织一场大规模的考试训练（训练 AI 模型），你需要做以下几步：</p>
+<h4>✅ Task 1: 阅读“任务说明书” (读取配置)</h4>
+<p><strong>代码位置:</strong> <code>@hydra.main(...)</code> 和 <code>main(config)</code>
+*   <strong>在做什么:</strong> 工头刚上班，先拿到一份详细的施工图纸（Config）。
+*   <strong>解释:</strong> 这里使用了 <code>hydra</code> 库。用户在命令行里输入的参数（比如学习率是多少、用几个 GPU、模型路径在哪），都会被打包成一个 <code>config</code> 对象传进来。
+*   <strong>目的:</strong> 搞清楚今天要干嘛。</p>
+<h4>✅ Task 2: 启动“中央控制室” (初始化 Ray)</h4>
+<p><strong>代码位置:</strong> <code>ray.init(...)</code>
+*   <strong>在做什么:</strong> 检查工厂的电源和网络有没有通。
+*   <strong>解释:</strong> 这个脚本是为了在大规模集群上跑的。<code>ray</code> 是一个分布式计算框架，它能把任务分发到很多台机器的很多个 GPU 上。
+*   <strong>目的:</strong> 确保有多台机器可以听从调遣。如果不初始化，就没法指挥大家干活。</p>
+<h4>✅ Task 3: 指派“项目经理” (TaskRunner)</h4>
+<p><strong>代码位置:</strong> <code>runner = TaskRunner.remote()</code> 和 <code>class TaskRunner</code>
+*   <strong>在做什么:</strong> 工头（主进程）不亲自下场干活，而是雇了一个项目经理（<code>TaskRunner</code>）专门负责协调。
+*   <strong>解释:</strong> 为了不阻塞主节点（Head node），代码把主要的逻辑放到了一个独立的 <code>TaskRunner</code> 类里去执行。
+*   <strong>目的:</strong> 任务隔离，防止主进程挂了导致整个集群失控。</p>
+<h4>✅ Task 4: 组建“施工队” (定义 Workers)</h4>
+<p><strong>代码位置:</strong> <code>if config.actor_rollout_ref.actor.strategy ...</code> 和 <code>role_worker_mapping</code>
+*   <strong>在做什么:</strong> 决定招聘哪些工种。
+*   <strong>核心逻辑 (SPPO 的特点):</strong>
+    *   <strong>Actor (演员/学生):</strong> <code>SPPOActorRolloutRefWorker</code>。负责生成文本（做题）。
+    *   <strong>Ref Policy (参考模型):</strong> 用于防止模型跑偏（防止为了高分乱答题）。
+    *   <strong>Reward Model (打分老师):</strong> <code>RewardModelWorker</code>。负责给生成的文本打分。
+    *   <strong>❌ Critic (评论家):</strong> 代码里有一句注释 <code># sppo does not use critic</code>。
+*   <strong>解释:</strong> 这是一个关键点！普通的 PPO 算法需要一个 Critic 模型，但 <strong>SPPO (Self-Play Preference Optimization)</strong> 是一种特殊的算法，它不需要 Critic 模型，所以这里少招了一个工种。
+*   <strong>目的:</strong> 确定每个 GPU 上跑什么角色的代码。</p>
+<h4>✅ Task 5: 分配“工位” (资源调度)</h4>
+<p><strong>代码位置:</strong> <code>ResourcePoolManager</code> 和 <code>mapping</code>
+*   <strong>在做什么:</strong> 告诉 Ray，哪个工种去哪台机器、哪个 GPU 上上班。
+*   <strong>解释:</strong>
+    *   <code>global_pool</code>: 所有的 GPU 资源池。
+    *   <code>mapping</code>: 把“学生（Actor）”、“老师（Reward）”都分配到资源池里。
+*   <strong>目的:</strong> 确保每个模型都有显卡可以用。</p>
+<h4>✅ Task 6: 准备“教材”和“试卷” (加载模型与分词器)</h4>
+<p><strong>代码位置:</strong> <code>copy_to_local</code>, <code>hf_tokenizer</code>, <code>load_reward_manager</code>
+*   <strong>在做什么:</strong>
+    1.  把模型文件从远程硬盘（HDFS）下载到本地。
+    2.  加载分词器（Tokenizer），把文字变成数字。
+    3.  加载奖励函数（Reward Manager），定义什么样的答案是好的。
+*   <strong>目的:</strong> 准备好训练所需的素材。</p>
+<h4>✅ Task 7: 正式开工 (初始化 Trainer 并开始 Fit)</h4>
+<p><strong>代码位置:</strong> <code>RaySPPOTrainer(...)</code>, <code>trainer.init_workers()</code>, <code>trainer.fit()</code>
+*   <strong>在做什么:</strong> 把上面准备好的所有人、资源、配置，全部塞给 <code>RaySPPOTrainer</code> 这个总指挥，然后按下“开始按钮”（<code>.fit()</code>）。
+*   <strong>解释:</strong> <code>RaySPPOTrainer</code> 是真正控制训练循环（生成数据 -&gt; 打分 -&gt; 更新参数）的类。一旦调用 <code>fit()</code>，模型就开始一轮轮地变聪明了。
+*   <strong>目的:</strong> 启动训练循环，直到训练结束。</p>
+<hr />
+<h3>总结：这文件到底是讲啥的？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>基于 Ray 框架的 SPPO 算法训练启动器</strong>。</p>
+<p><strong>它的独特之处（文中观点）：</strong>
+1.  <strong>SPPO 不需要 Critic:</strong> 代码特意根据 Config 选择了 <code>SPPOActorRolloutRefWorker</code> 并且明确注释排除了 Critic Worker。这是 SPPO 相比传统 PPO 最显著的工程区别（省显存、省计算）。
+2.  <strong>存算分离/模块化:</strong> 它把“生成（Actor）”、“打分（Reward）”、“参考（Ref）”拆成了不同的独立模块（Worker），方便在多卡多机上灵活调度。</p>
+<p>现在的感觉是不是清晰一点了？它就是一个负责招人、分发设备、然后喊开始的“包工头”脚本。</p>

@@ -1,0 +1,81 @@
+<h1>recipe/one_step_off_policy/fsdp_workers.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到了<strong>大模型分布式训练</strong>中最复杂的一个环节：<strong>训练（Training）与推理（Inference/Rollout）之间的参数同步</strong>。</p>
+<p>简单来说，这个文件的核心任务是：<strong>把刚训练好的模型参数（Actor），快速“复制”给负责生成文本的推理引擎（Rollout），以便用最新的模型去生成数据。</strong></p>
+<p>为了让你听懂，我们把这个过程想象成一个<strong>“学霸备考”</strong>的场景：
+*   <strong>Actor（训练者）</strong>：正在疯狂刷题、修正错题的大脑（正在不断更新参数）。
+*   <strong>Rollout（推理者）</strong>：负责参加模拟考试的大脑（用当前的智力去生成答案）。
+*   <strong>问题</strong>：学霸刚学会了新知识（参数更新了），怎么立刻让负责考试的大脑也同步掌握这些新知识？</p>
+<p>下面我为你列一个 <strong>Task To-Do List</strong>，一步步拆解代码在干什么：</p>
+<hr />
+<h3>Task List: 训练与推理的“脑波同步”流程</h3>
+<h4>✅ Step 1: 建立私密通话频道 (Setup Communication)</h4>
+<p><strong>目标</strong>：训练进程和推理进程可能分布在不同的显卡或机器上，它们需要一个专门的通道来传数据。
+*   <strong>代码对应</strong>：<code>create_weight_sync_group</code> 方法。
+*   <strong>解释</strong>：
+    *   就像两个特工对表一样，这里使用 <code>vllm_stateless_init_process_group</code> 建立了一个通信组。
+    *   这样 Actor 和 Rollout 就能互相“打电话”传文件了。</p>
+<h4>✅ Step 2: 互通“货物清单” (Exchange Meta-Info)</h4>
+<p><strong>目标</strong>：在传几十GB的模型参数之前，接收方（Rollout）得先知道要收哪些参数，形状多大，叫什么名字。
+*   <strong>代码对应</strong>：
+    *   <strong>Actor 做的事</strong>：<code>get_actor_weights_info</code>。它把模型里所有的参数名（key）、形状（shape）、类型（dtype）打包成一个清单。
+    *   <strong>Rollout 做的事</strong>：<code>set_actor_weights_info</code>。它拿着这个清单，准备好空的内存容器，等着填数据。
+*   <strong>细节</strong>：这里处理了 FSDP（全分片数据并行）的复杂情况，确保参数名是统一的。</p>
+<h4>✅ Step 3: 开始“搬运”参数 (Sync Weights - 核心逻辑)</h4>
+<p><strong>目标</strong>：这是最重的一步。把 Actor 的参数逐个搬运到 Rollout 的推理引擎里。
+*   <strong>代码对应</strong>：<code>sync_rollout_weights</code> 方法。
+*   <strong>详细步骤拆解</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="mf">3.1</span><span class="w"> </span><span class="n">准备发货</span><span class="w"> </span><span class="p">(</span><span class="n">Actor侧</span><span class="p">)</span><span class="o">**</span><span class="n">：</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="n">如果</span><span class="w"> </span><span class="n">Actor</span><span class="w"> </span><span class="n">为了省显存把参数卸载（Offload）到了</span><span class="w"> </span><span class="k">CPU</span><span class="n">，代码会先调用</span><span class="w"> </span><span class="n n-Quoted">`load_fsdp_model_to_gpu`</span><span class="w"> </span><span class="n">把它临时加载回</span><span class="w"> </span><span class="n">GPU，方便传输。</span>
+
+<span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="mf">3.2</span><span class="w"> </span><span class="n">准备收货</span><span class="w"> </span><span class="p">(</span><span class="n">Rollout侧</span><span class="p">)</span><span class="o">**</span><span class="n">：</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="n">代码会检查你用的是</span><span class="w"> </span><span class="n n-Quoted">`vllm`</span><span class="w"> </span><span class="n">还是</span><span class="w"> </span><span class="n n-Quoted">`sglang`</span><span class="n">（两个超快的推理引擎）。</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="n">如果是</span><span class="w"> </span><span class="n n-Quoted">`vllm`</span><span class="n">，它会打个补丁（patch），让</span><span class="w"> </span><span class="n">vLLM</span><span class="w"> </span><span class="n">准备好接收新权重。</span>
+
+<span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="mf">3.3</span><span class="w"> </span><span class="n">逐个包裹传送</span><span class="w"> </span><span class="p">(</span><span class="k">Loop</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="n">Broadcast</span><span class="p">)</span><span class="o">**</span><span class="n">：</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="n">代码进入一个循环：</span><span class="n n-Quoted">`for key, shape, dtype in self._weights_info:`</span><span class="n">（遍历之前那个清单）。</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">Actor</span><span class="o">**</span><span class="n">：把当前这个参数（比如“第5层的权重”）拿出来。</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">传输</span><span class="o">**</span><span class="n">：</span><span class="n n-Quoted">`collective.broadcast(tensor, ...)`</span><span class="n">。这是一个广播操作。Actor</span><span class="w"> </span><span class="n">就像大喇叭，把这个参数广播给所有负责推理的</span><span class="w"> </span><span class="n">Rollout</span><span class="w"> </span><span class="n">进程。</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">Rollout</span><span class="o">**</span><span class="n">：收到了这个</span><span class="w"> </span><span class="n">Tensor（张量）。</span>
+
+<span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="mf">3.4</span><span class="w"> </span><span class="n">安装零件</span><span class="w"> </span><span class="p">(</span><span class="k">Update</span><span class="w"> </span><span class="k">Engine</span><span class="p">)</span><span class="o">**</span><span class="n">：</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="n">Rollout</span><span class="w"> </span><span class="n">收到参数后，不能只拿在手里，得把它塞进推理引擎里。</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">如果是</span><span class="w"> </span><span class="n">vLLM</span><span class="o">**</span><span class="n">：</span><span class="n n-Quoted">`inference_model.load_weights(...)`</span><span class="n">。</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">如果是</span><span class="w"> </span><span class="n">SGLang</span><span class="o">**</span><span class="n">：调用</span><span class="w"> </span><span class="n n-Quoted">`update_weights`</span><span class="n">，这通常涉及更复杂的分布式推理更新（TP</span><span class="o">/</span><span class="n">Tensor</span><span class="w"> </span><span class="n">Parallelism）。</span>
+
+<span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="mf">3.5</span><span class="w"> </span><span class="n">清理现场</span><span class="w"> </span><span class="p">(</span><span class="n">Cleanup</span><span class="p">)</span><span class="o">**</span><span class="n">：</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">Actor</span><span class="o">**</span><span class="n">：如果之前是把参数从</span><span class="w"> </span><span class="k">CPU</span><span class="w"> </span><span class="n">搬上来的，现在传完了，赶紧再</span><span class="w"> </span><span class="n n-Quoted">`offload_fsdp_model_to_cpu`</span><span class="w"> </span><span class="n">扔回</span><span class="w"> </span><span class="k">CPU</span><span class="n">，把宝贵的</span><span class="w"> </span><span class="n">GPU</span><span class="w"> </span><span class="n">显存腾出来给别人用。</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="n">最后清空缓存</span><span class="w"> </span><span class="n n-Quoted">`empty_cache()`</span><span class="n">。</span>
+</code></pre></div>
+
+<hr />
+<h3>总结文中的三个类（Class）是干嘛的？</h3>
+<ol>
+<li>
+<p><strong><code>DetachSync</code> (基类/指挥官)</strong></p>
+<ul>
+<li>它是下面两个类的爸爸。</li>
+<li>它包含了核心的 <code>sync_rollout_weights</code>（同步权重）逻辑。</li>
+<li>它负责判断你是 Actor 还是 Rollout，然后决定你是“发货”还是“收货”。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>DetachActorWorker</code> (训练工人)</strong></p>
+<ul>
+<li><strong>身份</strong>：负责训练模型的人。</li>
+<li><strong>特长</strong>：它知道怎么从复杂的 FSDP（分片模型）中提取出完整的参数字典 (<code>_get_actor_params</code>)，并生成参数清单。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>DetachAsyncRolloutWorker</code> (推理工人)</strong></p>
+<ul>
+<li><strong>身份</strong>：负责跑推理生成文本的人。</li>
+<li><strong>特长</strong>：它主要负责接收清单 (<code>set_actor_weights_info</code>)，并利用基类的同步功能，把接收到的权重更新到自己的推理引擎（vLLM 或 SGLang）中。</li>
+</ul>
+</li>
+</ol>
+<h3>为什么这个文件很重要？</h3>
+<p>在强化学习（RLHF）中，流程是：<strong>生成数据 -&gt; 训练更新 -&gt; 生成新数据 -&gt; 训练更新...</strong> 循环往复。</p>
+<ul>
+<li>如果没有这个文件：每次训练完一轮，你可能需要保存模型到硬盘，然后推理引擎重新加载模型。这非常<strong>慢</strong>（硬盘读写慢，模型加载慢）。</li>
+<li>有了这个文件：模型参数直接在显存/内存之间通过网络飞过去，推理引擎做到<strong>“无缝热更新”</strong>。这就是 <code>One-Step Off-Policy</code>（一步异策略）能高效跑起来的关键。</li>
+</ul>

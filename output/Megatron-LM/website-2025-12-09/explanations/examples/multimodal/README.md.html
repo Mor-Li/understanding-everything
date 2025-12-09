@@ -1,0 +1,118 @@
+<h1>examples/multimodal/README.md</h1>
+<p>这份文档确实比较硬核，它是一份<strong>技术操作手册</strong>。</p>
+<p>简单来说，这份文档教你如何使用 <strong>Megatron-LM</strong>（一个在大规模GPU集群上训练超大模型的框架）来从头训练一个<strong>多模态大模型</strong>（类似 GPT-4V 或 LLaVA，既能看图也能说话的模型）。</p>
+<p>为了让你好理解，我们可以把这个过程想象成<strong>“组装并训练一个机器人”</strong>。
+*   <strong>大脑</strong>：Mistral-7B（语言模型）。
+*   <strong>眼睛</strong>：OpenAI CLIP（视觉模型）。
+*   <strong>训练目标</strong>：先把大脑和眼睛接通（预训练），然后教它听懂人类指令（指令微调）。</p>
+<p>下面我为你整理了一个 <strong>ToDo List</strong>，按顺序一步步拆解文档中的观点和任务：</p>
+<hr />
+<h3>📋 任务清单 (ToDo List)</h3>
+<h4>第一阶段：准备原材料 (Setup)</h4>
+<ul>
+<li>[ ] <strong>1. 搭建环境</strong>：准备 Docker 容器（相当于准备好厨房）。</li>
+<li>[ ] <strong>2. 准备“大脑”</strong>：下载 Mistral-7B 语言模型，并转换格式。</li>
+<li>[ ] <strong>3. 准备“眼睛”</strong>：下载 OpenAI CLIP 视觉模型，并转换格式。</li>
+<li>[ ] <strong>4. 组装模型</strong>：把“大脑”和“眼睛”的权重文件合并成一个大文件。</li>
+</ul>
+<h4>第二阶段：初级训练 - 预训练 (Pretraining)</h4>
+<p><em>目标：让大脑能理解眼睛看到了什么（主要是做图片描述）。</em>
+- [ ] <strong>5. 下载数据</strong>：下载 LLaVA-Pretrain 数据集（图片+描述）。
+- [ ] <strong>6. 数据格式转换 (WebDataset)</strong>：把零散的图片转成 WebDataset 格式。
+- [ ] <strong>7. 数据索引构建 (Energon)</strong>：使用 Megatron 专用的 Energon 工具处理数据索引。
+- [ ] <strong>8. 运行预训练</strong>：跑脚本开始训练，让模型学会“看图说话”。</p>
+<h4>第三阶段：高级训练 - 指令微调 (SFT)</h4>
+<p><em>目标：让模型不仅能描述图，还能回答复杂问题，听懂指令。</em>
+- [ ] <strong>9. 准备SFT数据</strong>：准备对话格式的数据（文档里没细说怎么做，假设你有了）。
+- [ ] <strong>10. 运行微调</strong>：跑 SFT 脚本，让模型变得更聪明、更听话。</p>
+<h4>第四阶段：考试验收 (Evaluation)</h4>
+<ul>
+<li>[ ] <strong>11. 生成测试结果</strong>：让模型做题（生成文本）。</li>
+<li>[ ] <strong>12. 评分 (COCO)</strong>：检查预训练效果（看图描述得准不准）。</li>
+<li>[ ] <strong>13. 评分 (MMMU)</strong>：检查微调效果（综合能力强不强）。</li>
+</ul>
+<hr />
+<h3>🧐 详细步骤讲解 (Step-by-Step)</h3>
+<p>现在我们按上面的 List，详细看看文档里每一步到底在讲什么。</p>
+<h4>🟢 第一阶段：准备原材料</h4>
+<p><strong>观点</strong>：Megatron 框架不能直接用网上下载的开源模型（HuggingFace格式），必须转换成 Megatron 专用的 <code>.mcore</code> 格式，而且要支持<strong>张量并行 (TP=4)</strong>（就是要把模型切成4份，由4张显卡同时处理）。</p>
+<ol>
+<li><strong>Docker</strong>：文档建议直接用提供的 <code>Dockerfile</code> 构建环境，保证软件版本一致。</li>
+<li><strong>Language Model (Mistral)</strong>：<ul>
+<li>去 HuggingFace 下载 Mistral-7B-Instruct-v0.3。</li>
+<li><strong>关键点</strong>：要转成 <code>mcore</code> 格式，且 <code>tensor-parallel-size 4</code>。</li>
+</ul>
+</li>
+<li><strong>Vision Model (CLIP)</strong>：<ul>
+<li>用的是 <code>ViT-L/14@336px</code> 这个版本。</li>
+<li>运行 <code>clip_converter.py</code> 脚本，不仅是下载，主要是为了转换格式以便 Megatron 能读取。</li>
+</ul>
+</li>
+<li><strong>Combined Checkpoint</strong>：<ul>
+<li>运行 <code>combine_lm_vision_checkpoints.sh</code>。</li>
+<li>这一步就像做手术，把视觉编码器硬塞进语言模型的文件夹里，变成一个多模态模型的初始存档。</li>
+</ul>
+</li>
+</ol>
+<h4>🟡 第二阶段：初级训练 (Pretraining)</h4>
+<p><strong>观点</strong>：这是让模型“开眼”的过程。此时模型还不太会聊天，主要任务是对齐（Alignment），即把图片特征翻译成文字特征。</p>
+<ol>
+<li><strong>准备数据 (LLaVA-Pretrain)</strong>：<ul>
+<li>这是一个经典的图文对数据集（图片 + 简短描述）。</li>
+<li>注意：需要 79GB 磁盘空间。</li>
+</ul>
+</li>
+<li><strong>数据清洗与转换</strong>：<ul>
+<li>Megatron 训练大规模数据不喜欢零散的小文件，所以要先转成 <code>WebDataset</code> (tar包)。</li>
+<li>然后使用 <code>energon prepare</code> 工具。这里文档列出了一大堆交互式命令（输入 <code>Y</code>, 输入 <code>jpg</code> 等），其实就是在告诉系统：<strong>“在这个数据包里，哪一列是图片，哪一列是文字答案”</strong>。</li>
+</ul>
+</li>
+<li><strong>开始跑 (Pretraining Script)</strong>：<ul>
+<li>修改 <code>pretrain_dataset.yaml</code> 配置文件指向刚才处理好的数据。</li>
+<li>运行 <code>pretrain_mistral_clip.sh</code>。</li>
+<li><strong>预期结果</strong>：文档给了一张 Loss 曲线图，告诉 loss 应该下降。但也提醒你：Loss 下降不代表模型一定好用，最终还是要看生成效果。</li>
+</ul>
+</li>
+</ol>
+<h4>🟠 第三阶段：高级训练 (SFT - Supervised Fine-Tuning)</h4>
+<p><strong>观点</strong>：预训练只是让模型认识了物体，SFT 才是让模型学会像人一样对话。</p>
+<ol>
+<li><strong>数据准备</strong>：<ul>
+<li>这里文档<strong>留白</strong>了（"we do not provide instructions for this"）。它假设你已经有了处理好的指令微调数据（比如用户问：“图里这只猫在干嘛？”，模型答：“它在睡觉”）。</li>
+<li>你需要把这些数据也搞成 Energon 格式。</li>
+</ul>
+</li>
+<li><strong>运行 SFT</strong>：<ul>
+<li>运行 <code>sft_mistral_clip.sh</code>。</li>
+<li>这个过程通常比预训练快。</li>
+</ul>
+</li>
+</ol>
+<h4>🔵 第四阶段：考试验收</h4>
+<p><strong>观点</strong>：训练完了怎么知道模型好不好？不能光看 Loss，要让模型做题并打分。</p>
+<ol>
+<li><strong>生成 (Generation)</strong>：<ul>
+<li>运行 <code>text_generation_mistral_clip.sh</code>。你需要指定任务名称（比如 <code>captioning</code> 还是 <code>MMMU</code>）。</li>
+<li>这步是让模型看着测试集的图，写出它的答案。</li>
+</ul>
+</li>
+<li><strong>COCO Captioning (针对预训练)</strong>：<ul>
+<li>这是考“看图说话”能力的。</li>
+<li>下载 COCO 2014 测试集和答案。</li>
+<li>运行脚本对比模型写的句子和标准答案。</li>
+<li><strong>及格线</strong>：CIDer 分数大约 94 分。</li>
+</ul>
+</li>
+<li><strong>MMMU (针对 SFT)</strong>：<ul>
+<li>这是一个很难的多模态基准测试（包含物理、化学、艺术等复杂题目）。</li>
+<li>运行 <code>evaluate_mmmu.py</code>。</li>
+<li><strong>及格线</strong>：分数大约 38 分（注意：这个分数不算高，因为文档开头说了，这只是个 Demo，不是业界最强模型）。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这篇文档的核心不是为了发布一个最强模型，而是为了<strong>演示</strong>：</p>
+<blockquote>
+<p>"如果在 Megatron 这个超大规模训练框架下，想把视觉模型和语言模型拼起来训练，代码流程应该是怎样的。"</p>
+</blockquote>
+<p>如果你是初学者，这篇文档的门槛非常高（涉及数据格式转换、分布式训练配置）。如果你只是想用 LLaVA 模型，建议直接去 HuggingFace 用 <code>transformers</code> 库加载现成的模型，那个简单得多。这篇文档是给<strong>需要自己从头训练大规模多模态模型的研究员</strong>看的。</p>

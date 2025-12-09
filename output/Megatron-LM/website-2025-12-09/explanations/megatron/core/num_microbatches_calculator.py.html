@@ -1,0 +1,70 @@
+<h1>megatron/core/num_microbatches_calculator.py</h1>
+<p>这份代码看起来很长，其实它只做了一件事：<strong>算数</strong>。</p>
+<p>具体来说，它在计算<strong>“为了凑够一次大的训练更新（Global Batch），每张显卡需要跑几轮小的训练（Micro Batch）”</strong>。</p>
+<p>为了让你彻底理解，我把它拆解成一个<strong>“搬砖任务清单”</strong>。想象一下，我们是一个搬砖队（训练模型），要把一堆砖头（数据）搬完。</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<h4>✅ 第一步：搞懂核心术语（设定背景）</h4>
+<p>在看代码逻辑前，先搞懂这三个变量，这是全篇的核心：
+1.  <strong>Global Batch Size (GBS - 总任务量)</strong>：这一次参数更新，全世界（所有显卡加起来）一共要看多少张图片/文本。比如：1024张。
+2.  <strong>Micro Batch Size (MBS - 单次搬运量)</strong>：受限于显存，一张显卡一次只能处理多少张图片。比如：2张。
+3.  <strong>Data Parallel Size (DP - 工人数)</strong>：有多少个数据并行组（相当于有多少个工人在同时搬砖）。比如：8个工人。</p>
+<h4>✅ 第二步：理解基础算数逻辑（Constant 模式）</h4>
+<p>代码里有一个类叫 <code>ConstantNumMicroBatchesCalculator</code>（对应代码第 297 行）。它的逻辑最简单：</p>
+<ul>
+<li><strong>场景</strong>：老板规定，每次必须搬完 <strong>1024</strong> 块砖（GBS），不管训练到第几步都一样。</li>
+<li><strong>计算公式</strong>：<ul>
+<li>单轮全队运载力 = 工人数 (DP) $\times$ 单人运载力 (MBS)</li>
+<li>$8 \times 2 = 16$</li>
+<li><strong>需要跑几轮 (Num Microbatches)</strong> = 总任务量 (GBS) / 单轮全队运载力</li>
+<li>$1024 / 16 = 64$</li>
+</ul>
+</li>
+<li><strong>代码结论</strong>：这个计算器就是为了算出这个 <strong>64</strong>。意味着每张卡要连续跑 64 次小批次，梯度累积起来，才做一次权重更新。</li>
+</ul>
+<h4>✅ 第三步：理解进阶逻辑（Rampup 模式 / 预热模式）</h4>
+<p>代码里另一个复杂的类叫 <code>RampupBatchsizeNumMicroBatchesCalculator</code>（对应代码第 362 行）。</p>
+<ul>
+<li><strong>场景</strong>：模型刚开始训练时很脆弱（参数是随机的），如果直接搬 1024 块砖（大 Batch）容易把模型“压垮”（梯度爆炸或不收敛）。</li>
+<li><strong>策略</strong>：<ol>
+<li>刚开始，我们只搬 <strong>32</strong> 块砖（Start GBS）。</li>
+<li>每训练 1000 步，增加 <strong>8</strong> 块砖（Increment）。</li>
+<li>一直增加，直到达到 <strong>1024</strong> 块砖（End GBS）。</li>
+</ol>
+</li>
+<li><strong>代码做的事</strong>：<ul>
+<li>它有一个 <code>update</code> 函数（第 442 行）。</li>
+<li>每次训练前，它看一眼 <code>consumed_samples</code>（已经训练了多少样本）。</li>
+<li>根据进度，算出<strong>当前</strong>应该用的 Global Batch Size 是多少（比如现在涨到了 128）。</li>
+<li>重新计算：$128 / 16 = 8$ 轮。</li>
+<li>所以，<code>num_microbatches</code> 是<strong>动态变化</strong>的。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 第四步：处理“除不尽”的尴尬（Round / Decrease 逻辑）</h4>
+<p>这是代码中 <code>decrease_batch_size_if_needed</code> 参数的作用。</p>
+<ul>
+<li><strong>问题</strong>：<ul>
+<li>假设当前 Global Batch Size 涨到了 <strong>100</strong>。</li>
+<li>但是全队单轮运载力是 <strong>16</strong>。</li>
+<li>$100 / 16 = 6.25$。你不能跑 6.25 轮，只能跑整数轮。</li>
+</ul>
+</li>
+<li><strong>代码的解决方法</strong>：<ul>
+<li><strong>如果不允许调整 (False)</strong>：代码直接报错（Assert error），告诉你配置错了，除不尽。</li>
+<li><strong>如果允许调整 (True)</strong>：代码里的 <code>_round</code> 函数（第 272 行）出场。它会把 100 <strong>向下取整</strong>到能被 16 整除的数。</li>
+<li>$100 \rightarrow 96$。</li>
+<li>于是计算结果变成：$96 / 16 = 6$ 轮。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这代码到底是干嘛的？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>大管家</strong>，它负责告诉 Megatron 框架：<strong>“在当前的训练阶段，考虑到你的显卡数量和显存限制，为了凑够总的 Batch Size，你应该在每张卡上连续执行多少次 Micro Batch。”</strong></p>
+<p><strong>代码结构映射：</strong>
+1.  <strong><code>get_num_microbatches()</code></strong>: 外部只管调这个接口，问管家要数字。
+2.  <strong><code>update_num_microbatches()</code></strong>: 告诉管家“我又训练了一会儿”，管家如果处于 Rampup（预热）模式，就会重新计算这个数字。
+3.  <strong><code>Constant...Calculator</code></strong>: 笨管家，数字永远不变。
+4.  <strong><code>Rampup...Calculator</code></strong>: 聪明管家，数字随着训练进度从小变大。</p>
+<p>现在再看代码，是不是觉得它只是一个带了点“取整逻辑”的除法计算器？</p>

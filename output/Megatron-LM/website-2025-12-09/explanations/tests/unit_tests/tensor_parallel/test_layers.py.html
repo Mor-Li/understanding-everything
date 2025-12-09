@@ -1,0 +1,95 @@
+<h1>tests/unit_tests/tensor_parallel/test_layers.py</h1>
+<p>这份代码确实涉及了很多深度学习的高级概念（分布式训练、张量并行），乍一看很难懂。</p>
+<p>别担心，我们把它拆解成一个 <strong>“学习任务清单” (Todo List)</strong>。我们不需要一次搞懂所有细节，只需要按照这个流程，一步步看它在干什么。</p>
+<p>这份代码的核心目的是：<strong>测试一个叫 <code>linear_with_frozen_weight</code> 的函数，看看它在“单卡模式”和“多卡并行模式”下算出的结果是否正确。</strong></p>
+<hr />
+<h3>📋 任务清单：一步步读懂代码</h3>
+<h4>✅ Task 1: 搞清楚“考场环境” (Setup)</h4>
+<p>首先，这是一个测试用例（Test Case）。
+*   <strong>代码位置</strong>：<code>@pytest.mark.parametrize...</code>
+*   <strong>含义</strong>：这行代码定义了两种测试环境：
+    1.  <code>tensor_parallel=1</code>：<strong>单机模式</strong>（就像你在自己电脑上跑代码，不做切分）。
+    2.  <code>tensor_parallel=8</code>：<strong>8卡并行模式</strong>（模拟把一个大矩阵切成8份，分给8个GPU算）。
+*   <strong>初始化</strong>：<code>Utils.initialize_model_parallel(...)</code> 负责把虚拟的“并行环境”搭建好。</p>
+<h4>✅ Task 2: 准备输入数据 (Input Data)</h4>
+<p>为了方便验证对错，测试通常使用最简单的数字（比如0和1）。
+*   <strong>Input (输入)</strong>：<code>input_data</code> 是一个 $8 \times 8$ 的<strong>单位矩阵</strong>（对角线是1，其他是0）。
+    *   <em>数学特性</em>：单位矩阵乘以任何矩阵，结果还是那个矩阵本身。这非常适合用来做测试。
+*   <strong>Weight (权重)</strong>：<code>weight</code> 是一个<strong>全为 1</strong> 的矩阵。
+    *   <strong>关键点</strong>：<code>size_per_partition = 8 / tensor_parallel</code>。
+    *   如果是单机 (TP=1)，权重就是 $8 \times 8$ 的全1矩阵。
+    *   如果是8卡 (TP=8)，权重被切分了，每个GPU只拿到 $1 \times 8$ 的一小条。
+*   <strong>Bias (偏置)</strong>：全为 0。</p>
+<h4>✅ Task 3: 执行核心任务 (The Action)</h4>
+<p>代码调用了核心函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">output_parallel</span> <span class="o">=</span> <span class="n">linear_with_frozen_weight</span><span class="p">(</span><span class="n">input_data</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>他在干什么？</strong> 做线性运算（Linear Layer）。简单来说就是矩阵乘法：$Y = Input \times Weight + Bias$。</li>
+<li><strong>为什么叫 "Frozen Weight"?</strong> 这个函数可能用于某些特殊场景（比如微调大模型时冻结主权重），但在数学计算上，它依然是在做矩阵乘法。</li>
+<li><strong>并行计算</strong>：如果 TP=8，每个 GPU 只计算了结果的一部分。</li>
+</ul>
+<h4>✅ Task 4: 收集结果 (Gather)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">output</span> <span class="o">=</span> <span class="n">gather_from_tensor_model_parallel_region</span><span class="p">(</span><span class="n">output_parallel</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：如果你用了8张卡（TP=8），结果是散落在8个地方的。这行代码把大家的计算结果<strong>拼凑</strong>回来，变成一个完整的 $8 \times 8$ 矩阵。</li>
+<li>如果是单机（TP=1），这步啥也不干，因为结果本来就是完整的。</li>
+</ul>
+<h4>✅ Task 5: 反向传播 (Backward)</h4>
+<p>测试不仅要测“算得对不对”，还要测“梯度传得对不对”（这对训练至关重要）。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">output</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：把输出结果加起来，然后求导（反向传播）。这是为了检查 <code>input_data.grad</code>（输入的梯度）。</li>
+</ul>
+<h4>✅ Task 6: 批改作业 (Verification)</h4>
+<p>最后，用 <code>assert</code> 语句来检查答案是否符合预期。</p>
+<p><strong>检查 1：输出对不对？</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">expected_output</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="mi">8</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
+<span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">expected_output</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>输入是单位矩阵 $I$。</li>
+<li>权重是全1矩阵 $W$。</li>
+<li>$I \times W = W$。</li>
+<li>所以输出应该全是 1。</li>
+<li>代码检查 <code>output</code> 是否全是 1。</li>
+</ul>
+</li>
+</ul>
+<p><strong>检查 2：梯度对不对？</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">expected_grad</span> <span class="o">=</span> <span class="mi">8</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="mi">8</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
+<span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">input_data</span><span class="o">.</span><span class="n">grad</span><span class="p">,</span> <span class="n">expected_grad</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>：这里涉及一点微积分。<ul>
+<li>因为权重矩阵全是 1，且维度是 8。</li>
+<li>在反向传播时，梯度的累加效应会导致输入端的梯度变成 8（具体来说是 $1 \times 8 = 8$）。</li>
+<li>代码检查输入的梯度是否全是 8。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结 (大白话版)</h3>
+<p>这段代码在说：</p>
+<blockquote>
+<p>"嘿，系统！我要做个测试。</p>
+<ol>
+<li>先假装我们有 1 张卡，或者 8 张卡。</li>
+<li>给我造一个 $8 \times 8$ 的单位矩阵当输入，再造一个全 1 的矩阵当权重。</li>
+<li>用那个叫 <code>linear_with_frozen_weight</code> 的函数帮我算一下乘法。</li>
+<li>如果用了多张卡，记得把结果拼起来。</li>
+<li><strong>检查点 A</strong>：结果是不是全是 1？（因为 $1 \times 1 = 1$）</li>
+<li>算一下梯度。</li>
+<li><strong>检查点 B</strong>：梯度是不是全是 8？（因为矩阵大小是8，梯度累加了）</li>
+</ol>
+<p>如果都对，说明这个函数没毛病；如果有不对，测试报错。"</p>
+</blockquote>
+<p><strong>核心观点</strong>：这段代码不是在讲算法原理，而是在<strong>验证</strong> Megatron-Core 库里的并行矩阵乘法功能，在切分数据（Tensor Parallel）的情况下，数学计算依然是准确无误的。</p>

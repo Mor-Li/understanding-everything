@@ -1,0 +1,68 @@
+<h1>tests/unit_tests/test_optimizer_cpu_offloading.py</h1>
+<p>这个文件是一个<strong>单元测试（Unit Test）</strong>脚本。</p>
+<p>简单来说，它的目的是为了验证一个叫 <code>HybridDeviceOptimizer</code>（混合设备优化器）的组件是否工作正常。</p>
+<p><strong>核心背景知识</strong>：
+在训练超大模型时，显存（GPU Memory）通常不够用。<code>HybridDeviceOptimizer</code> 的作用是把一部分优化器的状态（比如 Adam 算法里的动量信息）<strong>搬运（Offload）到 CPU 内存</strong>里去，从而节省显存。</p>
+<p>为了让你看懂，我把你当成这个测试的设计者，列一个 <strong>Task List（任务清单）</strong>，带你一步步走完这个测试的逻辑：</p>
+<hr />
+<h3>任务清单：验证“CPU 卸载优化器”是否靠谱</h3>
+<h4>Task 1: 准备“对照组”和“实验组” (Setup)</h4>
+<p>我们要验证新功能（实验组）算出来的结果，必须和标准功能（对照组）一模一样。
+*   <strong>动作</strong>：
+    1.  固定随机种子 (<code>setup_seed</code>)，确保每次运行的随机数都一样，方便对比。
+    2.  创建两个完全一样的神经网络模型：<code>net1</code>（实验组）和 <code>net2</code>（对照组）。
+    3.  把 <code>net1</code> 的初始参数复制给 <code>net2</code>，确保它俩起跑线完全一致。</p>
+<h4>Task 2: 配置两边的优化器 (Optimizer Init)</h4>
+<p>这是测试的核心。
+*   <strong>动作</strong>：
+    1.  <strong>实验组 (<code>hdo</code>)</strong>：使用 <code>HybridDeviceOptimizer</code>。
+        *   关键参数 <code>offload_fraction</code>：决定有多少比例的状态放到 CPU 上（比如 0.5 代表一半在 CPU，一半在 GPU）。
+        *   关键参数 <code>overlap_...</code>：是否一边计算一边传输数据（测试流水线并行是否通过）。
+    2.  <strong>对照组 (<code>ref_optimizer</code>)</strong>：使用标准的 GPU 优化器（如 <code>FusedAdam</code> 或标准 <code>Adam</code>）。这是我们信任的“标准答案”。</p>
+<h4>Task 3: 运行第一步训练 (Step 1 Run)</h4>
+<p>先跑一步，看看能不能跑通，顺便检查一下“内脏”。
+*   <strong>动作</strong>：
+    1.  造一些假数据 (<code>torch.randn</code>)。
+    2.  让两个模型分别进行前向传播（Forward）和反向传播（Backward）。
+    3.  让优化器更新参数 (<code>step()</code>)。
+*   <strong>检查点 (Checkpoints)</strong>：
+    *   如果是 Adam 优化器，它会产生“状态”（State，比如梯度的移动平均）。
+    *   <strong>核心检查</strong>：检查 <code>hdo</code>（实验组）的状态存储位置。
+        *   如果你设置了 <code>offload_fraction &gt; 0</code>，代码会检查前面的参数状态<strong>是不是不在 CUDA (GPU) 上</strong>。
+        *   如果你设置了 <code>offload_fraction &lt; 1</code>，代码会检查后面的参数状态<strong>是不是在 CUDA (GPU) 上</strong>。
+    *   <em>目的：验证“混合存储”是不是真的按比例把东西放到了 CPU 和 GPU 上。</em></p>
+<h4>Task 4: 持续跑几步 (Loop Run)</h4>
+<p>光跑一步可能看不出累积误差，多跑几步试试。
+*   <strong>动作</strong>：
+    *   在一个循环里（<code>n_steps</code>），重复“输入数据 -&gt; 算 Loss -&gt; 反向传播 -&gt; 更新权重”的过程。
+    *   实验组和对照组同时进行，输入同样的数据。</p>
+<h4>Task 5: 最终对答案 (Final Validation)</h4>
+<p>跑完训练后，两个模型的脑子（权重参数）应该是一模一样的。
+*   <strong>动作</strong>：
+    *   提取 <code>net1</code>（实验组）的所有权重。
+    *   提取 <code>net2</code>（对照组）的所有权重。
+    *   使用 <code>torch.allclose</code> 进行比对。
+*   <strong>判定标准</strong>：
+    *   如果两个模型的权重差异极小（误差在 <code>1e-03</code> 以内），测试通过 ✅。说明把状态搬到 CPU 上去计算，并没有影响数学上的准确性。
+    *   如果有差异，报错 ❌。</p>
+<hr />
+<h3>总结文中的关键点</h3>
+<ol>
+<li>
+<p><strong>参数化测试 (<code>@pytest.mark.parametrize</code>)</strong>：
+    你可以看到函数头上顶着很多参数。这意味着这个测试会自动运行很多次，覆盖各种情况：</p>
+<ul>
+<li><code>optimizer</code>: 测 SGD，也要测 Adam。</li>
+<li><code>offload_fraction</code>: 测 0% (全GPU)，50% (混合)，100% (全CPU) 三种情况。</li>
+<li><code>with_param_groups</code>: 测简单的参数列表，也要测复杂的参数组（比如不同层用不同学习率）。</li>
+</ul>
+</li>
+<li>
+<p><strong>PyTorch 版本检查</strong>：
+    代码开头有一个 <code>skipif</code>，跳过 PyTorch 2.3.0 以下的版本。注释里写了，低版本的 PyTorch 在 CPU 和 GPU 上的计算精度对不齐，会导致测试失败（并非代码写错了，是旧版 PyTorch 的锅）。</p>
+</li>
+<li>
+<p><strong>核心结论</strong>：
+    这个文件的唯一目的就是证明：<strong>用了 Megatron 的 <code>HybridDeviceOptimizer</code> 省显存后，训练出来的模型效果和完全不省显存的标准训练是一模一样的。</strong></p>
+</li>
+</ol>

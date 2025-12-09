@@ -1,0 +1,120 @@
+<h1>examples/gspo_trainer/run_qwen30b_gspo.sh</h1>
+<p>这份脚本确实包含了很多术语，因为它涉及到了大模型训练中最复杂的部分之一：<strong>强化学习（RLHF/RLAIF）</strong>，而且是针对超大模型（30B参数）的分布式训练。</p>
+<p>为了让你看懂，我们把这个脚本想象成<strong>“组织一场大型考试培训班”</strong>。</p>
+<p>我把这个脚本拆解成一个 <strong>Project Manager (项目经理) 的 To-Do List</strong>，我们一步步来看每项任务在脚本里对应什么。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>【后勤准备】确定工作目录与监控</strong> (设置路径、日志)</li>
+<li><strong>【教学大纲】确定教学方法</strong> (设置算法：GSPO/GRPO)</li>
+<li><strong>【招生与教材】选定学生和课本</strong> (指定模型路径、训练数据)</li>
+<li><strong>【教室布局】安排座位与分工</strong> (分布式训练设置：Megatron/FSDP)</li>
+<li><strong>【模拟考试】如何做题</strong> (推理生成设置：Rollout/vLLM)</li>
+<li><strong>【阅卷标准】如何打分</strong> (奖励模型设置：Reward)</li>
+<li><strong>【正式开课】启动指令</strong> (运行 Python 命令)</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<h4>1. 【后勤准备】确定工作目录与监控</h4>
+<p>这一步是告诉电脑：文件在哪？日志记在哪？</p>
+<ul>
+<li><strong>脚本内容：</strong>
+    <code>bash
+    HDFS_ROOT=...           # 远程文件存储地址
+    DATA_ROOT=...           # 本地数据地址
+    project_name=...        # 项目名 (在wandb上显示的名字)
+    experiment_name=...     # 本次实验名</code></li>
+<li><strong>白话解释：</strong> 设置好文件夹路径，并给这次训练起个名字，方便在 WandB（一个可视化监控网页）上查看训练曲线。</li>
+</ul>
+<h4>2. 【教学大纲】确定教学方法 (核心算法)</h4>
+<p>这是这份脚本最核心的数学逻辑部分。</p>
+<ul>
+<li><strong>脚本内容：</strong>
+    <code>bash
+    adv_estimator=grpo      # 优势估计器：GRPO (Group Relative Policy Optimization)
+    loss_mode=gspo          # 损失函数模式：GSPO
+    actor_lr=1e-6           # 学习率：学生学得多快</code></li>
+<li><strong>白话解释：</strong><ul>
+<li><strong>GRPO/GSPO</strong>：这是一种比传统 PPO 更省显存、效果可能更好的算法。传统的 PPO 需要一个“老师模型”（Critic）和一个“学生模型”（Actor）。</li>
+<li><strong>重点细节</strong>：注意脚本后面有一句判断 <code>if [[ $adv_estimator == "gae" ]]; then ... else CIRITC_CONFIG="" fi</code>。因为这里用了 <code>grpo</code>，脚本<strong>并没有加载 Critic 模型</strong>。这意味着它通过让模型一次生成多条答案，组内互相比较来学习，从而省下了一个巨型模型的显存。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 【招生与教材】选定学生和课本</h4>
+<p>告诉程序用哪个模型作为底座，用什么数据来训练。</p>
+<ul>
+<li><strong>脚本内容：</strong>
+    <code>bash
+    train_files=...dapo-math-17k.parquet  # 教材：数学题库
+    actor_model_path=...Qwen3-30B-A3B-Base # 学生：Qwen3-30B 模型
+    max_prompt_length=2048                # 题目最长多长
+    max_response_length=8192              # 答案最长多长</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>我们要训练的是 <strong>Qwen3-30B</strong>（一个很强的开源模型）。</li>
+<li>用的数据是 <strong>DAPO-Math</strong>（数学题）。</li>
+<li>因为是数学题，推理过程很长，所以设置了 <code>max_response_length</code> 为 8192 个 token（允许模型写很长的解题步骤）。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 【教室布局】安排座位与分工 (最难懂的部分)</h4>
+<p>30B 的模型很大，一张显卡装不下，需要把模型“切开”放在多张显卡上运行。</p>
+<ul>
+<li><strong>脚本内容：</strong>
+    <code>bash
+    backend=megatron        # 使用 NVIDIA Megatron 框架（处理超大模型专用）
+    TP_SIZE=2               # 张量并行：把每一层切成2份
+    EP_SIZE=8               # 专家并行：这是 MoE 模型的特征
+    ACTOR_MEGATRON_CONFIG=... # 一大堆配置</code></li>
+<li><strong>白话解释：</strong><ul>
+<li><strong>Qwen3-30B A3B</strong> 很可能是一个 <strong>MoE (混合专家)</strong> 模型。</li>
+<li><strong>TP=2</strong>：把模型的矩阵计算拆到 2 张卡上算。</li>
+<li><strong>EP=8</strong>：因为是 MoE 模型，它有不同的“专家”模块，这里把专家分发到 8 个不同的地方处理。</li>
+<li><strong>Offload=True</strong>：为了省显存，把暂时不用的参数存到 CPU 内存里。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 【模拟考试】如何做题 (Rollout)</h4>
+<p>在强化学习中，模型需要先自己做题（生成答案），然后才能被评分。</p>
+<ul>
+<li><strong>脚本内容：</strong>
+    <code>bash
+    rollout_name=vllm       # 使用 vLLM 引擎（生成速度极快）
+    n_resp_per_prompt=16    # 每一道题，让模型生成 16 个不同的答案</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>这里用 <strong>vLLM</strong> 来加速生成。</li>
+<li>关键点是 <code>n=16</code>：对于同一个数学题，让模型一口气写 16 种解法/答案。GRPO 算法会对比这 16 个答案，哪个好哪个坏，从而让模型学习。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 【阅卷标准】如何打分 (Reward)</h4>
+<p>模型写完 16 个答案后，谁来决定哪个是满分？</p>
+<ul>
+<li><strong>脚本内容：</strong>
+    <code>bash
+    reward_manager=dapo     # 奖励管理器
+    overlong_penalty_factor=1.0 # 如果废话太长，是否扣分</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>这里使用了一个叫 <code>dapo</code> 的规则来打分（通常对于数学题，就是看最终答案对不对，或者过程是否合规）。</li>
+<li>如果模型生成的内容超过了长度限制，会给予惩罚。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 【正式开课】启动指令</h4>
+<p>最后那一大段 <code>python3 -m verl.trainer.main_ppo ...</code>。</p>
+<ul>
+<li><strong>白话解释：</strong><ul>
+<li>这就是把上面定义的所有变量（路径、参数、并行策略）拼接成一条长命令，扔给 Python 去执行。</li>
+<li>它会启动 <code>verl</code> 这个训练框架，开始跑训练循环：<strong>生成答案 -&gt; 打分 -&gt; 计算优势(GRPO) -&gt; 更新模型参数</strong>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个脚本在干嘛？</h3>
+<p>简单来说，这个脚本在做一件事：</p>
+<blockquote>
+<p><strong>利用多张显卡（分布式），使用 GRPO 算法，让 Qwen3-30B 这个模型做大量的数学题（DAPO数据）。对于每一道题，让它尝试生成 16 个答案，然后根据答案的对错来更新模型，目的是让这个模型做数学题更厉害。</strong></p>
+</blockquote>
+<p><strong>你需要重点关注的几个参数（如果需要修改）：</strong>
+1.  <code>train_batch_size</code> / <code>n_resp_per_prompt</code>: 显存不够时，通常要调小这两个。
+2.  <code>actor_lr</code>: 训练发散（Loss乱跳）时，调小这个。
+3.  <code>max_response_length</code>: 如果你的题目不需要那么长的推理，可以调小以节省时间。</p>

@@ -1,0 +1,141 @@
+<h1>verl/tools/mcp_search_tool.py</h1>
+<p>没问题，这段代码乍一看全是正则匹配和数据处理，确实容易让人晕头转向。</p>
+<p>你可以把这段代码想象成一个<strong>“搜索引擎结果的整理员”</strong>。它的核心任务不是去“搜索”（那是外部工具干的），而是把外部工具搜回来的那一堆乱七八糟的原始数据，<strong>清洗、提取、打包</strong>成大模型（AI）能看懂的格式。</p>
+<p>为了让你彻底理解，我为你列了一个<strong>“学习任务清单 (Todo List)”</strong>，我们一步步把这个代码拆解开来看。</p>
+<hr />
+<h3>✅ Task 1：搞清楚“我是谁” (类的定义)</h3>
+<p>首先，我们要知道这个脚本定义了一个什么东西。</p>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    class MCPSearchTool(MCPBaseTool):
+        def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema):
+            super().__init__(config, tool_schema)</code></li>
+<li><strong>解读</strong>：<ul>
+<li>这是一个叫 <code>MCPSearchTool</code> 的类。</li>
+<li>它继承自 <code>MCPBaseTool</code>（说明它是基于 MCP 协议的一种工具）。</li>
+<li>它的初始化 <code>__init__</code> 非常简单，直接照搬父类的设置。</li>
+<li><strong>观点</strong>：这一步只是在“挂牌营业”，告诉系统“我是一个基于MCP协议的搜索工具插件”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2：准备处理原材料 (核心方法的入口)</h3>
+<p>接下来的所有逻辑都在 <code>_parse_tool_result</code> 这个函数里。这是代码的灵魂。</p>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    def _parse_tool_result(self, content: list) -&gt; tuple[str, dict]:
+        res = ""              # 用来存最后提取出的搜索结果文本
+        res_cnt = 0           # 用来数一共搜到了几条结果
+        query_list = []       # 用来存我们到底搜了什么关键词
+        metadata = { ... }    # 用来存状态报告（成功没？报错没？）</code></li>
+<li><strong>解读</strong>：<ul>
+<li>这个函数的输入是 <code>content</code>（一个列表，里面装着搜索工具返回的原始数据）。</li>
+<li><strong>观点</strong>：这里是在准备“空箱子”。因为原始数据很乱，我们需要把有用的东西挑出来，分门别类地放进这些变量里。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3：清洗“脏”数据 (循环与预处理)</h3>
+<p>原始数据可能包含非文本内容，或者格式不标准的符号，需要先洗一遍。</p>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    for part in content:
+        if part.type != "text":  # 如果不是文本，直接扔掉
+            continue
+        text = part.text.replace("'", '"') # 把单引号换成双引号</code></li>
+<li><strong>解读</strong>：<ul>
+<li>代码开始遍历拿到的 <code>content</code>。</li>
+<li><strong>关键动作</strong>：它做了一个 <code>replace("'", '"')</code>。</li>
+<li><strong>观点</strong>：这里隐含了一个假设——上游传来的数据格式不太标准（可能是 Python 风格的字典字符串），为了后面能像 JSON 一样处理，它强制把单引号全变成了双引号。这是典型的“脏数据清洗”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4：从乱码中“通过特征”提取信息 (正则匹配)</h3>
+<p>这是最难懂的部分，也是代码的核心逻辑。作者没有使用标准的 <code>json.loads()</code> 来解析数据，而是用了 <code>re</code> (正则表达式) 硬抠。</p>
+<ul>
+<li><strong>为什么这么做？</strong><ul>
+<li>通常是因为返回的数据不是合法的 JSON，或者混杂了其他文字。正则匹配更“宽容”，只要长得像，就能抓出来。</li>
+</ul>
+</li>
+</ul>
+<h4>4.1 提取“搜了什么” (Query)</h4>
+<ul>
+<li><strong>代码</strong>：
+    <code>python
+    query_match = re.search(r'query"\s*:\s*"([^"]+)"', text)
+    query = query_match.group(1) if query_match else ""
+    query_list.append(query)</code></li>
+<li><strong>解读</strong>：<ul>
+<li>它在文本里找 <code>query": "xxx"</code> 这样的模式。</li>
+<li>找到了就把 <code>xxx</code> 拿出来，放进 <code>query_list</code>。</li>
+<li><strong>目的</strong>：记录下这次操作到底搜索了什么关键词。</li>
+</ul>
+</li>
+</ul>
+<h4>4.2 提取“搜到了多少条” (Title Count)</h4>
+<ul>
+<li><strong>代码</strong>：
+    <code>python
+    title_matches = re.findall(r'"title"\s*:', text)
+    title_count = len(title_matches)
+    res_cnt += title_count</code></li>
+<li><strong>解读</strong>：<ul>
+<li>它数了数文本里出现了多少次 <code>"title":</code>。</li>
+<li><strong>观点</strong>：作者认为每一个搜索结果都有个标题，所以“标题出现的次数”约等于“搜索结果的数量”。这是一个估算逻辑。</li>
+</ul>
+</li>
+</ul>
+<h4>4.3 提取“真正的搜索结果内容” (Results)</h4>
+<ul>
+<li><strong>代码</strong>：
+    <code>python
+    results_match = re.search(r'"results"\s*:\s*(\[.*?\])', text, re.DOTALL)
+    results_content = results_match.group(1) if results_match else ""
+    res += results_content</code></li>
+<li><strong>解读</strong>：<ul>
+<li>它试图找到 <code>"results": [...]</code> 这一大段内容。</li>
+<li><code>re.DOTALL</code> 意思是哪怕中间有换行符也要匹配。</li>
+<li><strong>目的</strong>：把搜索到的具体内容（摘要、链接等）整个挖出来，拼接到 <code>res</code> 字符串里。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5：处理意外情况 (错误捕获)</h3>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    except json.JSONDecodeError:
+        # 记录错误日志，标记状态为 error</code></li>
+<li><strong>解读</strong>：<ul>
+<li>虽然主要逻辑是用正则写的，但代码里保留了 <code>try...except</code> 结构。</li>
+<li><strong>吐槽</strong>：其实这段代码里并没有显式调用 <code>json.loads</code>，所以这个 <code>JSONDecodeError</code> 捕获可能有点多余，或者是为了防范未来修改逻辑时出错。但在当前逻辑下，它主要起一个“兜底”的作用。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 6：打包交货 (Return)</h3>
+<p>最后，整理员要把工作成果交上去。</p>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    # update metadata
+    metadata["status"] = "success"
+    metadata["queries"] = query_list
+    metadata["total_results"] = res_cnt
+    return res, metadata</code></li>
+<li><strong>解读</strong>：<ul>
+<li><code>res</code>：一大串字符串，里面是搜索结果的原始 JSON 数组文本。</li>
+<li><code>metadata</code>：一个字典，告诉调用者“我成功了”、“我搜了这些词”、“一共找到了几条”。</li>
+<li><strong>观点</strong>：这就是这个 Tool 的最终产出——<strong>一份内容（Content） + 一份说明书（Metadata）</strong>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底想干啥？</h3>
+<p>如果只用一句话概括：
+<strong>这是一个“容错率很高”的解析器，专门通过正则表达式，从可能格式不规范的搜索工具返回文本中，硬抠出“搜索词”、“搜索结果”和“结果数量”。</strong></p>
+<p>它不追求完美的 JSON 解析，而是追求“只要文本里有这些字段，我就能把它抓出来给大模型用”。</p>

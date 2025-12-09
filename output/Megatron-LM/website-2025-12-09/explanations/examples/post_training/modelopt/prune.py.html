@@ -1,0 +1,66 @@
+<h1>examples/post_training/modelopt/prune.py</h1>
+<p>这份代码是一个用于<strong>模型剪枝（Pruning）</strong>的脚本。</p>
+<p>简单来说，它的作用是把一个巨大的大语言模型（比如 GPT 或 Mamba），通过“做手术”的方式切掉一部分参数，让模型变小、变快，但尽量不损失太多的智能。这个过程主要使用了 NVIDIA 的 <strong>ModelOpt</strong> 工具库。</p>
+<p>为了让你看懂，我把这个脚本做的事情拆解成一个 <strong>“模型瘦身手术 Todo List”</strong>，按执行顺序一步步给你讲：</p>
+<hr />
+<h3>📋 任务清单：模型瘦身手术流程</h3>
+<h4>Task 1: 制定手术方案（配置参数）</h4>
+<p><strong>代码位置：</strong> <code>add_prune_args</code> 函数
+<strong>解释：</strong>
+在动刀之前，必须先决定要切哪里。这一步是读取用户输入的命令行参数。
+*   <strong>你要瘦哪里？</strong>
+    *   <code>--target-hidden-size</code>: 把每一层的“宽度”变窄（比如把隐层维度从 4096 砍到 2048）。
+    *   <code>--target-num-attention-heads</code>: 把注意力的“头”砍掉几个。
+    *   <code>--layers-to-drop</code>: 直接把某几层抽走（比如把第 10 层直接删了）。
+    *   <code>--target-num-layers</code>: 让算法自动决定保留多少层。
+*   <strong>用什么数据来测试？</strong>
+    *   <code>--calib-size</code>: 用多少条数据来评估模型（校准）。
+    *   <code>--prompts</code>: 手术后用来测试模型还能不能说话的提示词。</p>
+<h4>Task 2: 准备手术台（初始化环境）</h4>
+<p><strong>代码位置：</strong> <code>if __name__ == "__main__":</code> 开头部分
+<strong>解释：</strong>
+*   初始化 Megatron（NVIDIA 的分布式训练框架）。
+*   设置好 GPU 分布式环境，因为大模型通常一张卡放不下。</p>
+<h4>Task 3: 把病人抬上来（加载模型）</h4>
+<p><strong>代码位置：</strong> <code>get_model</code>, <code>load_modelopt_checkpoint</code>, <code>import_mcore_gpt_from_hf</code>
+<strong>解释：</strong>
+*   脚本需要把原始的大模型加载到内存里。
+*   代码支持两种来源：
+    1.  Megatron 自己的 Checkpoint (<code>.pt</code> 文件)。
+    2.  HuggingFace 的预训练模型（通过 <code>import_mcore_gpt_from_hf</code> 转换加载）。</p>
+<h4>Task 4: 术前检查（校准 Calibration）</h4>
+<p><strong>代码位置：</strong> <code>_hf_dataset_forword_loop_func</code> 和 <code>get_calib_dataloader</code>
+<strong>解释：</strong>
+这是最关键的一步。你不能随机乱砍神经元，否则模型就傻了。
+*   <strong>怎么做？</strong> 代码加载了一个数据集（这里用的是 CNN/DailyMail 新闻数据集）。
+*   <strong>目的是什么？</strong> 让模型阅读这些文章。ModelOpt 会在后台观察：<strong>“哪些神经元经常被激活？哪些神经元从不工作？”</strong>
+*   <strong>结论：</strong> 经常工作的保留，从不工作的就可以剪掉。</p>
+<h4>Task 5: 执行手术（剪枝 Pruning）</h4>
+<p><strong>代码位置：</strong> <code>if args.layers_to_drop:</code> ... <code>else: mtp.prune(...)</code>
+<strong>解释：</strong>
+这里分两种情况：
+*   <strong>方案 A（简单粗暴）：</strong> 如果你指定了 <code>layers_to_drop</code>，代码调用 <code>drop_mcore_language_model_layers</code>，直接把指定的层扔掉。
+*   <strong>方案 B（精细手术）：</strong> 如果你指定了目标维度（如 hidden size），代码调用 <code>mtp.prune</code>。
+    *   它会利用 Task 4 里的“术前检查”数据。
+    *   使用 <code>mcore_minitron</code> 模式（这是 NVIDIA 的一种剪枝策略）。
+    *   真正地修改模型结构，把权重矩阵变小。</p>
+<h4>Task 6: 术后唤醒测试（验证）</h4>
+<p><strong>代码位置：</strong> <code>_custom_prompt_forward_loop_func</code>
+<strong>解释：</strong>
+手术做完了，得看看模型还活着没。
+*   代码会用简单的 Prompt（如 "Hello!"）让剪枝后的模型生成一段话。
+*   如果能生成通顺的句子，说明手术基本成功；如果输出乱码，说明剪坏了。
+*   同时会打印剪枝后的参数量（比如从 7B 变成了 3B）。</p>
+<h4>Task 7: 缝合出院（保存模型）</h4>
+<p><strong>代码位置：</strong> <code>save_checkpoint</code>
+<strong>解释：</strong>
+*   把这个变小了的新模型保存到硬盘上 (<code>--save</code> 参数指定的路径)。
+*   以后你就可以直接加载这个小模型进行推理，速度会更快，显存占用更小。</p>
+<hr />
+<h3>总结文中的核心观点</h3>
+<ol>
+<li><strong>Minitron 策略：</strong> 这个脚本主要实现的是 NVIDIA "Minitron" 论文中的思路，即通过<strong>宽度剪枝</strong>（变窄）和<strong>深度剪枝</strong>（变浅）来压缩大模型。</li>
+<li><strong>数据驱动：</strong> 剪枝不是随机的，必须依赖真实数据（Calibration Data）来计算重要性分数，保留最重要的权重。</li>
+<li><strong>兼容性：</strong> 这个脚本设计得很灵活，既支持 GPT 架构，也支持 Mamba 架构，并且深度集成在 Megatron-Core (mcore) 中。</li>
+</ol>
+<p>现在再回头看代码，你应该能对应上每一块是在干什么了。</p>

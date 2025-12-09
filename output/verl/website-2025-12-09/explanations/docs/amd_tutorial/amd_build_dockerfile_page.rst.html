@@ -1,0 +1,130 @@
+<h1>docs/amd_tutorial/amd_build_dockerfile_page.rst</h1>
+<p>这份文档主要是在讲 <strong>如何在 AMD 显卡（特别是 MI300系列）上配置和运行 <code>verl</code> 这个强化学习框架</strong>。因为 AMD 的软件生态（ROCm）和 NVIDIA（CUDA）不同，所以需要很多特殊的配置。</p>
+<p>为了让你更容易理解，我把这篇文档拆解成一个 <strong>Todo List (任务清单)</strong>，你可以按照这个顺序一步步操作：</p>
+<hr />
+<h3>✅ 阶段一：准备环境 (Docker 镜像)</h3>
+<p>这部分是基础，没有环境什么都跑不了。文档提供了两种方法，<strong>强烈建议选方法 B</strong>。</p>
+<ul>
+<li>
+<p><strong>Task 1.1: 决定如何获取镜像</strong></p>
+<ul>
+<li><strong>方法 A (困难模式 - 自己构建):</strong> 文档开头那一长串 <code>docker/Dockerfile.rocm</code> 代码，是教你怎么从零编译的。它安装了 Python 3.12, TransformerEngine, vLLM, SGLang, Megatron-Core 等一堆依赖。除非你是开发者想魔改，否则<strong>跳过这步</strong>。</li>
+<li><strong>方法 B (简单模式 - 直接下载):</strong> 作者已经打包好了镜像，直接拉取即可。</li>
+<li><strong>执行命令:</strong>
+    <code>bash
+    docker pull rlsys/verl:verl-0.4.1_ubuntu-22.04_rocm6.3.4-numa-patch_vllm0.8.5_sglang0.4.6.post4
+    # 给它改个短点的名字，方便后面用
+    docker tag rlsys/verl:verl-0.4.1_ubuntu-22.04_rocm6.3.4-numa-patch_vllm0.8.5_sglang0.4.6.post4 verl-rocm:latest</code></li>
+</ul>
+</li>
+<li>
+<p><strong>Task 1.2: 启动 Docker 容器</strong></p>
+<ul>
+<li>AMD 显卡需要特殊的权限才能在 Docker 里调用 GPU。</li>
+<li><strong>关键点:</strong> 必须加上 <code>--device /dev/dri</code> 和 <code>--device /dev/kfd</code>，以及 <code>--shm-size</code> 要够大。</li>
+<li><strong>执行命令:</strong>
+    <code>bash
+    docker run --rm -it \
+      --device /dev/dri \
+      --device /dev/kfd \
+      -p 8265:8265 \
+      --group-add video \
+      --cap-add SYS_PTRACE \
+      --security-opt seccomp=unconfined \
+      --privileged \
+      -v $HOME/.ssh:/root/.ssh \
+      -v $HOME:$HOME \
+      --shm-size 128G \
+      -w $PWD \
+      verl-rocm \
+      /bin/bash</code></li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ 阶段二：单机训练 (Single Node Training)</h3>
+<p>环境进去了，现在要开始试着跑代码了。</p>
+<ul>
+<li>
+<p><strong>Task 2.1: 设置关键的环境变量 (非常重要)</strong></p>
+<ul>
+<li>文档特别强调：由于 AMD ROCm 和 Ray 框架的兼容性问题，必须设置一个特殊的变量，否则会报错。</li>
+<li><strong>操作:</strong> 在运行训练脚本前，确保设置了：
+    <code>bash
+    # 如果你的 Ray 版本 &gt;= 2.45.0 (文档默认是这个)
+    export RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1</code></li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.2: 准备数据和模型</strong></p>
+<ul>
+<li>你需要下载模型（比如 Qwen）和数据（比如 GSM8k）。</li>
+<li>
+<p><strong>操作:</strong>
+    ```bash
+    # 1. 设置使用的 GPU (比如用 8 张卡)
+    export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7</p>
+<h1>2. 准备数据</h1>
+<p>python3 examples/data_preprocess/gsm8k.py --local_save_dir data/gsm8k</p>
+<h1>3. 预加载模型 (测试一下能不能跑通)</h1>
+<p>export MODEL_PATH=Qwen/Qwen2.5-0.5B-Instruct
+python3 -c "import transformers; transformers.pipeline('text-generation', model='$MODEL_PATH')"
+```</p>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.3: 选择算法并运行</strong></p>
+<ul>
+<li>文档给了两个例子：<strong>PPO</strong> (经典的强化学习算法) 和 <strong>GRPO</strong> (DeepSeek-R1 用的算法)。</li>
+<li><strong>选择 A (跑 PPO):</strong> 复制文档中 <code>PPO</code> 章节下的代码块运行。关键参数是 <code>actor_rollout_ref.rollout.name=vllm</code> (使用 vllm 加速推理)。</li>
+<li><strong>选择 B (跑 GRPO):</strong> 复制文档中 <code>GRPO</code> 章节下的代码块运行。GRPO 省略了 Critic 模型，配置稍微不同。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ 阶段三：多机集群训练 (Multi-node / Slurm) - 进阶</h3>
+<p>如果你有多台服务器（节点），需要用 Slurm 调度系统来跑，看这一部分。</p>
+<ul>
+<li>
+<p><strong>Task 3.1: 理解 Slurm 脚本逻辑</strong></p>
+<ul>
+<li>文档提供了一个很长的 <code>slurm_script.sh</code>。它的逻辑是：<ol>
+<li><strong>资源申请:</strong> <code>#SBATCH</code> 开头的部分申请节点和 GPU。</li>
+<li><strong>环境配置:</strong> 设置网络接口 (NCCL_IB_HCA) 和环境变量。</li>
+<li><strong>启动容器:</strong> 在每个节点上启动 Docker。</li>
+<li><strong>启动 Ray 集群:</strong><ul>
+<li>先在主节点 (Head Node) 启动 <code>ray start --head</code>。</li>
+<li>然后在其他节点 (Worker Nodes) 启动 <code>ray start --address ...</code> 连接到主节点。</li>
+</ul>
+</li>
+<li><strong>运行训练:</strong> 最后由主节点调用 <code>python3 -m verl.trainer.main_ppo</code> 开始训练。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.2: 修改脚本配置</strong></p>
+<ul>
+<li>你不能直接复制粘贴，需要改里面的路径：<ul>
+<li><code>verl_workdir</code>: 你的代码路径。</li>
+<li><code>NCCL_IB_HCA</code>: 你的集群网卡名称（这个得问你的运维）。</li>
+<li><code>MODEL_PATH</code>: 你想跑的模型路径。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.3: 提交任务</strong></p>
+<ul>
+<li><strong>操作:</strong> <code>sbatch slurm_script.sh</code></li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下核心观点</h3>
+<ol>
+<li><strong>AMD ROCm 很折腾</strong>：不能用普通的 PyTorch 镜像，必须用专门打了补丁（Patch）并编译了 ROCm 版本 vLLM/FlashAttention 的镜像。</li>
+<li><strong>Ray 框架有坑</strong>：在 AMD 上跑 Ray 需要手动屏蔽它对 GPU 可见性的自动设置 (<code>RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1</code>)，否则 Ray 找不到卡。</li>
+<li><strong>推荐用 Docker</strong>：不要尝试在裸机上配环境，依赖关系极其复杂，直接用作者提供的 Docker 镜像是最优解。</li>
+</ol>

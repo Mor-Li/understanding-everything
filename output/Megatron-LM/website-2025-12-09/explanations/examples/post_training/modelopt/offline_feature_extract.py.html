@@ -1,0 +1,76 @@
+<h1>examples/post_training/modelopt/offline_feature_extract.py</h1>
+<p>这份代码确实涉及了很多底层框架（NVIDIA Megatron），如果对大模型训练框架不熟悉，看起来会非常头大。</p>
+<p>简单来说，这个脚本的<strong>核心目的</strong>是：<strong>“离线特征提取”（Offline Feature Extract）</strong>。</p>
+<p>你可以把它想象成<strong>“把大模型（老师）对一批数据的反应（脑电波/隐藏层特征）先录制下来，存成文件，以后拿去教小模型（学生），而不需要每次都请大模型现场演示。”</strong> 这种做法通常用于训练像 <strong>Eagle</strong> 这样的投机采样（Speculative Decoding）模型。</p>
+<p>为了让你听懂，我把这个脚本的工作流拆解成一个 <strong>Task Todo List</strong>，我们一步一步来勾选：</p>
+<hr />
+<h3>✅ Task 1: 搭建舞台（初始化环境与参数）</h3>
+<p>在做任何事之前，先要配置好环境，告诉程序我们要用几张显卡，数据存哪里。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>if __name__ == "__main__":</code> 下面的 <code>initialize_megatron(...)</code> 和 <code>add_extract_args</code>。</li>
+<li><strong>在做什么</strong>:<ol>
+<li>启动 Megatron 分布式环境（因为大模型通常一张卡装不下，或者多卡跑得快）。</li>
+<li>读取命令行参数：比如 <code>--num-samples</code>（我们要处理多少条数据）和 <code>--output-dir</code>（结果存哪里）。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 2: 请出“老师”（加载大模型）</h3>
+<p>我们需要把那个已经训练好的、聪明的大模型加载到显存里。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>model = get_model(...)</code> 和 <code>load_modelopt_checkpoint(...)</code>。</li>
+<li><strong>在做什么</strong>:<ol>
+<li>构建模型架构（GPT 或 Mamba 架构）。</li>
+<li>加载训练好的权重文件（Checkpoint）。</li>
+<li><strong>关键点</strong>: <code>unwrapped_model.eval()</code>。把模型设为“评估模式”，意味着我们现在只让它推理，不更新它的参数。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 3: 准备“教材”（加载数据集）</h3>
+<p>老师来了，得有书才能讲课。这里加载的是用于微调（SFT）的数据。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>sft_dataset = SFTDataset(...)</code>。</li>
+<li><strong>在做什么</strong>:<ol>
+<li>读取原始文本数据。</li>
+<li>用 Tokenizer 把文本切分成模型能读懂的数字 ID。</li>
+<li>处理多卡分配（<code>shard_index</code>）：如果有8张卡，每张卡只领走一部分“教材”，互不干扰。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 4: 核心任务 —— “录制讲课”（提取特征）</h3>
+<p>这是全篇最难懂、也是最重要的部分。我们要让模型读数据，但不只是输出文字，而是要把内部的“特征”拿出来。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>extract_feature</code> 函数内部。</li>
+<li><strong>步骤拆解</strong>:<ol>
+<li><strong>循环数据</strong>: <code>for i in range(...)</code>，挨个处理数据样本。</li>
+<li><strong>模型推理</strong>: <code>output = model(input_ids, return_eagle_inputs=True)</code>。<ul>
+<li><strong>重点解释</strong>: 这里不仅仅是 <code>model(input)</code>。注意那个参数 <code>return_eagle_inputs=True</code>。这说明这个脚本是为了 <strong>Eagle</strong> 算法服务的。它要求模型不仅输出预测结果，还要输出<strong>底层的特征向量（Feature Vectors）</strong>。</li>
+</ul>
+</li>
+<li><strong>存盘</strong>: <code>torch.save(output, file_path)</code>。把这些特征向量保存成 <code>.pt</code> 文件（PyTorch 文件）。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 5: 整理归档（切分训练集、验证集、测试集）</h3>
+<p>录制完的数据不能乱放，要按比例分成三堆，方便以后训练小模型用。</p>
+<ul>
+<li><strong>代码位置</strong>: 脚本最后的三个 <code>extract_feature(...)</code> 调用。</li>
+<li><strong>在做什么</strong>:<ol>
+<li><strong>Train (训练集)</strong>: 拿走前 98% 的数据，存到 <code>output_dir/train</code> 文件夹。</li>
+<li><strong>Valid (验证集)</strong>: 拿走 98% ~ 99% 的数据，存到 <code>output_dir/valid</code> 文件夹。</li>
+<li><strong>Test (测试集)</strong>: 拿走最后 1% 的数据，存到 <code>output_dir/test</code> 文件夹。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结一下这个脚本的“剧情”：</h3>
+<ol>
+<li><strong>老板（你）</strong> 下令：我们要训练一个小助手（Eagle），需要大模型的指导数据。</li>
+<li><strong>工头（脚本）</strong> 叫醒了 <strong>大模型（Model）</strong>。</li>
+<li><strong>工头</strong> 搬来了一堆 <strong>书（Dataset）</strong>。</li>
+<li><strong>大模型</strong> 开始读书，<strong>工头</strong> 在旁边拿着摄像机，把大模型读书时脑子里产生的 <strong>特征（Feature/Eagle Inputs）</strong> 全部录了下来。</li>
+<li><strong>工头</strong> 把录像带按 <strong>98:1:1</strong> 的比例分装在三个箱子里，存入硬盘。</li>
+<li><strong>完工</strong>。以后训练小助手时，直接看录像带就行，不用再麻烦大模型了（这就是所谓的“Offline/离线”）。</li>
+</ol>
+<h3>为什么看不懂？</h3>
+<p>你看不懂主要是因为里面夹杂了大量的 <strong>分布式训练黑话</strong>（比如 <code>mpu.get_expert_data_parallel_rank()</code>）。
+你只需要知道：<strong>这些代码是为了让多张显卡不打架，大家分工合作，每张卡处理一部分数据，最后只由一张卡负责把文件写到硬盘上（防止写入冲突）。</strong></p>

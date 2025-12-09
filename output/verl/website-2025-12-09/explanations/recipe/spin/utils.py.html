@@ -1,0 +1,101 @@
+<h1>recipe/spin/utils.py</h1>
+<p>这段代码其实是一个<strong>“起飞前的安全检查清单”</strong>（Pre-flight Checklist）。</p>
+<p>在训练大模型（特别是涉及强化学习，如代码路径里的 SPIN 或 PPO 算法）时，配置参数非常多且复杂。如果参数设置得自相矛盾（比如显卡数量和数据量对不上），跑了一半报错会非常浪费时间和算力。</p>
+<p>这个函数 <code>validate_config</code> 的作用就是：<strong>在训练真正开始前，把所有配置参数过一遍，确保它们合逻辑、不冲突。</strong></p>
+<p>为了让你看懂，我把你（作为程序）需要做的检查工作列成了一个 <strong>To-Do List</strong>，我们一步步来看：</p>
+<h3>📋 任务清单：配置检查员的 To-Do List</h3>
+<ol>
+<li><strong>[硬件核对]</strong> 算算总共有多少块 GPU？</li>
+<li><strong>[数据分配检查]</strong> 这么多的数据，能不能平均分给所有 GPU？</li>
+<li><strong>[参数排雷]</strong> 用户有没有同时设置了“旧参数”和“新参数”导致冲突？</li>
+<li><strong>[套娃数学题]</strong> 大Batch、小Batch、微Batch，它们的大小关系合逻辑吗？</li>
+<li><strong>[高级功能检查]</strong> 如果开了“序列并行”加速，是否开启了必要的优化选项？</li>
+<li><strong>[评估检查]</strong> 验证时的采样设置对不对？</li>
+</ol>
+<hr />
+<h3>逐步讲解（对应代码逻辑）</h3>
+<h4>1. [硬件核对] 算算总共有多少块 GPU？</h4>
+<ul>
+<li><strong>代码位置：</strong>
+    <code>python
+    n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes</code></li>
+<li><strong>解读：</strong>
+    这就是简单的数学题。比如你有 2 台机器（nodes），每台机器 8 张卡，那总共就是 16 张 GPU。这是后续计算的基础。</li>
+</ul>
+<h4>2. [数据分配检查] 数据能不能平分？</h4>
+<ul>
+<li><strong>代码位置：</strong>
+    <code>python
+    real_train_batch_size = ...
+    assert real_train_batch_size % n_gpus == 0, (...)</code></li>
+<li><strong>解读：</strong>
+    假设你总共有 100 条数据要一次性塞进去训练，但你有 16 张显卡。
+    $100 \div 16 = 6.25$。
+    每张卡分不到整数条数据，程序就会崩。所以这里强制要求：<strong>总数据量必须能被显卡总数整除</strong>。</li>
+</ul>
+<h4>3. [参数排雷] 只能二选一</h4>
+<ul>
+<li><strong>代码位置：</strong> <code>def check_mutually_exclusive(...)</code> 以及随后的调用。</li>
+<li>
+<p><strong>解读：</strong>
+    代码里定义了一个规则：设置“微批次大小”（micro batch size）时，有两种写法：</p>
+<ul>
+<li>写法 A (旧)：<code>micro_batch_size</code> (所有卡加起来的总大小)</li>
+<li>写法 B (新)：<code>micro_batch_size_per_gpu</code> (每张卡的大小)</li>
+</ul>
+<p><strong>检查员的任务：</strong>
+*   如果用户两个都没写 -&gt; <strong>报错</strong>（不知道多大）。
+*   如果用户两个都写了 -&gt; <strong>报错</strong>（冲突了，不知道听谁的）。
+*   <strong>目的：</strong> 强迫用户只用一种写法（通常推荐用 per_gpu 这种更清晰的写法）。它对 Actor（生成模型）、Critic（评论模型）、Reward Model（奖励模型）都做了这个检查。</p>
+</li>
+</ul>
+<h4>4. [套娃数学题] 大、中、小盒子的关系</h4>
+<ul>
+<li><strong>代码位置：</strong>
+    <code>python
+    assert config.data.train_batch_size &gt;= config.actor_rollout_ref.actor.ppo_mini_batch_size
+    ...
+    assert ppo_mini_batch_size % ppo_micro_batch_size == 0</code></li>
+<li>
+<p><strong>解读：</strong>
+    训练大模型时，Batch Size 像俄罗斯套娃：</p>
+<ul>
+<li><strong>Train Batch (大盒子):</strong> 训练一步用到的总数据。</li>
+<li><strong>Mini Batch (中盒子):</strong> PPO 更新时切分的数据块。</li>
+<li><strong>Micro Batch (小盒子):</strong> 真正塞进显卡显存里计算的最小单位。</li>
+</ul>
+<p><strong>检查员的任务：</strong>
+*   大盒子必须比中盒子大。
+*   中盒子必须能被小盒子整除（不能切一半）。
+*   如果切得太碎（Micro batch太小），还得保证够分给所有 GPU。</p>
+</li>
+</ul>
+<h4>5. [高级功能检查] 序列并行 (Sequence Parallelism)</h4>
+<ul>
+<li><strong>代码位置：</strong>
+    <code>python
+    if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
+        if ...ulysses_sequence_parallel_size &gt; 1 ...:
+            assert config.actor_rollout_ref.model.use_remove_padding, (...)</code></li>
+<li><strong>解读：</strong>
+    这是一个很技术的检查。<ul>
+<li><strong>场景：</strong> 当你在训练超长文本（比如写小说）时，一条数据太长，一张显卡放不下，需要把一句话切成几段放在不同显卡上算（这就是 Ulysses 序列并行）。</li>
+<li><strong>问题：</strong> 这种切分技术非常依赖数据的紧凑性。如果数据里有很多 Padding（为了对齐长度填充的 0），切分处理起来效率极低甚至会出错。</li>
+<li><strong>强制要求：</strong> 如果你开了序列并行，就必须开启 <code>use_remove_padding</code>（去除无效填充），否则不让你过。</li>
+</ul>
+</li>
+</ul>
+<h4>6. [评估检查] 采样温度</h4>
+<ul>
+<li><strong>代码位置：</strong>
+    <code>python
+    if config.actor_rollout_ref.rollout.val_kwargs.do_sample:
+        assert config.actor_rollout_ref.rollout.temperature &gt; 0</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>场景：</strong> 训练过程中要让模型试着写点东西（Validation），看看效果。</li>
+<li><strong>逻辑：</strong> 如果开启了 <code>do_sample</code>（随机采样，让模型有创造力地写），那么 <code>temperature</code>（温度参数）必须大于 0。如果温度是 0，模型就变成了只会选概率最大的词的机器人（Greedy Search），这和 <code>do_sample</code> 的定义矛盾。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件不涉及核心的神经网络计算，它就是一个<strong>严格的管家</strong>。它保证了你在按下“开始训练”按钮后，不会因为低级的数学错误或配置冲突而炸机。</p>

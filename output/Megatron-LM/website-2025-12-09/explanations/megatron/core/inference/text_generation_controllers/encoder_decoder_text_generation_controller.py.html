@@ -1,0 +1,81 @@
+<h1>megatron/core/inference/text_generation_controllers/encoder_decoder_text_generation_controller.py</h1>
+<p>这份代码确实属于比较底层的“基础设施”代码，如果不了解 Megatron（一个用于训练和推理超大模型的框架）的架构，确实很难看懂。</p>
+<p>不要慌，我们把它想象成一个 <strong>“大厨（模型）的备菜员”</strong>。</p>
+<p>为了让你听懂，我把理解这份代码的过程拆解成一个 <strong>学习任务清单 (To-Do List)</strong>，我们一步一步打钩，做完这几个任务，你就懂了。</p>
+<hr />
+<h3>✅ Task 1：搞懂“背景设定” (Encoder-Decoder 是什么？)</h3>
+<p>首先，你得知道这个文件是为哪种模型服务的。</p>
+<ul>
+<li><strong>GPT 系列 (Decoder-only):</strong> 像是在做“成语接龙”。给它前半句，它往下编后半句。它只需要处理一种输入。</li>
+<li><strong>T5 / BART 系列 (Encoder-Decoder):</strong> 像是做“英汉翻译”或“阅读理解”。<ul>
+<li><strong>Encoder (编码器):</strong> 负责读原文（比如英语句子）。</li>
+<li><strong>Decoder (解码器):</strong> 负责写译文（比如中文句子）。</li>
+<li><strong>重点:</strong> 这种架构需要 <strong>两份输入</strong>：一份给 Encoder 读，一份给 Decoder 开始写。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论：</strong> 这个文件的类 <code>EncoderDecoderTextGenerationController</code>，就是专门用来管理 <strong>“既有 Encoder 输入，又有 Decoder 输入”</strong> 这种复杂情况的控制中心。</p>
+<hr />
+<h3>✅ Task 2：搞懂核心函数 <code>prep_inference_input</code> 的任务</h3>
+<p>代码里主要就这一个函数。它的名字叫 <code>prep_inference_input</code>（准备推理输入）。</p>
+<p>想象一下，现在有 10 个用户（Batch）同时发来请求。
+*   <strong>用户的请求 (<code>active_requests</code>):</strong> 包含用户发来的原文（Encoder Prompt）。
+*   <strong>当前生成的进度 (<code>prompts_tokens</code>):</strong> 包含 Decoder 目前已经写出来的字（或者刚开始生成的引导符）。</p>
+<p><strong>这个函数的任务是：</strong> 把这些杂乱的数据打包好，变成模型（大厨）能直接下锅炒菜的格式（Tensor/Dict）。</p>
+<hr />
+<h3>✅ Task 3：逐行拆解代码逻辑 (一步步执行)</h3>
+<p>现在我们进入代码内部，看看它具体干了哪三件事：</p>
+<h4>步骤 1：提取“给 Encoder 读的内容”</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">encoder_prompts</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span>
+    <span class="nb">map</span><span class="p">(</span><span class="k">lambda</span> <span class="n">request</span><span class="p">:</span> <span class="n">request</span><span class="o">.</span><span class="n">encoder_prompt</span><span class="p">,</span> <span class="n">active_requests</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>翻译：</strong> 这里用了一个 <code>map</code> 和 <code>lambda</code>（匿名函数）。</li>
+<li><strong>动作：</strong> 它遍历了所有的活跃请求 (<code>active_requests</code>)，把每个请求里的 <code>encoder_prompt</code>（比如用户要求翻译的那句英语原文）单独拎出来，组成一个新的列表 <code>encoder_prompts</code>。</li>
+<li><strong>目的：</strong> 准备好喂给 Encoder 的原料。</li>
+</ul>
+<h4>步骤 2：打包所有原料，扔给模型包装器</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">inference_input</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">inference_wrapped_model</span><span class="o">.</span><span class="n">prep_inference_input</span><span class="p">(</span>
+    <span class="n">prompts_tokens</span><span class="p">,</span> <span class="n">encoder_prompts</span><span class="p">,</span> <span class="n">tokenizer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>翻译：</strong> 这是最关键的一步。它调用了 <code>inference_wrapped_model</code>（被包装的模型）的方法。</li>
+<li><strong>动作：</strong><ol>
+<li>传入 <code>prompts_tokens</code>（Decoder 已经写好的字）。</li>
+<li>传入 <code>encoder_prompts</code>（刚刚步骤1提取出来的原文）。</li>
+<li>传入 <code>tokenizer</code>（分词器，用于把文字变成数字）。</li>
+</ol>
+</li>
+<li><strong>目的：</strong> 让底层模型把这些文本和数字转换成电脑能算的矩阵（Embeddings/Tensors），并返回一个叫 <code>inference_input</code> 的字典。</li>
+</ul>
+<h4>步骤 3：补全“注意力面具” (Attention Mask)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">use_attention_mask</span> <span class="ow">and</span> <span class="p">(</span>
+    <span class="n">attention_mask</span> <span class="o">:=</span> <span class="n">inference_input</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;attention_mask&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span>
+<span class="p">):</span>
+    <span class="n">inference_input</span><span class="p">[</span><span class="s2">&quot;attention_mask&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">get_attention_mask</span><span class="p">(</span><span class="n">prompts_tokens</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">1</span><span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>翻译：</strong> 这是一个检查和补救措施。</li>
+<li><strong>动作：</strong><ul>
+<li><code>if use_attention_mask</code>: 如果这次任务需要使用 Mask（面具）...</li>
+<li><code>and ... is None</code>: 并且之前的步骤里没有生成 Mask...</li>
+<li><code>inference_input["attention_mask"] = ...</code>: 那我就手动创建一个 Mask 放进去。</li>
+</ul>
+</li>
+<li><strong>背景知识：</strong> 什么是 Mask？因为一句话有长有短，为了凑成整齐的矩阵，短的句子后面会补 0。Mask 就是告诉模型：“嘿，后面这几个 0 是废话，不要读它，只关注前面的有效内容。”</li>
+</ul>
+<hr />
+<h3>✅ Task 4：总结回顾</h3>
+<p>看完了吗？我们来总结一下这个文件到底在讲啥：</p>
+<ol>
+<li><strong>它是一个控制器：</strong> 专门服务于 T5/BART 这种 Encoder-Decoder 模型的推理。</li>
+<li><strong>它比 GPT 的控制器多做了一件事：</strong> GPT 只需要管“接着往下写”；这个控制器必须先把用户给的“原文”（Encoder Prompt）提取出来。</li>
+<li><strong>它的产出：</strong> 把“原文”和“已生成的文”打包在一起，交给底层模型去计算。</li>
+</ol>
+<p><strong>用一句话说人话：</strong>
+这个脚本是 <strong>“备菜员”</strong>，它从一堆用户订单中，把 <strong>“要翻译的原文”</strong> 挑出来，连同 <strong>“已经翻译好的半成品”</strong> 一起，整理好交给 <strong>“大厨（模型）”</strong> 去做下一步的烹饪。</p>

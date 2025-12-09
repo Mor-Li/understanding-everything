@@ -1,0 +1,95 @@
+<h1>megatron/core/inference/contexts/dynamic_context.py</h1>
+<p>这份代码确实非常复杂，因为它涉及到了大模型推理中最核心、最底层的显存管理和动态调度逻辑。</p>
+<p>如果不了解<strong>Paged Attention（分页注意力机制）</strong>和<strong>Continuous Batching（动态/连续批处理）</strong>这两个概念，读这份代码就像看天书。</p>
+<p>为了让你读懂，我制定了一个 <strong>5步走的“学习任务清单” (Task List)</strong>。我们把这个文件当成一个<strong>餐厅经理</strong>，一步步看它是怎么工作的。</p>
+<hr />
+<h3>任务清单 (Task Todo List)</h3>
+<h4>✅ Task 01: 理解核心角色 —— "餐厅经理" (Context)</h4>
+<p><strong>目标：</strong> 明白 <code>DynamicInferenceContext</code> 这个类到底是干嘛的。</p>
+<ul>
+<li><strong>观点：</strong><ul>
+<li>在大模型推理中，显存（GPU内存）是最贵的资源。</li>
+<li>这个类就是一个<strong>显存大管家</strong>。</li>
+<li>它的核心职责是：<strong>在推理过程中，动态地管理所有请求（Request）的状态和它们的 KV Cache（键值缓存）。</strong></li>
+<li>它不负责计算（计算由模型层负责），它负责<strong>记账</strong>和<strong>分地盘</strong>。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 02: 搞定内存 —— "把显存切成小方块" (Block Allocation)</h4>
+<p><strong>目标：</strong> 理解代码中 <code>BlockAllocator</code> 和 <code>memory_buffer</code> 的作用。这是<strong>Paged Attention</strong>的核心。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>self.block_size_tokens</code>: 一个块能存多少个 Token（比如 64 或 256）。</li>
+<li><code>self.memory_buffer</code>: 这是预先申请好的一大块显存，是真正的物理仓库。</li>
+<li><code>self.block_allocator</code>: 分配器。</li>
+</ul>
+</li>
+<li><strong>观点：</strong><ul>
+<li>传统的推理是给每个请求预留一大块连续显存，如果请求很短就浪费了。</li>
+<li><strong>现在的做法（Paged Attention）：</strong> 把显存切成无数个固定大小的<strong>块（Block）</strong>，就像操作系统的内存分页。</li>
+<li>当一个请求变长时，就动态给它发一个新的块。这些块在物理显存上是不连续的，但在逻辑上是连起来的。</li>
+<li><strong>代码行为：</strong> <code>allocate_all_tensors</code> 方法里初始化了这些巨大的缓存池。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 03: 记账 —— "谁坐在哪张桌子？" (Metadata Management)</h4>
+<p><strong>目标：</strong> 理解那一堆 <code>request_...</code> 和 <code>token_...</code> 开头的张量（Tensor）是干嘛的。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>self.request_ids</code>: 记录当前处理的请求ID。</li>
+<li><code>self.request_to_kv_block_ids</code>: <strong>最重要的表</strong>。记录“请求A”用到了“显存块1、显存块5、显存块9”。这叫<strong>页表（Block Table）</strong>。</li>
+<li><code>self.token_to_input_ids</code>: 把所有请求的 Token 拼成一个长长的一维数组（Flattened），而不是二维矩阵。</li>
+</ul>
+</li>
+<li><strong>观点：</strong><ul>
+<li>为了让 GPU 跑得快，我们不能让 GPU 在内存里跳来跳去。</li>
+<li>这个 Context 维护了精密的索引表，告诉计算核心（Kernel）："第 5 个请求的第 100 个 Token 的 KV Cache 存在显存的第 X 号块里"。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 04: 动态调度 —— "客人来了又走" (Dynamic Batching)</h4>
+<p><strong>目标：</strong> 理解 <code>add_request</code> 和 <code>update_requests</code> 这两个核心函数。这是<strong>Continuous Batching</strong>的核心。</p>
+<ul>
+<li><strong>场景 1：客人来了 (<code>add_request</code>)</strong><ul>
+<li>新请求进来，Context 检查显存块够不够 (<code>check_availability</code>)。</li>
+<li>如果够，分配初始的块，把它的 Token 填入 <code>token_to_input_ids</code>，并在页表里记录它分到了哪些块。</li>
+</ul>
+</li>
+<li><strong>场景 2：客人边吃边聊 (<code>step</code> / 推理一步)</strong><ul>
+<li>模型生成了一个新 Token。</li>
+<li>Context 需要把这个新 Token 的 KV Cache 存入刚才分配的块里 (<code>append_key_value_cache</code>)。</li>
+</ul>
+</li>
+<li><strong>场景 3：客人走了或暂停 (<code>update_requests</code>)</strong><ul>
+<li>这是代码逻辑最复杂的地方。</li>
+<li><strong>Finished (吃完了):</strong> 请求生成了结束符。Context 回收它占用的所有显存块 (<code>block_allocator.release_memory_blocks</code>)。</li>
+<li><strong>Paused (暂停/翻台):</strong> 如果显存不够了，或者为了给新请求腾地儿，可能会把某些请求暂时挂起。</li>
+<li><strong>Swap (挪位置):</strong> 代码里有大量的 <code>_swap_book_keeping_tensors</code>。为了保持数据紧凑，当中间的一个请求结束时，它会把列表末尾的请求数据挪到这个空位上，保证数组是连续紧凑的。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 05: 高级优化 —— "预制菜与混合模型" (CUDA Graphs &amp; Hybrid)</h4>
+<p><strong>目标：</strong> 理解代码中关于 <code>cuda_graph</code> 和 <code>mamba</code> 的部分。</p>
+<ul>
+<li><strong>CUDA Graphs:</strong><ul>
+<li><strong>问题：</strong> 每次发指令给 GPU 太慢了（CPU overhead）。</li>
+<li><strong>解决：</strong> 对于固定大小的批次（比如总是处理 16 个请求），我们可以把指令“录制”下来反复播放。</li>
+<li><strong>代码：</strong> <code>CUDAGraphBatchDimensionBuilder</code> 就是在凑这个固定的大小。</li>
+</ul>
+</li>
+<li><strong>Hybrid Models (Mamba):</strong><ul>
+<li>这代码不仅支持 Transformer，还支持 Mamba（一种SSM模型）。</li>
+<li>Mamba 不需要 KV Cache，但需要 <code>conv_states</code> 和 <code>ssm_states</code>。代码里专门有 <code>if self.is_hybrid_model:</code> 的分支来处理这种特殊的“状态内存”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码在讲什么故事？</h3>
+<p>想象你在管理一个<strong>超高并发的网吧</strong>：</p>
+<ol>
+<li><strong>初始化 (<code>__init__</code>)</strong>: 你买了一大堆内存条，插在主板上，并把它们划分成无数个 256MB 的小格子（Block）。</li>
+<li><strong>新用户上机 (<code>add_request</code>)</strong>: 用户来了，你给他分配几个小格子，在账本（<code>request_to_kv_block_ids</code>）上记下："用户A 用了格子 3, 5, 8"。</li>
+<li><strong>运行中 (<code>step</code>)</strong>: 用户每操作一步（生成一个Token），产生的数据就存进这些格子里。如果格子满了，你再动态给他发个新格子。</li>
+<li><strong>用户下机 (<code>update_requests</code>)</strong>: 用户A 走了。你立刻把格子 3, 5, 8 擦除标记为“空闲”，并把排在最后的用户B 的数据挪到用户A 的账本位置上，保持账本整洁。</li>
+</ol>
+<p><strong>这就是 <code>megatron/core/inference/contexts/dynamic_context.py</code> 做的事情。</strong> 它是 Megatron-Core 推理引擎的<strong>内存调度器</strong>。</p>

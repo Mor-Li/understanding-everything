@@ -1,0 +1,60 @@
+<h1>recipe/spin/main_spin.py</h1>
+<p>这份代码确实看起来比较复杂，因为它是一个<strong>大规模分布式训练任务的“启动脚本”</strong>。</p>
+<p>你可以把它想象成一个<strong>工程总指挥</strong>。它的工作不是具体去搬砖（具体的数学计算），而是负责招募工人、分配工具、安排场地，最后一声令下开始干活。</p>
+<p>这份代码是为了运行一种叫 <strong>SPIN (Self-Play Fine-Tuning)</strong> 的算法，这是一种让大模型自己跟自己玩（自我博弈）来变强的技术。</p>
+<p>为了让你更容易理解，我把你当作这个“总指挥”，为你列一个 <strong>Task Todo List（任务清单）</strong>。代码的执行流程就是按顺序划掉这些任务的过程。</p>
+<hr />
+<h3>📋 任务清单：启动 SPIN 训练</h3>
+<h4>Task 1: 阅读“施工图纸” (读取配置)</h4>
+<p><strong>代码对应：</strong> <code>@hydra.main(...)</code> 和 <code>def main(config)</code>
+*   <strong>解释：</strong> 你不能瞎干活，得先看图纸。这里用了 <code>Hydra</code> 这个工具。它会从配置文件（比如 <code>.yaml</code> 文件）里读取所有的参数：用几个 GPU？模型路径在哪？学习率是多少？
+*   <strong>你的动作：</strong> 程序一启动，先把这些参数读进 <code>config</code> 变量里。</p>
+<h4>Task 2: 搭建“施工现场” (初始化 Ray)</h4>
+<p><strong>代码对应：</strong> <code>ray.init(...)</code>
+*   <strong>解释：</strong> 训练大模型通常一台电脑搞不定，需要很多台服务器（节点）和很多 GPU。<code>Ray</code> 就是一个负责管理这些机器的管家。
+*   <strong>你的动作：</strong> 呼叫 Ray 管家，告诉他：“我们要开工了，帮我把集群连起来，准备好环境。”</p>
+<h4>Task 3: 任命“工头” (启动 TaskRunner)</h4>
+<p><strong>代码对应：</strong> <code>runner = TaskRunner.remote()</code> 和 <code>runner.run.remote(config)</code>
+*   <strong>解释：</strong> <code>main</code> 函数本身在主节点上，它不想干杂活，所以它指派了一个叫 <code>TaskRunner</code> 的工头。
+*   <strong>你的动作：</strong> 创建一个 <code>TaskRunner</code> 实例，把刚才读到的配置（图纸）扔给它，让它去具体负责下面的事。</p>
+<h4>Task 4: 招募“工人”并分配角色 (定义 Worker)</h4>
+<p><strong>代码对应：</strong> <code>class TaskRunner</code> 内部的 <code>role_worker_mapping</code>
+*   <strong>解释：</strong> 在 SPIN/RLHF 训练中，我们需要不同的角色（就像足球队有前锋、后卫）：
+    *   <strong>Actor (主角):</strong> 也就是我们要训练的那个模型，负责生成文本。
+    *   <strong>Ref (参考者):</strong> 原始模型，用来做对比，防止主角练偏了（忘本）。
+    *   <strong>Reward Model (裁判):</strong> 用来给主角生成的文本打分（代码里根据配置决定是否启用）。
+*   <strong>你的动作：</strong> 代码里判断是用 <code>FSDP</code> 还是 <code>Megatron</code>（这是两种不同的并行加速技术），然后把 <code>SPINRolloutRefWorker</code>（一种专门干 SPIN 活的工人）分配给 Actor 和 Ref 角色。</p>
+<h4>Task 5: 分配“工位” (资源调度)</h4>
+<p><strong>代码对应：</strong> <code>resource_pool_spec</code> 和 <code>mapping</code>
+*   <strong>解释：</strong> 工人招到了，得给他们分显卡（GPU）。
+*   <strong>你的动作：</strong>
+    *   <code>global_pool_id</code>: 定义一个资源池（比如：我有 2 个节点，每个节点 8 张卡）。
+    *   <code>mapping</code>: 告诉系统，Actor 去这个池子里拿卡，Ref 也去这个池子里拿卡。</p>
+<h4>Task 6: 准备“课本” (下载模型和 Tokenizer)</h4>
+<p><strong>代码对应：</strong> <code>copy_to_local(...)</code> 和 <code>hf_tokenizer(...)</code>
+*   <strong>解释：</strong> 训练总得有基础模型。
+*   <strong>你的动作：</strong>
+    *   从远程存储（如 HDFS）把预训练好的模型下载到本地。
+    *   加载 Tokenizer（分词器），这是模型理解人类语言的翻译机。</p>
+<h4>Task 7: 制定“评分标准” (设置 Reward Function)</h4>
+<p><strong>代码对应：</strong> <code>reward_manager_cls</code> 和 <code>get_custom_reward_fn</code>
+*   <strong>解释：</strong> 模型写出东西来，得有人告诉它写得好不好。
+*   <strong>你的动作：</strong> 初始化奖励管理器。在 SPIN 算法中，这通常涉及到根据数据某种规则来计算分数。</p>
+<h4>Task 8: 组建“训练营” (初始化 Trainer)</h4>
+<p><strong>代码对应：</strong> <code>RaySPINTrainer(...)</code>
+*   <strong>解释：</strong> 这是最核心的控制器。它把上面准备好的工人、显卡、模型、评分标准全部整合在一起。
+*   <strong>你的动作：</strong> 创建 <code>RaySPINTrainer</code> 对象。</p>
+<h4>Task 9: 正式开工！ (Start Training)</h4>
+<p><strong>代码对应：</strong> <code>trainer.init_workers()</code> 和 <code>trainer.fit_dpo()</code>
+*   <strong>解释：</strong> 万事俱备。
+*   <strong>你的动作：</strong>
+    *   <code>init_workers()</code>: 让所有工人在各自的 GPU 上把模型加载进显存，准备就绪。
+    *   <code>fit_dpo()</code>: <strong>开始循环训练</strong>。虽然函数名叫 <code>fit_dpo</code>（可能因为代码复用了 DPO 算法的逻辑），但实际上是在执行 SPIN 算法的训练流程：生成数据 -&gt; 对比 -&gt; 更新模型参数。</p>
+<hr />
+<h3>总结</h3>
+<p>这文件其实就是一个<strong>复杂的“开机按钮”</strong>。</p>
+<p>如果你看不懂具体的 Python 语法没关系，你只需要知道：
+1.  它先<strong>读取配置</strong>。
+2.  然后<strong>连接 Ray 集群</strong>（管理多显卡）。
+3.  接着<strong>分配角色</strong>（谁负责生成，谁负责打分）。
+4.  最后<strong>启动 Trainer</strong>，开始让模型根据数据进行自我博弈和优化。</p>

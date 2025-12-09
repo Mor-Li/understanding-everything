@@ -1,0 +1,80 @@
+<h1>tests/test_protocol_on_cpu.py</h1>
+<p>这份代码其实是在测试一个叫做 <strong><code>DataProto</code></strong> 的核心数据结构（以及相关的辅助函数）。</p>
+<p>你可以把 <code>DataProto</code> 想象成一个<strong>专门给 AI 训练用的“超级 Excel 表格”</strong>。
+*   <strong>Tensors (Batch):</strong> 表格里的某些列全是数字，可以直接喂给显卡（GPU）算，比如 <code>obs</code>（观察值）。
+*   <strong>Non-Tensors:</strong> 表格里的某些列是字符串或者复杂的对象，显卡看不懂但逻辑需要，比如 <code>labels</code>（标签文本）或者 <code>uid</code>。
+*   <strong>Meta Info:</strong> 表格的表头或备注，存一些全局信息。</p>
+<p>这个测试文件就是在疯狂折腾这个“超级表格”，确保它在各种极端情况下都不会散架。</p>
+<p>为了让你听懂，我把这个测试文件拆解成一个 <strong>6步走的 Task List</strong>，每一项任务对应代码里的一组测试用例。</p>
+<hr />
+<h3>✅ Task 1: 基础搭建与查验 (Basic Construction)</h3>
+<p><strong>目标</strong>：确保这个“超级表格”能造出来，而且能正确数出有多少行。</p>
+<ul>
+<li><strong>测试代码对应</strong>：<code>test_tensor_dict_constructor</code>, <code>test_len</code>, <code>test_old_vs_new_from_single_dict</code></li>
+<li><strong>观点解读</strong>：<ul>
+<li><strong>构造</strong>：你可以用字典（Dict）来初始化它。如果你的数据有100行，那么生成的对象必须知道 <code>batch_size</code> 是 100。</li>
+<li><strong>长度</strong>：像 <code>len(data)</code> 这样调用时，必须返回行数。如果只有元数据（Meta Info）没有数据行，长度应该是0。</li>
+<li><strong>兼容性</strong>：代码里还测试了新旧版本的构造函数是否兼容，保证老代码升级后不报错。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 2: 数据的增删改查 (Data Manipulation)</h3>
+<p><strong>目标</strong>：像操作 Excel 一样，对这个表格进行切分、合并、排序和筛选。</p>
+<ul>
+<li><strong>测试代码对应</strong>：<ul>
+<li><code>test_reorder</code>：<strong>排序</strong>。给我一个索引列表 <code>[3, 1, 2...]</code>，表格里的所有列（数字列和文本列）都要跟着变顺序，不能乱。</li>
+<li><code>test_chunk_concat</code>：<strong>切分与粘合</strong>。把100行数据切成两半（Chunk），或者把两半拼回去（Concat），数据不能丢。</li>
+<li><code>test_pop</code>：<strong>删除</strong>。把某一列（比如 <code>obs</code>）从表格里“抠”出来，剩下的部分要保持原样。</li>
+<li><code>test_dataproto_index</code>：<strong>索引</strong>。支持像 <code>data[0:10]</code> 或者 <code>data[[1, 3, 5]]</code> 这样取数据，不管是传 List、Numpy 还是 Tensor 都要能识别。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 3: 复杂数据的合并 (Merging &amp; Union)</h3>
+<p><strong>目标</strong>：当有两份数据（比如来自两个不同的训练节点）要合并时，怎么处理冲突和特殊值？</p>
+<ul>
+<li><strong>测试代码对应</strong>：<ul>
+<li><code>test_union_tensor_dict</code> &amp; <code>test_union_numpy_dict</code>：测试把两个字典合并。</li>
+<li><strong>核心难点</strong>：<ul>
+<li><strong>NaN (Not a Number)</strong>：如果数据里有 NaN，程序不能崩，且要能正确判断两个 NaN 是否相等。</li>
+<li><strong>对象数组</strong>：如果数组里存的是字符串或混合对象（Object dtype），合并时要非常小心，确保是深拷贝还是浅拷贝。</li>
+<li><strong>分布式指标合并</strong> (<code>test_concat_metrics_from_multiple_workers</code>)：这是分布式训练特有的。Worker 1 只有 loss，Worker 2 也有 loss，合并后应该变成一个列表 <code>[loss1, loss2]</code>，而不是互相覆盖。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 4: 变形金刚 (Reshaping &amp; Padding)</h3>
+<p><strong>目标</strong>：为了适应模型输入，数据经常需要变形，比如把多轮对话压扁，或者把不够长的数据补齐。</p>
+<ul>
+<li><strong>测试代码对应</strong>：<ul>
+<li><code>test_repeat</code> &amp; <code>test_sample_level_repeat</code>：<strong>复制</strong>。把数据重复 N 次，支持“交替重复”（AABB）和“顺序重复”（ABAB）。</li>
+<li><code>test_dataproto_pad_unpad</code>：<strong>补齐</strong>。比如显卡要求数据长度必须能被 8 整除，如果只有 7 条数据，就需要补 1 条假的（Padding），算完后再把假的去掉（Unpad）。</li>
+<li><code>test_dataproto_fold_unfold</code>：<strong>折叠/展开</strong>。处理多维数据，比如把 <code>[Batch, Sequence]</code> 变成 <code>[Batch * Sequence]</code>，算完再变回来。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 5: 与标准库的兼容性 (TensorDict Interop)</h3>
+<p><strong>目标</strong>：PyTorch 生态里有一个标准库叫 <code>tensordict</code>。<code>DataProto</code> 必须能无缝转换成 <code>tensordict</code>，这样才能利用生态里的其他工具。</p>
+<ul>
+<li><strong>测试代码对应</strong>：<code>test_to_tensordict</code>, <code>test_from_tensordict</code>, 以及各种 <code>nested</code> 测试。</li>
+<li><strong>核心观点</strong>：<ul>
+<li>这是最容易出 Bug 的地方。因为 <code>DataProto</code> 里存了列表、字典、嵌套列表（比如 <code>[[{"role": "user"}], ...]</code>）。</li>
+<li>测试重点在于：<strong>复杂的嵌套结构（Nested Structure）</strong> 转成 <code>tensordict</code> 后再转回来，数据必须一模一样，不能变成乱码或报错。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 6: 序列化与传输 (Serialization)</h3>
+<p><strong>目标</strong>：把数据变成二进制流（Bytes），以便保存到硬盘或者通过网络发给其他机器（CPU -&gt; GPU，或者机器 A -&gt; 机器 B）。</p>
+<ul>
+<li><strong>测试代码对应</strong>：<code>test_torch_save_data_proto</code>, <code>test_serialize_*</code></li>
+<li><strong>核心观点</strong>：<ul>
+<li>测试了各种数据类型的序列化：Float, Int, Double, Bool, 甚至 <strong>BFloat16</strong> 和 <strong>Nested Tensor</strong>（不规则张量）。</li>
+<li>确保在序列化（打包）和反序列化（解包）的过程中，数据的形状（Shape）、类型（Dtype）和设备（Device）信息都不丢失。</li>
+<li>特别测试了 <strong>Empty TensorDict</strong>（空数据）的情况，防止因为数据为空导致程序崩溃。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就在说一件事：
+<strong>“我们的 <code>DataProto</code> 数据容器非常结实。无论你是像切菜一样切它（Chunk/Index），像揉面团一样揉它（Reshape/Pad），还是往里面塞各种奇怪的嵌套数据（Nested Data）并跨网络传输（Serialize），它都能保证数据完整、不丢、不错。”</strong></p>

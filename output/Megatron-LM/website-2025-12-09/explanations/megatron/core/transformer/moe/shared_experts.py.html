@@ -1,0 +1,124 @@
+<h1>megatron/core/transformer/moe/shared_experts.py</h1>
+<p>这份代码确实涉及了很多底层优化的细节，如果直接看代码很容易晕。</p>
+<p>简单来说，这个文件定义了一个 <strong>“共享专家”（Shared Expert）</strong> 的神经网络层。在混合专家模型（MoE）中，通常有多个“专家”供选择，但“共享专家”是<strong>所有数据都会经过的一个通用专家</strong>，用来补充特定专家的能力。</p>
+<p>为了让你听懂，我把这个代码的逻辑拆解成一个 <strong>“待办事项清单”（Task List）</strong>。你可以把这个类 <code>SharedExpertMLP</code> 想象成一个正在流水线上工作的工人。</p>
+<p>我们将分三个阶段来解读：<strong>准备阶段</strong>、<strong>普通工作模式</strong>、<strong>高级并行工作模式（这是难点）</strong>。</p>
+<hr />
+<h3>阶段一：准备阶段（初始化 <code>__init__</code>）</h3>
+<p>当这个“工人”（SharedExpertMLP 对象）被创建时，他需要做以下检查清单：</p>
+<ol>
+<li>
+<p><strong>检查配置单</strong>：</p>
+<ul>
+<li>确认配置里的 <code>add_bias_linear</code> 是关闭的（共享专家通常不用偏置 bias）。</li>
+<li>设置这个神经网络层的大小（<code>ffn_hidden_size</code>）。</li>
+</ul>
+</li>
+<li>
+<p><strong>决定是否要在门口设个“门卫”（Gating）</strong>：</p>
+<ul>
+<li><strong>Todo:</strong> 检查 <code>gate</code> 参数。如果是 <code>True</code>，就要创建一个权重参数 <code>gate_weight</code>。</li>
+<li><em>作用：</em> 这个“门卫”会计算一个 0 到 1 之间的分数，决定最后输出的信息要保留多少（类似于调节音量）。</li>
+</ul>
+</li>
+<li>
+<p><strong>高级装备检查（FP8/FP4 量化优化）</strong>：</p>
+<ul>
+<li><strong>Todo:</strong> 检查是否使用了 Transformer Engine (TE) 以及 FP8/FP4 低精度训练。</li>
+<li><em>作用：</em> 如果用了，需要做一些显存优化的特殊设置（比如保存原始输入以节省显存）。</li>
+</ul>
+</li>
+<li>
+<p><strong>开启“一心二用”模式（Overlap 核心设置）</strong>：</p>
+<ul>
+<li><strong>Todo:</strong> 检查 <code>config.moe_shared_expert_overlap</code> 是否开启。</li>
+<li><em>解释：</em> 这是代码里最复杂的部分。通常 GPU 做事是一件件来的。开启这个后，这个“共享专家”会尝试和模型里的“路由器（Dispatcher）”<strong>同时工作</strong>。</li>
+<li><em>操作：</em><ul>
+<li>创建一个独立的 <code>stream</code>（CUDA 流，相当于开辟一条新的车道）。</li>
+<li>关闭普通的自动通信功能（手动控制数据传输，以便精确卡点）。</li>
+<li>初始化几个缓存变量（<code>cached_fc1_input</code> 等），用来在不同步骤间暂存数据。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>阶段二：普通工作模式（<code>forward</code>）</h3>
+<p>如果没开那些复杂的并行优化，工作流程很简单：</p>
+<ol>
+<li>
+<p><strong>执行计算</strong>：</p>
+<ul>
+<li><strong>Todo:</strong> 调用父类 <code>MLP</code> 的 <code>forward</code> 方法。</li>
+<li><em>动作：</em> 输入数据 -&gt; 线性层1 -&gt; 激活函数 -&gt; 线性层2 -&gt; 输出数据。</li>
+</ul>
+</li>
+<li>
+<p><strong>过门卫（如果开启）</strong>：</p>
+<ul>
+<li><strong>Todo:</strong> 如果有 <code>gate</code>，计算输入数据的权重分数（Sigmoid函数），然后把输出数据乘以这个分数。</li>
+<li><em>结果：</em> 返回最终结果。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>阶段三：高级并行工作模式（Overlap 拆解）</h3>
+<p>这是你觉得“完全看不懂”的地方。为了让共享专家计算的时间不被浪费，代码把原本一步完成的 <code>forward</code> <strong>强行拆成了 5 个手动步骤</strong>。</p>
+<p>你可以想象：原本是“做完饭再洗碗”，现在变成了“电饭煲煮饭的同时，我在洗碗”。</p>
+<p>这 5 个步骤必须按顺序被外部（通常是 MoE 的调度器）调用：</p>
+<h4>步骤 1: <code>pre_forward_comm</code> (准备食材)</h4>
+<ul>
+<li><strong>任务：</strong> 数据通信（All-Gather）。</li>
+<li><strong>Todo:</strong><ul>
+<li>因为显卡是并行计算的（Tensor Parallelism / Sequence Parallelism），数据可能分散在不同卡上。</li>
+<li>这一步把散落在各处的数据<strong>收集（Gather）</strong>起来，放到 <code>cached_fc1_input</code> 缓存里。</li>
+<li><em>关键点：</em> 这个动作是在独立的 <code>stream</code> 里做的，不会阻塞主线程。</li>
+</ul>
+</li>
+</ul>
+<h4>步骤 2: <code>linear_fc1_forward_and_act</code> (切菜并下锅)</h4>
+<ul>
+<li><strong>任务：</strong> 第一层全连接层 + 激活函数。</li>
+<li><strong>Todo:</strong><ul>
+<li>从缓存拿数据。</li>
+<li>执行第一次矩阵乘法（Linear FC1）。</li>
+<li>执行激活函数（GeLU 或 SwiGLU）。</li>
+<li>把结果存入 <code>cached_fc2_input</code>。</li>
+<li><em>注意：</em> 代码里有一大堆 <code>if-else</code> 是在处理不同的激活函数优化（比如是否融合 bias，是否用 TE 加速），核心就是 <code>y = Act(xW + b)</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>步骤 3: <code>linear_fc2_forward</code> (炒菜)</h4>
+<ul>
+<li><strong>任务：</strong> 第二层全连接层。</li>
+<li><strong>Todo:</strong><ul>
+<li>拿上一步的结果。</li>
+<li>执行第二次矩阵乘法（Linear FC2）。</li>
+<li>把结果存入 <code>cached_fc2_output</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>步骤 4: <code>post_forward_comm</code> (分盘装菜)</h4>
+<ul>
+<li><strong>任务：</strong> 数据通信（Reduce-Scatter）。</li>
+<li><strong>Todo:</strong><ul>
+<li>计算完了，数据现在是完整的。</li>
+<li>需要把数据再次<strong>切分（Scatter）</strong>回各个显卡，恢复到并行训练的状态。</li>
+<li>结果存入 <code>cached_output</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>步骤 5: <code>get_output</code> (上菜)</h4>
+<ul>
+<li><strong>任务：</strong> 获取最终结果。</li>
+<li><strong>Todo:</strong><ul>
+<li>如果有“门卫”（Gate），在这里乘以分数。</li>
+<li>等待那个独立的 <code>stream</code> 跑完（同步），确保饭真的做好了。</li>
+<li>返回最终数据。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就讲了一件事：</p>
+<p><strong>如何造一个“共享专家”层，并且为了追求极致速度，把原本“一键完成”的计算过程，拆解成了“通信-计算1-计算2-通信”的手动挡模式，以便让它能和 MoE 里的其他计算任务（比如路由分配）重叠（Overlap）运行，从而掩盖掉计算或通信的耗时。</strong></p>

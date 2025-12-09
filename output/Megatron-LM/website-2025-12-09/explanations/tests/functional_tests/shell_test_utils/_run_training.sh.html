@@ -1,0 +1,95 @@
+<h1>tests/functional_tests/shell_test_utils/_run_training.sh</h1>
+<p>这份脚本确实写得比较复杂，因为它涉及了很多<strong>文本处理</strong>（用来解析配置文件）和<strong>环境配置</strong>。</p>
+<p>你可以把这个脚本想象成一个<strong>“大管家”</strong>。它的工作不是亲自去训练模型，而是<strong>为“训练模型”这件事做好所有的准备工作</strong>，然后按下一个启动按钮。</p>
+<p>为了让你更容易理解，我把它拆解成一个<strong>Task Todo List（任务清单）</strong>，脚本就是按照这个顺序一步步打钩执行的。</p>
+<hr />
+<h3>📋 脚本执行的 Task Todo List</h3>
+<ol>
+<li><strong>[输入处理]</strong> 把用户传进来的参数变成环境变量。</li>
+<li><strong>[安全检查]</strong> 检查必须的文件路径和变量是不是都齐了（没齐就报错）。</li>
+<li><strong>[配置渲染]</strong> 把配置文件（YAML）里的占位符填上真值。</li>
+<li><strong>[环境准备]</strong> 从配置文件里读取额外的环境变量，并执行“预处理脚本”。</li>
+<li><strong>[参数拼装]</strong> <strong>(最复杂的一步)</strong> 把 YAML 配置文件里的参数，翻译成 Python 脚本能看懂的命令行格式（比如 <code>--batch_size 32</code>）。</li>
+<li><strong>[分布式设置]</strong> 设置多显卡（GPU）并行训练的参数（比如有多少个节点，主节点是谁）。</li>
+<li><strong>[启动训练]</strong> 使用 <code>uv run</code> 和 <code>torch.distributed.run</code> 正式启动 Python 训练代码。</li>
+<li><strong>[收尾工作]</strong> 执行“后处理脚本”并修改文件权限。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解</h3>
+<p>下面我按照上面的 List，把代码对应给你讲一遍：</p>
+<h4>1. 输入处理 (Input Parsing)</h4>
+<ul>
+<li><strong>代码位置</strong>：开头到 <code>set -x</code> 之前。</li>
+<li><strong>在干嘛</strong>：脚本启动时你可能会传一堆参数（如 <code>A=1 B=2</code>）。这段代码把这些参数一个个读进来，并设置成系统的环境变量，方便后面使用。</li>
+</ul>
+<h4>2. 安全检查 (Mandatory Check)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>MANDATORY_VARS=(...)</code> 那一段循环。</li>
+<li><strong>在干嘛</strong>：大管家在检查：“老板，你的<strong>训练脚本路径</strong>、<strong>参数文件路径</strong>、<strong>输出路径</strong>、<strong>数据路径</strong>都给我了吗？”</li>
+<li><strong>如果不全</strong>：直接报错退出 (<code>exit 1</code>)，不干了。</li>
+</ul>
+<h4>3. 配置渲染 (Envsubst)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>cat $TRAINING_PARAMS_PATH | envsubst ...</code></li>
+<li><strong>在干嘛</strong>：你的 YAML 配置文件里可能写着 <code>data_path: $DATA_PATH</code>。这行代码的作用是<strong>“填空”</strong>，把 <code>$DATA_PATH</code> 替换成真实的路径（比如 <code>/home/data</code>），然后生成一个临时文件。</li>
+</ul>
+<h4>4. 环境准备 (Env Vars &amp; Before Script)</h4>
+<ul>
+<li><strong>代码位置</strong>：<ul>
+<li><code>ENV_VARS=$(/usr/local/bin/yq ...)</code>：用 <code>yq</code> 工具去读 YAML 文件里的 <code>ENV_VARS</code> 字段，导出更多环境变量。</li>
+<li><code>BEFORE_SCRIPT=...</code>：查看 YAML 里有没有定义 <code>BEFORE_SCRIPT</code>（比如“训练前先清理缓存”），如果有，就执行它。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 参数拼装 (Argument Parsing) - <strong>核心难点</strong></h4>
+<ul>
+<li><strong>代码位置</strong>：中间那个巨大的 <code>if [[ "$IS_NEMO_TEST" == "true" ]]; then ... else ... fi</code> 块。</li>
+<li><strong>在干嘛</strong>：这是最繁琐的一步。Python 脚本通常需要长这样的参数：<code>--lr 0.01 --epochs 10</code>。但这些配置写在 YAML 文件里是键值对。</li>
+<li><strong>逻辑</strong>：<ul>
+<li>它使用 <code>yq</code> 工具读取 YAML 里的 <code>MODEL_ARGS</code>（模型参数）。</li>
+<li><strong>如果是 NeMo 测试</strong> (<code>IS_NEMO_TEST=true</code>)：走一套专门的逻辑来拼接字符串。</li>
+<li><strong>如果是普通测试</strong> (<code>else</code>)：<ul>
+<li>它会判断这是不是“第2次运行”（断点续训），如果是，可能会读 <code>MODEL_ARGS_2</code>。</li>
+<li>它通过复杂的文本处理（sed/grep），处理<strong>空格、括号、True/False</strong>等情况，把 YAML 变成 <code>key value</code> 的数组。</li>
+</ul>
+</li>
+<li>最后把这些参数存到 <code>PARAMS</code> 数组里。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 分布式设置 (Distributed Settings)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>######## Distributed training settings. ########</code> 之后。</li>
+<li><strong>在干嘛</strong>：为 PyTorch 的分布式训练（DDP）做准备。<ul>
+<li>它会看 SLURM（集群调度系统）的环境变量，确定现在有几台机器 (<code>NUM_NODES</code>)，每台机器几张卡 (<code>GPUS_PER_NODE</code>)，主节点 IP 是多少。</li>
+<li>把这些信息打包进 <code>DISTRIBUTED_ARGS</code> 数组。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 启动训练 (Start Training)</h4>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>bash
+    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+        $TRAINING_SCRIPT_PATH "${PARAMS[@]}" ...</code></li>
+<li><strong>在干嘛</strong>：这是<strong>真正干活</strong>的一行。<ul>
+<li><code>uv run</code>：使用 <code>uv</code> 这个工具（一个很快的 Python 包管理器/运行器）来跑命令。</li>
+<li><code>torch.distributed.run</code>：PyTorch 的启动器，负责管理多显卡并行。</li>
+<li><code>${DISTRIBUTED_ARGS[@]}</code>：刚才准备好的显卡参数。</li>
+<li><code>$TRAINING_SCRIPT_PATH</code>：你真正的 Python 训练代码（如 <code>train.py</code>）。</li>
+<li><code>"${PARAMS[@]}"</code>：刚才辛辛苦苦拼出来的模型参数。</li>
+</ul>
+</li>
+</ul>
+<h4>8. 收尾工作 (After Script &amp; Cleanup)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>AFTER_SCRIPT=...</code> 和 <code>chmod ...</code>。</li>
+<li><strong>在干嘛</strong>：<ul>
+<li>如果 YAML 里定义了训练后要跑的脚本（比如“发个通知说训练完了”），这里执行。</li>
+<li><code>chmod -R g+w</code>：把输出文件夹的权限改一下，让组内的其他人也能写（防止权限锁死）。</li>
+<li>最后根据训练成功与否返回 <code>EXIT_CODE</code>。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>自动化的包装器（Wrapper）</strong>。你只需要给它一个配置文件路径和几个基础变量，它就会帮你处理好所有复杂的格式转换和环境配置，最后帮你敲下运行命令。</p>

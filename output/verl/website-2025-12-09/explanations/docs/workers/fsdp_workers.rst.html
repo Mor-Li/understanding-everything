@@ -1,0 +1,96 @@
+<h1>docs/workers/fsdp_workers.rst</h1>
+<p>这份文档确实充满了技术术语，特别是涉及分布式训练（Distributed Training）和强化学习（RLHF）的底层实现。如果不是专门做这一块的工程师，很难一眼看懂。</p>
+<p>为了让你理解，我们可以把这个系统想象成<strong>“训练一个学生写作文”</strong>的过程。</p>
+<p>这份文档主要讲的是：<strong>如何利用 PyTorch FSDP（一种让多张显卡合作的技术）来搭建这个训练系统的“后台架构”。</strong></p>
+<p>我将按照你要求的 <strong>Task To-Do List</strong> 形式，把文档中的逻辑拆解成一个个具体的步骤。</p>
+<hr />
+<h3>🟢 第一阶段：决策与准备 (Pros &amp; Cons)</h3>
+<p>在开始写代码或跑任务之前，你需要先决定是否使用这个架构。</p>
+<ul>
+<li><strong>Task 1: 评估项目规模</strong><ul>
+<li><strong>文档观点</strong>：如果你是做算法研究，或者模型不是超级大（比如小于 70B 参数），推荐用这个。</li>
+<li><strong>原因</strong>：<ul>
+<li><strong>优点 (Pros)</strong>：简单。你想换个新模型（比如从 Llama 换到 Qwen），几乎不需要改代码，只要写个简单的权重加载器（<code>loader</code>）就行。</li>
+<li><strong>缺点 (Cons)</strong>：如果模型特别巨大（比如 Llama 70B/405B），这个架构会变慢（扩展性差），而且在“生成”和“训练”之间切换时，显卡之间的数据搬运开销比较大。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 第二阶段：分配角色 (Workers)</h3>
+<p>在强化学习（RLHF）中，我们需要几个不同的“角色”模型。文档介绍了如何把这些角色分配到 GPU 上。</p>
+<ul>
+<li>
+<p><strong>Task 2: 设置“学生与陪练”组 (<code>ActorRolloutRefWorker</code>)</strong></p>
+<ul>
+<li><strong>解释</strong>：这是最核心的一组 worker。它把三个功能合在了一起：<ol>
+<li><strong>Actor (学生)</strong>：负责学习怎么写作文。</li>
+<li><strong>Rollout (生成器)</strong>：负责实际动手写（这里用了 <strong>vLLM</strong> 技术，写得飞快）。</li>
+<li><strong>Reference (参照物)</strong>：负责记住学生“最开始”是怎么写的，防止学生学偏了（忘本）。</li>
+</ol>
+</li>
+<li><strong>操作步骤</strong>：<ol>
+<li><strong>初始化 (<code>init_model</code>)</strong>：所有显卡同时加载模型。这里用到了 <code>HybridEngine</code>，意思是既能训练（FSDP）又能快速推理（vLLM）。</li>
+<li><strong>生成 (<code>generate_sequences</code>)</strong>：让 vLLM 快速生成文本，然后 Actor 计算这些文本的概率（Log Prob）。</li>
+<li><strong>更新 (<code>update_actor</code>)</strong>：根据反馈的“分数”，修改 Actor 的参数（让它下次写得更好）。</li>
+<li><strong>参照对比 (<code>compute_ref_log_prob</code>)</strong>：计算 Reference 模型的概率，用来做对比。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3: 设置“打分员”组 (<code>CriticWorker</code> 和 <code>RewardWorker</code>)</strong></p>
+<ul>
+<li><strong>解释</strong>：这些是负责评价作文质量的。<ol>
+<li><strong>Reward (奖励模型)</strong>：给作文打最终分（好/坏）。</li>
+<li><strong>Critic (评论家)</strong>：在写的过程中预判能得多少分（用于 PPO 算法）。</li>
+</ol>
+</li>
+<li><strong>操作步骤</strong>：<ol>
+<li><strong>初始化</strong>：和上面类似，但不需要 vLLM 那么复杂的生成引擎。</li>
+<li><strong>打分 (<code>compute_rm_score</code>)</strong>：Reward 模型给生成的数据打分。</li>
+<li><strong>估值 (<code>compute_values</code>)</strong>：Critic 模型评估当前状态的价值。</li>
+<li><strong>自我提升 (<code>update_critic</code>)</strong>：Critic 模型也要学习，让自己打分打得更准。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 第三阶段：执行流程 (Workflow)</h3>
+<p>当系统跑起来时，数据是怎么流转的？文档里提到了具体的函数。</p>
+<ul>
+<li>
+<p><strong>Task 4: 数据分发 (Dispatch)</strong></p>
+<ul>
+<li><strong>文档观点</strong>：代码里有很多 <code>@register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)</code>。</li>
+<li><strong>解释</strong>：这叫“数据并行”。假设你有 100 道作文题要练，你有 4 张显卡。系统会自动把这 100 题分成 4 份，每张卡处理 25 题。大家各干各的，最后把结果汇总。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 5: 权重同步</strong></p>
+<ul>
+<li><strong>文档观点</strong>：提到了 <code>dtensor_weight_loader</code> 和 <code>hf_weight_loader</code>。</li>
+<li><strong>解释</strong>：因为 FSDP 把模型切碎了放在不同显卡上，而 vLLM (生成引擎) 可能需要完整的或者切分方式不同的模型。这个 Task 就是要保证<strong>“训练时的脑子”和“写作文时的脑子”是同步的</strong>，权重加载器就是负责这个转换工作的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 第四阶段：未来改进 (HybridShard)</h3>
+<ul>
+<li><strong>Task 6: 了解当前限制</strong><ul>
+<li><strong>文档观点</strong>：目前不支持 FSDP 的 <code>HybridShard</code> 策略。</li>
+<li><strong>解释</strong>：<code>HybridShard</code> 是一种更高级的省显存技术（比如在一台机器内部切分，机器之间复制）。文档说目前还没支持，如果以后要支持，需要写更复杂的 2D 设备网格（2D device mesh）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇文档到底讲了啥？</h3>
+<p><strong>简单来说，这篇文档是给开发者的说明书：</strong></p>
+<ol>
+<li><strong>我们做了一个系统</strong>：用 PyTorch FSDP 来训练大模型，用 vLLM 来加速生成。</li>
+<li><strong>它是怎么组织的</strong>：我们把模型分成了“学生组”（Actor/Rollout/Ref）和“老师组”（Critic/Reward）。</li>
+<li><strong>怎么用</strong>：你只需要实现简单的权重加载代码，就能跑各种模型。</li>
+<li><strong>注意坑</strong>：跑超大模型（70B+）可能会慢，目前主要适合搞研究和原型开发。</li>
+</ol>

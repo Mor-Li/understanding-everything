@@ -1,0 +1,125 @@
+<h1>tests/unit_tests/test_local_multi_tensor_fns.py</h1>
+<p>没问题，这个文件看起来全是代码和数学术语，确实容易让人晕。</p>
+<p>简单来说，这个文件的<strong>核心目的</strong>是：<strong>“找茬” (找不同)</strong>。</p>
+<p>Megatron-Core（也就是代码里的 <code>local</code> 版本）写了一套自己的算法，想要替代或者模仿 NVIDIA Apex 库（代码里的 <code>amp_C</code> 或 <code>apex</code>）的功能。这个测试文件就是为了证明：<strong>我自己写的版本（Local）和业界权威版本（Apex）算出来的结果是一模一样的。</strong></p>
+<p>我们可以把理解这段代码的过程拆解成一个 <strong>Task Todo List</strong>，一步步来勾选完成：</p>
+<h3>📝 你的理解任务清单 (Todo List)</h3>
+<ol>
+<li><strong>[ ] 任务一：搞懂背景 (Context)</strong><ul>
+<li>知道这是在做什么对比测试（Apex vs. Local）。</li>
+</ul>
+</li>
+<li><strong>[ ] 任务二：准备数据 (Setup)</strong><ul>
+<li>看懂它是如何创建两份一模一样的数据的。</li>
+</ul>
+</li>
+<li><strong>[ ] 任务三：对比 L2 Norm (L2范数/模长)</strong><ul>
+<li>看懂它怎么测试“算大小”的功能。</li>
+</ul>
+</li>
+<li><strong>[ ] 任务四：对比 Scale (缩放/乘法)</strong><ul>
+<li>看懂它怎么测试“乘系数”的功能。</li>
+</ul>
+</li>
+<li><strong>[ ] 任务五：对比 Applier (执行器)</strong><ul>
+<li>看懂它怎么测试“运行机制”本身。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解 (Step-by-Step Walkthrough)</h3>
+<h4>1. [ ] 任务一：搞懂背景</h4>
+<p>代码里频繁出现 <code>amp_C</code> (Apex的底层C代码) 和 <code>local_...</code> (Megatron自己的代码)。
+*   <strong>Apex</strong>: 是 NVIDIA 出的一个加速库，算得快且准，作为“标准答案”。
+*   <strong>Local</strong>: 是 Megatron 团队自己写的实现。
+*   <strong>目标</strong>: 只要 <code>assert_close(apex_result, local_result)</code> 通过，就说明自己写的代码没毛病。</p>
+<h4>2. [ ] 任务二：准备数据 (Setup)</h4>
+<p>看 <code>test_local_multi_tensor_l2_norm_and_scale</code> 函数的开头：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 生成 10 个 5x5 的随机张量，放在 GPU 上</span>
+<span class="n">tensor_list</span> <span class="o">=</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">5</span><span class="p">,</span> <span class="mi">5</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">)]</span>
+
+<span class="c1"># 关键步骤：复制数据</span>
+<span class="c1"># tensor_list 给 Apex 用</span>
+<span class="c1"># tensor_list_copy 给 Local 用</span>
+<span class="n">tensor_list_copy</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="n">tensor_list</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：就像考试一样，为了公平，必须给两个考生（Apex 和 Local）发一模一样的卷子（数据），然后看他们填的答案是不是一样。</p>
+<h4>3. [ ] 任务三：对比 L2 Norm (L2范数)</h4>
+<p>L2 Norm 简单理解就是把一堆向量的<strong>长度</strong>算出来（比如所有数字平方求和再开根号）。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 让 Apex 算一遍</span>
+<span class="n">norm_apex</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">multi_tensor_apply</span><span class="o">.</span><span class="n">multi_tensor_applier</span><span class="p">(</span>
+    <span class="n">amp_C</span><span class="o">.</span><span class="n">multi_tensor_l2norm</span><span class="p">,</span> <span class="c1"># 使用 Apex 的算法</span>
+    <span class="o">...</span><span class="p">,</span> 
+    <span class="p">[</span><span class="n">tensor_list</span><span class="p">],</span>             <span class="c1"># 用第一份数据</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+
+<span class="c1"># 2. 让 Local (Megatron) 算一遍</span>
+<span class="n">norm_local</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">multi_tensor_apply</span><span class="o">.</span><span class="n">multi_tensor_applier</span><span class="p">(</span>
+    <span class="n">local_multi_tensor_l2_norm</span><span class="p">,</span> <span class="c1"># 使用 Local 的算法</span>
+    <span class="o">...</span><span class="p">,</span>
+    <span class="p">[</span><span class="n">tensor_list_copy</span><span class="p">],</span>         <span class="c1"># 用第二份数据</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+
+<span class="c1"># 3. 判卷子：两个结果必须极其接近</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">assert_close</span><span class="p">(</span><span class="n">norm_apex</span><span class="p">,</span> <span class="n">norm_local</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：如果你算出来是 10.5，我也算出 10.5，那这一关就过了。</p>
+<h4>4. [ ] 任务四：对比 Scale (缩放)</h4>
+<p>Scale 就是把张量里的每个数字都乘以一个系数（比如乘以 0.05）。这里测试稍微复杂一点，分了两种情况。</p>
+<p><strong>情况 A：原地修改 (src is dst)</strong>
+就是直接在原数据上修改。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">clip_coeff</span> <span class="o">=</span> <span class="mf">0.05</span> <span class="c1"># 乘的系数</span>
+
+<span class="c1"># Apex 修改 tensor_list</span>
+<span class="n">multi_tensor_apply</span><span class="o">.</span><span class="n">multi_tensor_applier</span><span class="p">(</span>
+    <span class="n">amp_C</span><span class="o">.</span><span class="n">multi_tensor_scale</span><span class="p">,</span> 
+    <span class="o">...</span><span class="p">,</span> 
+    <span class="p">[</span><span class="n">tensor_list</span><span class="p">,</span> <span class="n">tensor_list</span><span class="p">],</span> <span class="c1"># 输入是它，输出也是它</span>
+    <span class="n">clip_coeff</span>
+<span class="p">)</span>
+
+<span class="c1"># Local 修改 tensor_list_copy</span>
+<span class="n">multi_tensor_apply</span><span class="o">.</span><span class="n">multi_tensor_applier</span><span class="p">(</span>
+    <span class="n">local_multi_tensor_scale</span><span class="p">,</span> 
+    <span class="o">...</span><span class="p">,</span> 
+    <span class="p">[</span><span class="n">tensor_list_copy</span><span class="p">,</span> <span class="n">tensor_list_copy</span><span class="p">],</span> 
+    <span class="n">clip_coeff</span>
+<span class="p">)</span>
+
+<span class="c1"># 判卷子：修改后的两份数据应该一模一样</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">assert_close</span><span class="p">(</span><span class="n">tensor_list</span><span class="p">,</span> <span class="n">tensor_list_copy</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>情况 B：非原地修改 (src is not dst)</strong>
+读取一份数据，计算结果存到另一份新的数据里。
+*   代码逻辑和上面类似，只是把输入和输出的列表分开了。
+*   同样最后对比：Apex 处理完的结果 vs Local 处理完的结果。</p>
+<h4>5. [ ] 任务五：对比 Applier (执行器)</h4>
+<p>这是第二个测试函数 <code>test_local_multi_tensor_apply</code>。
+之前的测试是对比“算法公式”（L2 Norm 或 Scale），这个测试是对比“<strong>发动机</strong>”（Applier）。</p>
+<p><code>multi_tensor_applier</code> 是一个用来高效遍历处理一堆 Tensor 的工具。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 用 Apex 的发动机 (applier) 跑 Apex 的算法</span>
+<span class="n">norm_apex</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">multi_tensor_apply</span><span class="o">.</span><span class="n">multi_tensor_applier</span><span class="p">(</span>
+    <span class="n">amp_C</span><span class="o">.</span><span class="n">multi_tensor_l2norm</span><span class="p">,</span> <span class="o">...</span>
+<span class="p">)</span>
+
+<span class="c1"># 2. 用 Local 的发动机 (local_multi_tensor_applier) 跑 Apex 的算法</span>
+<span class="c1"># 注意：这里算法没变，变的是外面的壳子（Applier）</span>
+<span class="n">norm_local</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">local_multi_tensor_applier</span><span class="p">(</span>
+    <span class="n">amp_C</span><span class="o">.</span><span class="n">multi_tensor_l2norm</span><span class="p">,</span> <span class="o">...</span>
+<span class="p">)</span>
+
+<span class="c1"># 3. 判卷子</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">assert_close</span><span class="p">(</span><span class="n">norm_apex</span><span class="p">,</span> <span class="n">norm_local</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：这证明了 Megatron 自己写的这个“批量处理工具”和 NVIDIA 原厂的工具一样好用，能正确地驱动底层的计算函数。</p>
+<h3>总结</h3>
+<p>这个文件就是为了回答三个问题：
+1.  我们自己写的 <strong>求模长(L2 Norm)</strong> 算法准不准？（准，和 Apex 一样）
+2.  我们自己写的 <strong>缩放(Scale)</strong> 算法准不准？（准，和 Apex 一样）
+3.  我们自己写的 <strong>批量执行器(Applier)</strong> 稳不稳？（稳，和 Apex 一样）</p>

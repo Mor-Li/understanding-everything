@@ -1,0 +1,55 @@
+<h1>recipe/prime/prime_fsdp_workers.py</h1>
+<p>这份代码确实比较硬核，涉及到了大模型训练中最底层的<strong>分布式并行（Distributed Parallelism）</strong>和<strong>显存管理</strong>。</p>
+<p>为了让你更容易理解，我们可以把这个 <code>PRIMERewardModelWorker</code> 类想象成一个<strong>专门负责“奖励模型（Reward Model）”的打工人</strong>。他在一个巨大的工厂（分布式集群）里工作。</p>
+<p>下面我列一个 <strong>Task To-Do List</strong>，按照代码的逻辑顺序，一步步带你看这位“打工人”每天都在干什么。</p>
+<hr />
+<h3>📋 任务清单：奖励模型打工人的一天</h3>
+<h4>Task 1: 入职与工位整理 (Initialization)</h4>
+<p><strong>对应代码：</strong> <code>__init__</code> 方法
+*   <strong>动作</strong>：打工人刚到岗，首先要确认自己在哪个部门，有多少个同事（GPU数量）。
+*   <strong>核心逻辑</strong>：
+    *   <code>init_process_group</code>：和所有同事建立联系（联网）。
+    *   <code>create_device_mesh</code>：划分小组。比如 8 张卡，怎么分组合作？这里用到了 <strong>FSDP</strong>（完全分片数据并行）来切分模型。
+    *   <strong>Ulysses (尤利西斯) 设置</strong>：这是一个专门处理<strong>超长文本</strong>的技术。如果文本太长，一张卡放不下，就把一句话切开给多张卡处理。代码里的 <code>ulysses_device_mesh</code> 就是在做这件事。</p>
+<h4>Task 2: 领取与组装工具 (Model Building)</h4>
+<p><strong>对应代码：</strong> <code>init_model</code> 和 <code>_build_reward_ref_model_optimizer</code> 方法
+*   <strong>动作</strong>：干活需要工具（模型）。但他需要两套工具：
+    1.  <strong>Reward Model (RM)</strong>：当前要训练的奖励模型（主角）。
+    2.  <strong>Ref Model (Reference Model)</strong>：参考模型（用来做对比，通常不更新参数）。
+*   <strong>核心逻辑</strong>：
+    *   <strong>加载模型</strong>：从硬盘（HDFS/Local）读取模型权重。
+    *   <strong>FSDP 包装 (切分)</strong>：大模型太大了，一张 GPU 放不下。代码里的 <code>FSDP(...)</code> 就是把模型切碎，每个 GPU 只拿一小部分碎片。
+    *   <strong>Offload (卸载)</strong>：<code>offload_fsdp_model_to_cpu</code>。为了省显存，如果暂时不用模型，就把它们从昂贵的 GPU 显存踢到便宜的 CPU 内存里去待命。</p>
+<h4>Task 3: 给作业打分 (Compute Score)</h4>
+<p><strong>对应代码：</strong> <code>compute_rm_score</code> 方法
+*   <strong>动作</strong>：老板发来了一堆数据（DataProto），让你给这些回答打分。
+*   <strong>核心逻辑</strong>：
+    1.  <strong>搬运</strong>：<code>load_fsdp_model_to_gpu</code>。刚才为了省地儿把模型扔到 CPU 了，现在要干活了，赶紧把碎片搬回 GPU。
+    2.  <strong>切分数据</strong>：<code>ulysses_sharding_manager</code>。如果句子太长，按之前定好的规则切分数据。
+    3.  <strong>计算</strong>：<code>self.rm.compute_rm_score</code>。模型进行前向传播（Forward），算出分数。
+    4.  <strong>算指标</strong>：计算 DPO (Direct Preference Optimization) 准确率，看看模型判别好坏的能力如何。
+    5.  <strong>清理</strong>：算完了，<code>offload...</code> 再次把模型踢回 CPU，腾出显存给别的任务用。</p>
+<h4>Task 4: 自我学习与进化 (Update Model)</h4>
+<p><strong>对应代码：</strong> <code>update_rm</code> 方法
+*   <strong>动作</strong>：根据打分的结果和标准答案的差异，修改自己的脑子（更新参数），让自己下次打分更准。
+*   <strong>核心逻辑</strong>：
+    1.  <strong>准备</strong>：把模型（RM）和优化器（Optimizer）都搬回 GPU。注意，Ref Model 这次只看不动，作为参考。
+    2.  <strong>训练</strong>：<code>self.rm.update_rm</code>。计算 Loss（损失），反向传播梯度。
+    3.  <strong>更新</strong>：<code>optimizer.step()</code>。修改模型里的参数。
+    4.  <strong>收尾</strong>：再次把所有东西卸载回 CPU。</p>
+<h4>Task 5: 写日记存档 (Checkpointing)</h4>
+<p><strong>对应代码：</strong> <code>save_checkpoint</code> / <code>load_checkpoint</code>
+*   <strong>动作</strong>：防止机器挂了白干，定期把当前的脑子（模型参数）存到硬盘上。
+*   <strong>核心逻辑</strong>：
+    *   因为模型是切碎在不同 GPU 上的 (FSDP)，保存的时候需要大家配合，把碎片拼起来或者按规则存好。
+    *   <code>save_checkpoint</code> 会处理这些复杂的分布式保存逻辑。</p>
+<hr />
+<h3>💡 总结：这篇文章的核心观点</h3>
+<p>这并不是一篇议论文，而是一个<strong>工程实现文件</strong>。它表达的“观点”其实是<strong>一种高效训练大模型的设计模式</strong>：</p>
+<ol>
+<li><strong>显存是极其宝贵的</strong>：所以代码里疯狂地在做 <code>load</code> (加载到GPU) 和 <code>offload</code> (卸载到CPU)。这是一种用<strong>时间换空间</strong>的策略，允许你在有限的显存上训练更大的模型。</li>
+<li><strong>长文本需要特殊处理</strong>：引入了 <code>Ulysses</code> (尤利西斯) 并行机制，说明这个 Worker 专门设计用来处理非常长的 Context（上下文）。</li>
+<li><strong>FSDP 是默认标配</strong>：不再使用普通的 DDP，而是全量使用 Fully Sharded Data Parallel，把参数、梯度、优化器状态全部切分，以最大化利用集群资源。</li>
+</ol>
+<p><strong>简单一句话概括：</strong>
+这是一个极其抠门（省显存）且擅长处理长文章的打工人，专门负责在大规模集群里训练和更新奖励模型。</p>

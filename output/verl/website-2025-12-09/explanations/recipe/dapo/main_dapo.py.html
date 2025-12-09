@@ -1,0 +1,92 @@
+<h1>recipe/dapo/main_dapo.py</h1>
+<p>这段代码确实涉及很多分布式训练和强化学习（RL）的概念，乍一看很晕是很正常的。</p>
+<p>你可以把这个脚本看作是一个<strong>“装修总指挥”</strong>或者<strong>“剧组制片人”</strong>。它的核心任务不是直接去“搬砖”（具体的矩阵计算），而是<strong>组建团队、分配资源、制定规则，最后喊“Action”</strong>。</p>
+<p>这个脚本是为了启动一个叫 <strong>DAPO</strong>（一种强化学习算法）的训练任务。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>Task Todo List（任务清单）</strong>，然后一步步给你解释。</p>
+<hr />
+<h3>📋 Task Todo List (总指挥的任务清单)</h3>
+<ol>
+<li><strong>[读取说明书]</strong>: 获取训练配置（Config）。</li>
+<li><strong>[搭建工地]</strong>: 启动分布式计算平台（Ray）。</li>
+<li><strong>[任命工头]</strong>: 启动一个专门的任务管理者（TaskRunner）。</li>
+<li><strong>[准备工具]</strong>: 下载模型文件，加载分词器（Tokenizer）。</li>
+<li><strong>[招募工种]</strong>: 确定需要哪些角色的工人（Actor, Critic, Reward Model 等）。</li>
+<li><strong>[分配工位]</strong>: 给每个角色分配 GPU 资源。</li>
+<li><strong>[制定奖惩]</strong>: 加载奖励函数（Reward Function），告诉 AI 什么是好结果。</li>
+<li><strong>[正式开工]</strong>: 初始化训练器（Trainer）并开始训练循环（Fit）。</li>
+</ol>
+<hr />
+<h3>🧩 逐步详解 (Step-by-Step)</h3>
+<h4>1. [读取说明书] 获取配置</h4>
+<p><strong>代码位置:</strong> <code>@hydra.main(...)</code> 和 <code>def main(config)</code>
+*   <strong>讲的是啥:</strong>
+    程序一上来使用 <code>Hydra</code> 这个工具。它的作用是读取配置文件（比如 <code>config/dapo_trainer.yaml</code>）。
+*   <strong>观点:</strong>
+    不要硬编码参数（比如学习率、Batch Size），而是从外部配置文件里读。这样改参数不用改代码。</p>
+<h4>2. [搭建工地] 启动 Ray</h4>
+<p><strong>代码位置:</strong> <code>run_ppo</code> 函数中的 <code>ray.init(...)</code>
+*   <strong>讲的是啥:</strong>
+    DAPO 是一个大规模训练，单机跑不动，需要多张卡甚至多台机器。<code>Ray</code> 是一个分布式计算框架，用来管理这些机器。
+*   <strong>观点:</strong>
+    如果 Ray 还没启动，就根据配置初始化它。这就像是把所有服务器连通，准备好干活。</p>
+<h4>3. [任命工头] 启动 TaskRunner</h4>
+<p><strong>代码位置:</strong> <code>TaskRunner.remote()</code> 和 <code>ray.get(...)</code>
+*   <strong>讲的是啥:</strong>
+    主函数 <code>main</code> 并不直接干重活，它聘请了一个 <code>TaskRunner</code>。注意那个 <code>.remote()</code>，这意味着 <code>TaskRunner</code> 会被发送到集群的某台机器上独立运行。
+*   <strong>观点:</strong>
+    把“管理任务”本身也变成一个独立的进程，避免和主节点（Head Node）抢资源。</p>
+<h4>4. [准备工具] 模型与分词器</h4>
+<p><strong>代码位置:</strong> <code>TaskRunner.run</code> 中的 <code>copy_to_local</code> 和 <code>hf_tokenizer</code>
+*   <strong>讲的是啥:</strong>
+    *   <code>copy_to_local</code>: 训练的大模型（LLM）通常存在云端存储（如 HDFS），这里先把它下载到本地硬盘。
+    *   <code>tokenizer</code>: 加载分词器，用来把人类语言变成机器能懂的数字。
+*   <strong>观点:</strong>
+    工欲善其事，必先利其器。数据和模型文件必须先就位。</p>
+<h4>5. [招募工种] 确定角色策略</h4>
+<p><strong>代码位置:</strong> <code>if config.actor_rollout_ref.actor.strategy in ...</code>
+*   <strong>讲的是啥:</strong>
+    在大模型强化学习（RLHF）中，通常需要好几个模型同时工作：
+    *   <strong>Actor (演员)</strong>: 负责生成回答的 AI。
+    *   <strong>Critic (评论家)</strong>: 负责预估这个回答值多少分的 AI。
+    *   <strong>Ref (参考者)</strong>: 原始模型，用来防止 Actor 跑偏。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">代码在这里判断是用</span><span class="w"> </span><span class="n n-Quoted">`FSDP`</span><span class="n">（完全分片数据并行）还是</span><span class="w"> </span><span class="n n-Quoted">`Megatron`</span><span class="n">（张量并行）等技术来切分这些大模型。</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点:</strong>
+    根据模型大小和显卡数量，选择合适的“切分蛋糕”策略，并加载对应的工人代码类（Worker Class）。</li>
+</ul>
+<h4>6. [分配工位] 资源映射</h4>
+<p><strong>代码位置:</strong> <code>role_worker_mapping</code> 和 <code>resource_pool_manager</code>
+*   <strong>讲的是啥:</strong>
+    这里在做<strong>排班表</strong>。
+    *   <code>Role.ActorRollout</code>: 谁负责生成？
+    *   <code>Role.Critic</code>: 谁负责打分？
+    *   <code>Role.RewardModel</code>: 谁负责提供真实奖励？</p>
+<div class="codehilite"><pre><span></span><code><span class="n">代码将这些角色（Role）映射到具体的</span><span class="w"> </span><span class="n">GPU</span><span class="w"> </span><span class="n">资源池（</span><span class="n n-Quoted">`global_pool`</span><span class="n">）。</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点:</strong>
+    大模型太大了，必须明确规定哪几张卡跑 Actor，哪几张卡跑 Critic。</li>
+</ul>
+<h4>7. [制定奖惩] 加载奖励函数</h4>
+<p><strong>代码位置:</strong> <code>load_reward_manager</code>
+*   <strong>讲的是啥:</strong>
+    强化学习的核心是“奖励”。
+    *   <code>reward_fn</code>: 训练用的奖励函数。
+    *   <code>val_reward_fn</code>: 验证用的奖励函数。
+*   <strong>观点:</strong>
+    不管是通过规则打分，还是用另一个模型（Reward Model）打分，这里统一封装成一个接口，告诉训练器如何评价 AI 写得好不好。</p>
+<h4>8. [正式开工] 初始化 Trainer 并 Fit</h4>
+<p><strong>代码位置:</strong> <code>RayDAPOTrainer(...)</code>, <code>trainer.init_workers()</code>, <code>trainer.fit()</code>
+*   <strong>讲的是啥:</strong>
+    最后，把上面所有的东西（配置、分词器、工人、资源表、奖励函数）打包塞给 <code>RayDAPOTrainer</code> 这个类。
+    *   <code>init_workers()</code>: 真正地在各个 GPU 上把模型加载进显存。
+    *   <code>fit()</code>: 开始循环训练（生成数据 -&gt; 打分 -&gt; 更新模型）。
+*   <strong>观点:</strong>
+    万事俱备，开始迭代。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件 <strong><code>main_dapo.py</code></strong> 其实就是一个<strong>组装车间</strong>。它本身不包含复杂的数学公式，它的作用是把<strong>数据、模型、硬件资源、分布式策略</strong>全部粘合在一起，然后启动 <code>DAPO</code> 算法的训练流程。</p>
+<p>你看不懂可能是因为被 <code>Ray</code> 的分布式语法和复杂的配置读取给绕晕了，但只要记住它是在<strong>“分配任务和资源”</strong>，逻辑就清晰了。</p>

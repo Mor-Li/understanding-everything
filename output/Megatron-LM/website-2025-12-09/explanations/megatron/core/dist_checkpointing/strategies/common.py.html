@@ -1,0 +1,122 @@
+<h1>megatron/core/dist_checkpointing/strategies/common.py</h1>
+<p>没问题，这个文件确实涉及到底层分布式存储的逻辑，乍一看全是类和函数调用，很容易晕。</p>
+<p>简单来说，<strong>这个文件的核心作用是：定义如何用最原始、最标准的 PyTorch 方式（<code>torch.save</code> / <code>torch.load</code>）来保存和读取分布式训练的检查点（Checkpoint）。</strong></p>
+<p>为了让你彻底看懂，我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>。请按照这个顺序，一步步拆解代码。</p>
+<hr />
+<h3>任务 1：理解核心概念——“Common” vs “Sharded”</h3>
+<p>在看代码前，你必须先理解 Megatron-Core 在保存模型时把数据分成了两类。这是读懂这个文件的基础。</p>
+<ul>
+<li>
+<p><strong>Common（通用数据）：</strong></p>
+<ul>
+<li><strong>定义：</strong> 所有 GPU 上都一样的数据，或者只需要存一份的数据。比如：当前的训练步数（iteration）、优化器的超参数、全局配置 args。</li>
+<li><strong>文件中的体现：</strong> <code>COMMON_STATE_FNAME = 'common.pt'</code>。</li>
+<li><strong>策略：</strong> 只需要有一个人（通常是 Rank 0）把它存下来就行，不用每个人都存。</li>
+</ul>
+</li>
+<li>
+<p><strong>Sharded（分片数据）：</strong></p>
+<ul>
+<li><strong>定义：</strong> 被切分到不同 GPU 上的巨大模型参数。比如一个 100亿参数的矩阵，被切成了 8 份，每张卡只拿 1 份。</li>
+<li><strong>文件中的体现：</strong> <code>ShardedObject</code> 类。</li>
+<li><strong>策略：</strong> 每张卡负责存自己手里的那一小块数据，存成独立的文件。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>任务 2：分析“保存策略” (TorchCommonSaveStrategy)</h3>
+<p>现在看代码中的 <code>TorchCommonSaveStrategy</code> 类。它的任务是：<strong>把内存里的模型存到硬盘上</strong>。</p>
+<ul>
+<li>
+<p><strong>Step 2.1: 看 <code>save_common</code> 方法</strong></p>
+<ul>
+<li><strong>逻辑：</strong><ol>
+<li>检查 <code>if torch.distributed.get_rank() == 0:</code>。这印证了任务 1 的观点，只有主进程（Rank 0）干活。</li>
+<li>拼接路径：<code>checkpoint_dir/common.pt</code>。</li>
+<li>调用 <code>torch.save</code> 把 <code>common_state_dict</code> 存进去。</li>
+</ol>
+</li>
+<li><em>忽略 <code>MultiStorageClientFeature</code> (MSC)，那个只是为了兼容云存储（比如存到 S3），逻辑和本地存储是一样的。</em></li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.2: 看 <code>save_sharded_objects</code> 方法</strong></p>
+<ul>
+<li><strong>逻辑：</strong><ol>
+<li>遍历字典里所有的对象 (<code>nested_values</code>)。</li>
+<li><code>if is_main_replica(...)</code>: 检查当前 GPU 是否持有这个分片的主副本（防止多卡存重复了）。</li>
+<li><strong>核心动作：</strong> 为每个分片生成一个唯一文件名 (<code>unique_key.pt</code>)，然后调用 <code>torch.save(sh_obj.data, ...)</code>。</li>
+</ol>
+</li>
+<li><strong>结果：</strong> 你的 checkpoint 文件夹里会多出一堆小文件，比如 <code>layer_1_weight.pt</code>, <code>layer_2_weight.pt</code> 等等。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>任务 3：分析“加载策略” (TorchCommonLoadStrategy)</h3>
+<p>现在看 <code>TorchCommonLoadStrategy</code> 类。它的任务是：<strong>把硬盘上的文件读回内存</strong>。</p>
+<ul>
+<li>
+<p><strong>Step 3.1: 看 <code>load_common</code> 方法</strong></p>
+<ul>
+<li><strong>逻辑：</strong> 很简单，就是去读 <code>common.pt</code> 文件。</li>
+<li><strong>异常处理：</strong> 如果文件找不到 (<code>FileNotFoundError</code>)，它会把当前目录下的文件列表打印出来报错，方便你 Debug。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2: 看 <code>load_sharded_objects</code> 方法</strong></p>
+<ul>
+<li><strong>逻辑：</strong> 这是一个替换的过程。<ol>
+<li>输入是一个 <code>sharded_objects_state_dict</code>，里面全是<strong>占位符</strong>（告诉程序这里缺一块数据）。</li>
+<li>定义了一个内部函数 <code>load_sharded_object</code>：<ul>
+<li>根据占位符的 <code>unique_key</code> 找到硬盘上对应的 <code>.pt</code> 文件。</li>
+<li>调用 <code>torch.load</code> 读取数据。</li>
+<li><strong>兼容性处理：</strong> 代码里有一大段 <code>try...except</code>，是因为以前旧版本的保存路径格式不一样（<code>old_load_path</code>），这里做了向后兼容，如果新文件名找不到，就试着找旧文件名。</li>
+</ul>
+</li>
+<li>最后返回填好数据的字典。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>任务 4：理解“元数据扫描” (load_sharded_metadata)</h3>
+<p>看 <code>load_sharded_metadata</code> 方法。</p>
+<ul>
+<li><strong>场景：</strong> 假设你只拿到了一个 Checkpoint 文件夹，但你不知道这个模型长啥样（有多少层，切分成了几块），你需要先“扫描”一下文件夹。</li>
+<li><strong>逻辑：</strong><ol>
+<li>遍历文件夹 (<code>iterdir</code>)。</li>
+<li>寻找 <code>shard_*.pt</code> 格式的文件。</li>
+<li>根据文件名反推这就代表一个 <code>ShardedObject</code>。</li>
+<li><strong>构建索引：</strong> 返回一个字典，告诉系统“在这个文件夹里，我发现了哪些分片数据”。</li>
+<li><em>注：中间有一段关于 <code>global_shape[-1] &lt; 0</code> 的代码是修补旧版本 bug 的，可以先跳过。</em></li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>任务 5：理解“注册” (Registration)</h3>
+<p>最后看文件开头的 <code>register_default_common_strategies</code> 函数。</p>
+<ul>
+<li><strong>逻辑：</strong> 这就像是把上面写好的两个类（Save 和 Load）去“民政局”登记一下。</li>
+<li><strong>含义：</strong> 告诉 Megatron 系统：<ul>
+<li>如果用户配置里指定了 backend 是 <code>'torch'</code>，</li>
+<li>并且要执行 <code>LOAD_COMMON</code> 动作，请使用 <code>TorchCommonLoadStrategy</code>。</li>
+<li>如果要执行 <code>SAVE_COMMON</code> 动作，请使用 <code>TorchCommonSaveStrategy</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结回顾</h3>
+<p>把这个文件看作一个<strong>“搬运工”</strong>：</p>
+<ol>
+<li><strong>保存时：</strong> 它是搬运工，把内存里的数据搬到硬盘上。Rank 0 搬运全局配置 (<code>common.pt</code>)，其他 Rank 搬运各自负责的碎片数据 (<code>*.pt</code>)。</li>
+<li><strong>加载时：</strong> 它是组装工，看着图纸（StateDict），去硬盘上把一个个零件 (<code>*.pt</code>) 找回来填进模型里。</li>
+<li><strong>工具：</strong> 它使用的工具是最普通的 <code>torch.save</code> 和 <code>torch.load</code>。</li>
+</ol>
+<h3>你的下一步行动</h3>
+<p>建议你按照以下顺序再读一遍代码：
+1.  先看 <code>TorchCommonSaveStrategy</code> 的 <code>save_common</code> (最简单)。
+2.  再看 <code>TorchCommonSaveStrategy</code> 的 <code>save_sharded_objects</code> (理解它是怎么存碎片的)。
+3.  最后看 <code>TorchCommonLoadStrategy</code> 的 <code>load_sharded_objects</code> (理解它是怎么把碎片读回来的)。</p>
+<p>这样你应该就能看懂了！</p>

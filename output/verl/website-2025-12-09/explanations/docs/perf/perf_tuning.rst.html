@@ -1,0 +1,102 @@
+<h1>docs/perf/perf_tuning.rst</h1>
+<p>这份文档确实涉及了很多底层系统优化和深度学习框架（如 PyTorch FSDP, vLLM）的术语，看起来比较吃力是很正常的。</p>
+<p>简单来说，这份文档的目标只有两个：<strong>1. 让训练跑得更快（提高吞吐量）；2. 让显存更省（避免 OOM - Out Of Memory）。</strong></p>
+<p>为了帮你理解，我把它拆解成一个 <strong>“性能调优 To-Do List”</strong>，按照从<strong>最容易上手</strong>到<strong>进阶微调</strong>的顺序排列。你可以把它想象成在给赛车（你的模型训练任务）做改装。</p>
+<hr />
+<h3>🛠️ 性能调优 To-Do List</h3>
+<h4>第一阶段：优化“生成”环节 (Rollout)</h4>
+<p>在 RLHF（如 PPO）训练中，模型需要先“生成”答案，这一步很慢。我们主要用 vLLM 来加速。</p>
+<ul>
+<li>[ ] <strong>调整显存占用比例 (<code>gpu_memory_utilization</code>)</strong><ul>
+<li><strong>讲人话</strong>：vLLM 是个吃显存的大户。你需要限制它吃多少，给后续的训练留点剩饭。</li>
+<li><strong>怎么做</strong>：通常设置在 <code>0.5</code> 到 <code>0.7</code> 之间。太高会导致训练时显存不足报错（OOM），太低则生成速度变慢。</li>
+</ul>
+</li>
+<li>[ ] <strong>增加并发量 (<code>max_num_batched_tokens</code> / <code>max_num_seqs</code>)</strong><ul>
+<li><strong>讲人话</strong>：让 GPU 一口气处理更多的数据，别让它闲着。</li>
+<li><strong>怎么做</strong>：如果日志显示 GPU 没跑满，就把这个数调大（建议 <code>&gt; 2048</code>）。</li>
+</ul>
+</li>
+<li>[ ] <strong>减少模型切分 (<code>tensor_parallel_size</code>)</strong><ul>
+<li><strong>讲人话</strong>：如果显存够，尽量少把模型切碎放在不同卡上，因为卡之间通信很慢。</li>
+<li><strong>怎么做</strong>：能用单卡跑就别用多卡切分（TP），多开几个独立的进程（DP）通常比切分模型跑得快。</li>
+</ul>
+</li>
+</ul>
+<h4>第二阶段：优化数据处理</h4>
+<ul>
+<li>[ ] <strong>开启“去填充” (<code>use_remove_padding=True</code>)</strong><ul>
+<li><strong>讲人话</strong>：以前把长短不一的句子拼成一个 Batch 时，短句子后面要补很多 0（padding）。计算这些 0 是浪费时间。</li>
+<li><strong>怎么做</strong>：对于 Llama, Mistral, Qwen 等主流模型，开启这个选项，把数据像“俄罗斯方块”一样紧密打包，不留空隙。</li>
+</ul>
+</li>
+</ul>
+<h4>第三阶段：核心训练速度优化 (Batch Size)</h4>
+<p>这是提升速度最关键的一步。Verl 提供了两种方式，<strong>推荐用第 2 种（动态）</strong>。</p>
+<ul>
+<li>[ ] <strong>方式 A：传统微批次调优 (如果不使用动态 Batch)</strong><ul>
+<li><strong>讲人话</strong>：手动指定每张卡每次处理几条数据。</li>
+<li><strong>怎么做</strong>：调整 <code>micro_batch_size_per_gpu</code>。<ul>
+<li>开启 <code>gradient_checkpointing</code>（用计算换显存）来允许更大的 Batch Size。</li>
+<li><strong>Critic 模型</strong>（打分模型）和 <strong>Reward 模型</strong> 通常比 Actor 模型（生成模型）能吃更大的 Batch Size，可以设得更大。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>[ ] <strong>方式 B (推荐)：动态 Batch Size (<code>use_dynamic_bsz=True</code>)</strong><ul>
+<li><strong>讲人话</strong>：不要按“几条数据”来算，而是按“总共有多少个字（token）”来算。这样能更充分利用显存，避免忽长忽短的数据导致显存波动。</li>
+<li><strong>怎么做</strong>：<ul>
+<li>开启 <code>use_dynamic_bsz=True</code>。</li>
+<li><strong>核心动作</strong>：把 <code>*max_token_len_per_gpu</code> 这个参数尽量调大，直到显存快爆为止。</li>
+<li>通常 Critic/Reward 模型的这个参数可以设为 Actor 模型的 2-4 倍。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>第四阶段：特殊场景与进阶优化</h4>
+<p>如果你有特殊需求（比如超长文本）或想压榨最后一点性能：</p>
+<ul>
+<li>[ ] <strong>超长文本训练 (<code>Ulysses Sequence Parallel</code>)</strong><ul>
+<li><strong>场景</strong>：你要训练 32k 以上的超长上下文。</li>
+<li><strong>怎么做</strong>：开启 Ulysses 序列并行 (<code>size &gt; 1</code>)，把一句话切分到多张卡上处理。</li>
+</ul>
+</li>
+<li>[ ] <strong>SFT 专项加速 (<code>LigerKernel</code>)</strong><ul>
+<li><strong>场景</strong>：做 SFT（有监督微调）任务。</li>
+<li><strong>怎么做</strong>：安装 <code>liger-kernel</code> 并在配置里开启 <code>use_liger: True</code>。这是一个专门优化的底层计算核。</li>
+</ul>
+</li>
+<li>[ ] <strong>FSDP 通信优化 (<code>Forward prefetch</code>)</strong><ul>
+<li><strong>场景</strong>：使用 FSDP 分布式训练。</li>
+<li><strong>怎么做</strong>：开启 <code>fsdp_config.forward_prefetch=True</code>。这会让 GPU 在算当前层时，提前去拉取下一层的数据，掩盖通信时间。</li>
+</ul>
+</li>
+<li>[ ] <strong>升级到 FSDP2 (<code>strategy="fsdp2"</code>)</strong><ul>
+<li><strong>场景</strong>：使用 PyTorch 2.1+。</li>
+<li><strong>怎么做</strong>：FSDP2 是新一代标准，更省显存、更快。如果环境支持，直接切换。</li>
+</ul>
+</li>
+</ul>
+<h4>第五阶段：最后的内存“抠门”技巧</h4>
+<ul>
+<li>[ ] <strong>Logits 内存优化</strong><ul>
+<li><strong>问题</strong>：计算熵（Entropy）时，全词表（Vocab Size）非常大，极占显存。</li>
+<li><strong>怎么做</strong>：<ul>
+<li>开启 <code>entropy_from_logits_with_chunking=True</code>：切成小块计算，不要一口气全算。</li>
+<li>开启 <code>entropy_checkpointing=True</code>：训练时重计算这部分，用时间换空间。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：我该怎么操作？</h3>
+<p>如果你不想看那么多细节，直接按这个<strong>“懒人包”</strong>顺序操作：</p>
+<ol>
+<li><strong>先开动态 Batch</strong>：在配置里设 <code>use_dynamic_bsz=True</code>。</li>
+<li><strong>再开去填充</strong>：设 <code>use_remove_padding=True</code>。</li>
+<li><strong>压榨显存</strong>：慢慢调大 <code>ppo_max_token_len_per_gpu</code>，直到报 OOM 错误，然后稍微回调一点。这是提升吞吐量最直接的手段。</li>
+<li><strong>调整 vLLM</strong>：确保 <code>gpu_memory_utilization</code> 设置在 0.6 左右，给训练留空间。</li>
+<li><strong>进阶</strong>：如果还慢，再考虑 FSDP 预取、Liger Kernel 等高级选项。</li>
+</ol>

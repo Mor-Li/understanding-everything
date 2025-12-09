@@ -1,0 +1,85 @@
+<h1>tools/checkpoint/saver_hf_llava.py</h1>
+<p>这份代码的核心功能非常明确：<strong>它是一个“搬运工”兼“翻译官”。</strong></p>
+<p>它的任务是将 <strong>Megatron-LM 格式</strong>（一种用于大规模分布式训练的深度学习框架格式）的模型权重，<strong>接收、转换并保存</strong>为 <strong>HuggingFace Transformers 格式</strong>（社区通用的标准格式），专门针对 <strong>LLaVA</strong>（一种多模态大模型）。</p>
+<p>想象你有一堆散乱的乐高积木（Megatron 权重），你需要把它们按照说明书拼好，并装进一个标准的盒子里（HuggingFace 权重文件），以便别人能直接拿去玩。</p>
+<p>下面是一个按执行顺序排列的 <strong>Task Todo List</strong>，帮你一步步拆解代码逻辑：</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>环境准备 (Setup)</strong>: 设置路径，确保能引用到必要的代码库。</li>
+<li><strong>建立通信 (Connect)</strong>: 建立一个“传送带”（Queue），准备从加载器那里接收模型数据。</li>
+<li><strong>获取说明书 (Get Metadata)</strong>: 接收模型的配置信息（比如有多少层、隐藏层多大），以便知道怎么处理数据。</li>
+<li><strong>搬运视觉模型 (Process Vision Encoder)</strong>: 接收处理图片的模型部分（ViT），转换变量名和数据形状。</li>
+<li><strong>搬运连接层 (Process Projector)</strong>: 接收连接视觉和语言的“桥梁”层（MLP Projection）。</li>
+<li><strong>搬运语言模型 (Process LLM)</strong>: 接收处理文字的模型部分（LLaMA等），这是最麻烦的一步，需要拆分 QKV 矩阵。</li>
+<li><strong>打包存档 (Save)</strong>: 将所有整理好的权重切分（Shard），并保存为 HuggingFace 标准文件。</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码详解</h3>
+<p>下面我按照上面的 List，对应代码中的函数给你讲解：</p>
+<h4>Step 1: 环境准备 &amp; 建立通信</h4>
+<ul>
+<li><strong>对应代码</strong>: <code>HFCheckpointSaverLLaVA</code> 类初始化, <code>insert_megatron_path</code>, <code>queue_get</code></li>
+<li><strong>讲人话</strong>:<ul>
+<li>脚本启动后，它通过 <code>queue</code>（队列）等待上游程序给它发数据。</li>
+<li><code>insert_megatron_path</code> 是为了防止 Python 找不到 Megatron 的依赖包，临时把路径加进去。</li>
+<li><code>queue_get</code> 就是站在传送带口等着拿东西，如果没有拿到想要的东西（名字不对），它会报错。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 2: 获取说明书</h4>
+<ul>
+<li><strong>对应代码</strong>: <code>save()</code> 函数中的 <code>self.md = self.queue_get()</code></li>
+<li><strong>讲人话</strong>:<ul>
+<li>在开始搬砖前，先拿一张“清单” (<code>self.md</code>)。这张清单告诉脚本：这个模型用了什么视觉塔（SigLIP 还是 InternViT？）、有多少层 Transformer、头数是多少等。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 3: 搬运视觉模型 (Vision Backbone)</h4>
+<ul>
+<li><strong>对应代码</strong>: <code>receive_vision_backbone()</code></li>
+<li><strong>讲人话</strong>:<ul>
+<li><strong>拿 Embedding</strong>: 先拿处理图片输入的底层参数。</li>
+<li><strong>处理不同型号</strong>: 代码里有很多 <code>if self.md.vision_model_type == ...</code>，这是因为不同的视觉模型（Radio, InternViT, SigLIP）参数名字不一样。这里在做“改名”工作，把 Megatron 的名字改成 HuggingFace 的名字。</li>
+<li><strong>循环搬运层</strong>: <code>for i in range(self.md.vision_num_layers)</code>，一层一层地把 Transformer 的权重拿过来，改名，存进字典。</li>
+<li><strong>特殊处理</strong>: 注意 <code>recover_qkv</code> 或 <code>order</code> 相关的代码。有些模型把 Q、K、V 三个矩阵拼在一起存，这里需要把它们切开或者重新排序。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 4: 搬运连接层 (Projection)</h4>
+<ul>
+<li><strong>对应代码</strong>: <code>receive_vision_projection()</code></li>
+<li><strong>讲人话</strong>:<ul>
+<li>LLaVA 模型有一个关键组件叫做 Projector（通常是两层 MLP），它的作用是把图片特征“翻译”成语言模型能懂的向量。这一步就是专门搬运这几层参数。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 5: 搬运语言模型 (Language Model)</h4>
+<ul>
+<li><strong>对应代码</strong>: <code>receive_lm()</code>, <code>recover_lm_qkv_weight()</code>, <code>recover_lm_qkv_bias()</code></li>
+<li><strong>讲人话</strong>:<ul>
+<li>这是大头。逻辑和搬运视觉模型类似：拿 Embedding -&gt; 循环拿层 -&gt; 拿输出层。</li>
+<li><strong>难点 (recover_lm_qkv_weight)</strong>:<ul>
+<li>Megatron 为了训练快，把 Query(Q), Key(K), Value(V) 的权重拼成了一整块大张量，而且因为是分布式训练（Tensor Parallel），这些张量是被切碎过的。</li>
+<li>HuggingFace 要求 Q, K, V 是独立的三个矩阵。</li>
+<li>所以 <code>recover_lm_qkv_weight</code> 做了一件很复杂的<strong>数学拼图游戏</strong>：把切碎且混合的张量还原，切分出 Q、K、V，再拼回完整的形状。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Step 6: 打包存档 (Save)</h4>
+<ul>
+<li><strong>对应代码</strong>: <code>save_state_dict_to_hf_checkpoint()</code></li>
+<li><strong>讲人话</strong>:<ul>
+<li>现在 <code>self.state_dict</code> 里已经存好了完整的、改好名字的模型参数。</li>
+<li><strong>切分 (Sharding)</strong>: 如果模型太大（比如几十 GB），HuggingFace 建议切分成几个小文件（比如每个 4GB）。<code>shard_checkpoint</code> 就是做这个的。</li>
+<li><strong>落盘</strong>: 最后调用 <code>torch.save</code> 把文件写真正的硬盘上，并生成一个 <code>index.json</code> 索引文件，告诉加载者哪个参数在哪个文件里。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>格式转换器</strong>。它不需要进行训练，也不涉及复杂的算法，主要工作全是<strong>数据清洗</strong>：
+1.  <strong>重命名</strong> (Key Mapping)
+2.  <strong>重塑形状</strong> (Reshaping/Splitting tensors)
+3.  <strong>保存文件</strong> (Saving to disk)</p>

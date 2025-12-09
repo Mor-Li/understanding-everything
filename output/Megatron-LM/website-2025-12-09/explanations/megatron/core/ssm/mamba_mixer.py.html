@@ -1,0 +1,139 @@
+<h1>megatron/core/ssm/mamba_mixer.py</h1>
+<p>这份代码确实比较复杂，因为它不仅仅是 Mamba 模型的实现，更是 <strong>Megatron-LM</strong>（NVIDIA 的超大规模分布式训练框架）中的 Mamba 实现。这意味着它混合了 <strong>模型算法逻辑</strong> 和 <strong>分布式并行工程逻辑</strong>。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“构建 MambaMixer 的任务清单 (To-Do List)”</strong>。我们可以假设你是一个工程师，正在一步步搭建这个模块。</p>
+<hr />
+<h3>任务清单 1：理解核心概念 (What is this?)</h3>
+<p>在看代码前，先明确我们在造什么：
+*   <strong>目标</strong>：构建 Mamba 架构的核心层 <code>MambaMixer</code>。
+*   <strong>作用</strong>：它在模型中的地位等同于 Transformer 中的 <strong>Self-Attention</strong> 层。它的作用是混合序列中的信息。
+*   <strong>特点</strong>：不像 Attention 那样需要 $O(N^2)$ 的计算量，Mamba 是线性的 $O(N)$，推理时可以像 RNN 一样一步步生成。</p>
+<hr />
+<h3>任务清单 2：准备零部件 (<code>__init__</code> 函数)</h3>
+<p>我们要初始化这个层，需要准备哪些“零件”？看 <code>__init__</code> 方法：</p>
+<ol>
+<li>
+<p><strong>输入投影 (<code>self.in_proj</code>)</strong>:</p>
+<ul>
+<li><strong>任务</strong>：把输入的向量（维度 <code>d_model</code>）放大。</li>
+<li><strong>细节</strong>：Mamba 需要把维度放大 <code>expand</code> 倍（通常是2倍）。投影后的结果包含了 <code>z, x, B, C, dt</code> 这五个信号。</li>
+<li><strong>并行</strong>：代码里用了 <code>build_module</code>，这是为了支持 Megatron 的 Tensor Parallel (TP)，即把这层的大矩阵切分到多张显卡上。</li>
+</ul>
+</li>
+<li>
+<p><strong>局部卷积 (<code>self.conv1d</code>)</strong>:</p>
+<ul>
+<li><strong>任务</strong>：在进行复杂的 SSM 状态传递前，先看一眼“邻居”的信息。</li>
+<li><strong>细节</strong>：这是一个 1D 卷积，核大小 <code>d_conv</code> 通常是 4。它负责捕捉极短距离的局部依赖。</li>
+</ul>
+</li>
+<li>
+<p><strong>SSM 核心参数</strong>:</p>
+<ul>
+<li><strong>任务</strong>：初始化状态空间模型的参数，这是 Mamba 的灵魂。</li>
+<li><strong>零件</strong>：<ul>
+<li><code>dt_bias</code>: 时间步长参数，控制信息传递的快慢。</li>
+<li><code>A_log</code>: 状态转移矩阵 A（存的是 log 值），控制由于遗忘多少历史信息。</li>
+<li><code>D</code>: 跳跃连接参数。</li>
+</ul>
+</li>
+<li><strong>并行</strong>：注意代码里的 <code>setattr(..., "tensor_model_parallel", True)</code>，这说明这些参数也是被切分存储的。</li>
+</ul>
+</li>
+<li>
+<p><strong>输出投影 (<code>self.out_proj</code>)</strong>:</p>
+<ul>
+<li><strong>任务</strong>：把计算完的结果投影回原本的 <code>d_model</code> 维度，以便传给下一层。</li>
+</ul>
+</li>
+<li>
+<p><strong>并行控制器 (<code>self.cp</code>)</strong>:</p>
+<ul>
+<li><strong>任务</strong>：处理 <strong>Context Parallel (CP)</strong>。这是 Megatron 特有的，用于处理超长序列，把长序列切段分给不同 GPU 处理。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>任务清单 3：设计流水线 (<code>forward</code> 函数)</h3>
+<p>现在零件有了，我们要定义数据怎么流过这些零件。看 <code>forward</code> 方法：</p>
+<ol>
+<li>
+<p><strong>判断模式</strong>:</p>
+<ul>
+<li>是 <strong>训练 (Training)</strong> 还是 <strong>推理 (Inference)</strong>？</li>
+<li>如果是推理（<code>in_inference_mode</code>），走快速通道（缓存状态，一步步生成）。</li>
+<li>如果是训练，走并行通道（一次性并行算出所有结果）。</li>
+</ul>
+</li>
+<li>
+<p><strong>第一步：全连接投影</strong>:</p>
+<ul>
+<li>代码：<code>zxBCdt, _ = self.in_proj(hidden_states)</code></li>
+<li>解释：输入进来了，先变大，生成混合信号 <code>zxBCdt</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>第二步：核心计算 (SSM)</strong>:</p>
+<ul>
+<li>代码调用了 <code>self.ssm_training</code> 或 <code>self.ssm_prefill</code> / <code>self.ssm_decode</code>。</li>
+<li>这是最难的部分，它包含：卷积 -&gt; 激活 -&gt; 状态空间扫描 (Selective Scan)。</li>
+</ul>
+</li>
+<li>
+<p><strong>第三步：输出投影</strong>:</p>
+<ul>
+<li>代码：<code>out, out_bias = self.out_proj(y)</code></li>
+<li>解释：把处理好的 <code>y</code> 变回原来的形状输出。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>任务清单 4：实现核心算法 (SSM 的三种形态)</h3>
+<p>这是文件中最“硬核”的数学部分，作者为了性能写了三个版本：</p>
+<h4>A. 训练模式 (<code>ssm_training</code>)</h4>
+<ul>
+<li><strong>场景</strong>：训练时，我们拥有整个句子的所有 Token。</li>
+<li><strong>做法</strong>：<ol>
+<li>把 <code>zxBCdt</code> 拆解开。</li>
+<li>调用 <code>mamba_split_conv1d_scan_combined</code>。这是一个融合的 CUDA Kernel（通常由 Triton 编写）。</li>
+<li>它同时做了：卷积、计算 <code>dt</code>、计算 <code>A</code> 的离散化、以及最关键的 <strong>Selective Scan</strong>（选择性扫描，类似前缀和算法）。</li>
+<li><strong>目的</strong>：利用 GPU 并行能力，一次算完整个序列。</li>
+</ol>
+</li>
+</ul>
+<h4>B. 推理-预填充 (<code>ssm_prefill</code>)</h4>
+<ul>
+<li><strong>场景</strong>：用户刚发来一段 Prompt（例如 "你好"），模型需要先读懂这俩字。</li>
+<li><strong>做法</strong>：类似于训练模式，并行处理已有的 Prompt，但需要把最后时刻产生的“记忆状态” (<code>conv_state</code>, <code>ssm_state</code>) 存下来，留给生成下一个字用。</li>
+</ul>
+<h4>C. 推理-解码 (<code>ssm_decode</code>)</h4>
+<ul>
+<li><strong>场景</strong>：模型开始一个字一个字往外蹦（例如生成 "我" -&gt; "是" -&gt; "AI"）。</li>
+<li><strong>做法</strong>：<ol>
+<li>输入只有一个 Token。</li>
+<li>读取缓存的状态 (<code>conv_state</code>, <code>ssm_state</code>)。</li>
+<li>更新状态：<code>new_state = A * old_state + B * input</code>。</li>
+<li>输出结果。</li>
+<li><strong>目的</strong>：极低延迟，不需要看以前所有的输入，只看状态。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>任务清单 5：搞定分布式并行 (Distributed Checkpointing)</h3>
+<p>文件最后有一大段代码 <code>sharded_state_dict</code> 和 <code>_split_tensor_factory</code>。</p>
+<ul>
+<li><strong>痛点</strong>：如果你用了 8 张显卡训练，模型参数被切成了 8 份碎块。当你保存模型（Checkpoint）时，你不想存 8 个碎文件，或者你想下次用 4 张卡加载。</li>
+<li><strong>解决</strong>：<ul>
+<li>这个函数负责告诉保存程序：“我是 <code>conv1d.weight</code>，但我现在的显存里只存了切分后的第 i 部分，请在保存时把大家拼起来，或者记录好偏移量。”</li>
+<li>特别是 <code>in_proj</code>，它把 <code>z, x, B, C, dt</code> 拼在一起了，保存时需要把它们逻辑上拆开再存，方便以后读取。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇文章讲了啥？</h3>
+<p>如果用一句话概括：
+<strong>这是一个为了在成千上万张显卡上高效运行而经过深度工程优化的 Mamba 层实现。</strong></p>
+<p>它不仅实现了 Mamba 的数学公式（SSM），还处理了：
+1.  <strong>显存优化</strong>：用 Triton Kernel 融合算子。
+2.  <strong>模型并行</strong>：把大矩阵切分给不同 GPU (Tensor Parallel)。
+3.  <strong>序列并行</strong>：把长文本切分给不同 GPU (Context Parallel)。
+4.  <strong>推理加速</strong>：区分 Prefill 和 Decode 阶段，支持 KV Cache（这里叫 State Cache）。</p>

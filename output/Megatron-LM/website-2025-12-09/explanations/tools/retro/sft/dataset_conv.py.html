@@ -1,0 +1,108 @@
+<h1>tools/retro/sft/dataset_conv.py</h1>
+<p>这份代码确实看起来比较复杂，因为它涉及到大模型训练中非常具体的一个环节：<strong>数据预处理与加载</strong>。</p>
+<p>简单来说，这个文件的作用是：<strong>把原始的问答（QA）文本数据，转换成模型能看懂的数字格式，喂给模型进行“有监督微调”（SFT）。</strong> 这里的模型特指 <strong>Megatron</strong> 框架下的模型，以及一种增强型模型 <strong>RETRO</strong>。</p>
+<p>为了让你更容易理解，我把你当作这个程序，列一份你的 <strong>“工作清单 (Task Todo List)”</strong>。每完成一项，就是代码中的一部分逻辑。</p>
+<hr />
+<h3>📋 你的工作清单 (Task Todo List)</h3>
+<p>想象你是一个数据加工流水线，你的任务是把一堆乱七八糟的 JSON 文件变成整齐的训练数据。你的工作步骤如下：</p>
+<ol>
+<li><strong>[配置设定]</strong>：先读说明书，看看今天要处理什么样的数据（是普通问答？还是多选？要不要参考资料？）。</li>
+<li><strong>[读取原料]</strong>：从硬盘上把 JSON 文件读进来，提取出“问题”、“答案”和“参考资料（Context/Neighbors）”。</li>
+<li><strong>[格式化对话]</strong>：把提取出的内容包装成“对话”的样子（比如加上“User: ... Assistant: ...”）。</li>
+<li><strong>[数字化 (Tokenization)]</strong>：把文字翻译成模型能懂的数字编号（Token IDs）。</li>
+<li><strong>[统一长度 (Padding)]</strong>：把长短不一的句子补齐到统一长度，并标记出哪部分是答案。</li>
+<li><strong>[特殊打包 (Retro)]</strong>：如果是 RETRO 模型，还要额外打包检索到的“邻居”信息。</li>
+</ol>
+<hr />
+<h3>🧐 逐步深度解析 (Step-by-Step)</h3>
+<p>现在我们按照上面的清单，一步步对应代码里的内容来讲。</p>
+<h4>第一步：配置设定 (Config)</h4>
+<p><strong>代码对应：</strong> <code>JsonQADatasetConfig</code> 和 <code>RetroJsonQADatasetConfig</code> 类。</p>
+<ul>
+<li><strong>讲了啥：</strong> 这部分定义了开关。<ul>
+<li><code>ft_neighbours</code>: 微调时要用到几条参考资料？</li>
+<li><code>bert_retriever_neighbours</code>: 参考资料是不是用 BERT 找出来的？</li>
+<li><code>retro_num_neighbors</code>: 如果是 RETRO 模型，需要几个邻居块？</li>
+</ul>
+</li>
+<li><strong>观点：</strong> 程序运行前必须先明确规则。比如，如果 <code>longform_answer=True</code>，说明我们要训练模型回答长篇大论，而不是简单的“是/否”。</li>
+</ul>
+<h4>第二步：读取原料 (Preprocessing)</h4>
+<p><strong>代码对应：</strong> <code>preprocess</code> 函数。</p>
+<ul>
+<li><strong>讲了啥：</strong> 这是一个大循环，负责“清洗数据”。<ul>
+<li>它打开文件，一行行读取 JSON。</li>
+<li>它把数据拆解成三块：<ol>
+<li><strong>Question (问题)</strong>：如果是多选题，它会把选项拼到问题后面（<code>format_multichoice_question</code>）。</li>
+<li><strong>Neighbours (参考资料)</strong>：模型不能瞎编，通常需要根据检索到的文档回答。这里把检索到的 <code>ctxs</code> (contexts) 提取出来，格式化成 <code>title: ... source: ...</code> 的形式。</li>
+<li><strong>Answer (答案)</strong>：找到标准答案。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li><strong>观点：</strong> 原始数据格式各异（有的答案是列表，有的是字典），这里必须把它们统一成 <code>(问题, 答案, 参考资料)</code> 的元组列表，方便后续处理。</li>
+</ul>
+<h4>第三步：格式化对话 (Prompt Engineering)</h4>
+<p><strong>代码对应：</strong> <code>reformat_prompt</code> 和 <code>reformat_prompt_retro</code> 函数。</p>
+<ul>
+<li><strong>讲了啥：</strong> 这是大模型训练中最关键的“提示词工程”。模型不是直接看问题的，它看到的是一段完整的对话脚本。</li>
+<li><strong>流程：</strong><ol>
+<li><strong>加系统提示 (System Prompt)</strong>：代码里写死了一段话：“System: This is a chat between a user and an AI...”（这是一个用户和AI的对话，AI很礼貌...）。</li>
+<li><strong>加背景知识 (Context)</strong>：如果 <code>ft_neighbours &gt; 0</code>，它会把刚才提取的参考资料拼在前面。</li>
+<li><strong>加用户提问 (User)</strong>：根据数据集的名字（比如 squad, nq, boolq），它会用不同的模板。<ul>
+<li>有的模板是：“User: Answer True or False. [Question]”</li>
+<li>有的模板是：“User: [Question]”</li>
+</ul>
+</li>
+<li><strong>加助手引导 (Assistant)</strong>：最后加上 “Assistant:”，提示模型该开口说话了。</li>
+</ol>
+</li>
+<li><strong>观点：</strong> 不同的任务（是非题、简答题、多选题）需要不同的“指令”来激发模型的能力。</li>
+</ul>
+<h4>第四步：数字化 (Tokenization)</h4>
+<p><strong>代码对应：</strong> <code>__getitem__</code> 方法中的 <code>tokenizer.tokenize</code>。</p>
+<ul>
+<li><strong>讲了啥：</strong> 计算机不认识中文或英文，只认识数字。<ul>
+<li><code>input_tokens</code>: 把上面拼接好的“系统+参考资料+问题”转成数字列表。</li>
+<li><code>output_tokens</code>: 把“标准答案”转成数字列表。</li>
+</ul>
+</li>
+<li><strong>观点：</strong> 输入（Prompt）和输出（Answer）在这一步被分开了，因为计算 Loss（误差）的时候，我们通常只关心模型生成的答案对不对，而不关心它复述问题对不对。</li>
+</ul>
+<h4>第五步：统一长度与掩码 (Padding &amp; Masking)</h4>
+<p><strong>代码对应：</strong> <code>pad_and_convert_to_numpy</code> 函数。</p>
+<ul>
+<li><strong>讲了啥：</strong><ul>
+<li><strong>截断</strong>：如果文章太长，超过了 <code>max_seq_length</code>（比如 2048），就切掉多余的。</li>
+<li><strong>拼接</strong>：把 <code>Input</code> 和 <code>Output</code> 拼成一条长龙。</li>
+<li><strong>Padding</strong>：如果拼完只有 1000 个字，剩下 1048 个位置填 <code>pad_id</code>（通常是0），保证所有数据长度一致，方便显卡并行计算。</li>
+<li><strong>Answer Mask (关键点)</strong>：生成一个全是 0 和 1 的列表。<ul>
+<li>问题部分填 0（不计入损失）。</li>
+<li>答案部分填 1（模型要在这里学习）。</li>
+<li>填充部分填 0。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>观点：</strong> 这是 SFT（有监督微调）的核心。我们只教模型“在看到这个问题后，该怎么输出这个答案”。</li>
+</ul>
+<h4>第六步：特殊打包 (Retro)</h4>
+<p><strong>代码对应：</strong> <code>RetroJsonQADataset</code> 类。</p>
+<ul>
+<li><strong>讲了啥：</strong> RETRO 是一种特殊的模型，它不仅看输入的文字，还会去一个巨大的数据库里检索相关的“块（Chunks）”。</li>
+<li><strong>逻辑：</strong><ul>
+<li>在这个代码里，你可以看到 <code>neighbor_tokens</code> 被初始化了。</li>
+<li><em>注意：</em> 代码里有一行注释 <code>disable retro encoder</code> 并且把 <code>neighbor_tokens</code> 设为了全 0。这说明在这个特定的脚本版本里，可能暂时禁用了复杂的检索编码，或者只是占个位。</li>
+</ul>
+</li>
+<li><strong>观点：</strong> 这是一个为特定架构（Retro）预留的接口，普通 GPT 模型不需要这一步。</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件其实就是一个<strong>高级的“翻译+排版”工具</strong>。</p>
+<ul>
+<li><strong>输入</strong>：一堆给人看的 JSON 问答题。</li>
+<li><strong>处理</strong>：加上“User/Assistant”的对话格式，加上背景资料，切分成固定长度。</li>
+<li><strong>输出</strong>：给机器看的 PyTorch/Numpy 数组（Token IDs 和 Mask）。</li>
+</ul>
+<p>你看不懂可能是因为被里面繁琐的正则表达式（regex）和针对不同数据集（squad, nq, drop...）的 <code>if-else</code> 判断给绕晕了。但只要抓住 <strong>“读数据 -&gt; 拼Prompt -&gt; 转数字 -&gt; 补齐长度”</strong> 这条主线，逻辑就很清晰了。</p>

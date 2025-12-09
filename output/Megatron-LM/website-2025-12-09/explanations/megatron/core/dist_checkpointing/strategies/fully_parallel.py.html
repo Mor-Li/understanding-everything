@@ -1,0 +1,98 @@
+<h1>megatron/core/dist_checkpointing/strategies/fully_parallel.py</h1>
+<p>这份代码确实比较抽象，因为它处理的是<strong>分布式训练中最底层的“存取档（Checkpointing）”逻辑</strong>。</p>
+<p>简单来说，这个文件的核心目的是：<strong>为了让保存和加载模型更快，不要让所有显卡（Rank）都去读写硬盘，而是分工合作。</strong></p>
+<p>我们可以把它想象成一个<strong>“搬家项目”</strong>。假设有8个人（8张显卡）要搬家（存/读模型），如果8个人都去挤同一个门口（硬盘I/O），效率很低。这个文件就是<strong>搬家队长</strong>，负责指挥谁搬哪个箱子。</p>
+<p>下面我列一个 <strong>Task List (任务清单)</strong>，带你一步步拆解这个文件的逻辑：</p>
+<hr />
+<h3>任务清单：优化分布式模型的存取速度</h3>
+<h4>Task 1: 理解背景 (Context)</h4>
+<ul>
+<li><strong>现状</strong>：在分布式训练（尤其是数据并行 Data Parallelism）中，很多显卡上的参数其实是一样的（副本）。</li>
+<li><strong>痛点</strong>：保存时，如果8张卡都把同样的参数写入硬盘，既浪费时间又浪费存储。加载时，如果8张卡都从硬盘读同一个文件，硬盘读写速度（I/O）会成为瓶颈。</li>
+<li><strong>目标</strong>：<ol>
+<li>保存时：重复的数据只存一份。</li>
+<li>加载时：大家分头读不同的部分，读完后通过网络（NVLink/InfiniBand）互相交换数据（因为网络通常比硬盘快）。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h4>Task 2: 搞定“保存”策略 (Saving Strategy)</h4>
+<p><strong>对应类：<code>FullyParallelSaveStrategyWrapper</code></strong></p>
+<p>这个类的任务是给原来的保存策略“套一层壳”，通过修改元数据来控制谁干活。</p>
+<ul>
+<li>
+<p><strong>Todo 2.1: 找出谁是“组长”</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>apply_saving_parallelization</code> 方法。</li>
+<li><strong>逻辑</strong>：查看 <code>sharded_state_dict</code>（切片状态字典）。如果有多个显卡持有相同的数据（比如模型参数在多张卡上有副本），算法会计算出一个分布方案。</li>
+<li><strong>操作</strong>：它会把负责保存的那张卡的 <code>replica_id</code> 设为 <code>0</code>（代表主副本，Main Replica），其他的设为 <code>1</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 2.2: 只让组长干活</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>distribute_main_replicas_with_precomputed_distribution</code> 函数。</li>
+<li><strong>逻辑</strong>：这是这个策略的核心trick。它不直接搬运数据，而是告诉底层的保存策略（<code>base_strategy</code>）：“嘿，只有标记为 0 的那个人需要写硬盘，其他人休息。”</li>
+<li><strong>结果</strong>：大幅减少了写硬盘的并发量。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>Task 3: 搞定“加载”策略 (Loading Strategy)</h4>
+<p><strong>对应类：<code>FullyParallelLoadStrategyWrapper</code></strong></p>
+<p>加载比保存复杂，因为不仅要分工读，读完还得把数据分给没读的人。</p>
+<ul>
+<li>
+<p><strong>Todo 3.1: 制定分工计划</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>load</code> 方法中的 <code>Step 1 &amp; 2</code>。</li>
+<li><strong>逻辑</strong>：大家先别动，先计算一下怎么分工最均匀。比如模型有 Layer 1 到 Layer 8。</li>
+<li><strong>计划</strong>：Rank 0 负责读 Layer 1-2，Rank 1 负责读 Layer 3-4……以此类推。这叫 <code>precomputed_distribution</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 3.2: 各自只读自己的部分 (Defer Loading)</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>_defer_loading_sharded_tensors</code> 和 <code>Step 3</code>。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>先挑出自己<strong>不负责</strong>读的部分，把它们扔进 <code>unloaded_shards</code>（未加载列表）。</li>
+<li>只把自己<strong>负责</strong>读的部分传给 <code>base_strategy.load</code> 去真正读硬盘。</li>
+</ol>
+</li>
+<li><strong>目的</strong>：最大化利用带宽，每个人只读一小块，速度极快。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 3.3: 互相交换数据 (Exchange)</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>Step 4</code> 中的 <code>exchange_by_distribution</code>。</li>
+<li><strong>逻辑</strong>：这是最关键的一步。<ul>
+<li>Rank 0 喊：“我有 Layer 1-2 的数据，谁要？” -&gt; 发送给需要的人。</li>
+<li>Rank 1 喊：“我有 Layer 3-4 的数据，谁要？” -&gt; 发送给需要的人。</li>
+</ul>
+</li>
+<li><strong>技术</strong>：使用 <code>all_gather</code> 或者 <code>broadcast</code> 等通信原语。虽然有网络开销，但通常比所有人都去挤硬盘要快得多。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 3.4: 拼图完成</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>fill_in_deferred_sharded_tensors</code>。</li>
+<li><strong>逻辑</strong>：把自己从硬盘读的，加上从别人那里通过网络收到的数据，拼成一个完整的模型状态字典。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：文中的核心观点</h3>
+<ol>
+<li><strong>I/O 是昂贵的，网络是廉价的</strong>：与其让所有 GPU 去轰炸文件系统，不如利用 GPU 之间超快的互联网络。</li>
+<li><strong>包装器模式 (Wrapper)</strong>：这个文件里的类不是自己去写文件，而是包装了现有的策略（比如 PyTorch 原生的保存策略），在调用底层策略之前，先用算法修改“谁该干活”的标记。</li>
+<li><strong>确定性算法</strong>：<code>determine_main_replica_uniform_distribution</code>（计算均匀分布）是确定性的，保证所有显卡算出来的分工计划是一致的，不会打架。</li>
+</ol>
+<h3>怎么读这个代码？（建议顺序）</h3>
+<ol>
+<li>先看 <strong><code>FullyParallelSaveStrategyWrapper.apply_saving_parallelization</code></strong>：看它怎么把任务分配给 <code>replica_id=0</code> 的人。</li>
+<li>再看 <strong><code>FullyParallelLoadStrategyWrapper.load</code></strong>：这是全文最长的方法。关注注释里的 <code>Step 1</code> 到 <code>Step 4</code>，这是标准的“分治（Divide and Conquer）”逻辑。</li>
+<li>最后看 <strong><code>distribute_main_replicas_with_precomputed_distribution</code></strong>：看它具体是怎么修改 <code>replica_id</code> 的。</li>
+</ol>
+<p>希望这个 List 能帮你把逻辑理顺！</p>

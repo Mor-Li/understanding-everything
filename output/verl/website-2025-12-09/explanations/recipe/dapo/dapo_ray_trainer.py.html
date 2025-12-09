@@ -1,0 +1,122 @@
+<h1>recipe/dapo/dapo_ray_trainer.py</h1>
+<p>这份代码文件 <code>dapo_ray_trainer.py</code> 是一个用于训练大模型（LLM）的“教练”程序。它的核心任务是使用 <strong>PPO（强化学习）</strong> 算法来优化模型，让模型生成的回答更能符合人类的喜好（即获得更高的奖励分数）。</p>
+<p>这个文件继承自标准的 PPO 训练器，但增加了一些特殊的<strong>数据筛选机制</strong>（DAPO 相关的逻辑）。</p>
+<p>为了让你看懂，我把这个 Trainer（训练器）想象成一个<strong>“高三班主任”</strong>，模型是<strong>“学生”</strong>。</p>
+<p>下面是这位“班主任”每天工作的 <strong>ToDo List（任务清单）</strong>，代码中的 <code>fit()</code> 函数就是按照这个流程在执行：</p>
+<hr />
+<h3>📋 班主任（Trainer）的每日任务清单 (ToDo List)</h3>
+<ol>
+<li>
+<p><strong>[课前准备] 检查进度与摸底</strong></p>
+<ul>
+<li>加载之前的存档（Checkpoint）。</li>
+<li>先做一次小测验（Validation），看看学生现在的水平怎么样。</li>
+</ul>
+</li>
+<li>
+<p><strong>[开始刷题] 让学生做作业 (Rollout / Generation)</strong></p>
+<ul>
+<li>给学生发一批题目（Prompts）。</li>
+<li>学生针对每道题生成几个不同的答案（Samples）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[批改作业] 老师打分 (Reward Computation)</strong></p>
+<ul>
+<li>用“评分标准”（Reward Model / Reward Function）给每个答案打分。</li>
+<li><em>注意纪律分（KL Penalty）：</em> 如果答案写得太离谱（偏离参考模型太远），要扣分。</li>
+</ul>
+</li>
+<li>
+<p><strong>[筛选题目] 挑出有价值的错题 (Filtering - 核心逻辑)</strong></p>
+<ul>
+<li><strong>这是 DAPO 的重点：</strong> 检查每道题的几个答案。</li>
+<li>如果对于同一道题，学生写的几个答案分数<strong>完全一样</strong>（方差为 0），说明这道题对学生来说没有区分度（要么都满分，要么都零分），这题<strong>无效</strong>，扔掉。</li>
+<li><strong>补题机制：</strong> 如果扔掉的题太多，导致作业量不够（Batch size 不足），就<strong>返回第 2 步</strong>，让学生继续做新题，直到凑够足够多“有区分度”的题目。</li>
+</ul>
+</li>
+<li>
+<p><strong>[总结分析] 归纳解题思路 (Advantage &amp; Value)</strong></p>
+<ul>
+<li>分析哪些步骤是得分的关键（计算 Advantage）。</li>
+<li>预估每道题大概能得多少分（计算 Value）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[提升自我] 更新大脑 (Update Actor &amp; Critic)</strong></p>
+<ul>
+<li><strong>更新 Critic（评论家模型）：</strong> 修正对题目难度的预估能力。</li>
+<li><strong>更新 Actor（学生模型）：</strong> 学习那些得分高的答案的写法，避免低分的写法。</li>
+</ul>
+</li>
+<li>
+<p><strong>[写日报] 记录数据 (Logging)</strong></p>
+<ul>
+<li>记录今天的平均分、做题速度、训练耗时等，存到日志里。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 对应代码的详细步骤讲解</h3>
+<p>现在我们对照着代码，一步步看他是怎么实现上面的 List 的：</p>
+<h4>1. 课前准备</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段：fit() 函数开头</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">_load_checkpoint</span><span class="p">()</span> <span class="c1"># 加载存档</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">val_reward_fn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="o">...</span><span class="p">:</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">_validate</span><span class="p">()</span>    <span class="c1"># 验证一下当前水平</span>
+</code></pre></div>
+
+<p>这部分很简单，就是训练开始前的准备工作。</p>
+<h4>2. 刷题 (Generation)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段：在 for 循环内部</span>
+<span class="n">gen_batch_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">async_rollout_manager</span><span class="o">.</span><span class="n">generate_sequences</span><span class="p">(</span><span class="n">gen_batch_output</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这里的 <code>generate_sequences</code> 就是让 Actor 模型（学生）根据题目生成文本。</p>
+<h4>3. 批改作业 (Reward)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段：with marked_timer(&quot;reward&quot;...):</span>
+<span class="n">reward_tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rm_wg</span><span class="o">.</span><span class="n">compute_rm_score</span><span class="p">(</span><span class="n">new_batch</span><span class="p">)</span> <span class="c1"># 奖励模型打分</span>
+<span class="n">reward_tensor</span><span class="p">,</span> <span class="o">...</span> <span class="o">=</span> <span class="n">compute_reward</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">reward_fn</span><span class="p">)</span> <span class="c1"># 规则打分</span>
+<span class="c1"># ...</span>
+<span class="n">new_batch</span><span class="p">,</span> <span class="n">kl_metrics</span> <span class="o">=</span> <span class="n">apply_kl_penalty</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 加上 KL 惩罚</span>
+</code></pre></div>
+
+<p>这里计算了每个 Token（字/词）的奖励。</p>
+<h4>4. 筛选题目 (Filtering - 这里的核心)</h4>
+<p>这是这个文件最独特的地方，请看 <code>if not self.config.algorithm.filter_groups.enable:</code> 之后的 <code>else</code> 部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 算出每个 Prompt 下所有回答的分数方差 (std)</span>
+<span class="n">prompt_uid2metric_std</span><span class="p">[</span><span class="n">prompt_uid</span><span class="p">]</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">std</span><span class="p">(</span><span class="n">metric_vals</span><span class="p">)</span>
+
+<span class="c1"># 2. 只保留方差大于 0 的题目（或者只有1个回答的题目）</span>
+<span class="n">kept_prompt_uids</span> <span class="o">=</span> <span class="p">[</span><span class="n">uid</span> <span class="k">for</span> <span class="n">uid</span><span class="p">,</span> <span class="n">std</span> <span class="ow">in</span> <span class="o">...</span> <span class="k">if</span> <span class="n">std</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="o">...</span><span class="p">]</span>
+
+<span class="c1"># 3. 如果保留下来的题目不够一个 Batch 的数量</span>
+<span class="k">if</span> <span class="n">num_prompt_in_batch</span> <span class="o">&lt;</span> <span class="n">prompt_bsz</span><span class="p">:</span>
+    <span class="c1"># 打印日志：不够，继续生成！</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">num_gen_batches</span><span class="si">=}</span><span class="s2">. Keep generating...&quot;</span><span class="p">)</span>
+    <span class="k">continue</span> <span class="c1"># 跳过后面的更新步骤，直接回到循环开头去生成更多数据</span>
+</code></pre></div>
+
+<p><strong>解读：</strong> 如果对于同一个问题，模型生成的回答好坏不一（方差大），说明模型正在犹豫，这时候告诉它哪个好哪个坏，学习效果最好。如果分数都一样，学不到东西，所以直接过滤掉，并且<strong>循环去生成</strong>，直到凑够一车（Batch）高质量数据。</p>
+<h4>5. 总结分析 (Advantage)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段：</span>
+<span class="n">values</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">critic_wg</span><span class="o">.</span><span class="n">compute_values</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span> <span class="c1"># Critic 估值</span>
+<span class="n">batch</span> <span class="o">=</span> <span class="n">compute_advantage</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 计算优势函数（GAE）</span>
+</code></pre></div>
+
+<p>这一步是为了告诉模型：在这个特定的上下文中，你做的这个动作比“平均水平”好了多少。</p>
+<h4>6. 更新大脑 (Update)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段：</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">critic_wg</span><span class="o">.</span><span class="n">update_critic</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span> <span class="c1"># 更新裁判（Critic）</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">actor_rollout_wg</span><span class="o">.</span><span class="n">update_actor</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span> <span class="c1"># 更新选手（Actor）</span>
+</code></pre></div>
+
+<p>这里就是真正的“反向传播”和参数更新，模型在这里变聪明。</p>
+<h4>7. 写日报 (Logging)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段：</span>
+<span class="n">logger</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">data</span><span class="o">=</span><span class="n">metrics</span><span class="p">,</span> <span class="n">step</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">global_steps</span><span class="p">)</span>
+</code></pre></div>
+
+<p>把训练曲线画出来，让你在网页上（比如 WandB）能看到。</p>
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>“挑食”的 PPO 训练器</strong>。它不仅仅是生成数据然后训练，它会<strong>检查生成数据的质量（通过分数的方差）</strong>。如果生成的数据大家分数都一样，它觉得没用，就会扔掉并重新生成，直到凑够一批有区分度的数据再进行模型更新。</p>

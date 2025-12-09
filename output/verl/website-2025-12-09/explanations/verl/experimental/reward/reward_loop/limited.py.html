@@ -1,0 +1,88 @@
+<h1>verl/experimental/reward/reward_loop/limited.py</h1>
+<p>这份代码的核心目的是解决<strong>“在使用外部 API（如 GPT-4）给模型生成的答案打分时，如何防止请求太快被封号或报错”</strong>的问题。</p>
+<p>简单来说，这就是一个<strong>高级的“限流器”（Rate Limiter）</strong>。</p>
+<p>为了让你更容易理解，我把你当作这个系统的<strong>管理员</strong>，列一个 <strong>Task List (任务清单)</strong>。我们通过完成这 5 个任务，来一步步拆解这份代码的逻辑。</p>
+<hr />
+<h3>任务 1：准备一个“令牌桶”工具 (理解 <code>AsyncTokenBucket</code> 类)</h3>
+<p><strong>背景：</strong> 很多 API 限制每分钟只能发 60 次请求。我们可以想象有一个桶，每秒钟往里滴 1 滴水（令牌）。你要发请求，就得从桶里舀一勺水。如果桶空了，你就得等水滴进来。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>class AsyncTokenBucket</code></li>
+<li><strong>你的 To-Do：</strong><ol>
+<li><strong>初始化 (<code>__init__</code>)：</strong> 设定水龙头的流速 (<code>rate_limit</code>) 和桶的大小 (<code>max_tokens</code>)。</li>
+<li><strong>取水 (<code>acquire</code>)：</strong><ul>
+<li>当有人要发请求时，计算一下距离上次取水过去了多久。</li>
+<li>根据时间，往桶里补充相应数量的“令牌”（水）。</li>
+<li>如果桶里的令牌够用，扣除令牌，放行。</li>
+<li>如果不够用，计算需要等多久 (<code>wait_time</code>)，然后让程序“睡”一会儿 (<code>await asyncio.sleep</code>)，醒来再取。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>任务 2：设定三种限流规则 (理解 <code>RateLimitedRewardLoopManager</code> 的初始化)</h3>
+<p><strong>背景：</strong> 仅仅限制请求次数是不够的。OpenAI 等 API 通常有三种限制：并发数（同时连多少个）、RPM（每分钟请求数）、TPM（每分钟 Token 数）。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>init_class</code> 方法</li>
+<li><strong>你的 To-Do：</strong><ol>
+<li><strong>读取配置：</strong> 从 <code>config</code> 里读出用户设定的限制。</li>
+<li><strong>设置并发锁 (<code>_semaphore</code>)：</strong> 就像银行只有 5 个柜台，同时只能服务 5 个人。代码里用 <code>asyncio.Semaphore</code> 来控制同时进行的请求数。</li>
+<li><strong>设置 RPM 桶 (<code>_rpm_limiter</code>)：</strong> 限制每分钟请求次数。比如每分钟 60 次，就创建一个每秒生成 1 个令牌的桶。</li>
+<li><strong>设置 TPM 桶 (<code>_tpm_limiter</code>)：</strong> 限制每分钟消耗的单词量 (Tokens)。比如每分钟 10万 token，每次请求预估消耗 2000 token。</li>
+<li><strong>全局共享：</strong> 注意代码里的 <code>cls._semaphore</code> 等变量，这意味着无论你开了多少个进程，大家共用这一套限流规则（防止多进程把 API 打挂）。</li>
+</ol>
+</li>
+</ul>
+<h3>任务 3：处理单个打分请求 (理解 <code>run_single</code> 方法)</h3>
+<p><strong>背景：</strong> 现在来了一个具体的任务：模型生成了一个答案，你需要把这个答案发给 GPT-4 打分。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>run_single</code> 方法</li>
+<li><strong>你的 To-Do（按顺序执行）：</strong><ol>
+<li><strong>准备数据：</strong> 把模型生成的数字 ID 转换成文字 (<code>tokenizer.decode</code>)。</li>
+<li><strong>过第一道关 (RPM)：</strong> 问 RPM 桶：“我现在能发一个请求吗？” -&gt; 调用 <code>_rpm_limiter.acquire(1.0)</code>。如果桶空了，就等。</li>
+<li><strong>过第二道关 (TPM)：</strong> 问 TPM 桶：“我大概要消耗 2000 个 token，预算够吗？” -&gt; 调用 <code>_tpm_limiter.acquire(2000)</code>。不够就等。</li>
+<li><strong>过第三道关 (并发)：</strong> 看柜台有没有空位？ -&gt; <code>async with self._semaphore</code>。没空位就排队。</li>
+<li><strong>执行打分：</strong> 终于通关了！调用 <code>_compute_reward</code> 发送网络请求给 API。<ul>
+<li><em>设置超时：</em> 如果 API 300秒没反应，就直接报错 (<code>asyncio.TimeoutError</code>)，防止卡死。</li>
+</ul>
+</li>
+<li><strong>处理结果：</strong> 拿到分数，打包返回。如果出错了（超时或断网），给 0 分，并记录错误信息。</li>
+</ol>
+</li>
+</ul>
+<h3>任务 4：执行打分逻辑 (理解 <code>_compute_reward</code> 方法)</h3>
+<p><strong>背景：</strong> 这是真正干活的地方，发请求。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>_compute_reward</code> 方法</li>
+<li><strong>你的 To-Do：</strong><ol>
+<li>检查你的打分函数 (<code>compute_score</code>) 是同步的还是异步的。</li>
+<li>如果是异步的（比如用了 <code>aiohttp</code>），直接 <code>await</code> 调用。</li>
+<li>如果是同步的（普通的 Python 函数），为了不卡住整个程序，把它扔到线程池里跑 (<code>loop.run_in_executor</code>)。</li>
+</ol>
+</li>
+</ul>
+<h3>任务 5：批量处理所有数据 (理解 <code>__call__</code> 方法)</h3>
+<p><strong>背景：</strong> 训练时，数据是一批一批（Batch）进来的，比如一次进来 64 条数据。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>__call__</code> 方法</li>
+<li><strong>你的 To-Do：</strong><ol>
+<li><strong>检查缓存：</strong> 如果这些数据以前算过分 (<code>rm_scores</code>)，直接返回，省钱省时间。</li>
+<li><strong>创建任务列表：</strong> 遍历这 64 条数据，为每一条数据创建一个 <strong>任务 3 (<code>run_single</code>)</strong>。</li>
+<li><strong>并发执行：</strong> 使用 <code>asyncio.gather</code> 同时启动这 64 个任务。<ul>
+<li><em>注意：</em> 虽然是“同时”启动，但因为有 <strong>任务 2</strong> 设定的限流器，它们会乖乖排队或按速度执行，不会瞬间把 API 冲垮。</li>
+</ul>
+</li>
+<li><strong>收集结果：</strong> 等所有任务都做完了，把分数填进一个张量 (<code>Tensor</code>) 里，返回给训练程序。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇文章到底讲了啥？</h3>
+<p>这个文件 <code>limited.py</code> 就是一个<strong>为了保护钱包和 API 账号的中间件</strong>。</p>
+<p>如果不加这个文件：</p>
+<blockquote>
+<p>你的程序会瞬间发出 1000 个请求 -&gt; API 服务商检测到流量攻击 -&gt; 封禁账号或拒绝服务 -&gt; 训练崩溃。</p>
+</blockquote>
+<p>加了这个文件：</p>
+<blockquote>
+<p>你的程序想发 1000 个请求 -&gt; <strong>限流管理器</strong>说：“等等，每秒只能过 5 个” -&gt; 请求排队有序发送 -&gt; 训练稳定进行。</p>
+</blockquote>

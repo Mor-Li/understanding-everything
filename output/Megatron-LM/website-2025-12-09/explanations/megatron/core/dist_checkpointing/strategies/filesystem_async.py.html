@@ -1,0 +1,83 @@
+<h1>megatron/core/dist_checkpointing/strategies/filesystem_async.py</h1>
+<p>完全理解你的感受。这种涉及底层分布式存储和多进程的代码，如果不了解上下文，确实像看天书一样。</p>
+<p>简单来说，这个文件的核心目的是：<strong>在训练大模型时，为了不让“保存模型（Checkpointing）”这件事卡住显卡（GPU）的计算，把保存硬盘的操作放到后台（CPU多进程）去偷偷执行。</strong></p>
+<p>我们可以把这个过程想象成一家<strong>繁忙的餐厅（训练任务）</strong>。
+*   <strong>主厨（GPU）</strong>：负责炒菜（训练），每一秒都很贵，不能停。
+*   <strong>洗碗工（硬盘IO）</strong>：负责清理盘子（保存模型），动作很慢。</p>
+<p>如果没有这个文件，主厨每炒几个菜就要停下来自己去洗碗，非常浪费时间。
+有了这个文件，主厨只需要把脏盘子放到<strong>传送带（CPU内存）</strong>上，然后继续炒菜。后台会有专门的清洁工把盘子拿去洗。</p>
+<p>下面我为你列一个 <strong>Task Todo List</strong>，按照代码执行的逻辑顺序，一步步拆解在这个文件中发生了什么：</p>
+<hr />
+<h3>📝 异步保存模型任务清单 (Todo List)</h3>
+<h4>✅ Task 1: 制定计划与打包 (Preparation)</h4>
+<p><strong>对应方法：</strong> <code>prepare_write_data</code>
+<strong>发生时间：</strong> 主训练进程中（同步，会短暂阻塞）。</p>
+<ul>
+<li><strong>情景：</strong> 此时训练暂停，准备保存模型。</li>
+<li><strong>动作：</strong><ol>
+<li><strong>分组 (<code>_split_by_size_and_type</code>)：</strong> 看看有多少个张量（Tensor）需要保存，根据大小把它们分配到不同的“桶”（Bucket）里。每个桶对应将来要写入的一个文件。</li>
+<li><strong>搬运 (<code>preload_tensors</code>)：</strong> 这是最关键的一步。因为硬盘写入太慢，我们不能直接从GPU写到硬盘。代码会先把数据从 <strong>GPU显存</strong> 快速复制到 <strong>CPU内存</strong> 中。<ul>
+<li><em>代码细节：</em> <code>tensor.to("cpu", non_blocking=True)</code>。</li>
+</ul>
+</li>
+<li><strong>目的：</strong> 只要数据到了CPU内存，GPU就可以解放出来继续去训练（炒菜）了，不用等硬盘写完。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 2: 招聘外包团队 (Delegation)</h4>
+<p><strong>对应方法：</strong> <code>get_save_function_and_args</code>
+<strong>发生时间：</strong> 主训练进程即将恢复训练前。</p>
+<ul>
+<li><strong>情景：</strong> 数据已经在CPU内存里了，主程序问：“谁负责把这些数据写到硬盘？”</li>
+<li><strong>动作：</strong><ol>
+<li>返回一个函数指针 <code>write_preloaded_data_multiproc</code>。</li>
+<li>告诉调用者：“你拿着这个函数，在后台起一个异步任务去跑它，我要回去训练了。”</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 3: 工头分配任务 (Manager Process)</h4>
+<p><strong>对应方法：</strong> <code>write_preloaded_data_multiproc</code>
+<strong>发生时间：</strong> 后台异步进程中（主GPU已经在训练下一轮了）。</p>
+<ul>
+<li><strong>情景：</strong> 这是一个独立于主训练进程之外的进程（或者线程）。</li>
+<li><strong>动作：</strong><ol>
+<li><strong>禁止垃圾回收 (<code>@_disable_gc</code>)：</strong> 为了防止处理张量时出现内存错误（特别是涉及CUDA上下文时），这里暂时关掉了Python的GC。</li>
+<li><strong>招募工人 (<code>mp.get_context("fork")</code>)：</strong> 根据之前分的“桶”的数量，启动多个<strong>子进程</strong>。</li>
+<li><strong>分发任务：</strong> 把包含数据的“桶”分给每个子进程。</li>
+<li><strong>监听结果：</strong> 拿着一个结果队列 (<code>global_results_queue</code>)，等着工人们汇报工作。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 4: 工人干苦力 (Worker Process)</h4>
+<p><strong>对应方法：</strong> <code>write_preloaded_data</code>
+<strong>发生时间：</strong> 后台的子进程中。</p>
+<ul>
+<li><strong>情景：</strong> 这是真正干活的地方，负责把内存里的数据写成文件。</li>
+<li><strong>动作：</strong><ol>
+<li><strong>打开文件 (<code>open</code> 或 <code>msc.open</code>)：</strong> 创建 checkpoint 文件。</li>
+<li><strong>写入数据 (<code>_write_item</code>)：</strong> 遍历桶里的每一个张量（现在都在CPU上），把它们序列化并写入硬盘。</li>
+<li><strong>刷盘 (<code>fsync</code>)：</strong> 确保数据真的写进物理磁盘了，而不是卡在操作系统缓存里。</li>
+<li><strong>汇报：</strong> 告诉工头：“我这个文件写完了”，或者“我报错了”。</li>
+<li><strong>记录内存：</strong> 代码里还顺便记录了一下内存使用情况 (<code>_process_memory</code>)。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 5: 验收与收尾 (Finalization)</h4>
+<p><strong>对应方法：</strong> <code>retrieve_write_results</code> 和 <code>finish</code>
+<strong>发生时间：</strong> 下一次需要确认保存是否成功时（或者训练结束时）。</p>
+<ul>
+<li><strong>情景：</strong> 主程序想确认：“之前的后台保存任务搞定了吗？”</li>
+<li><strong>动作：</strong><ol>
+<li><strong>检查队列 (<code>results_queue</code>)：</strong> 看看工头有没有发回“全部完成”的信号。</li>
+<li><strong>写元数据 (<code>finish</code>)：</strong> 如果所有数据文件都写好了，就在目录下生成一个总的索引文件（Metadata），告诉PyTorch如何读取这个模型。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结关键点（为什么你要看这个文件？）</h3>
+<ol>
+<li><strong>Async（异步）：</strong> 这是核心。传统的 <code>FileSystemWriter</code> 是同步的，保存时训练必须完全停下。这个 <code>FileSystemWriterAsync</code> 允许 <strong>GPU复制到CPU</strong> 后立刻恢复训练，由CPU慢慢写盘。</li>
+<li><strong>Multiproc（多进程）：</strong> 为了加快写盘速度，它利用了Python的 <code>multiprocessing</code> 并行写多个文件。</li>
+<li><strong>MSC (MultiStorageClient)：</strong> 代码里有很多 <code>if use_msc:</code>，这是 NVIDIA 的一个高性能存储库，为了在集群环境（如HDFS, S3等）下写得更快。如果不用 MSC，就是普通的本地文件写入。</li>
+</ol>
+<p>希望这个清单能帮你把代码的逻辑串起来！建议对照着代码里的函数名再看一遍这个流程。</p>

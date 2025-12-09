@@ -1,0 +1,111 @@
+<h1>docs/source/api-guide/pipeline_parallel_layout.md</h1>
+<p>这段文档确实写得很技术化，充满了缩写和符号。我们可以把它想象成一个<strong>“分蛋糕”的说明书</strong>。</p>
+<p>这里的场景是：你有一个超级巨大的模型（比如 DeepSeek-V3），大到一张显卡装不下，必须切开了分给多张显卡（比如 16 张）去运行。但是，这个模型长得很“畸形”（层数不是整数，头尾不一样重），普通的平均切法切不匀，所以需要你手动写一个“切割方案”。</p>
+<p>为了让你看懂，我列了一个 <strong>5 步走的 Task List（任务清单）</strong>，带你逐渐理解它的意思。</p>
+<hr />
+<h3>Task 1: 理解背景——为什么要“切蛋糕”？</h3>
+<p><strong>概念：</strong> 流水线并行 (Pipeline Parallelism, PP)。
+*   <strong>情景：</strong> 模型是一个很长的流水线。
+*   <strong>问题：</strong> DeepSeek-V3 这个模型很特殊，它有 <strong>61 层</strong> Transformer 解码层（Body），加上 1 层 MTP 层（特殊层），再加上开头（Embedding）和结尾（Loss）。
+*   <strong>难点：</strong> 61 是个质数，很难被 16（显卡数）整除。如果强行平均分，有的显卡会累死，有的显卡在摸鱼。
+*   <strong>目标：</strong> 我们需要一个<strong>自定义的布局 (Layout)</strong>，精确指挥每一块显卡拿多少东西，保证大家工作量均衡。</p>
+<h3>Task 2: 学习“切蛋糕”的黑话（符号含义）</h3>
+<p>文档里定义了一套简写的符号，用来代表模型的不同部位。请把它们当作乐高积木的代号：</p>
+<ul>
+<li><strong><code>E</code></strong> (Embedding): <strong>龙头</strong>。模型的输入层。</li>
+<li><strong><code>t</code></strong> (Transformer decoder): <strong>龙身</strong>。模型的主体层（DeepSeek-V3 有 61 个这玩意）。</li>
+<li><strong><code>m</code></strong> (MTP): <strong>特殊的龙鳞</strong>。DeepSeek 特有的层。</li>
+<li><strong><code>L</code></strong> (Loss): <strong>龙尾</strong>。计算损失的输出层。</li>
+<li><strong><code>|</code></strong> (竖线): <strong>切一刀</strong>。表示“这一块给当前显卡/阶段，剩下的给下一个”。</li>
+<li><strong><code>*</code></strong> (星号): <strong>乘法</strong>。表示重复多少次（比如 <code>t*3</code> 就是 3 层龙身）。</li>
+</ul>
+<h3>Task 3: 理解“虚拟切分” (VPP)</h3>
+<p><strong>概念：</strong> Virtual Pipeline Parallelism (VPP)。
+*   文档中提到了 <code>PP16VPP2</code>。
+*   <strong>PP16</strong>：有 16 个物理显卡（工人）。
+*   <strong>VPP2</strong>：每个显卡负责<strong>2 个</strong>逻辑阶段（每个工人分两个时间段干活）。
+*   <strong>结论：</strong> 这意味着我们一共要把模型切成 $16 \times 2 = 32$ 小块（32 个 Stages）。</p>
+<h3>Task 4: 破解那串“天书”代码</h3>
+<p>现在我们来逐字翻译文档里给出的这个字符串：
+<code>"Et*3|(tt|)*29,m|L"</code></p>
+<p>我们要把它拆解开，按照<strong>流水线顺序</strong>填满那 32 个小块：</p>
+<ol>
+<li>
+<p><strong><code>Et*3</code></strong>:</p>
+<ul>
+<li>意思是：1 个 E (龙头) + 3 个 t (龙身)。</li>
+<li>这是<strong>第 1 块</strong>蛋糕。</li>
+<li><strong><code>|</code></strong>: 切一刀，第 1 块结束。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>(tt|)*29</code></strong>:</p>
+<ul>
+<li>意思是：括号里的内容重复 29 次。</li>
+<li>括号里是 <code>tt|</code>，也就是“2 个 t (龙身)，然后切一刀”。</li>
+<li>这一步一口气切出了 <strong>29 块</strong>蛋糕，每块都是 2 层龙身。</li>
+<li>目前总块数：1 (龙头) + 29 (中间) = 30 块。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>,m</code></strong>:</p>
+<ul>
+<li>逗号只是装饰，没意义。</li>
+<li>这里有一个 <strong><code>m</code></strong> (MTP层)。注意这里没有竖线，说明它和后面的是连着的，或者它自己单独算一块（结合上下文，这里是为了填补剩下的位置）。</li>
+<li><em>注：结合表格看，这里实际上是把 <code>m</code> 分配给了第 31 个位置的一部分。</em></li>
+</ul>
+</li>
+<li>
+<p><strong><code>|L</code></strong>:</p>
+<ul>
+<li>切一刀，最后剩下 <strong><code>L</code></strong> (龙尾)。</li>
+</ul>
+</li>
+</ol>
+<p><strong>算一下总账（层数）：</strong>
+*   开头：3 个 t
+*   中间：29 × 2 = 58 个 t
+*   总共 <code>t</code> 的数量 = 3 + 58 = <strong>61 层</strong>。
+*   正好对上了 DeepSeek-V3 的 61 层！</p>
+<h3>Task 5: 对照表格看结果 (可视化)</h3>
+<p>最后，文档里的那个表格就是上面那串代码的<strong>执行结果</strong>。</p>
+<p>我们有 16 张卡（Rank 0~15），每张卡领 2 份任务（VPP Rank 0 和 1）。</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">显卡编号 (Rank)</th>
+<th style="text-align: left;">任务 1 (VPP 0)</th>
+<th style="text-align: left;">任务 2 (VPP 1)</th>
+<th style="text-align: left;">解释</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>Rank 0</strong></td>
+<td style="text-align: left;"><strong>Embedding + 3 × t</strong></td>
+<td style="text-align: left;"><strong>2 × t</strong></td>
+<td style="text-align: left;">对应代码开头的 <code>Et*3</code> 和后面循环里的第一个 <code>tt</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Rank 1~13</strong></td>
+<td style="text-align: left;"><strong>2 × t</strong></td>
+<td style="text-align: left;"><strong>2 × t</strong></td>
+<td style="text-align: left;">中间那些重复的 <code>(tt|)*29</code> 均匀分给了大家</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Rank 14</strong></td>
+<td style="text-align: left;"><strong>2 × t</strong></td>
+<td style="text-align: left;"><strong>mtp</strong></td>
+<td style="text-align: left;">循环里的 <code>tt</code> 和代码后半截的 <code>m</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Rank 15</strong></td>
+<td style="text-align: left;"><strong>2 × t</strong></td>
+<td style="text-align: left;"><strong>loss</strong></td>
+<td style="text-align: left;">循环里的最后一个 <code>tt</code> 和代码结尾的 <code>L</code></td>
+</tr>
+</tbody>
+</table>
+<h3>总结</h3>
+<p>这篇文档就是在教你：
+<strong>“如果你的模型长得很奇怪（比如 DeepSeek-V3），请用这一行代码（字符串），告诉系统每一刀切在哪里，分别包含几个 Transformer 层、有没有 Embedding 或 Loss，从而让 16 张显卡都能吃饱，且不撑着。”</strong></p>

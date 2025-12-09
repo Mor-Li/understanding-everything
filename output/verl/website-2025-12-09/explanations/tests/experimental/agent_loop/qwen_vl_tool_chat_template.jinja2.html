@@ -1,0 +1,129 @@
+<h1>tests/experimental/agent_loop/qwen_vl_tool_chat_template.jinja2</h1>
+<p>这份代码是一个 <strong>Jinja2 模板</strong>。在像 Hugging Face 这样的库中，它的作用是<strong>把人类和程序产生的对话列表（Messages List）转换成大模型（LLM）真正能“读懂”的单一字符串格式</strong>。</p>
+<p>对于 Qwen-VL（Qwen 的视觉语言模型）来说，它需要特定的特殊符号（如 <code>&lt;|im_start|&gt;</code>）和特定的格式来理解哪里是图片、哪里是视频、哪里是它该调用工具的时候。</p>
+<p>为了让你看懂，我把这个模板的工作流程拆解成一个 <strong>Task Todo List（任务清单）</strong>。模板引擎在渲染时，实际上就是在按顺序执行这些任务。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>初始化计数器</strong>：准备好数一数有多少张图片和多少个视频。</li>
+<li><strong>判断模式（是否有工具）</strong>：检查用户是否传入了工具（Functions/Tools）定义。</li>
+<li><strong>构建系统提示词 (System Prompt)</strong>：<ul>
+<li>如果有工具：告诉模型“你是一个助手”，并把工具的定义（XML格式）塞给模型。</li>
+<li>如果没有工具：只告诉模型“你是一个助手”。</li>
+</ul>
+</li>
+<li><strong>循环处理每一条对话消息</strong>：<ul>
+<li><strong>处理多媒体输入（User/System）</strong>：如果是文本，直接放文本；如果是图片/视频，插入特殊的占位符（如 <code>&lt;|vision_start|&gt;</code>）并更新计数。</li>
+<li><strong>处理助手回复（Assistant）</strong>：<ul>
+<li>如果是普通回复：直接放文本。</li>
+<li><strong>如果是工具调用（Tool Call）</strong>：把模型想调用的函数名和参数转换成 XML 格式 (<code>&lt;tool_call&gt;</code>)。</li>
+</ul>
+</li>
+<li><strong>处理工具返回结果（Tool Response）</strong>：把工具运行后的结果包装成 <code>&lt;tool_response&gt;</code>，并伪装成 User 的一部分发回给模型。</li>
+</ul>
+</li>
+<li><strong>收尾</strong>：如果需要模型接着生成，加上 <code>&lt;|im_start|&gt;assistant</code> 引导符。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详解 (Step-by-Step)</h3>
+<p>现在我们按照上面的清单，一步一步对照代码看它是怎么实现的。</p>
+<h4>1. 初始化计数器</h4>
+<p>代码最开头：</p>
+<div class="codehilite"><pre><span></span><code>{% set image_count = namespace(value=0) %}
+{% set video_count = namespace(value=0) %}
+</code></pre></div>
+
+<ul>
+<li><strong>目的</strong>：Qwen-VL 在处理多图/多视频时，可能需要用 "Picture 1", "Picture 2" 来区分。这里先设为 0，后面遇到图片就 +1。</li>
+</ul>
+<h4>2. 构建系统提示词与工具定义 (System Prompt &amp; Tools)</h4>
+<p>这是代码中最长的一块逻辑 <code>{%- if tools %}</code>：</p>
+<ul>
+<li>
+<p><strong>如果传入了 <code>tools</code> 列表</strong>：</p>
+<ol>
+<li>它会先写 <code>&lt;|im_start|&gt;system</code>。</li>
+<li>检查 <code>messages[0]</code> 是不是 system prompt，如果是就用，不是就默认用 "You are a helpful assistant."。</li>
+<li><strong>关键点</strong>：它会追加一段硬编码的提示词：
+    <code>text
+    # Tools
+    You may call one or more functions...
+    &lt;tools&gt;
+    ...这里循环填入具体的工具JSON定义...
+    &lt;/tools&gt;</code></li>
+<li>告诉模型：如果你要用工具，请输出 <code>&lt;tool_call&gt;...JSON...&lt;/tool_call&gt;</code> 这种格式。</li>
+</ol>
+</li>
+<li>
+<p><strong>如果没有传入 <code>tools</code> (<code>{%- else %}</code> 分支)</strong>：</p>
+<ul>
+<li>逻辑很简单，就是普通的聊天，开头只写 "You are a helpful assistant."，不塞那一堆工具说明。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 循环处理消息 (The Loop)</h4>
+<p>代码进入 <code>{% for message in messages %}</code>。这是最核心的部分，它根据 <code>role</code>（角色）不同做不同处理。</p>
+<p><strong>A. 处理 User 或 System 消息 (包含多媒体)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="cp">{%</span>- <span class="k">if</span> <span class="o">(</span><span class="nv">message.role</span> <span class="o">==</span> <span class="s2">&quot;user&quot;</span><span class="o">)</span> <span class="p">...</span> <span class="cp">%}</span>
+<span class="x">&lt;|im_start|&gt;</span><span class="cp">{{</span> <span class="nv">message</span><span class="o">[</span><span class="s1">&#39;role&#39;</span><span class="o">]</span> <span class="cp">}}</span>
+</code></pre></div>
+
+<p>这里有一个复杂的嵌套循环，用来处理<strong>图文混排</strong>：
+*   <strong>如果是图片</strong>：
+    <code>jinja2
+    {% set image_count.value = image_count.value + 1 %}
+    Picture {{ image_count.value }}: &lt;|vision_start|&gt;&lt;|image_pad|&gt;&lt;|vision_end|&gt;</code>
+    它会插入 <code>&lt;|image_pad|&gt;</code>，这是模型“看”图片的地方。
+*   <strong>如果是视频</strong>：类似图片，插入 <code>&lt;|video_pad|&gt;</code>。
+*   <strong>如果是文本</strong>：直接显示文本。</p>
+<p><strong>B. 处理 Assistant 消息 (模型回复)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="cp">{%</span>- <span class="k">elif</span> <span class="nv">message.role</span> <span class="o">==</span> <span class="s2">&quot;assistant&quot;</span> <span class="cp">%}</span>
+<span class="cp">{{</span><span class="o">-</span> <span class="s1">&#39;&lt;|im_start|&gt;&#39;</span> <span class="o">+</span> <span class="nv">message.role</span> <span class="cp">}}</span>
+</code></pre></div>
+
+<p>这里有两个分支：
+1.  <strong>普通说话</strong>：如果有 <code>message.content</code>，直接显示。
+2.  <strong>工具调用 (Tool Calls)</strong>：如果模型决定调用工具（<code>message.tool_calls</code> 存在）：
+    <code>jinja2
+    &lt;tool_call&gt;
+    {"name": "函数名", "arguments": {参数}}
+    &lt;/tool_call&gt;</code>
+    它把 Python 对象转换成 JSON 字符串，包裹在 XML 标签里。</p>
+<p><strong>C. 处理 Tool 消息 (工具运行结果)</strong>
+这是 Agent 流程的关键。当工具运行完，结果需要传回给模型。</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span><span class="o">%-</span><span class="w"> </span><span class="k">elif</span><span class="w"> </span><span class="n">message</span><span class="o">.</span><span class="n">role</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s2">&quot;tool&quot;</span><span class="w"> </span><span class="o">%</span><span class="p">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>伪装成 User</strong>：注意这行代码 <code>{{- '&lt;|im_start|&gt;user' }}</code>。在 Qwen 的格式里，工具的返回结果通常被视为 User 轮次的一部分（或者紧跟在 User 之后）。</li>
+<li><strong>包裹结果</strong>：
+    <code>jinja2
+    &lt;tool_response&gt;
+    ...工具的返回内容(可能是字，也可能是图)...
+    &lt;/tool_response&gt;</code>
+    这告诉模型：“这是你刚才调用的那个函数的运行结果，请查收。”</li>
+</ul>
+<h4>4. 收尾 (Generation Prompt)</h4>
+<p>代码最后：</p>
+<div class="codehilite"><pre><span></span><code><span class="cp">{%</span> <span class="k">if</span> <span class="nv">add_generation_prompt</span> <span class="cp">%}</span>
+<span class="x">&lt;|im_start|&gt;assistant</span>
+<span class="cp">{%</span> <span class="k">endif</span> <span class="cp">%}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>目的</strong>：对话构建完了，现在轮到模型说话了。所以模板最后加上 <code>&lt;|im_start|&gt;assistant</code>，就像把麦克风递给模型，让它开始补全后面的内容。</li>
+</ul>
+<hr />
+<h3>💡 总结一下</h3>
+<p>这段代码就是个<strong>翻译官</strong>：</p>
+<ol>
+<li><strong>输入</strong>：你给的一堆 Python 字典（比如 <code>{"role": "user", "content": "帮我画个猫"}</code>，或者包含工具定义的列表）。</li>
+<li><strong>处理</strong>：<ul>
+<li>把工具定义变成 XML 塞进 System Prompt。</li>
+<li>把图片/视频变成 <code>&lt;|image_pad|&gt;</code> 占位符。</li>
+<li>把函数调用变成 <code>&lt;tool_call&gt;</code> XML。</li>
+<li>把函数结果变成 <code>&lt;tool_response&gt;</code> XML。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：一个巨大的字符串，格式完全符合 Qwen-VL 的训练要求，让模型能看懂图、能调用工具。</li>
+</ol>

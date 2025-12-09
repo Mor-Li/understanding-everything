@@ -1,0 +1,85 @@
+<h1>examples/split_placement/README.md</h1>
+<p>这份文档其实是在讲 <strong>“如何优化大规模AI模型的训练效率”</strong>，具体是用在 <strong>PPO（强化学习）</strong> 训练阶段。</p>
+<p>简单来说，PPO训练通常需要4个模型同时运行（Actor, Critic, Ref, Reward）。如果把它们都塞在一个地方，显存不够用，或者运行起来像“排队”一样慢。</p>
+<p>这个文档的核心思想是 <strong>“分家（Split Placement）”</strong>：把这4个模型分成两组，放在不同的显卡（GPU）上，并且让它们 <strong>“同时干活（异步并行）”</strong>，而不是互相干等。</p>
+<p>为了让你更容易理解，我把你当作这个项目的工程师，给你列一个 <strong>Task Todo List</strong>，我们一步步来拆解文档里的观点：</p>
+<hr />
+<h3>📋 任务清单：PPO模型分家计划</h3>
+<h4>✅ Task 0: 理解核心概念（为什么要分家？）</h4>
+<ul>
+<li><strong>背景</strong>：PPO训练涉及四个角色：<ol>
+<li><strong>Actor（演员）</strong>：负责生成回答（最占显存）。</li>
+<li><strong>Ref（参考）</strong>：旧版的演员，用来做对比。</li>
+<li><strong>Critic（评论家）</strong>：负责给演员打分。</li>
+<li><strong>Reward（奖励模型）</strong>：负责判断回答好不好。</li>
+</ol>
+</li>
+<li><strong>痛点</strong>：如果这四个都在一张卡或者一组卡上，显存会爆，而且必须等Actor跑完，Critic才能跑，效率低。</li>
+<li><strong>目标</strong>：把它们拆开。<ul>
+<li><strong>A组</strong>：Actor + Ref（放在前半部分显卡）。</li>
+<li><strong>B组</strong>：Critic + Reward（放在后半部分显卡）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 1: 分配宿舍（对应文档 Step 1）</h4>
+<p><strong>任务目标</strong>：写代码告诉程序，谁住哪里。</p>
+<ul>
+<li><strong>文档解读</strong>：<ul>
+<li>文档定义了两个“资源池（Pool）”：<code>actor_rollout_ref_pool</code>（A组）和 <code>critic_pool</code>（B组）。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>如果你只有一台机器（Node）：把这台机器的GPU劈成两半，前一半给A组，后一半给B组。</li>
+<li>如果你有多台机器：把机器数量劈成两半，前几台机器给A组，后几台机器给B组。</li>
+</ul>
+</li>
+<li><strong>映射关系（Mapping）</strong>：最后一段代码把具体的角色（Actor, Critic等）绑定到刚才分好的池子里。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 2: 解除阻塞，允许并行（对应文档 Step 2）</h4>
+<p><strong>任务目标</strong>：修改底层代码，让它们不要“死等”。</p>
+<ul>
+<li><strong>文档解读</strong>：<ul>
+<li>默认情况下，Python代码是同步的（Blocking）。意思是：Actor不更新完，Critic就不敢动。</li>
+<li><strong>操作</strong>：我们需要去修改 <code>fsdp_workers.py</code> 文件。</li>
+<li><strong>关键点</strong>：找到 <code>update_actor</code> 和 <code>update_critic</code> 这两个函数，在它们头上的装饰器里加上 <code>blocking=False</code>。</li>
+<li><strong>人话解释</strong>：这就像告诉Actor：“你去更新你的参数吧，不用向我汇报，我先去忙Critic的事了。”这样两个更新过程就能在不同的显卡上同时进行了。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 3: 在总控室回收结果（对应文档 Step 3）</h4>
+<p><strong>任务目标</strong>：虽然干活是并行的，但最后总要汇总确认。</p>
+<ul>
+<li><strong>文档解读</strong>：<ul>
+<li>因为刚才我们在Task 2里设置了不阻塞（不用等），所以主程序发令后会立刻往下走，但这时候结果还没算出来呢。</li>
+<li><strong>操作</strong>：在 <code>ray_trainer.py</code> 里，我们需要显式地去“拿（Get）”结果。</li>
+<li><strong>代码</strong>：<code>critic_output.get()</code> 和 <code>actor_output.get()</code>。</li>
+<li><strong>人话解释</strong>：这就像你去咖啡店点单。<ul>
+<li>Task 2 是点完单给你个小票（Future对象），你不用站那等，可以去玩手机（并行）。</li>
+<li>Task 3 是店员喊号了，你拿着小票去把做好的咖啡端回来（<code>.get()</code>）。如果不执行这一步，程序就不知道什么时候才算真正做完了。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 启动引擎（对应文档 Step 4）</h4>
+<p><strong>任务目标</strong>：运行脚本开始训练。</p>
+<ul>
+<li><strong>文档解读</strong>：<ul>
+<li>一切配置好后，运行官方提供的脚本即可：<code>bash run_deepseek7b_llm.sh</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结给你的“极简版”执行指南</h3>
+<p>如果你只是想跑通这个例子，文档其实给了你一个<strong>捷径</strong>（"For quickstart..."那句话）：</p>
+<ol>
+<li><strong>不用管 Task 1</strong>（代码里可能已经默认配置好了或者作为示例展示）。</li>
+<li><strong>重点做 Task 2</strong>：去 <code>fsdp_workers.py</code> 把 <code>blocking</code> 改成 <code>False</code>。</li>
+<li><strong>理解 Task 3</strong>：知道主程序会等待结果回收。</li>
+<li><strong>执行 Task 4</strong>：跑脚本。</li>
+</ol>
+<p>这样讲是不是清晰一点了？这个文档本质上就是教你<strong>如何通过改几行代码，把原本串行（排队）的任务，变成在不同显卡上并行（同时）的任务</strong>。</p>

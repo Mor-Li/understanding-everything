@@ -1,0 +1,93 @@
+<h1>tests/single_controller/test_decorator_on_cpu.py</h1>
+<p>这份代码其实是在测试一个<strong>分布式计算系统</strong>中的“装饰器（Decorator）”功能。</p>
+<p>简单来说，这个系统（<code>verl</code>）利用 <code>Ray</code>（一个分布式框架）来管理多个“工人（Worker）”。这个测试文件的目的是验证：<strong>当我们给这群工人派发任务时，能不能通过一个简单的标签（装饰器），自动把数据切分好，分给不同的工人去算，最后再把结果拼回来。</strong></p>
+<p>为了让你听懂，我把阅读这份代码的任务拆解成一个 <strong>Todo List</strong>，然后一步一步带你过一遍。</p>
+<h3>📋 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>环境准备</strong>：理解 <code>ray_init_shutdown</code> 是做什么的。</li>
+<li><strong>定义工人 (Worker)</strong>：看懂 <code>DecoratorTestWorker</code> 类，明白工人能干什么活。</li>
+<li><strong>核心魔法 (装饰器)</strong>：理解 <code>@register(...)</code> 这个标签在干嘛（这是全篇最难也是最重要的点）。</li>
+<li><strong>测试场景一：同步计算</strong>：看懂 <code>test_decorator_dp_compute</code> 如何测试“做完才准走”的模式。</li>
+<li><strong>测试场景二：异步计算</strong>：看懂 <code>test_decorator_async_function</code> 如何测试“你先做，我过会来拿结果”的模式。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>1. 环境准备 (<code>ray_init_shutdown</code>)</h4>
+<p>代码最上面的 <code>@pytest.fixture</code> 部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">ray_init_shutdown</span><span class="p">():</span>
+    <span class="n">ray</span><span class="o">.</span><span class="n">init</span><span class="p">(</span><span class="n">num_cpus</span><span class="o">=</span><span class="mi">100</span><span class="p">)</span> <span class="c1"># 启动 Ray 引擎，模拟有100个CPU核</span>
+    <span class="k">yield</span>
+    <span class="n">ray</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>         <span class="c1"># 测试完关闭引擎</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：这就好比开工前先把工厂的电闸拉上，机器预热好。测试结束后再拉闸断电。</p>
+<h4>2. 定义工人 (<code>DecoratorTestWorker</code>)</h4>
+<p>这是一个类，代表一个会在后台运行的“工人”。</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@ray</span><span class="o">.</span><span class="n">remote</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">DecoratorTestWorker</span><span class="p">(</span><span class="n">Worker</span><span class="p">):</span>
+    <span class="c1"># ... 初始化代码 ...</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+*   <code>initial_value</code>：工人自带的一个初始数字（比如工号或者基础分）。
+*   <code>dp_compute</code> 和 <code>async_dp_compute</code>：这是工人会的技能（函数）。</p>
+<h4>3. 核心魔法：装饰器 (<code>@register</code>)</h4>
+<p>这是代码里最看不懂但最重要的部分。请看工人技能上的帽子：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@register</span><span class="p">(</span><span class="n">dispatch_mode</span><span class="o">=</span><span class="n">Dispatch</span><span class="o">.</span><span class="n">DP_COMPUTE_PROTO</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">dp_compute</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="n">DataProto</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">DataProto</span><span class="p">:</span>
+    <span class="c1"># ... 计算逻辑 ...</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+*   <strong>普通情况</strong>：如果你调用一个函数，它就在本地运行。
+*   <strong>加了装饰器后</strong>：当你对着“工人组”调用这个函数时，系统会自动执行 <strong>数据并行 (Data Parallelism, DP)</strong>。
+*   <strong>具体发生了啥</strong>：假设你有 4 个数据 <code>[0, 1, 2, 3]</code>，你有 2 个工人。
+    *   系统会自动把数据切开。
+    *   工人 A 拿到 <code>[0, 1]</code>。
+    *   工人 B 拿到 <code>[2, 3]</code>。
+    *   他们各自算完后，系统再把结果拼成 <code>[结果0, 结果1, 结果2, 结果3]</code> 返回给你。
+*   <strong>代码里的计算逻辑</strong>：<code>输入 + 初始值 + 工人的排名(rank)</code>。用来验证是不是真的分给了不同的人（因为不同工人的 rank 不一样）。</p>
+<h4>4. 测试场景一：同步计算 (<code>test_decorator_dp_compute</code>)</h4>
+<p>这是第一个测试函数。
+*   <strong>创建团队</strong>：
+    <code>python
+    num_workers = 2
+    # 创建一个包含2个工人的组
+    worker_group = RayWorkerGroup(...)</code>
+*   <strong>准备数据</strong>：
+    <code>python
+    # 造了4个数：[0, 1, 2, 3]
+    input_tensor = torch.arange(4, ...)</code>
+*   <strong>派发任务</strong>：
+    <code>python
+    # 关键点！直接对着 group 调用方法
+    output = worker_group.dp_compute(data)</code>
+    <strong>逻辑分析</strong>：
+    *   工人 0 (Rank 0) 处理 <code>[0, 1]</code>。初始值是 10。
+        *   算：0+10+0=10, 1+10+0=11。
+    *   工人 1 (Rank 1) 处理 <code>[2, 3]</code>。初始值是 10。
+        *   算：2+10+1=13, 3+10+1=14。
+    *   最后拼起来应该是 <code>[10, 11, 13, 14]</code>。
+*   <strong>验证</strong>：代码最后的 <code>torch.testing.assert_close</code> 就是在比对这个结果。</p>
+<h4>5. 测试场景二：异步计算 (<code>test_decorator_async_function</code>)</h4>
+<p>这是第二个测试函数，测试 <code>async</code>（异步）。
+*   <strong>装饰器不同</strong>：注意 Worker 类里的定义加了 <code>blocking=False</code>。
+*   <strong>派发任务</strong>：
+    <code>python
+    # 这里调用后，不会立刻卡住等待结果，而是马上返回一个“未来凭证”(Future)
+    future_output = worker_group.async_dp_compute(data)</code>
+*   <strong>获取结果</strong>：
+    <code>python
+    # 拿着凭证去换结果，这时候如果没算完就会等待
+    result_data = future_output.get()</code>
+*   <strong>逻辑分析</strong>：
+    *   这次初始值是 5，算法变成了 <code>input * 2 + 初始值 + rank</code>。
+    *   工人 0 处理 <code>[0, 1]</code> -&gt; <code>0*2+5+0=5</code>, <code>1*2+5+0=7</code>。
+    *   工人 1 处理 <code>[2, 3]</code> -&gt; <code>2*2+5+1=10</code>, <code>3*2+5+1=12</code>。
+    *   预期结果 <code>[5, 7, 10, 12]</code>。</p>
+<h3>总结</h3>
+<p>这个文件就是在测试：<strong>那个 <code>@register</code> 装饰器好不好用？</strong>
+1.  能不能自动把大数据切成小块分给多个 CPU？（能）
+2.  能不能正确地把大家算好的结果拼回去？（能）
+3.  同步执行（死等结果）和异步执行（先拿号，稍后取结果）是不是都正常？（都正常）</p>

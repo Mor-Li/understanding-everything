@@ -1,0 +1,50 @@
+<h1>.github/workflows/vllm.yml</h1>
+<p>这份文件是一个 <strong>GitHub Actions 的自动化工作流配置文件</strong>。</p>
+<p>简单来说，它的作用是：<strong>每当你（或其他人）修改了代码并提交时，GitHub 会自动按照这个“清单”去租一台带显卡的机器，跑一遍特定的测试，看看你的代码有没有把原本的功能（特别是 vLLM 相关的推理功能）搞挂。</strong></p>
+<p>为了让你好理解，我把你这个文件转化成一个<strong>给机器人的“任务清单”（To-Do List）</strong>，分为三个阶段：<strong>准备阶段</strong>、<strong>干活阶段</strong>、<strong>收尾阶段</strong>。</p>
+<hr />
+<h3>🤖 机器人的任务清单 (To-Do List)</h3>
+<h4>第一阶段：什么时候开始干活？ (Trigger)</h4>
+<p>这个文件告诉机器人，只有在满足以下条件时才起床干活：
+1.  <strong>动作</strong>：有人向 <code>main</code> 分支或者 <code>v0.*</code> 版本分支 <strong>推送代码 (Push)</strong> 或者 <strong>提交合并请求 (Pull Request)</strong> 时。
+2.  <strong>筛选</strong>：
+    *   如果只改了文档或无关紧要的文件，<strong>不干活</strong>。
+    *   重点关注：修改了 <code>.py</code> 结尾的代码。
+    *   <strong>特例</strong>：虽然大部分代码都关注，但它特意<strong>排除</strong>了 <code>examples</code>（示例代码）、普通的 <code>tests</code>（普通测试）等。
+    *   <strong>核心关注点</strong>：它非常具体地列出了一堆路径（如 <code>verl/trainer/main_generation.py</code>），意思是：“如果这些跟 <strong>vLLM</strong>（一种大模型加速库）或者生成任务相关的文件变动了，必须立马执行这个任务！”</p>
+<h4>第二阶段：准备工作环境 (Job: setup)</h4>
+<p>因为跑大模型测试需要很强的算力（GPU），GitHub 自带的免费服务器跑不动，所以需要去云端“租”一台机器。
+1.  <strong>[ ] 检查身份</strong>：确认仓库的所有者是 <code>volcengine</code>（火山引擎）。
+2.  <strong>[ ] 申请机器</strong>：调用一个接口（<code>volcengine/vemlp-github-runner</code>），去火山引擎的云端申请一台配置为 <code>L20x8</code>（8张 L20 显卡）或者其他配置的强力服务器。
+3.  <strong>[ ] 拿到钥匙</strong>：记录下这台机器的 ID（<code>mlp-task-id</code>），方便一会儿干完活把它关掉。</p>
+<h4>第三阶段：正式干活 (Job: vllm)</h4>
+<p>机器申请好了，现在登录上去开始跑测试。
+1.  <strong>[ ] 配置网络代理</strong>：设置 HTTP/HTTPS 代理（因为服务器在国内，访问 HuggingFace 等国外网站可能需要梯子），并设置 HF 镜像站，确保下载模型不卡顿。
+2.  <strong>[ ] 下载代码</strong>：把当前的 GitHub 仓库代码全部下载到这台机器上。
+3.  <strong>[ ] 安装环境</strong>：运行 <code>pip3 install -e .[test]</code>，把项目依赖的软件包都装好。
+4.  <strong>[ ] 准备数据</strong>：
+    *   先清理一下后台进程（<code>ray stop</code>）。
+    *   运行一个脚本，准备 <code>gsm8k</code> 数据集（这是一个常用的数学题数据集，用来测模型聪不聪明）。
+5.  <strong>[ ] 执行测试 A (核心)</strong>：
+    *   <strong>任务</strong>：测试 vLLM 的 Rollout（推理生成）功能，特别是异步 Agent 循环。
+    *   <strong>命令</strong>：<code>pytest ... tests/experimental/agent_loop</code>。
+    *   <strong>目的</strong>：确保模型在使用 vLLM 加速推理时，能正常和环境交互，不会卡死。
+6.  <strong>[ ] 执行测试 B (功能)</strong>：
+    *   <strong>任务</strong>：测试 vLLM 的“中断”功能。
+    *   <strong>命令</strong>：<code>pytest ... test_vllm_abort.py</code>。
+    *   <strong>目的</strong>：确保如果用户想停止生成，服务器能立刻停下来，而不是继续瞎算浪费电。</p>
+<h4>第四阶段：打扫战场 (Job: cleanup)</h4>
+<p>不管测试是成功了还是报错失败了（<code>if: always()</code>），都要执行这一步。
+1.  <strong>[ ] 归还机器</strong>：调用接口，把第二阶段申请的那台昂贵的 GPU 服务器销毁/退还，避免一直扣费。</p>
+<hr />
+<h3>🧐 补充解释：文件开头的那些注释是啥？</h3>
+<p>你看到文件最上面有一大段被 <code>#</code> 注释掉的内容（<code># # Tests layout...</code>），那不是给机器看的，是<strong>写给在这个项目里工作的程序员看的说明书</strong>。</p>
+<p>它解释了这个项目的测试文件结构：
+*   <strong>普通测试</strong>：放在 <code>tests/trainer</code>, <code>tests/models</code> 等文件夹。
+*   <strong>特殊测试</strong>：
+    *   <code>special_distributed</code>: 必须要多张显卡才能跑的测试。
+    *   <code>special_e2e</code>: 端到端（从头到尾）的完整测试。
+    *   <code>special_npu</code>: 专门给 NPU（华为昇腾芯片等）跑的测试。
+*   <strong>工作流逻辑</strong>：它列出了 <code>.github/workflows</code> 下还有哪些文件，比如 <code>cpu_unit_tests.yml</code> 是跑 CPU 测试的，而你现在看的这个 <code>vllm.yml</code> 属于“重型多 GPU 单元测试”。</p>
+<h3>总结</h3>
+<p>这个文件的核心目的就是：<strong>专门为 vLLM（大模型推理）相关的功能，开一台带显卡的豪车（服务器），跑两圈特定的测试，跑完把车还了。</strong></p>

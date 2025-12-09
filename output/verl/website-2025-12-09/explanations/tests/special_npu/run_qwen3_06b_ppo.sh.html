@@ -1,0 +1,61 @@
+<h1>tests/special_npu/run_qwen3_06b_ppo.sh</h1>
+<p>这份脚本看起来确实很复杂，因为它包含了很多深度学习（特别是大模型强化学习）的专业术语。</p>
+<p>简单来说，这是一个<strong>启动脚本</strong>。它的作用是：<strong>指挥 8 张 NPU（华为昇腾芯片）显卡，利用 PPO（强化学习算法），去训练一个叫 Qwen（千问）的小型模型，让它学会做数学题（GSM8K 数据集）。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“项目经理的 To-Do List”</strong>，我们一步步来看这个脚本在安排什么任务：</p>
+<hr />
+<h3>📋 任务清单：训练 Qwen 模型 (PPO版)</h3>
+<h4>✅ 第一步：准备硬件环境 (Environment Setup)</h4>
+<p>在脚本的最开头，它先设置了一些环境变量，告诉机器我们要在什么环境下运行。
+*   <code>set -x</code>: 开启调试模式，运行的时候把每一行命令都打印出来，方便你看哪里出错了。
+*   <code>export VLLM_ASCEND_ENABLE_NZ=0</code>: <strong>这是一个暗号</strong>。<code>ASCEND</code> 通常指华为昇腾 NPU 芯片。这句话是在调整底层推理引擎（vLLM）在华为芯片上的特定设置。</p>
+<h4>✅ 第二步：选定“底子”模型 (Model Selection)</h4>
+<p>我们要训练谁？
+*   <code>MODEL_ID</code>: 这里写着 <code>Qwen2.5-0.5B-Instruct</code>。意思是选用了阿里千问的 0.5B（5亿参数）的小模型作为基础。
+    *   <em>注：注释里写了 TODO，说等环境好了要换成 Qwen3-0.6B，但目前先用 2.5 版本顶替。</em>
+*   <code>MODEL_PATH</code>: 告诉程序去哪里找到这个模型文件。</p>
+<h4>✅ 第三步：启动核心训练程序 (Main Execution)</h4>
+<p>这是脚本的主干：<code>python3 -m verl.trainer.main_ppo ...</code>。
+*   它启动了一个叫 <code>verl</code> 的框架（这是一个大模型强化学习框架）。
+*   使用的是 <code>main_ppo</code> 模块。<strong>PPO</strong> 是一种经典的强化学习算法（类似 ChatGPT 训练用的 RLHF），你可以理解为<strong>“通过奖惩机制来教模型说话”</strong>。</p>
+<hr />
+<p><strong>接下来的一大堆参数，其实是在配置 PPO 训练中的三个关键角色：</strong></p>
+<ol>
+<li><strong>Actor (学生)</strong>: 负责写作业（生成回答）。</li>
+<li><strong>Critic (老师)</strong>: 负责打分（评估回答好不好）。</li>
+<li><strong>Rollout (考试过程)</strong>: 负责让学生批量做题。</li>
+</ol>
+<hr />
+<h4>✅ 第四步：准备教材 (Data Config)</h4>
+<ul>
+<li><code>data.train_files</code>: 指定训练数据是 <code>gsm8k</code>。这是一个经典的小学数学题数据集。</li>
+<li><code>data.max_prompt_length=512</code>: 题目最长 512 个字。</li>
+<li><code>data.max_response_length=128</code>: 回答最长 128 个字。</li>
+</ul>
+<h4>✅ 第五步：配置“学生”与“考试” (Actor &amp; Rollout Config)</h4>
+<p>这部分参数最多（<code>actor_rollout_ref...</code>），因为这里涉及到<strong>性能优化</strong>。
+*   <strong>怎么生成回答？</strong>
+    *   <code>rollout.name=vllm</code>: 使用 <strong>vLLM</strong> 这个加速引擎来生成回答。它比普通的 PyTorch 推理快很多。
+*   <strong>显存不够怎么办？（省钱大法）</strong>
+    *   <code>fsdp_config.param_offload=True</code>: <strong>显存卸载</strong>。如果显存满了，把暂时不用的模型参数搬到 CPU 内存里去。
+    *   <code>fsdp_config.optimizer_offload=True</code>: 把优化器状态也搬到 CPU 去。
+    *   这说明 0.5B 虽然小，但可能显卡显存也很紧张，或者为了跑更大的 Batch Size 做了极致优化。
+*   <strong>文本太长怎么办？</strong>
+    *   <code>ulysses_sequence_parallel_size=2</code>: <strong>尤利西斯序列并行</strong>。这是一种高级技术，把一句话切成两半，放在两张卡上处理。
+*   <strong>学习率</strong>: <code>actor.optim.lr=1e-6</code>，学生学习的速度（步子迈得很小，比较谨慎）。</p>
+<h4>✅ 第六步：配置“阅卷老师” (Critic Config)</h4>
+<ul>
+<li><code>critic.optim.lr=1e-5</code>: 老师的学习率比学生快一点（1e-5 &gt; 1e-6），因为老师得先学会怎么打分，学生才能学会怎么做题。</li>
+<li>同样开启了 <code>offload</code> (卸载到CPU) 和 <code>ulysses</code> (序列并行) 来节省显存。</li>
+</ul>
+<h4>✅ 第七步：设定全局规则 (Trainer Config)</h4>
+<p>最后是 <code>trainer...</code> 开头的参数，控制整个流程：
+*   <code>trainer.device=npu</code>: <strong>关键点</strong>。明确告诉程序，我们用的是 <strong>NPU</strong>（华为昇腾），而不是常见的 GPU（NVIDIA）。
+*   <code>trainer.n_gpus_per_node=8</code>: 一台机器上有 8 张卡。
+*   <code>trainer.total_epochs=1</code>: 教材只学 1 遍（Epoch）。
+*   <code>trainer.project_name=...</code>: 给这次训练起个名字，方便在日志里找。</p>
+<hr />
+<h3>总结：这个文件到底想干嘛？</h3>
+<p>用一句大白话总结：</p>
+<blockquote>
+<p><strong>“嘿，电脑！用这台机器上的 8 张华为 NPU 卡，加载 Qwen-0.5B 模型。通过 vLLM 加速让它做数学题，同时用 PPO 算法根据做得对不对来调整它的参数。因为显存可能不够，记得把不用的参数随时往 CPU 内存里搬，稍微慢点没事，别把显存撑爆了。”</strong></p>
+</blockquote>

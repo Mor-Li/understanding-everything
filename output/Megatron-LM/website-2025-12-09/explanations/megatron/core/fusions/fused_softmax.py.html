@@ -1,0 +1,121 @@
+<h1>megatron/core/fusions/fused_softmax.py</h1>
+<p>没问题，这份代码确实容易让人晕，因为它涉及到深度学习框架底层性能优化的核心——<strong>算子融合（Operator Fusion）</strong>。</p>
+<p>简单来说，这个文件的作用是：<strong>“为了让 Transformer 跑得更快，我们试图把 <code>缩放(Scale)</code> + <code>遮盖(Mask)</code> + <code>Softmax</code> 这三步合并成一步在 GPU 上执行。如果条件允许就用最快的（C++写好的）方法，不允许就退回到普通的 PyTorch 写法。”</strong></p>
+<p>我们可以把理解这份代码的过程拆解为一个 <strong>Task List</strong>，跟着这 5 步走，你就能看懂了。</p>
+<hr />
+<h3>📝 任务清单 Task List</h3>
+<ol>
+<li><strong>[基础概念]</strong> 理解为什么要“Fused”（融合）？</li>
+<li><strong>[底层工兵]</strong> 认识三个负责干脏活累活的“加速器”类。</li>
+<li><strong>[特殊技巧]</strong> 理解 <code>SoftmaxOne</code> 这个奇怪的小补丁。</li>
+<li><strong>[核心指挥]</strong> 分析主类 <code>FusedScaleMaskSoftmax</code> 的初始化。</li>
+<li><strong>[决策逻辑]</strong> 看懂 <code>forward</code> 函数是如何做“二选一”决策的。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 理解为什么要“Fused”（融合）？</h4>
+<p>在 Transformer 的注意力机制（Attention）里，公式通常是这样的：
+$$ \text{Softmax}\left(\frac{Q \times K^T}{\text{scale}} + \text{Mask}\right) $$</p>
+<p>如果不融合，GPU 需要做三件事：
+1.  读取数据，除以 scale，写回显存。
+2.  读取数据，加上 Mask（比如把某些位置设为负无穷），写回显存。
+3.  读取数据，算 Softmax，写回显存。</p>
+<p><strong>Fused（融合）</strong> 就是写一个底层的 CUDA kernel（C++代码），把这三步合成一步：读取一次，算完这三样，写回一次。<strong>这能极大减少显存读写，显著提升训练速度。</strong></p>
+<h4>Task 2: 认识三个负责干脏活累活的“加速器”类</h4>
+<p>文件开头定义了三个类，它们都继承自 <code>torch.autograd.Function</code>。这意味着它们是自定义的 PyTorch 算子，手动定义了前向传播（forward）和反向传播（backward）。</p>
+<p>它们其实只是<strong>接口</strong>，真正的活是调用 <code>import ..._cuda</code> 里的 C++ 代码干的。</p>
+<ol>
+<li>
+<p><strong><code>ScaledUpperTriangMaskedSoftmax</code></strong> (针对 GPT 类模型)</p>
+<ul>
+<li><strong>场景</strong>：GPT 是单向语言模型，看过去不能看未来，所以需要一个“上三角掩码”（Upper Triangular Mask）。</li>
+<li><strong>动作</strong>：缩放(Scale) -&gt; 加上三角Mask -&gt; Softmax。</li>
+<li><strong>特点</strong>：这是最常用的，因为 Megatron 主要跑 GPT。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>ScaledMaskedSoftmax</code></strong> (通用场景)</p>
+<ul>
+<li><strong>场景</strong>：比如 BERT 或者 T5，或者你需要自定义 Mask 的时候。</li>
+<li><strong>动作</strong>：缩放 -&gt; 加上你传入的任意 Mask -&gt; Softmax。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>ScaledSoftmax</code></strong> (无 Mask 场景)</p>
+<ul>
+<li><strong>场景</strong>：不需要 Mask 的时候。</li>
+<li><strong>动作</strong>：缩放 -&gt; Softmax。</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>Todo 总结</strong>：这三个类就是三辆“跑车”，速度极快，但对路况（输入数据的形状）有要求。</p>
+</blockquote>
+<h4>Task 3: 理解 <code>SoftmaxOne</code> 这个奇怪的小补丁</h4>
+<p>代码中间有一个 <code>class SoftmaxOne(nn.Module)</code>。
+*   <strong>背景</strong>：这是一个比较新的学术Trick（来自 Evan Miller 的博客）。
+*   <strong>问题</strong>：标准的 Softmax 在所有输入分数都很小（负无穷）时，数值会不稳定。
+*   <strong>解决</strong>：它在计算 Softmax 时，人为添加一个额外的“Sink Token”（汇聚点），通常值设为 1 或 0。如果注意力分数都很低，概率就会流向这个 Sink，而不是在原有词表里乱分配。
+*   <strong>代码逻辑</strong>：
+    1.  造一个额外的列 <code>sink</code>。
+    2.  拼接到输入 <code>x</code> 后面。
+    3.  做 Softmax。
+    4.  把最后那个 <code>sink</code> 对应的概率扔掉。</p>
+<h4>Task 4: 分析主类 <code>FusedScaleMaskSoftmax</code> 的初始化</h4>
+<p>这是外部调用的<strong>总管</strong>。看看它的 <code>__init__</code> 存了什么：</p>
+<ul>
+<li><code>input_in_fp16/bf16</code>: 你的输入是半精度（FP16）还是 BFloat16？（加速通常需要半精度）。</li>
+<li><code>attn_mask_type</code>: 是 GPT 这种因果掩码（Causal），还是 BERT 这种填充掩码？</li>
+<li><code>scaled_masked_softmax_fusion</code>: <strong>开关</strong>。用户到底想不想用上面那三辆“跑车”？</li>
+<li><code>softmax_in_fp32</code>: 为了精度，Softmax 的计算过程通常在 FP32 下进行，算完再转回 FP16。</li>
+</ul>
+<h4>Task 5: 看懂 <code>forward</code> 函数是如何做“二选一”决策的</h4>
+<p>这是全篇最核心的逻辑。当数据流进来时，<code>forward</code> 函数做了一个判断：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 伪代码逻辑</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">input</span><span class="p">,</span> <span class="n">mask</span><span class="p">):</span>
+    <span class="c1"># 如果：</span>
+    <span class="c1"># 1. 满足硬件加速的形状要求 (is_kernel_available)</span>
+    <span class="c1"># 2. 且没有使用 SoftmaxOne 这种特殊技巧 (softmax_offset is None)</span>
+    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_kernel_available</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="ow">and</span> <span class="n">softmax_offset</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># 走快车道！调用 C++ 融合算子</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">forward_fused_softmax</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># 走慢车道！用 PyTorch 原生函数一步步算</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">forward_torch_softmax</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">mask</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>我们细看两个分支：</strong></p>
+<ol>
+<li>
+<p><strong>快车道 (<code>forward_fused_softmax</code>)</strong>：</p>
+<ul>
+<li>如果是 GPT 模式 (<code>AttnMaskType.causal</code>)：调用 Task 2 中的 <code>ScaledUpperTriangMaskedSoftmax</code>。</li>
+<li>如果是通用模式：调用 <code>ScaledMaskedSoftmax</code>。</li>
+<li><strong>限制条件 (<code>is_kernel_available</code>)</strong>：<ul>
+<li>必须是 FP16。</li>
+<li>序列长度 (<code>sk</code>) 必须在 16 到 4096 之间。</li>
+<li>长度必须能被 4 整除（GPU 内存对齐要求）。</li>
+<li>这就是为什么有时候你改了模型参数，速度突然变慢，可能就是因为不满足条件，跌回了慢车道。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>慢车道 (<code>forward_torch_softmax</code>)</strong>：</p>
+<ul>
+<li>这就是普通的 PyTorch 写法。</li>
+<li>先转 float (如果需要)。</li>
+<li><code>input * scale</code>。</li>
+<li>生成 Mask (比如 <code>get_default_causal_mask</code>)。</li>
+<li>应用 Mask (<code>input + mask</code>)。</li>
+<li>调用 <code>torch.softmax</code>。</li>
+<li>最后转回 fp16/bf16。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这份文件的核心思想是<strong>“能快则快，兜底兼容”</strong>。</p>
+<ul>
+<li>如果你在用标准的 GPT 结构、标准的序列长度、FP16 训练，它会默默调用底层的 NVIDIA CUDA 代码（那三个 <code>Scaled...</code> 类），把三个操作融合，让你训练飞快。</li>
+<li>如果你搞了一些非标的长度、或者没开融合开关，它就会老老实实地用 PyTorch 原生算子跑通流程，保证程序不报错，只是稍微慢一点。</li>
+</ul>

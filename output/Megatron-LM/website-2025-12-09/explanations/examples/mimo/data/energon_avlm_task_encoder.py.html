@@ -1,0 +1,73 @@
+<h1>examples/mimo/data/energon_avlm_task_encoder.py</h1>
+<p>这份代码确实比较复杂，因为它涉及到了<strong>多模态大模型（Audio-Visual-Language Model, AVLM）</strong>的数据预处理流程。它的核心作用是：<strong>把原始的图片、音频、文本对话数据，转化成模型能看懂的数字（Tensor）格式。</strong></p>
+<p>为了让你看懂，我把这个文件要做的事情想象成一个<strong>“流水线工厂”</strong>。我们列一个 <strong>Task To-Do List</strong>，按顺序一步步拆解每一步在做什么。</p>
+<hr />
+<h3>📝 AVLM 数据处理流水线 To-Do List</h3>
+<h4>Task 1: 定义原材料 (定义数据结构)</h4>
+<p><strong>代码位置:</strong> <code>VisionAudioQASample</code> 类
+*   <strong>目标:</strong> 告诉程序，我们的输入数据长什么样。
+*   <strong>动作:</strong> 定义了一个包裹，里面必须包含：
+    *   <code>context</code> (用户的问题/历史对话)
+    *   <code>answers</code> (机器人的回答)
+    *   <code>image</code> (原始图片数据，字节流)
+    *   <code>audio</code> (原始音频数据，字节流)</p>
+<h4>Task 2: 准备加工工具 (初始化编码器)</h4>
+<p><strong>代码位置:</strong> <code>AVLMTaskEncoder.__init__</code>
+*   <strong>目标:</strong> 准备好处理各种数据的工具。
+*   <strong>动作:</strong> 
+    *   拿出一个 <code>image_processor</code> (用来把图片变成标准尺寸和颜色)。
+    *   拿出一个 <code>audio_processor</code> (用来把声音变成频谱图)。
+    *   拿出一个 <code>processor</code> (包含 Tokenizer，用来把文字变成 ID)。</p>
+<h4>Task 3: 编写剧本 (构建对话模板)</h4>
+<p><strong>代码位置:</strong> <code>apply_prompt_template</code> 方法
+*   <strong>目标:</strong> 把零散的对话整理成模型训练的标准格式。
+*   <strong>动作:</strong>
+    *   把用户的每句话前面加 <code>User:</code>，机器人的每句话前面加 <code>Assistant:</code> (具体格式取决于 Chat Template)。
+    *   <strong>关键点:</strong> 确保第一句话里包含 <code>&lt;image&gt;</code> 和 <code>&lt;audio&gt;</code> 这样的占位符，告诉模型这里有图片和声音。</p>
+<h4>Task 4: 清洗与加工素材 (处理图片和音频)</h4>
+<p><strong>代码位置:</strong> <code>encode_sample</code> 方法的前半部分
+*   <strong>目标:</strong> 把原始的二进制数据变成 PyTorch Tensor。
+*   <strong>动作 (音频):</strong>
+    *   读取音频字节流。
+    *   <strong>重采样 (Resample):</strong> 强制把音频采样率转为 16000Hz (这是 Whisper 等模型的标准)。
+    *   计算音频需要多少个 Token (<code>num_audio_tokens</code>)。
+*   <strong>动作 (图片):</strong>
+    *   读取图片字节流。
+    *   归一化处理 (像素值除以 255)。</p>
+<h4>Task 5: 核心拼接 (多模态占位符替换)</h4>
+<p><strong>代码位置:</strong> <code>encode_sample</code> 中处理 <code>processed_prompt</code> 的部分
+*   <strong>目标:</strong> 这一步最关键。文本里只有一个 <code>&lt;audio&gt;</code> 标签，但一段音频可能对应几百个向量。
+*   <strong>动作:</strong>
+    *   如果算出来音频对应 100 个 Token，代码就把文本里的 <code>&lt;audio&gt;</code> 替换成 100 个 <code>&lt;audio&gt;</code> 连在一起。
+    *   这样文字的长度就和音频特征的长度对齐了。</p>
+<h4>Task 6: 数字化与打包 (Tokenization)</h4>
+<p><strong>代码位置:</strong> <code>self.processor(...)</code>
+*   <strong>目标:</strong> 把处理好的文本（包含重复了很多次的占位符）变成数字 ID。
+*   <strong>动作:</strong>
+    *   调用 HuggingFace 的 <code>processor</code>。
+    *   输入：处理后的图片 + 替换好占位符的文本。
+    *   输出：<code>input_ids</code> (一串数字)。</p>
+<h4>Task 7: 制作“参考答案” (Label Masking)</h4>
+<p><strong>代码位置:</strong> <code>encode_sample</code> 的后半部分 (处理 <code>labels</code>)
+*   <strong>目标:</strong> 训练模型时，我们只希望它学习<strong>怎么回答</strong>，而不希望它学习<strong>怎么提问</strong>。
+*   <strong>动作:</strong>
+    *   先创建一个全是 <code>-100</code> 的 <code>labels</code> 数组 (在 PyTorch 里，-100 代表“不算分/忽略”)。
+    *   找到 <code>input_ids</code> 里属于“机器人回答”的那些片段。
+    *   把这些片段的 <code>-100</code> 替换成真实的 Token ID。
+    *   <strong>结果:</strong> 计算 Loss 时，模型只会被惩罚“回答错误”的部分，提问部分被忽略。</p>
+<h4>Task 8: 装箱发货 (Batching)</h4>
+<p><strong>代码位置:</strong> <code>batch</code> 和 <code>encode_batch</code> 方法
+*   <strong>目标:</strong> 把处理好的一个个样本（Sample）凑成一批（Batch），喂给 GPU。
+*   <strong>动作:</strong>
+    *   <strong>Padding (填充):</strong> 因为每句话长度不一样，要把短的补 0，让大家一样长。
+    *   <strong>Stacking (堆叠):</strong> 把图片 Tensor 堆在一起，音频特征堆在一起。
+    *   最后输出一个大字典，包含 <code>input_ids</code>, <code>images</code>, <code>audios</code>, <code>labels</code> 等，这就是模型 <code>forward</code> 函数接收的参数。</p>
+<hr />
+<h3>🔍 总结：这个文件在讲什么？</h3>
+<p>简单来说，这个文件就是一个<strong>翻译官</strong>。</p>
+<ol>
+<li>它左手拿着原始的<strong>MP3音频、JPG图片、TXT文本</strong>。</li>
+<li>它中间经过一系列复杂的计算（重采样、计算Token数量、替换占位符、Mask掉提问部分）。</li>
+<li>它右手递给模型一个<strong>标准的字典数据包</strong>，里面是可以直接进行矩阵运算的 Tensor。</li>
+</ol>
+<p><strong>如果你要修改或调试这个代码，重点关注 <code>encode_sample</code> 函数，因为所有的魔法（数据变换逻辑）都发生在这里。</strong></p>

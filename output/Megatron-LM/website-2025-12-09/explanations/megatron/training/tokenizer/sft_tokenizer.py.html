@@ -1,0 +1,97 @@
+<h1>megatron/training/tokenizer/sft_tokenizer.py</h1>
+<p>这份代码确实涉及大模型训练中比较细节的部分，主要是在做 <strong>SFT（Supervised Fine-Tuning，有监督微调）</strong> 时的<strong>数据预处理</strong>。</p>
+<p>简单来说，它的核心任务是：<strong>把人类能看懂的对话（User问，AI答），转换成机器能训练的数字序列，并且告诉机器“哪部分是你需要学习预测的，哪部分是提示词不用学的”。</strong></p>
+<p>我为你整理了一个逻辑上的 <strong>Task List (任务清单)</strong>，然后按照这个清单一步步给你讲解代码在干什么。</p>
+<hr />
+<h3>Task List: SFT Tokenizer 的工作流程</h3>
+<ol>
+<li><strong>初始化 (Initialization)</strong>：加载基础词表，确定对话格式（是哪种模型架构）。</li>
+<li><strong>定义模板 (Templating)</strong>：给对话加上特殊的标记（比如 <code>&lt;System&gt;</code>, <code>&lt;User&gt;</code>），让模型分得清谁在说话。</li>
+<li><strong>对话分词 (Tokenization)</strong>：把加了标记的文本变成数字 ID。</li>
+<li><strong>构建训练目标 (Target Masking)</strong>：这是最关键的一步。把“用户说的话”和“系统提示”遮盖掉（Mask），只让模型学习预测“AI 的回答”。</li>
+<li><strong>辅助功能 (Utilities)</strong>：提供解码、获取词表大小等基础工具。</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>Task 1: 初始化 (Initialization)</h4>
+<p><strong>代码位置</strong>：<code>__init__</code> 方法</p>
+<ul>
+<li><strong>观点</strong>：大模型训练通常不从零写分词器，而是借用现有的工具（HuggingFace Transformers）。</li>
+<li><strong>代码行为</strong>：<ul>
+<li>它首先检查你有没有安装 <code>transformers</code> 库。</li>
+<li>使用 <code>transformers.AutoTokenizer.from_pretrained(tokenizer_path)</code> 加载一个现成的分词器（比如 Llama 或 Mistral 的分词器）。</li>
+<li><strong>关键点</strong>：根据传入的 <code>prompt_format</code>（提示词格式），它会决定使用哪种配置。代码里支持两种特定的格式：<ul>
+<li><code>nemotron-nano-v2</code></li>
+<li><code>nemotron-h-aligned</code></li>
+</ul>
+</li>
+<li>这些配置决定了特殊的 <strong>Padding Token</strong>（填充符）是什么，以及对话模板长什么样。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 定义模板 (Templating)</h4>
+<p><strong>代码位置</strong>：文件顶部的 <code>nemotron_h_aligned_custom_template</code> 等变量</p>
+<ul>
+<li><strong>观点</strong>：原生文本（Raw Text）直接丢给模型是不行的。模型需要“分隔符”来知道什么时候轮到谁说话。</li>
+<li><strong>代码行为</strong>：<ul>
+<li>代码定义了 Jinja2 格式的模板字符串。</li>
+<li>例如 <code>nemotron_h_aligned</code> 模板：<ul>
+<li>如果是 System（系统指令），加上 <code>&lt;SPECIAL_10&gt;System\n</code>。</li>
+<li>如果是 User（用户），加上 <code>&lt;SPECIAL_11&gt;User\n</code>。</li>
+<li>如果是 Assistant（AI），就直接接内容。</li>
+</ul>
+</li>
+<li>这些 <code>&lt;SPECIAL_xx&gt;</code> 就是特殊的 Token，模型看到它们就知道：“哦，这里换人说话了”。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 对话分词 (Tokenization)</h4>
+<p><strong>代码位置</strong>：<code>tokenize_conversation</code> 方法的前半部分</p>
+<ul>
+<li><strong>观点</strong>：将结构化的对话列表（List of Dicts）转化为计算机能算的数字张量。</li>
+<li><strong>代码行为</strong>：<ul>
+<li>输入是一个列表，长这样：
+    <code>python
+    [
+        {"role": "user", "content": "你好"},
+        {"role": "assistant", "content": "你好，有什么我可以帮你？"}
+    ]</code></li>
+<li>它调用 <code>self._tokenizer.apply_chat_template</code>。这个函数会把上面的列表，利用 Task 2 定义的模板，拼接成一个长字符串，然后转成一串数字 ID（Tokens）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 构建训练目标 (Target Masking) —— <strong>全篇最核心</strong></h4>
+<p><strong>代码位置</strong>：<code>tokenize_conversation</code> 方法的后半部分（<code>if not return_target: ...</code> 之后）</p>
+<ul>
+<li><strong>观点</strong>：在 SFT 训练中，<strong>我们不希望模型通过计算 Loss 来学习“用户问了什么”，我们只希望它学习“怎么回答”</strong>。因此，我们需要把用户说的话在计算 Loss 时“抹去”（通常设为 -100 或 IGNORE_INDEX）。</li>
+<li><strong>代码行为</strong>：<ol>
+<li>复制一份刚才生成的 Token 列表，命名为 <code>target</code>。</li>
+<li><strong>循环遍历每一轮对话</strong>：<ul>
+<li>如果这一轮是 <code>system</code> 或 <code>user</code>：把这部分的 Token 在 <code>target</code> 里全部设为 <code>IGNORE_INDEX</code>（忽略）。</li>
+<li>如果这一轮是 <code>assistant</code>（AI 回答）：保留 Token，因为这是要训练的答案。</li>
+<li><strong>细节处理</strong>：如果 AI 回答前面有固定的前缀（比如 "Assistant:" 这几个字），通过 <code>assistant_prefix_len</code> 把这几个字也 Mask 掉，让模型直接学内容，不要学这一成不变的前缀。</li>
+</ul>
+</li>
+<li>最后返回两个东西：<ul>
+<li><code>tokens</code>：完整的数字序列（输入给模型的）。</li>
+<li><code>target</code>：只有 AI 回答部分有数字，其他部分都是“忽略标记”的序列（用来算 Loss 的）。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 5: 辅助功能 (Utilities)</h4>
+<p><strong>代码位置</strong>：<code>tokenize</code>, <code>detokenize</code>, <code>convert_tokens_to_ids</code> 以及底部的 <code>@property</code></p>
+<ul>
+<li><strong>观点</strong>：为了兼容性和推理（Inference），需要提供标准接口。</li>
+<li><strong>代码行为</strong>：<ul>
+<li><code>tokenize</code>：如果是推理阶段（不是训练），就直接分词，不需要生成 Mask 过的 target。</li>
+<li><code>force_eod</code>：某些格式要求每条数据末尾必须强制加一个“结束符”（EOD），这里做了一个开关。</li>
+<li><code>vocab_size</code>：返回词表大小，模型初始化矩阵时需要这个数字。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件 <code>sft_tokenizer.py</code> 就是一个<strong>翻译官 + 考题出题人</strong>：
+1.  <strong>翻译官</strong>：把人类对话变成模型能读懂的 Token ID。
+2.  <strong>出题人</strong>：它把用户的问题涂黑（Mask），告诉模型：“别管问题是怎么生成的，你只需要看着问题，学会把答案填空填对就行了”。</p>

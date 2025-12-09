@@ -1,0 +1,127 @@
+<h1>recipe/fully_async_policy/ray_trainer.py</h1>
+<p>这份代码是一个基于 <strong>Ray</strong>（分布式计算框架）实现的 <strong>PPO（Proximal Policy Optimization）训练器</strong>。它的核心作用是协调多个不同的模型（Actor, Critic, Reward Model 等）在多张显卡或多台机器上协同工作，完成强化学习的训练流程。</p>
+<p>为了让你更容易理解，我把这个复杂的训练过程拆解成一个 <strong>“项目经理的任务清单（Todo List）”</strong>。</p>
+<p>你可以把 <code>FullyAsyncRayPPOTrainer</code> 想象成一个<strong>项目经理</strong>，他手下有几个专门的<strong>工种（Worker）</strong>：
+*   <strong>Actor (演员/学生)</strong>: 负责做题（生成文本）。
+*   <strong>Critic (评论家/老师)</strong>: 负责预估当前状态好不好。
+*   <strong>Reward Model (阅卷人)</strong>: 负责给结果打分。
+*   <strong>Ref Policy (参考员)</strong>: 作为一个基准，防止学生跑偏。</p>
+<p>下面是这位“项目经理”在代码中执行的 <strong>Todo List</strong>：</p>
+<hr />
+<h3>🟢 第一阶段：招聘与组建团队 (Initialization)</h3>
+<p>对应代码方法：<code>init_workers</code>, <code>_init_resource_pools</code>, <code>_init_worker_groups</code></p>
+<ul>
+<li><strong>Task 0.1: 分配计算资源</strong><ul>
+<li>经理先看配置文件，决定需要多少张 GPU。</li>
+<li>创建“资源池”（Resource Pool），把显卡划分给不同的角色。</li>
+</ul>
+</li>
+<li><strong>Task 0.2: 组建部门 (Worker Groups)</strong><ul>
+<li><strong>招聘 Actor</strong>: 负责生成回复（Rollout）。</li>
+<li><strong>招聘 Critic</strong>: 如果配置了 <code>use_critic</code>，就招募 Critic 组。</li>
+<li><strong>招聘 Reward Model</strong>: 如果需要模型打分，就招募 RM 组。</li>
+<li><strong>招聘 Reference Policy</strong>: 招募参考策略组。</li>
+</ul>
+</li>
+<li><strong>Task 0.3: 初始化模型</strong><ul>
+<li>让所有员工加载权重，把模型加载到显卡里准备干活（<code>_init_models</code>）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🔵 第二阶段：日常训练循环 (The <code>fit</code> Loop)</h3>
+<p>对应代码方法：<code>fit</code>。这是整个代码的主循环，经理每天（每个 Epoch）都在重复这个流程。</p>
+<ul>
+<li>
+<p><strong>Task 1: 准备题目 (Prepare Batch)</strong></p>
+<ul>
+<li>从数据加载器（Dataloader）里拿出一批 Prompt（提示词/问题）。</li>
+<li>给每个数据打上唯一的 ID (<code>uid</code>)，方便追踪。</li>
+<li>对应代码：<code>_prepare_generate_batch</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2: 学生做题 (Rollout / Generation)</strong></p>
+<ul>
+<li>经理把题目发给 <strong>Actor</strong>。</li>
+<li><strong>Actor</strong> 开始写作文（生成 <code>responses</code>）。</li>
+<li><em>注：如果是异步模式，这里会通过 <code>async_rollout_manager</code> 并行处理。</em></li>
+<li>对应代码：<code>actor_rollout_wg.generate_sequences</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3: 阅卷与评估 (Evaluation)</strong></p>
+<ul>
+<li>这一步非常关键，对应代码 <code>_process_batch_common</code>，经理需要收集多方意见：</li>
+<li><strong>Task 3.1: 阅卷 (Reward)</strong><ul>
+<li>把学生写的作文发给 <strong>Reward Model</strong> 打分，或者运行自定义的评分函数。</li>
+<li>对应代码：<code>rm_wg.compute_rm_score</code> 或 <code>compute_reward</code>。</li>
+</ul>
+</li>
+<li><strong>Task 3.2: 复盘旧概率 (Old Log Prob)</strong><ul>
+<li>计算生成这些文字时的概率（这是 PPO 算法需要的数学项）。</li>
+<li>对应代码：<code>actor_rollout_wg.compute_log_prob</code>。</li>
+</ul>
+</li>
+<li><strong>Task 3.3: 查重/对比 (Ref Log Prob)</strong><ul>
+<li>看一眼 <strong>Reference Policy</strong>（原始模型）对这道题怎么看，计算 KL 散度（防止模型训练坏了，乱说话）。</li>
+<li>对应代码：<code>ref_policy_wg.compute_ref_log_prob</code>。</li>
+</ul>
+</li>
+<li><strong>Task 3.4: 老师估值 (Critic Value)</strong><ul>
+<li><strong>Critic</strong> 预估当前状态的价值（Value），用于计算优势函数。</li>
+<li>对应代码：<code>critic_wg.compute_values</code>。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 4: 计算差距 (Advantage Estimation)</strong></p>
+<ul>
+<li>经理汇总所有分数：奖励分（Reward）- 惩罚项（KL Penalty）。</li>
+<li>计算 <strong>Advantage（优势）</strong>：即“这步操作比预期的好了多少？”。</li>
+<li>对应代码：<code>compute_advantage</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 5: 学习与进化 (Update / Learning)</strong></p>
+<ul>
+<li>根据刚才算出来的优势，更新模型参数。</li>
+<li><strong>Task 5.1: 更新老师 (Update Critic)</strong><ul>
+<li>让 Critic 以后估值更准。</li>
+<li>对应代码：<code>critic_wg.update_critic</code>。</li>
+</ul>
+</li>
+<li><strong>Task 5.2: 更新学生 (Update Actor)</strong><ul>
+<li>这是最终目的！让 Actor 以后多生成高分回答，少生成低分回答。</li>
+<li>对应代码：<code>actor_rollout_wg.update_actor</code>。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 6: 写日报 (Logging)</strong></p>
+<ul>
+<li>记录今天的训练指标（分数涨没涨？训练速度多少？显存用了多少？）。</li>
+<li>把生成的文本抽样打印出来看看效果。</li>
+<li>对应代码：<code>logger.log</code>, <code>_log_rollout</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 7: 存盘 (Checkpoint)</strong></p>
+<ul>
+<li>定期保存模型，防止机器挂了白干。</li>
+<li>对应代码：<code>_check_save_checkpoint</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑就是：
+1.  <strong>分发资源</strong>（Init）
+2.  <strong>拿题</strong>（Dataloader）
+3.  <strong>做题</strong>（Actor Generate）
+4.  <strong>打分</strong>（Reward Model + Critic + Ref Policy）
+5.  <strong>算账</strong>（Advantage）
+6.  <strong>改错</strong>（Update Actor &amp; Critic）</p>
+<p>之所以叫 <code>FullyAsync</code> 和 <code>Ray</code>，是因为上述的 Task 2, 3, 5 中的繁重计算，都是通过 Ray 远程发送给不同的显卡并行处理的，主进程（Trainer）只负责发号施令。</p>

@@ -1,0 +1,113 @@
+<h1>verl/trainer/ppo/core_algos.py</h1>
+<p>这份代码文件 <code>core_algos.py</code> 其实是 <strong>强化学习（RL）训练 LLM 的“核心数学公式库”</strong>。</p>
+<p>它不负责加载模型，也不负责发数据，它只负责最核心的一件事：<strong>算数</strong>。算出一个数字（Loss），告诉模型该往哪个方向优化。</p>
+<p>为了让你看懂，我把你（作为一个算法工程师）要训练一个“会写数学题的 AI”作为 <strong>Task</strong>，列一个 <strong>To-Do List</strong>。我们按照这个流程，一步步看代码里对应的功能。</p>
+<hr />
+<h3>Task: 训练一个数学解题 AI (使用 PPO/GRPO 算法)</h3>
+<h4>To-Do List 流程</h4>
+<ol>
+<li><strong>[阅卷]</strong>：模型做了一堆题，我要算出它做得好不好（计算 Advantage）。</li>
+<li><strong>[改错]</strong>：根据阅卷结果，告诉模型怎么修改参数（计算 Policy Loss）。</li>
+<li><strong>[防跑偏]</strong>：防止模型为了高分乱答题，要限制它不能离原版太远（计算 KL 散度）。</li>
+<li><strong>[预估]</strong>：如果用了 Critic 模型，还要训练 Critic 估分准不准（计算 Value Loss）。</li>
+</ol>
+<hr />
+<h3>第一步：[阅卷] 也就是“优势估计” (Advantage Estimation)</h3>
+<p>模型生成了一个回答，得了一个奖励分（Reward）。但光看分数不够，我们得知道<strong>这个分数相对于“平均水平”是高了还是低了</strong>。这就是 Advantage（优势）。</p>
+<p>代码里有一大堆 <code>compute_..._advantage</code> 函数，其实就是不同的阅卷流派：</p>
+<ul>
+<li><strong>流派 A：传统 PPO (GAE)</strong><ul>
+<li><strong>代码对应：</strong> <code>compute_gae_advantage_return</code></li>
+<li><strong>观点：</strong> 需要一个专门的“老师模型”（Critic/Value Model）来打分。通过对比实际得分和老师的预估分，算出优势。这是最经典的方法，但比较占显存。</li>
+</ul>
+</li>
+<li><strong>流派 B：省钱流派 (GRPO / RLOO)</strong> (这是目前 DeepSeek 等模型常用的)<ul>
+<li><strong>代码对应：</strong> <code>compute_grpo_outcome_advantage</code>, <code>compute_rloo_outcome_advantage</code></li>
+<li><strong>观点：</strong> 既然养一个“老师模型”太贵，那我就让学生<strong>针对同一个问题做 N 次回答</strong>。</li>
+<li><strong>怎么算优势？</strong> 比如做了 4 次，得分分别是 [10, 8, 5, 2]。<ul>
+<li>10 分那个就是优势巨大（比平均好）。</li>
+<li>2 分那个就是劣势（比平均差）。</li>
+</ul>
+</li>
+<li><strong>代码细节：</strong> 你会看到代码里有 <code>(scores - mean) / std</code> 这样的公式，这就是在算这组回答里的相对好坏。</li>
+</ul>
+</li>
+<li><strong>流派 C：其他变种 (ReMax, Reinforce++, etc.)</strong><ul>
+<li><strong>代码对应：</strong> <code>compute_remax_...</code>, <code>compute_reinforce_plus_plus_...</code></li>
+<li><strong>观点：</strong> 各种学术界提出的微调算法，目的都是为了更准、更省资源地算出“优势”。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>总结：</strong> 这一步是为了把“由于运气好得的分”和“由于实力强得的分”区分开。</p>
+</blockquote>
+<hr />
+<h3>第二步：[改错] 也就是“策略损失” (Policy Loss)</h3>
+<p>知道了哪些回答好（Advantage 高），哪些回答差，现在要正式修改模型的大脑（参数）了。</p>
+<ul>
+<li><strong>核心逻辑：</strong><ul>
+<li>如果优势是正的（Advantage &gt; 0），就<strong>提高</strong>生成这些词的概率。</li>
+<li>如果优势是负的（Advantage &lt; 0），就<strong>降低</strong>生成这些词的概率。</li>
+</ul>
+</li>
+</ul>
+<p>代码里 <code>POLICY_LOSS_REGISTRY</code> 注册了一堆函数：</p>
+<ul>
+<li><strong>经典 PPO (Vanilla)</strong><ul>
+<li><strong>代码对应：</strong> <code>compute_policy_loss_vanilla</code></li>
+<li><strong>核心观点（Clipping）：</strong> 步子大了容易扯着蛋。</li>
+<li><strong>解释：</strong> 虽然我们要提高好回答的概率，但<strong>不能一次提太高</strong>。代码里有很多 <code>torch.clamp(ratio, 1-clip, 1+clip)</code>，这就是著名的 PPO Clip 机制。它强制把修改幅度限制在一个小范围内（比如 0.2），保证训练稳定，不会因为一次坏数据把模型练崩。</li>
+</ul>
+</li>
+<li><strong>其他变种 (GSPO, GPG, Clip-Cov)</strong><ul>
+<li><strong>代码对应：</strong> <code>compute_policy_loss_gspo</code>, <code>compute_policy_loss_gpg</code> 等</li>
+<li><strong>观点：</strong> 在具体的数学计算上做微调。比如 GSPO 强调在序列级别（Sequence Level）做加权，而不是只看单个 Token。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>总结：</strong> 这一步是梯度下降的核心，利用第一步算出的“优势”来更新模型，同时用 Clip 机制防止更新过猛。</p>
+</blockquote>
+<hr />
+<h3>第三步：[防跑偏] 也就是 KL 散度 (KL Divergence)</h3>
+<ul>
+<li><strong>问题：</strong> 为了刷高分，模型可能会输出乱码（Reward Hacking），或者完全不说人话。</li>
+<li>
+<p><strong>解决：</strong> 我们要求现在的模型（Student）和没训练之前的原始模型（Reference）不能差太远。</p>
+</li>
+<li>
+<p><strong>代码对应：</strong></p>
+<ul>
+<li><code>AdaptiveKLController</code>：动态调整惩罚力度。如果跑偏太远，就加大惩罚系数。</li>
+<li><code>kl_penalty</code> 和 <code>compute_rewards</code>：在计算奖励时，直接减去 KL 散度。</li>
+<li><strong>观点：</strong> 创新要在守旧的基础上。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第四步：[辅助计算] 其他杂项</h3>
+<p>代码里还有一些辅助工具：</p>
+<ul>
+<li><strong><code>agg_loss</code> (损失聚合)：</strong><ul>
+<li>算出了每个 Token 的 Loss，最后怎么变成一个总数？是求平均（Mean）还是求和（Sum）？</li>
+<li>这在分布式训练（多张显卡）时特别重要，代码里专门处理了 <code>dp_size</code>（数据并行大小）来保证数学上的正确性。</li>
+</ul>
+</li>
+<li><strong><code>compute_value_loss</code>：</strong><ul>
+<li>如果你用了 Critic 模型（流派 A），这个函数用来训练 Critic，让它打分更准。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>全文观点总结 (Takeaway)</h3>
+<p>如果你要用一句话概括这个文件，它是：</p>
+<blockquote>
+<p><strong>一个模块化的 PPO/RL 算法仓库。</strong></p>
+</blockquote>
+<ol>
+<li><strong>模块化设计：</strong> 它把“怎么算分”（AdvantageEstimator）和“怎么更新”（PolicyLoss）解耦了。你可以组合 <code>GRPO</code> 的算分方式 + <code>Vanilla</code> 的更新方式。</li>
+<li><strong>兼容性强：</strong> 它不仅支持传统的 PPO（基于 Critic），还大力支持最新的 GRPO/RLOO（基于 Group 采样，不需要 Critic），这非常符合现在大模型训练省显存的趋势。</li>
+<li><strong>工程细节：</strong> 里面充满了 <code>masked_mean</code>、<code>no_grad</code>、<code>clamp</code> 等操作，都是为了处理变长序列（Padding）和数值稳定性（防止除以 0，防止梯度爆炸）。</li>
+</ol>
+<p><strong>你现在只需要知道：</strong>
+当你在配置文件里选 <code>adv_estimator: grpo</code> 时，程序就会跑去调 <code>compute_grpo_outcome_advantage</code>；选 <code>loss: vanilla</code> 时，就会调 <code>compute_policy_loss_vanilla</code>。这文件就是个菜单的后台实现。</p>

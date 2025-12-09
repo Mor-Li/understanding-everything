@@ -1,0 +1,62 @@
+<h1>examples/grpo_trainer/run_qwen2_5_vl-7b_lora.sh</h1>
+<p>这份脚本确实看着很吓人，充满了各种参数和缩写。但其实它就是一个<strong>“训练配置文件”</strong>。</p>
+<p>你可以把运行这个脚本想象成<strong>“招聘一名 AI 实习生，并安排它进行强化学习特训”</strong>的过程。</p>
+<p>为了让你看懂，我把这个脚本拆解成一个 <strong>6步走的 To-Do List（任务清单）</strong>。我们一步一步来看，这些参数到底在指挥电脑干什么。</p>
+<hr />
+<h3>任务清单：训练 Qwen2.5-VL 多模态模型 (GRPO 算法)</h3>
+<h4>✅ 第一步：确定“训练目标”和“核心引擎”</h4>
+<p><strong>（我们要干什么？）</strong></p>
+<p>这一部分定义了我们要用什么算法，以及用什么工具来加速。</p>
+<ul>
+<li><code>python3 -m verl.trainer.main_ppo</code>: <strong>启动指令</strong>。告诉程序，我们要开始跑强化学习（PPO类）的主程序了。</li>
+<li><code>algorithm.adv_estimator=grpo</code>: <strong>核心算法</strong>。这里指定使用 <strong>GRPO</strong>（Group Relative Policy Optimization）。这是 DeepSeek-R1 背后的核心算法，简单说就是“让模型自己生成好几个答案，然后对比哪个更好，不用训练一个额外的打分模型（Critic）”。</li>
+<li><code>ENGINE=${1:-vllm}</code>: <strong>推理引擎</strong>。指定使用 <code>vllm</code>。因为强化学习需要模型不断地生成答案（Rollout），vLLM 生成速度非常快，能节省大量时间。</li>
+</ul>
+<h4>✅ 第二步：准备“教材”</h4>
+<p><strong>（数据从哪来？长什么样？）</strong></p>
+<p>这一部分告诉模型去哪里读取数据，以及数据里包含什么（因为是 VL 模型，所以包含图片）。</p>
+<ul>
+<li><code>data.train_files=.../geo3k/train.parquet</code>: <strong>教材路径</strong>。这里用的是 <code>geo3k</code>，这是一个几何数学题的数据集（包含几何图形和题目）。</li>
+<li><code>data.image_key=images</code>: <strong>视觉开关</strong>。告诉代码，数据里有一列叫 <code>images</code>，这是图片数据，别把它当文字处理了。</li>
+<li><code>data.max_prompt_length=1024</code> &amp; <code>response_length=2048</code>: <strong>篇幅限制</strong>。题目最长 1024 个词，回答最长 2048 个词。</li>
+</ul>
+<h4>✅ 第三步：挑选“实习生”并设定“学习方式”</h4>
+<p><strong>（用哪个模型？怎么微调？）</strong></p>
+<p>这一部分最关键，定义了模型本身以及 LoRA（一种省显存的微调技术）的设置。</p>
+<ul>
+<li><code>actor_rollout_ref.model.path=Qwen/Qwen2.5-VL-7B-Instruct</code>: <strong>指定模型</strong>。我们要训练的是 Qwen2.5 的视觉语言版本（VL），70亿参数。</li>
+<li><code>...lora_rank=64</code> &amp; <code>lora_alpha=32</code>: <strong>LoRA 设置</strong>。这表示我们不全量训练整个大模型（太贵了），而是给它挂一个“外挂大脑”（LoRA适配器）来训练。</li>
+<li><code>...target_modules=all-linear</code>: <strong>训练范围</strong>。所有的线性层都参与训练。</li>
+<li><strong>重点来了</strong> 👉 <code>...exclude_modules='.*visual.*'</code>: <strong>视觉冻结</strong>。这句话非常重要！它的意思是<strong>“不要训练视觉部分（眼睛），只训练语言部分（大脑）”</strong>。因为视觉编码器通常很敏感，微调容易把它练坏，所以这里选择冻结它。</li>
+</ul>
+<h4>✅ 第四步：制定“考试规则” (强化学习核心)</h4>
+<p><strong>（GRPO 怎么玩？）</strong></p>
+<p>这是 GRPO 算法特有的设置。</p>
+<ul>
+<li><code>actor_rollout_ref.rollout.n=5</code>: <strong>一题多解</strong>。对于每一道几何题，让模型生成 <strong>5 个</strong> 不同的解题过程。GRPO 会在一组（Group）内比较这 5 个答案的好坏。</li>
+<li><code>actor_rollout_ref.actor.use_kl_loss=True</code>: <strong>防止跑偏</strong>。KL 散度惩罚，意思是让模型在创新的同时，不要偏离原始模型太远（不要开始胡言乱语）。</li>
+</ul>
+<h4>✅ 第五步：安排“工位” (硬件与显存优化)</h4>
+<p><strong>（怎么把大模型塞进显卡？）</strong></p>
+<p>因为模型很大，还要同时跑推理和训练，需要精细的显存管理。</p>
+<ul>
+<li><code>trainer.n_gpus_per_node=8</code>: <strong>显卡数量</strong>。这是一台 8 卡的机器。</li>
+<li><code>...tensor_model_parallel_size=2</code>: <strong>模型切分</strong>。Qwen-7B 虽然不算太大，但在训练时显存可能不够。这里把 1 个模型切开放在 <strong>2 张显卡</strong> 上跑（Tensor Parallelism）。</li>
+<li><code>...fsdp_config.param_offload=False</code>: <strong>FSDP 设置</strong>。这里没有开启参数卸载到 CPU（Offload），说明显存应该是够用的，追求速度。</li>
+</ul>
+<h4>✅ 第六步：行政管理 (记录与存档)</h4>
+<p><strong>（什么时候保存？去哪看进度？）</strong></p>
+<ul>
+<li><code>trainer.logger='["console","wandb"]'</code>: <strong>监控</strong>。把训练曲线画在控制台和 WandB（一个在线可视化工具）上。</li>
+<li><code>trainer.project_name='...'</code>: <strong>项目名</strong>。在 WandB 上显示的名字。</li>
+<li><code>trainer.save_freq=20</code>: <strong>存档频率</strong>。每 20 步保存一次模型。</li>
+<li><code>trainer.total_epochs=15</code>: <strong>学期长度</strong>。把所有教材反复学 15 遍。</li>
+</ul>
+<hr />
+<h3>总结：这个脚本在干嘛？</h3>
+<p>用大白话总结：</p>
+<blockquote>
+<p><strong>“嘿，电脑！我们要用 8 张显卡，把 Qwen2.5-VL-7B 这个懂图片的模型拿来进行特训。</strong></p>
+<p><strong>我们要用 GRPO 算法（类似于 DeepSeek 的训练方式），给它看几何题（Geo3k），每道题让它试着做 5 遍，然后通过对比优胜劣汰来提高它的解题能力。</strong></p>
+<p><strong>为了省显存，我们只训练它的语言部分（用 LoRA），不碰它的视觉部分。如果你是 vLLM 引擎，请帮我全速生成答案！”</strong></p>
+</blockquote>

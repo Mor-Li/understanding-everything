@@ -1,0 +1,62 @@
+<h1>tests/unit_tests/pipeline_parallel/test_schedules.py</h1>
+<p>这份代码文件 (<code>tests/unit_tests/pipeline_parallel/test_schedules.py</code>) 是 <strong>Megatron-LM</strong>（一个用于训练超大模型的框架）的单元测试代码。</p>
+<p>简单来说，<strong>它的核心任务是测试“流水线并行（Pipeline Parallelism）”的调度逻辑是否正确。</strong></p>
+<p>为了让你看懂，我们可以把“训练大模型”想象成在一个<strong>工厂流水线</strong>上组装产品。模型太大，一个工人（GPU）搞不定，所以拆成好几段，分给不同的工人（GPU）去干。</p>
+<p>这个文件就是用来检查这个“流水线”的<strong>调度员（Scheduler）</strong>有没有脑子进水。</p>
+<p>下面我列一个 <strong>Task List（任务清单）</strong>，带你一步步看懂这个文件在测试什么：</p>
+<hr />
+<h3>📋 任务清单：流水线调度测试流程</h3>
+<h4>1. ✅ Task 1: 检查“调度策略选择器”是否灵光</h4>
+<p><strong>对应的测试函数：</strong> <code>test_get_forward_backward_func</code>
+*   <strong>背景：</strong> 工厂有不同的运作模式：
+    *   如果是小模型，不需要流水线（单机模式）。
+    *   如果是大模型，需要普通流水线。
+    *   如果是超大模型，可能需要更复杂的“交错式”流水线（Interleaving）。
+*   <strong>测试内容：</strong>
+    *   我设置不同的配置（比如 GPU 数量、虚拟阶段数）。
+    *   <strong>检查点：</strong> 系统是不是自动给我返回了正确的“干活函数”（是 <code>no_pipelining</code>，还是 <code>without_interleaving</code>，还是 <code>with_interleaving</code>）？</p>
+<h4>2. ✅ Task 2: 检查“排班表”的数学逻辑</h4>
+<p><strong>对应的测试函数：</strong> <code>test_get_pipeline_parallel_order</code>
+*   <strong>背景：</strong> 在流水线上，不能所有人都同时做第一步。必须有人做“前向传播”（Forward，组装零件），有人做“反向传播”（Backward，检查质量）。这需要一个极其精确的顺序（比如著名的 1F1B 策略）。
+*   <strong>测试内容：</strong>
+    *   不跑真的模型，只算数字。
+    *   <strong>检查点：</strong> 生成的排班表（Schedule Table）里，任务总数对不对？有没有出现“还没组装好就开始检查质量”这种逻辑错误？每个人干的活是否收支平衡？</p>
+<h4>3. ✅ Task 3: 测试“单人模式”能不能跑通</h4>
+<p><strong>对应的测试函数：</strong> <code>test_forward_backward_func_without_pipeline_parallel</code>
+*   <strong>背景：</strong> 在上流水线之前，先确认一个人能不能把活干完。
+*   <strong>测试内容：</strong>
+    *   设置流水线并行度为 1（Pipeline Size = 1）。
+    *   <strong>检查点：</strong> 跑一遍训练，看能不能算出 Loss（损失值），结果是不是符合预期。这是最基础的对照组。</p>
+<h4>4. ✅ Task 4: 测试“普通流水线”能不能跑通</h4>
+<p><strong>对应的测试函数：</strong> <code>test_forward_backward_func_with_pipeline_parallel</code>
+*   <strong>背景：</strong> 这是最常见的场景。模型被切开，分给 4 个 GPU。
+*   <strong>测试内容：</strong>
+    *   启动 4 个虚拟进程。
+    *   让数据像接力棒一样在 GPU 之间传递。
+    *   <strong>检查点：</strong> 最后算出来的 Loss 对不对？如果不报错且结果正确，说明最基本的流水线调度（Schedule）是通的。</p>
+<h4>5. ✅ Task 5: 测试“进阶流水线（交错式）”能不能跑通</h4>
+<p><strong>对应的测试函数：</strong> <code>test_forward_backward_func_with_interleaving</code>
+*   <strong>背景：</strong> 普通流水线有个问题，中间会有气泡（闲置时间）。“交错式（Interleaving）”是指一个 GPU 负责模型的好几段（比如第1层和第5层），这样能减少闲置。
+*   <strong>测试内容：</strong>
+    *   设置 <code>virtual_pipeline_model_parallel_size</code>（虚拟阶段）。
+    *   <strong>检查点：</strong> 这种复杂的跳跃式传球，能不能把 Loss 算对？如果配置错了（比如微批次数量不对），系统会不会按预期报错（<code>pytest.raises(RuntimeError)</code>）？</p>
+<h4>6. ✅ Task 6: 测试“不均匀的模型切分”</h4>
+<p><strong>对应的测试函数：</strong> <code>test_forward_backward_func_with_uneven_interleaving</code>
+*   <strong>背景：</strong> 有时候切分模型不是切得整整齐齐的，可能一段大一段小。
+*   <strong>测试内容：</strong>
+    *   故意把模型设为不同的配置。
+    *   <strong>检查点：</strong> 调度器能不能处理这种“大小眼”的情况，依然正确跑完流程。</p>
+<h4>7. ✅ Task 7: 测试“自定义通讯组（Process Groups）”</h4>
+<p><strong>对应的测试函数：</strong> 带有 <code>_with_custom_pgs</code> 后缀的测试
+*   <strong>背景：</strong> 在超大规模集群（比如几千张卡）或者使用 DeviceMesh（PyTorch 2.3+ 新特性）时，我们不能用默认的通讯方式，需要手动指定“谁跟谁说话”。
+*   <strong>测试内容：</strong>
+    *   手动创建通讯组（Process Group Collection）。
+    *   把这个自定义的通讯录传给调度器。
+    *   <strong>检查点：</strong> 跑出来的结果，必须和“默认全自动”模式下的结果<strong>一模一样</strong>。这证明手动控制通讯是安全的。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就在回答一个问题：</p>
+<blockquote>
+<p><strong>“不管用户怎么配置（单机、普通流水线、交错流水线、自定义通讯），Megatron 的调度器（Schedule）能不能保证数据流转的顺序是正确的，并且算出来的结果是可靠的？”</strong></p>
+</blockquote>
+<p>如果你是开发者，改动了核心代码后，必须跑通这个文件，否则你的改动可能会导致训练死锁或者梯度计算错误。</p>

@@ -1,0 +1,84 @@
+<h1>tests/unit_tests/find_test_cases.py</h1>
+<p>这完全可以理解。这段代码乍一看全是路径处理和命令调用，容易让人晕头转向。</p>
+<p>简单来说，这个脚本是为了<strong>防止重复运行测试</strong>。</p>
+<p>想象一下：你有一个大文件夹叫“所有测试”，里面包含“A模块测试”和“B模块测试”。
+*   如果你的任务是“运行所有测试”，但同时另一台机器正在专门“运行A模块测试”。
+*   为了节省时间，你需要告诉“运行所有测试”的任务：<strong>“跑所有的，但是跳过A模块，因为别人在跑了。”</strong></p>
+<p>这个脚本就是用来<strong>计算这些需要“跳过（ignore）”的文件列表</strong>的。</p>
+<p>下面我列一个 Task Todo List，带你一步步拆解它的逻辑：</p>
+<hr />
+<h3>🔍 脚本逻辑 Todo List</h3>
+<h4>1. 准备阶段：拿到“总地图” (Get the Master Plan)</h4>
+<ul>
+<li><strong>任务</strong>：读取一个配置文件（YAML），看看系统里一共定义了哪些测试任务。</li>
+<li><strong>对应代码</strong>：<code>get_test_cases(YAML_FILE)</code></li>
+<li><strong>解释</strong>：它调用 <code>yq</code> 命令读取 <code>unit-tests.yaml</code>，把里面所有的测试路径都列出来（比如 <code>tests/unit/**</code>，<code>tests/unit/app/**</code> 等）。</li>
+</ul>
+<h4>2. 锁定当前目标：拿到“大桶” (Identify the Bucket)</h4>
+<ul>
+<li><strong>任务</strong>：看用户（命令行参数）指定了今天要跑哪个大范围的测试路径（我们称之为 Bucket）。</li>
+<li><strong>对应代码</strong>：<code>sys.argv[1]</code> 和 <code>expand_pattern(BUCKET)</code></li>
+<li><strong>解释</strong>：比如你输入了 <code>tests/unit/**</code>。脚本会去硬盘上扫描，把这个路径下所有的真实 <code>.py</code> 文件全找出来，放到一个集合里叫 <code>bucket_files</code>。</li>
+</ul>
+<h4>3. 侦查重叠：寻找“子任务” (Find Child Tasks)</h4>
+<ul>
+<li><strong>任务</strong>：遍历第1步拿到的“总地图”，看看有没有哪个测试任务是<strong>包含在</strong>当前这个“大桶”里面的。</li>
+<li><strong>对应代码</strong>：<code>is_child_of_bucket(test_case, BUCKET)</code></li>
+<li><strong>解释</strong>：<ul>
+<li>当前大桶：<code>tests/unit/**</code> (包含所有单元测试)</li>
+<li>发现一个任务：<code>tests/unit/core/**</code> (核心模块测试)</li>
+<li>判定：<code>core</code> 在 <code>unit</code> 里面，所以它是“子任务”。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 计算排除名单：找出要跳过的文件 (Calculate Ignore List)</h4>
+<ul>
+<li><strong>任务</strong>：如果发现了“子任务”，就把这个子任务里包含的所有文件找出来，标记为“需要忽略”。</li>
+<li><strong>对应代码</strong>：循环中的 <code>files_to_ignore.update(...)</code></li>
+<li><strong>解释</strong>：既然 <code>tests/unit/core/**</code> 已经有专门的任务去跑了，那么我在跑 <code>tests/unit/**</code> 这个大任务时，就应该把 <code>core</code> 里的文件剔除掉，避免重复跑两遍。</li>
+</ul>
+<h4>5. 最终输出：告诉测试器“别跑这些” (Output Results)</h4>
+<ul>
+<li><strong>任务</strong>：把所有计算出来需要忽略的文件打印出来，格式是 <code>--ignore=文件名</code>。</li>
+<li><strong>对应代码</strong>：最后的 <code>print(f"--ignore={file}")</code></li>
+<li><strong>解释</strong>：这个输出通常会被传递给 <code>pytest</code> 这样的测试工具。<ul>
+<li>最终效果相当于：<code>pytest tests/unit/** --ignore=tests/unit/core/test_a.py ...</code></li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🧩 关键代码片段对应讲解</h3>
+<p>为了让你更清楚，我把核心逻辑的<strong>中文翻译版</strong>写在下面：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+    <span class="c1"># 1. 拿到命令行输入的“大范围”路径 (比如 tests/unit/**)</span>
+    <span class="n">BUCKET</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+
+    <span class="c1"># 2. 拿到所有已知的测试任务列表</span>
+    <span class="n">YAML_FILE</span> <span class="o">=</span> <span class="s1">&#39;tests/test_utils/recipes/unit-tests.yaml&#39;</span>
+    <span class="n">all_test_cases</span> <span class="o">=</span> <span class="n">get_test_cases</span><span class="p">(</span><span class="n">YAML_FILE</span><span class="p">)</span> <span class="c1"># 比如 [&#39;tests/unit/**&#39;, &#39;tests/unit/child/**&#39;]</span>
+
+    <span class="c1"># 3. 把“大范围”里的所有真实文件都找出来</span>
+    <span class="n">bucket_files</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">expand_pattern</span><span class="p">(</span><span class="n">BUCKET</span><span class="p">))</span>
+
+    <span class="c1"># 4. 核心逻辑：找出重叠部分</span>
+    <span class="n">files_to_ignore</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">test_case</span> <span class="ow">in</span> <span class="n">all_test_cases</span><span class="p">:</span>
+        <span class="c1"># 如果某个测试任务是当前大范围的“子集” (is_child_of_bucket)</span>
+        <span class="c1"># 并且它不是大范围本身 (test_case != BUCKET)</span>
+        <span class="k">if</span> <span class="n">test_case</span> <span class="o">!=</span> <span class="n">BUCKET</span> <span class="ow">and</span> <span class="n">is_child_of_bucket</span><span class="p">(</span><span class="n">test_case</span><span class="p">,</span> <span class="n">BUCKET</span><span class="p">):</span>
+            <span class="c1"># 把它里面的文件加入“忽略列表”</span>
+            <span class="n">files_to_ignore</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">expand_pattern</span><span class="p">(</span><span class="n">test_case</span><span class="p">))</span>
+
+    <span class="c1"># 5. 输出结果 (交集部分)</span>
+    <span class="c1"># 也就是：既在当前大范围内，又属于子任务的文件，统统忽略</span>
+    <span class="k">for</span> <span class="n">file</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">files_to_ignore</span> <span class="o">&amp;</span> <span class="n">bucket_files</span><span class="p">):</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;--ignore=</span><span class="si">{</span><span class="n">file</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这个脚本是一个<strong>去重工具</strong>。</p>
+<ul>
+<li><strong>输入</strong>：一个大的测试目录。</li>
+<li><strong>输出</strong>：一系列 <code>--ignore=xxx.py</code> 参数。</li>
+<li><strong>目的</strong>：让测试运行器只运行“属于这个大目录，但<strong>不属于</strong>更细分目录”的那些测试文件。</li>
+</ul>

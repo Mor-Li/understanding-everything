@@ -1,0 +1,74 @@
+<h1>megatron/core/tensor_parallel/<strong>init</strong>.py</h1>
+<p>完全理解你的困惑。面对 <code>__init__.py</code> 这种文件，最容易让人摸不着头脑，因为它<strong>本身不写逻辑，只是把别的房间里的工具拿出来放在门口</strong>，方便别人取用。</p>
+<p>你可以把这个文件看作是 <strong>Megatron-LM 张量并行（Tensor Parallelism）模块的“工具箱清单”</strong>。</p>
+<p>为了让你看懂这个“工具箱”里都有啥，以及它们是干嘛的，我为你制定了一个 <strong>5步走的学习 Task List</strong>。我们不看代码细节，只看这些名词背后的物理意义。</p>
+<hr />
+<h3>🚀 学习任务清单 (Task Todo List)</h3>
+<h4>✅ Task 1: 搞懂“它想解决什么问题” (核心概念)</h4>
+<p><strong>目标</strong>：理解为什么会有这个文件夹。
+*   <strong>背景</strong>：现在的模型（比如 GPT-3, GPT-4）太大了，大到一张显卡（GPU）根本装不下。
+*   <strong>解法</strong>：<strong>张量并行 (Tensor Parallelism, TP)</strong>。
+*   <strong>比喻</strong>：假设有一个超级复杂的数学题（矩阵乘法），一个人算太慢且脑容量不够。我们把题目<strong>切碎</strong>，分给几个人（GPU）一起算，最后再把结果拼起来。
+*   <strong>文件中的对应</strong>：这个文件就是管理“怎么切”、“怎么算”、“怎么拼”的总指挥部。</p>
+<hr />
+<h4>✅ Task 2: 学习“怎么切蛋糕” (Layers - 核心层)</h4>
+<p><strong>目标</strong>：看懂 <code>layers</code> 和 <code>inference_layers</code> 部分的关键词。
+<strong>关键词</strong>：<code>ColumnParallelLinear</code>, <code>RowParallelLinear</code>, <code>VocabParallelEmbedding</code></p>
+<ul>
+<li><strong>讲解</strong>：神经网络的核心是矩阵乘法（Linear 层）。<ul>
+<li><strong><code>ColumnParallelLinear</code> (列并行)</strong>：把大矩阵竖着切一刀。GPU 1 存左半边，GPU 2 存右半边。</li>
+<li><strong><code>RowParallelLinear</code> (行并行)</strong>：把大矩阵横着切一刀。GPU 1 存上半边，GPU 2 存下半边。</li>
+<li><strong><code>VocabParallelEmbedding</code></strong>：词表（字典）太大了，几万个词。我们把字典撕开，GPU 1 负责查前 25000 个词，GPU 2 负责查后 25000 个词。</li>
+</ul>
+</li>
+<li><strong>总结</strong>：这一步是把模型的大参数拆散，塞进不同的显卡里。</li>
+</ul>
+<hr />
+<h4>✅ Task 3: 学习“切完怎么联系” (Mappings - 通信)</h4>
+<p><strong>目标</strong>：看懂 <code>mappings</code> 部分的关键词。
+<strong>关键词</strong>：<code>copy_to...</code>, <code>gather_from...</code>, <code>reduce_from...</code>, <code>all_gather</code>, <code>reduce_scatter</code></p>
+<ul>
+<li><strong>讲解</strong>：既然把模型切碎了，计算的时候大家得交流啊，不然结果对不上。这部分是<strong>显卡之间的“电话线”</strong>。<ul>
+<li><strong><code>copy_to_tensor_model_parallel_region</code></strong>：把数据复制给同一组的所有显卡（大家拿到的题要一样，才能开始算）。</li>
+<li><strong><code>reduce_from_tensor_model_parallel_region</code></strong>：大家算完了，把结果<strong>加总</strong>起来（All-Reduce）。比如行并行切分后，最后必须把两块卡的结果加在一起才是完整结果。</li>
+<li><strong><code>gather_from...</code></strong>：把大家手里的碎片<strong>收集</strong>起来拼成一个完整的。</li>
+<li><strong><code>scatter_to...</code></strong>：把一个完整的数据<strong>拆散</strong>分发给大家。</li>
+</ul>
+</li>
+<li><strong>总结</strong>：这些函数定义了数据如何在 GPU 之间流动，保证切开算的结果和不切开算是一样的。</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 学习“怎么算分和存盘” (Cross Entropy &amp; Random/Utils)</h4>
+<p><strong>目标</strong>：看懂 <code>cross_entropy</code>, <code>random</code>, <code>utils</code> 部分。</p>
+<ul>
+<li>
+<p><strong><code>vocab_parallel_cross_entropy</code> (算分)</strong>：</p>
+<ul>
+<li><strong>解释</strong>：模型训练最后要算 Loss（误差）。因为前面的词表（Embedding）被切开了，所以算误差的时候也得配合着切开算，不然显存会爆。这是专门为并行设计的算误差函数。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>checkpoint</code> (存盘/省内存)</strong>：</p>
+<ul>
+<li><strong>解释</strong>：大模型训练显存很珍贵。Checkpointing 是一种技术，它不存中间计算结果，等反向传播需要时再<strong>重算一遍</strong>。这里导出的是支持张量并行的版本。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>random</code> (随机数)</strong>：</p>
+<ul>
+<li><strong>解释</strong>：训练需要随机性（比如 Dropout）。但在并行训练中，有些地方大家生成的随机数必须<strong>一样</strong>（比如初始化参数），有些地方必须<strong>不一样</strong>。这个模块就是管随机种子的，防止大家“乱套”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 串起来看 (回顾 <code>__all__</code>)</h4>
+<p><strong>目标</strong>：现在回过头看文件最后的 <code>__all__ = [...]</code> 列表。</p>
+<p>你会发现这个列表其实就是一个<strong>对外服务菜单</strong>：
+1.  <strong>我要搭建模型骨架</strong> -&gt; 用 <code>Column/RowParallelLinear</code>。
+2.  <strong>我要处理输入输出</strong> -&gt; 用 <code>VocabParallelEmbedding</code> 和 <code>vocab_parallel_cross_entropy</code>。
+3.  <strong>我要手动控制数据流向</strong> -&gt; 用 <code>mappings</code> 里的 <code>gather/reduce</code>。
+4.  <strong>我要搞定随机种子和显存优化</strong> -&gt; 用 <code>random</code> 和 <code>checkpoint</code>。</p>
+<h3>总结</h3>
+<p>这个文件本身没有复杂的逻辑，它只是把 Megatron-LM 中关于 <strong>“如何把大模型切碎放在多张卡上跑”</strong> 的所有核心工具汇总在了一起。</p>
+<p><strong>建议下一步</strong>：
+如果你想深入，不要盯着这个文件看。去点开 <code>megatron/core/tensor_parallel/layers.py</code>，看看 <code>ColumnParallelLinear</code> 是怎么实现的，那是整个张量并行的灵魂。</p>

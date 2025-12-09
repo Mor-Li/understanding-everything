@@ -1,0 +1,97 @@
+<h1>tools/checkpoint/checkpoint_inspector.py</h1>
+<p>这份代码 <code>checkpoint_inspector.py</code> 可以被看作是一个 <strong>“AI 模型存档（Checkpoint）的瑞士军刀”</strong>。</p>
+<p>它主要用于管理、检查、转换和修改由 <strong>Megatron-Core</strong>（一个用于训练超大模型的框架）生成的分布式模型权重文件。</p>
+<p>为了让你更容易理解，我将通过一个<strong>“任务清单（To-Do List）”</strong>的形式，模拟一个工程师处理大模型权重的流程，一步步拆解代码中的功能。</p>
+<hr />
+<h3>📋 任务清单：从检查到转换的完整工作流</h3>
+<p>假设你刚刚训练完一个巨大的 GPT 模型，存下了一堆文件，现在你需要对这个存档进行操作。</p>
+<h4>✅ Task 1: 只是想看看存档里有什么，不要加载整个模型</h4>
+<p><strong>对应命令：</strong> <code>inspect</code>
+<strong>代码逻辑：</strong>
+1.  <strong>读取目录：</strong> 找到你指定的文件夹。
+2.  <strong>读取 <code>metadata.json</code>：</strong> 这是存档的“目录”。它不包含真正的几百 GB 的权重数据，只包含数据的描述（比如：这一层叫什么名字？形状是 4096<em>4096 吗？数据类型是 float16 吗？）。
+3.  </em><em>打印报告：</em><em>
+    *   告诉你有多少个 Tensor（张量/权重矩阵）。
+    *   总参数量是多少（例如 7B, 70B）。
+    *   列出每一个权重的名字和形状。
+    *   </em>代码亮点：* 它会区分哪些是普通的 Tensor，哪些是字节数据（Bytes），还会统计是否忽略了某些优化器元数据。</p>
+<h4>✅ Task 2: 我怀疑某个具体的权重坏了，想单独看它的数值</h4>
+<p><strong>对应命令：</strong> <code>print_tensor</code>
+<strong>代码逻辑：</strong>
+1.  <strong>精准定位：</strong> 你提供一个 key（例如 <code>model.layers.0.self_attention.linear_qkv.weight</code>）。
+2.  <strong>构建空壳：</strong> 在显存中创建一个空的 Tensor，形状和目标一样。
+3.  <strong>局部加载：</strong> 只从硬盘里把这<strong>一个</strong> Tensor 的数据读出来，填进去。
+4.  <strong>打印数值：</strong> 让你看到这个矩阵里的具体数字，用于 Debug。</p>
+<h4>✅ Task 3: 比较两个存档有什么不同（比如训练前 vs 训练后）</h4>
+<p><strong>对应命令：</strong> <code>compare_two_checkpoint</code>
+<strong>代码逻辑：</strong>
+1.  <strong>对比目录：</strong> 读取两个存档的 metadata。
+2.  <strong>找不同（Keys）：</strong> 存档 A 有而存档 B 没有的层，反之亦然。
+3.  <strong>找不同（Values）：</strong> 如果两个存档都有 <code>layer.0.weight</code>，它会加载这两个权重，计算它们是否相等（<code>torch.allclose</code>）。如果不相等，告诉你数值差异。</p>
+<h4>✅ Task 4: (核心功能) 格式转换 - 把“Megatron 格式”转成“通用 FSDP 格式”</h4>
+<p><strong>对应命令：</strong> <code>convert-torch-dist-to-fsdp-dtensor</code>
+这是代码中最长、最复杂的部分。
+<strong>背景：</strong> Megatron 训练时保存的格式是为了它自己方便（比如把 Q、K、V 拼在一起存）。但如果你想用标准的 PyTorch FSDP（Fully Sharded Data Parallel）来微调或推理，你需要拆分和重组这些权重。</p>
+<p><strong>代码执行步骤：</strong>
+1.  <strong>初始化环境：</strong> 启动多 GPU 环境（<code>init_process_group</code>），因为大模型单个 GPU 存不下。
+2.  <strong>建立空模型：</strong> 根据 metadata，在 GPU 上建立空的“坑位”。
+3.  <strong>加载原始数据：</strong> 把 Megatron 的存档读入内存。
+4.  <strong>手术式拆解（核心逻辑）：</strong>
+    *   <strong>处理层（Split Layers）：</strong> 如果原始存档把多层堆在一起，这里把它切开。
+    *   <strong>处理 MoE（专家模型）：</strong> 如果是混合专家模型，代码中的 <code>split_expert_weights</code> 会把混在一起的专家权重拆分成独立的 Tensor。
+    *   <strong>处理 SwiGLU（特殊激活函数）：</strong> 这里的 <code>split_swiglu_weight</code> 函数非常重要。SwiGLU 结构通常把两个矩阵（W 和 V）拼在一起训练，这里需要把它们沿着维度切开，分别保存为 <code>_w</code> 和 <code>_v</code>。
+    *   <strong>处理优化器状态：</strong> 如果是断点续训的存档，还需要调整优化器里的状态参数形状。
+5.  <strong>保存新格式：</strong> 使用 <code>save_checkpoint_with_pickle_protocol</code> 将处理好的权重保存为标准的 FSDP 格式（<code>dtensor</code>）。</p>
+<h4>✅ Task 5: 简单的修修补补（改名或删除）</h4>
+<p><strong>对应命令：</strong> <code>modify_state_dict</code>
+<strong>代码逻辑：</strong>
+1.  <strong>接收指令：</strong> 你告诉它 <code>--op remove key_name</code> 或者 <code>--op rename old_name new_name</code>。
+2.  <strong>执行修改：</strong>
+    *   <code>remove</code>：直接从字典里删掉这个 key，不保存。
+    *   <code>rename</code>：把 key 的名字改掉，指向原来的数据。
+3.  <strong>另存为：</strong> 把修改后的字典保存到新目录。</p>
+<hr />
+<h3>🔍 重点代码片段解读（中文翻译版）</h3>
+<p>为了让你更清楚 Task 4（转换）里发生了什么，我看几个关键函数：</p>
+<p><strong>1. <code>split_swiglu_weight</code> (拆分 SwiGLU)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">split_swiglu_weight</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
+    <span class="c1"># 把原本切分在不同卡上的数据收集起来变成一个完整的 Tensor</span>
+    <span class="n">value</span> <span class="o">=</span> <span class="n">gather_uneven_dtensor_to_full_tensor</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+
+    <span class="c1"># torch.chunk(value, 2, dim=0) -&gt; 沿着第0维度一刀切两半</span>
+    <span class="c1"># 一半给 w，一半给 v</span>
+    <span class="n">w</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">chunk</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+    <span class="c1"># 重新把完整的 Tensor 切分（Shard）分发给各个 GPU，准备保存</span>
+    <span class="n">w</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">redistribute</span><span class="p">(</span><span class="n">placements</span><span class="o">=</span><span class="p">[</span><span class="n">Shard</span><span class="p">(</span><span class="mi">0</span><span class="p">)])</span>
+    <span class="n">v</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">redistribute</span><span class="p">(</span><span class="n">placements</span><span class="o">=</span><span class="p">[</span><span class="n">Shard</span><span class="p">(</span><span class="mi">0</span><span class="p">)])</span>
+
+    <span class="c1"># 改名字，例如 linear.weight 变成 linear_w 和 linear_v</span>
+    <span class="c1"># ... (改名逻辑)</span>
+    <span class="k">return</span> <span class="p">{</span><span class="n">w_key</span><span class="p">:</span> <span class="n">w</span><span class="p">,</span> <span class="n">v_key</span><span class="p">:</span> <span class="n">v</span><span class="p">}</span>
+</code></pre></div>
+
+<p><strong>2. <code>convert_checkpoint</code> (转换主循环)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">while</span> <span class="n">state_dict</span><span class="p">:</span>
+    <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="o">=</span> <span class="n">state_dict</span><span class="o">.</span><span class="n">popitem</span><span class="p">()</span> <span class="c1"># 拿出一个权重</span>
+
+    <span class="c1"># 如果是参数（不是优化器状态）</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+        <span class="c1"># 1. 判断是不是 MoE 的专家层，如果是，调用 split_expert_weights</span>
+        <span class="k">if</span> <span class="s2">&quot;.experts.experts.&quot;</span> <span class="ow">in</span> <span class="n">new_key</span><span class="p">:</span>
+            <span class="n">split_tensors</span> <span class="o">=</span> <span class="n">split_expert_weights</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+        <span class="c1"># 2. 判断是不是 SwiGLU 结构，如果是，调用 split_swiglu_weight</span>
+        <span class="k">if</span> <span class="n">swiglu</span> <span class="ow">and</span> <span class="n">is_swiglu_key</span><span class="p">(</span><span class="n">key</span><span class="p">):</span>
+             <span class="c1"># ... 拆分逻辑 ...</span>
+
+        <span class="c1"># 3. 将处理好的 Tensor 放入新的字典 fsdp_dtensor_state_dict</span>
+        <span class="n">fsdp_dtensor_state_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">split_tensors</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>💡 总结</h3>
+<p>这个脚本 <strong><code>checkpoint_inspector.py</code></strong> 就是一个<strong>大模型权重的“格式工厂”和“体检中心”</strong>。</p>
+<ul>
+<li><strong>体检（Inspect/Print）：</strong> 让你不加载模型就能看结构，查错。</li>
+<li><strong>格式工厂（Convert）：</strong> 最主要的功能。它把 Megatron 这种为了<em>训练速度</em>而设计的特殊数据布局，转换成 PyTorch FSDP 这种为了<em>通用性</em>（推理、微调）设计的数据布局。其中涉及大量的矩阵切分（Chunking）和重组（Reshaping）。</li>
+</ul>

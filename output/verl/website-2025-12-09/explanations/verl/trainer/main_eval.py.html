@@ -1,0 +1,131 @@
+<h1>verl/trainer/main_eval.py</h1>
+<p>这份代码的核心功能是：<strong>给 AI 模型生成的答案“打分”，并统计各科目的平均分。</strong></p>
+<p>这就像是一个<strong>“阅卷系统”</strong>。为了让你更容易理解，我把你当作这个阅卷系统的总指挥，给你列一个 <strong>Task To-Do List（任务清单）</strong>，我们按照这个清单一步步把代码拆解开来讲。</p>
+<hr />
+<h3>📋 阅卷系统任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>准备试卷（Load Data）</strong>：把包含题目、AI 回答和标准答案的文件搬运过来并打开。</li>
+<li><strong>组建阅卷组（Init Ray）</strong>：因为试卷太多，一个人改不过来，需要启动并行计算系统（Ray），相当于雇佣几十个老师同时阅卷。</li>
+<li><strong>制定评分标准（Define Process）</strong>：告诉阅卷老师怎么改卷（把 AI 的回答和标准答案对比，给出一个分数）。</li>
+<li><strong>分发试卷（Dispatch Tasks）</strong>：把每一道题分发给阅卷老师。</li>
+<li><strong>回收成绩（Collect Results）</strong>：老师改完一份就收一份，直到所有试卷改完。</li>
+<li><strong>统计排名（Calculate Metrics）</strong>：按科目（比如数学、代码、写作）算出平均分，并打印出来。</li>
+</ol>
+<hr />
+<h3>📝 逐步详细讲解</h3>
+<p>下面我按照上面的清单，结合代码给你详细讲：</p>
+<h4>Task 1: 准备试卷 (Load Data)</h4>
+<p><strong>代码对应位置：</strong> <code>main</code> 函数的开头部分。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">local_path</span> <span class="o">=</span> <span class="n">copy_to_local</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">path</span><span class="p">,</span> <span class="n">use_shm</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;use_shm&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">))</span>
+<span class="n">dataset</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">read_parquet</span><span class="p">(</span><span class="n">local_path</span><span class="p">)</span>
+<span class="n">responses</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[</span><span class="n">config</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">response_key</span><span class="p">]</span>
+<span class="n">data_sources</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[</span><span class="n">config</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">data_source_key</span><span class="p">]</span>
+<span class="n">reward_model_data</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[</span><span class="n">config</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">reward_model_key</span><span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<ul>
+<li>你需要处理的数据在一个 Parquet 文件里（一种高效的数据存储格式）。</li>
+<li><code>copy_to_local</code>：先把文件从远程或者云端下载到本地，方便读取。</li>
+<li><code>pd.read_parquet</code>：用 Pandas 打开这个文件。</li>
+<li>接着提取三列关键信息：<ol>
+<li><code>responses</code>：AI 写的答案（考生的答卷）。</li>
+<li><code>data_sources</code>：这道题属于什么类型（比如 math, code, general）。</li>
+<li><code>reward_model_data</code>：这里面通常包含 <code>ground_truth</code>（标准答案）。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 组建阅卷组 (Init Ray)</h4>
+<p><strong>代码对应位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="ow">not</span> <span class="n">ray</span><span class="o">.</span><span class="n">is_initialized</span><span class="p">():</span>
+    <span class="n">ray</span><span class="o">.</span><span class="n">init</span><span class="p">(</span><span class="o">**</span><span class="n">OmegaConf</span><span class="o">.</span><span class="n">to_container</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">ray_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ray_init&quot;</span><span class="p">,</span> <span class="p">{})))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<ul>
+<li><strong>Ray</strong> 是一个用来做并行计算的库。</li>
+<li>如果不开启 Ray，你只能一道题一道题地改，速度太慢。</li>
+<li>这段代码就是启动 Ray，相当于把“阅卷室”打开，准备好并行处理。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 制定评分标准 (Define Process)</h4>
+<p><strong>代码对应位置：</strong> 那个带 <code>@ray.remote</code> 的函数 <code>process_item</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@ray</span><span class="o">.</span><span class="n">remote</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">process_item</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">data_source</span><span class="p">,</span> <span class="n">response_lst</span><span class="p">,</span> <span class="n">reward_data</span><span class="p">):</span>
+    <span class="n">reward_fn</span> <span class="o">=</span> <span class="n">get_custom_reward_fn</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>  <span class="c1"># 获取评分规则</span>
+    <span class="n">ground_truth</span> <span class="o">=</span> <span class="n">reward_data</span><span class="p">[</span><span class="s2">&quot;ground_truth&quot;</span><span class="p">]</span> <span class="c1"># 拿到标准答案</span>
+    <span class="c1"># 对每一个回答进行打分</span>
+    <span class="n">score_lst</span> <span class="o">=</span> <span class="p">[</span><span class="n">reward_fn</span><span class="p">(</span><span class="n">data_source</span><span class="p">,</span> <span class="n">r</span><span class="p">,</span> <span class="n">ground_truth</span><span class="p">)</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">response_lst</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">data_source</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">score_lst</span><span class="p">)</span> <span class="c1"># 返回：(科目, 平均分)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<ul>
+<li>这是一个“远程任务”函数。</li>
+<li>它定义了阅卷老师具体要做什么：拿到题目类型、AI 的回答、标准答案。</li>
+<li><code>get_custom_reward_fn</code>：这是具体的打分逻辑（比如：答案和标准答案一致得1分，不一致得0分）。</li>
+<li>最后算出这道题的得分。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 分发试卷 (Dispatch Tasks)</h4>
+<p><strong>代码对应位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">remote_tasks</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="n">process_item</span><span class="o">.</span><span class="n">remote</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">data_sources</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">responses</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">reward_model_data</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">total</span><span class="p">)</span>
+<span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<ul>
+<li>这里用了一个列表推导式。</li>
+<li><code>process_item.remote(...)</code>：这句话的意思是“把这道题扔给 Ray 去后台跑，不要阻塞主程序”。</li>
+<li><code>remote_tasks</code> 列表里存的不是分数，而是<strong>“任务单号”</strong>（Future objects）。此时，成千上万个阅卷任务已经被分发出去了。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 回收成绩 (Collect Results)</h4>
+<p><strong>代码对应位置：</strong> <code>while</code> 循环部分。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">tqdm</span><span class="p">(</span><span class="n">total</span><span class="o">=</span><span class="n">total</span><span class="p">)</span> <span class="k">as</span> <span class="n">pbar</span><span class="p">:</span> <span class="c1"># 进度条</span>
+    <span class="k">while</span> <span class="nb">len</span><span class="p">(</span><span class="n">remote_tasks</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="c1"># 谁改完了，就先把谁的结果拿回来</span>
+        <span class="n">done_ids</span><span class="p">,</span> <span class="n">remote_tasks</span> <span class="o">=</span> <span class="n">ray</span><span class="o">.</span><span class="n">wait</span><span class="p">(</span><span class="n">remote_tasks</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">result_id</span> <span class="ow">in</span> <span class="n">done_ids</span><span class="p">:</span>
+            <span class="n">data_source</span><span class="p">,</span> <span class="n">score</span> <span class="o">=</span> <span class="n">ray</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">result_id</span><span class="p">)</span> <span class="c1"># 获取真正的分数</span>
+            <span class="n">data_source_reward</span><span class="p">[</span><span class="n">data_source</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">score</span><span class="p">)</span> <span class="c1"># 按科目记录分数</span>
+            <span class="n">pbar</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<ul>
+<li>这是最聪明的一步。它没有傻傻地按顺序等第1题改完再等第2题。</li>
+<li><code>ray.wait</code>：它在监听，只要有任意一个任务完成了，就立刻返回。</li>
+<li><code>data_source_reward</code>：这是一个字典，用来分类存分。比如 <code>{'math': [1.0, 0.0, ...], 'code': [1.0, ...]}</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: 统计排名 (Calculate Metrics)</h4>
+<p><strong>代码对应位置：</strong> 最后几行。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">metric_dict</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="k">for</span> <span class="n">data_source</span><span class="p">,</span> <span class="n">rewards</span> <span class="ow">in</span> <span class="n">data_source_reward</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+    <span class="c1"># 算出每个科目的平均分</span>
+    <span class="n">metric_dict</span><span class="p">[</span><span class="sa">f</span><span class="s2">&quot;test_score/</span><span class="si">{</span><span class="n">data_source</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">rewards</span><span class="p">)</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="n">metric_dict</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<ul>
+<li>阅卷结束了，现在看总表。</li>
+<li>遍历刚才存好的字典，计算每个 <code>data_source</code>（科目）的平均分。</li>
+<li>最后打印出类似这样的结果：<code>{'test_score/math': 0.85, 'test_score/code': 0.92}</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个脚本 <code>main_eval.py</code> 的作用就是：
+<strong>读取一批 AI 生成的数据，利用 Ray 进行大规模并行的自动化评分，最后按照数据来源（Data Source）输出各类的平均准确率（Score）。</strong></p>
+<p>它不是用来训练模型的，而是用来<strong>考试（评估）</strong>模型训练得怎么样的。</p>

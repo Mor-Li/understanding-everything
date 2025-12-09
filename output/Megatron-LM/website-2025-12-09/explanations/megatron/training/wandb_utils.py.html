@@ -1,0 +1,111 @@
+<h1>megatron/training/wandb_utils.py</h1>
+<p>完全没问题。这段代码对于不熟悉 <strong>Weights &amp; Biases (WandB)</strong> 或者大规模模型训练流程的人来说，确实有点抽象。</p>
+<p>你可以把这段代码想象成是一个 <strong>“仓库管理员”</strong> 的工作手册。它的核心任务是：<strong>把我们在本地硬盘上训练好的模型（Checkpoint），和云端的记录本（WandB）关联起来。</strong></p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>“模型训练任务清单 (Task Todo List)”</strong>。我们按照时间顺序，一步一步来看这段代码到底在干嘛。</p>
+<hr />
+<h3>任务背景</h3>
+<p>我们正在训练一个巨大的 AI 模型（Megatron）。
+*   <strong>本地硬盘</strong>：存放模型存档（Checkpoint）的地方。
+*   <strong>WandB</strong>：一个云端的仪表盘，用来记录实验数据。WandB 有一个概念叫 <strong>Artifact（工件/制品）</strong>，你可以把它理解为“打包好的模型存档记录”。</p>
+<hr />
+<h3>Task 1: 准备工作 —— 给存档起个名</h3>
+<p><strong>对应代码：</strong> <code>_get_wandb_artifact_tracker_filename</code> 和 <code>_get_artifact_name_and_version</code></p>
+<p>在开始存取之前，管理员需要规定命名格式，否则以后找不到。</p>
+<ul>
+<li>
+<p><strong>Todo 1.1: 决定记录文件的位置</strong></p>
+<ul>
+<li>代码逻辑：<code>_get_wandb_artifact_tracker_filename</code></li>
+<li><strong>人话解释</strong>：在保存模型的文件夹里，我们需要创建一个名为 <code>latest_wandb_artifact_path.txt</code> 的小纸条（文本文件）。这个小纸条专门用来记录“这个模型在 WandB 上属于哪个项目”。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 1.2: 决定存档的名字和版本</strong></p>
+<ul>
+<li>代码逻辑：<code>_get_artifact_name_and_version</code></li>
+<li><strong>人话解释</strong>：WandB 需要知道模型叫啥、版本号是多少。</li>
+<li>代码里直接用<strong>文件夹的名字</strong>作为模型名（<code>save_dir.stem</code>），用<strong>存档文件的名字</strong>作为版本号（<code>checkpoint_path.stem</code>）。简单粗暴。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 2: 存档成功后的操作 —— “我要记账”</h3>
+<p><strong>对应代码：</strong> <code>on_save_checkpoint_success</code></p>
+<p>这是最关键的一步。当 Megatron 刚刚在硬盘上保存完一个 Checkpoint（比如训练了 1000 步，存了个档），这个函数就会被触发。</p>
+<ul>
+<li>
+<p><strong>Todo 2.1: 呼叫记录员</strong></p>
+<ul>
+<li>代码：<code>wandb_writer = get_wandb_writer()</code></li>
+<li><strong>人话解释</strong>：确认 WandB 是否开启。如果没开，后面都不用干了。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 2.2: 创建一个“虚拟包裹” (Artifact)</strong></p>
+<ul>
+<li>代码：<code>artifact = wandb_writer.Artifact(...)</code></li>
+<li><strong>人话解释</strong>：在 WandB 的系统里新建一个条目，类型是 "model"（模型），并贴上标签（比如当前是第几步迭代 iteration）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 2.3: 建立链接（关键点！）</strong></p>
+<ul>
+<li>代码：<code>artifact.add_reference(f"file://{checkpoint_path}", checksum=False)</code></li>
+<li><strong>人话解释</strong>：大模型通常几百 GB，直接上传到 WandB 云端太慢了。</li>
+<li>这一步做的是 <strong>“引用” (Reference)</strong>。它不上传文件，而是告诉 WandB：“嘿，这个版本的模型文件就在这台机器的这个路径下（<code>file://...</code>）”。相当于只存了一个快捷方式。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 2.4: 登记并留下小纸条</strong></p>
+<ul>
+<li>代码：<code>wandb_writer.run.log_artifact(...)</code> 和 <code>wandb_tracker_filename.write_text(...)</code></li>
+<li><strong>人话解释</strong>：<ol>
+<li>正式把这个“虚拟包裹”登记到 WandB 网页上。</li>
+<li><strong>写小纸条</strong>：在本地硬盘的那个 <code>latest_wandb_artifact_path.txt</code> 文件里，写下这个模型在 WandB 上的归属（比如 <code>nvidia/megatron-gpt</code>）。为什么要写这个？为了 Task 3 读取的时候用。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 读档成功后的操作 —— “我胡汉三又回来了”</h3>
+<p><strong>对应代码：</strong> <code>on_load_checkpoint_success</code></p>
+<p>当你训练中断（比如服务器挂了），重新开始训练并加载了之前的 Checkpoint 时，触发这个函数。</p>
+<ul>
+<li>
+<p><strong>Todo 3.1: 搞清楚我读的是哪个档</strong></p>
+<ul>
+<li>代码：<code>_get_artifact_name_and_version(...)</code></li>
+<li><strong>人话解释</strong>：根据当前加载的文件夹路径，推算出模型名和版本号。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 3.2: 找回之前留下的“小纸条”</strong></p>
+<ul>
+<li>代码：读取 <code>wandb_tracker_filename</code></li>
+<li><strong>人话解释</strong>：去读那个 <code>.txt</code> 文件，看看之前保存的时候，把这个模型归类到 WandB 的哪个项目下面了。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 3.3: 告诉 WandB “我正在用这个旧档”</strong></p>
+<ul>
+<li>代码：<code>wandb_writer.run.use_artifact(...)</code></li>
+<li><strong>人话解释</strong>：向 WandB 汇报：“我现在加载了之前存的那个版本，接下来的训练数据请基于这个版本继续记录。” 这能让你的训练曲线在云端完美衔接，而不是断成两截。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 3.4: 容错处理</strong></p>
+<ul>
+<li>代码：<code>try...except</code></li>
+<li><strong>人话解释</strong>：万一找不到小纸条，或者 WandB 上没记录，不要让程序崩溃，在后台打印一句“找不到 Checkpoint”就行了，训练继续。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这个文件的作用就是 <strong>“桥梁”</strong>：</p>
+<ol>
+<li><strong>存的时候</strong>：不仅存硬盘，还在 WandB 上记一笔“我在本地存了个档，路径是XXX”。</li>
+<li><strong>取的时候</strong>：告诉 WandB “我把之前那个档读出来了，咱们继续”。</li>
+</ol>
+<p>它最大的特点是使用了 <code>add_reference</code>，<strong>只传路径不传文件</strong>，这对动辄 TB 级别的大模型训练来说非常重要，省流量、省时间。</p>

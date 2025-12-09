@@ -1,0 +1,57 @@
+<h1>recipe/r1_ascend/vllm_rollout_spmd.py</h1>
+<p>这份代码确实涉及了很多底层硬件适配和分布式推理的细节，乍一看很晕是很正常的。</p>
+<p>简单来说，这个文件的作用是：<strong>在华为昇腾（NPU）芯片上，让 <code>verl</code>（一个强化学习训练框架）能够调用 <code>vLLM</code>（一个高性能推理引擎）来进行文本生成（Rollout）。</strong></p>
+<p>因为昇腾芯片的特性和显存管理方式与 NVIDIA GPU 不同，所以这里写了很多<strong>“手动挡”</strong>的操作来管理内存和模型权重。</p>
+<p>下面我为你列一个 <strong>学习/阅读 Task List</strong>，然后按这个顺序一步步给你拆解核心观点。</p>
+<hr />
+<h3>📋 阅读理解 Task List (学习清单)</h3>
+<ol>
+<li><strong>搞懂角色定位</strong>：明白这个类 <code>vLLMRollout</code> 在强化学习流程中是干嘛的。</li>
+<li><strong>环境配置 (Init)</strong>：看它是怎么初始化 NPU 环境和并行策略的。</li>
+<li><strong>引擎配置 (Config)</strong>：看它给 vLLM 传了哪些特殊的参数（为了适配 NPU）。</li>
+<li><strong>手动内存管理 (核心)</strong>：这是最难懂的部分。看它怎么手动把模型搬进搬出显存（Onload/Offload）。</li>
+<li><strong>特殊模型支持 (MLA)</strong>：看它怎么处理 DeepSeek 这类模型的特殊结构。</li>
+<li><strong>生命周期控制</strong>：看 <code>resume</code> 和 <code>release</code> 怎么控制推理和训练的切换。</li>
+</ol>
+<hr />
+<h3>💡 逐步观点拆解 (Step-by-Step)</h3>
+<h4>Step 1: 角色定位 (它是干嘛的？)</h4>
+<p>在 RLHF（比如 PPO 或 R1 的 GRPO）训练中，有一个步骤叫 <strong>Rollout（采样/生成）</strong>。就是让模型根据 Prompt 生成一堆答案，然后去评分、去训练。
+*   <strong>观点</strong>：这个文件就是负责“生成答案”这个环节的<strong>驱动程序</strong>。它继承自 <code>vLLMRolloutBase</code>，专门针对华为 Ascend 硬件做了修改。</p>
+<h4>Step 2: 环境配置 (NPU 补丁与并行)</h4>
+<p>代码开头有一堆 <code># NPU-ADAPTATION</code> 的注释。
+*   <strong>代码位置</strong>：<code>__init__</code> 函数开头。
+*   <strong>观点</strong>：
+    *   <strong>打补丁</strong>：它导入了 <code>vllm_ascend</code> 和 <code>recipe.r1_ascend</code>。这是因为 vLLM 原生对 NVIDIA 支持最好，要在华为卡上跑，必须加载这些“外挂”补丁。
+    *   <strong>并行通信</strong>：<code>init_parallel_state(tensor_parallel_size)</code>。如果使用了多卡并行（TP），它需要手动初始化华为的通信域（HCCL），保证几张卡能一起工作。</p>
+<h4>Step 3: 引擎配置 (为了 NPU 做了什么妥协？)</h4>
+<p>在初始化 <code>self.inference_engine = LLM(...)</code> 这一大段里。
+*   <strong>代码位置</strong>：<code>__init__</code> 中间部分。
+*   <strong>核心观点</strong>：
+    *   <code>enable_sleep_mode=False</code>：<strong>关键点！</strong> 在 NVIDIA 上，vLLM 可以“睡眠”来让出显存。但在 NPU 上这个机制可能不成熟，所以强制关掉，准备后面自己手动管理内存。
+    *   <code>torchair_graph_config</code>：<strong>图模式</strong>。华为 NPU 跑“静态图”模式效率最高（类似编译过的代码），这里开启了图模式并配置了相关参数（如 <code>enabled: True</code>）。</p>
+<h4>Step 4: 手动内存管理 (最硬核的部分)</h4>
+<p>这是这个文件存在的主要原因。因为显存有限，训练的时候需要显存，推理的时候也需要显存。
+*   <strong>代码位置</strong>：<code>onload_model_weights</code>, <code>offload_model_weights</code>, <code>init_cache_engine</code>, <code>free_cache_engine</code>。
+*   <strong>核心观点（手动挡切换）</strong>：
+    *   <strong>Offload (下车)</strong>：当生成任务结束，轮到模型去“学习/训练”时，这个脚本会把 vLLM 的模型权重从 <strong>NPU显存</strong> 搬运到 <strong>CPU内存</strong> (<code>self.cpu_model</code>)，并清空 KV Cache。这是为了给训练腾出宝贵的显存。
+    *   <strong>Onload (上车)</strong>：当训练结束，需要模型再次生成文本时，它又把权重从 CPU 搬回 NPU，并重新初始化 KV Cache。
+    *   <strong>为什么这么做？</strong>：通常 vLLM 是一直占着显存的。但在 RL 训练中，单卡显存可能不够同时塞下“训练状态”和“推理引擎”，所以必须通过这种<strong>极其暴力的“搬进搬出”</strong>来复用显存。</p>
+<h4>Step 5: 特殊模型支持 (MLA)</h4>
+<p>代码中多次出现 <code>mla</code> 字样。
+*   <strong>代码位置</strong>：<code>_process_mla</code> 函数。
+*   <strong>观点</strong>：
+    *   这是为了适配 <strong>DeepSeek-V2/V3/R1</strong> 架构。DeepSeek 使用了 <strong>MLA (Multi-Head Latent Attention)</strong> 技术。
+    *   这种架构的权重处理比较特殊（可能有矩阵吸收合并的操作）。在手动搬运权重（Onload/Offload）的过程中，MLA 的权重需要特殊处理才能正确恢复，否则模型就傻了。</p>
+<h4>Step 6: 生命周期控制 (Resume &amp; Release)</h4>
+<ul>
+<li><strong>代码位置</strong>：文件末尾的 <code>resume</code> 和 <code>release</code> 方法。</li>
+<li><strong>观点</strong>：<ul>
+<li><strong>Release (释放)</strong>：外部调度器告诉它“你歇会儿，我要训练了”，它就调用 <code>offload</code> 和 <code>free_cache</code>，把显存清空。</li>
+<li><strong>Resume (恢复)</strong>：外部调度器说“该你干活了”，它就调用 <code>onload</code> 和 <code>init_cache</code>，把模型加载回来准备生成。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (一句话看懂)</h3>
+<p>这是一个<strong>华为昇腾 NPU 专用</strong>的 vLLM 驱动脚本，为了在显存有限的情况下跑强化学习（如 DeepSeek R1 流程），它实现了一套<strong>暴力的“显存分时复用”机制</strong>：推理时把模型加载进显存，不推理时把模型踢回 CPU 内存，并专门处理了 DeepSeek MLA 架构的兼容性问题。</p>

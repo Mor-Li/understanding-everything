@@ -1,0 +1,124 @@
+<h1>recipe/gkd/teacher/vllm_engine.py</h1>
+<p>这份代码确实涉及到底层模型推理库（vLLM）的深度定制，对于不熟悉 <code>vLLM</code> 源码或者大模型推理细节的人来说，读起来会非常晦涩。</p>
+<p>简单来说，这个文件的作用是：<strong>构建一个“老师模型”引擎，它不仅能生成文本，还能高效地输出每个token的“概率分布”（Logprobs），用于知识蒸馏（Knowledge Distillation）。</strong></p>
+<p>为了让你看懂，我把它拆解成 <strong>5个待办任务（Todo List）</strong>，带你一步步通关：</p>
+<h3>Task List: 理解 vLLM Teacher Engine</h3>
+<ol>
+<li><strong>Task 1: 理解背景（我们在做什么？）</strong><ul>
+<li><em>目标</em>：搞清楚为什么需要这个文件。</li>
+</ul>
+</li>
+<li><strong>Task 2: 破解“魔改”部分（Monkey Patching）</strong><ul>
+<li><em>目标</em>：理解代码开头那堆奇怪的函数和 <code>LogprobsProcessor</code> 是在干嘛。</li>
+</ul>
+</li>
+<li><strong>Task 3: 初始化引擎（<code>VLLMEngine</code> 类）</strong><ul>
+<li><em>目标</em>：看懂如何加载模型。</li>
+</ul>
+</li>
+<li><strong>Task 4: 核心功能（<code>get_topk_logprobs</code> 方法）</strong><ul>
+<li><em>目标</em>：理解如何获取“生成的文本”以及“老师的概率打分”。</li>
+</ul>
+</li>
+<li><strong>Task 5: 运行测试（<code>__main__</code> 模块）</strong><ul>
+<li><em>目标</em>：看懂脚本是如何被调用的。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>Task 1: 理解背景（我们在做什么？）</h4>
+<p>在“知识蒸馏”或者“GKD”（Generalized Knowledge Distillation）中，我们需要一个强大的模型（Teacher）来教导弱一点的模型（Student）。
+*   <strong>普通推理</strong>：只输出结果，比如问“1+1=？”，输出“2”。
+*   <strong>Teacher推理</strong>：不仅输出“2”，还要告诉Student，输出“2”的概率是99%，输出“3”的概率是0.01%。这些概率值就是 <strong>Logprobs</strong>。</p>
+<p>这个文件就是为了让 <code>vLLM</code> 这个推理库能<strong>极其高效</strong>地吐出这些概率值。</p>
+<hr />
+<h4>Task 2: 破解“魔改”部分（Monkey Patching）</h4>
+<p><strong>代码位置</strong>：从开头到 <code>class VLLMEngine</code> 之前。</p>
+<p><strong>发生了什么？</strong>
+作者觉得 <code>vLLM</code> 原生的处理 Logprobs（概率数据）的方式不符合他的需求（可能是数据结构太慢，或者格式不对），所以他用了 Python 的<strong>Monkey Patch（运行时替换）</strong>技术，强行修改了 <code>vLLM</code> 的内部行为。</p>
+<ul>
+<li><strong><code>_update_prompt_logprobs</code> 和 <code>_update_sample_logprobs</code></strong>:<ul>
+<li>这两个函数原本是 <code>vLLM</code> 内部用来收集概率的。</li>
+<li>作者重写了它们，把复杂的逻辑简化，或者改变了数据存储的方式（存入 <code>self.prompt_logprobs</code> 和 <code>self.logprobs</code>）。</li>
+</ul>
+</li>
+<li><strong><code>LogprobsProcessor._update_... = _update_...</code></strong>:<ul>
+<li>这两行代码是<strong>关键</strong>。它告诉 Python：“嘿，把 <code>vLLM</code> 库里原来的这两个函数换成我刚写的这两个”。这是一种“黑客”手段。</li>
+</ul>
+</li>
+<li><strong><code>class LogprobsTensors</code></strong>:<ul>
+<li>定义了一个新的数据结构，专门用来存 <code>token_ids</code>（词的ID）、<code>logprobs</code>（概率值）和 <code>ranks</code>（排名）。用 <code>NamedTuple</code> 和 <code>torch.Tensor</code> 是为了在 GPU/CPU 之间传输数据时更高效。</li>
+</ul>
+</li>
+</ul>
+<p><strong>总结</strong>：这部分是为了<strong>优化数据结构</strong>，让取概率这件事变得更顺手、更符合后续计算的需求。</p>
+<hr />
+<h4>Task 3: 初始化引擎（<code>VLLMEngine</code> 类）</h4>
+<p><strong>代码位置</strong>：<code>class VLLMEngine</code> 的 <code>__init__</code> 方法。</p>
+<p><strong>解读</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ckpt_path</span><span class="p">,</span> <span class="n">n_logprobs</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+    <span class="c1"># n_logprobs: 我们需要保留前多少个最高概率的词？（比如前256个）</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">n_logprobs</span> <span class="o">=</span> <span class="n">n_logprobs</span>
+    <span class="c1"># 初始化 vLLM 的核心对象 LLM</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+        <span class="n">ckpt_path</span><span class="p">,</span>                  <span class="c1"># 模型路径</span>
+        <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span> <span class="c1"># 使用几张显卡并行</span>
+        <span class="n">max_logprobs</span><span class="o">=</span><span class="n">n_logprobs</span><span class="p">,</span>    <span class="c1"># 告诉底层引擎我们需要概率</span>
+        <span class="c1"># ... 其他配置</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<p><strong>总结</strong>：这就是启动了一个 vLLM 服务实例，做好了随时推理的准备。</p>
+<hr />
+<h4>Task 4: 核心功能（<code>get_topk_logprobs</code> 方法）</h4>
+<p><strong>代码位置</strong>：<code>VLLMEngine</code> 类中的 <code>get_topk_logprobs</code>。这是全篇最重要的函数。</p>
+<p><strong>流程解析</strong>：</p>
+<ol>
+<li>
+<p><strong>设置采样参数 (<code>SamplingParams</code>)</strong>：</p>
+<ul>
+<li><code>temperature</code>: 控制生成的多样性。</li>
+<li><code>logprobs=self.n_logprobs</code>: <strong>关键点</strong>。告诉引擎，生成的每个 token，都要把前 N 个最可能的词及其概率返给我。</li>
+<li><code>prompt_logprobs</code>: 是否需要<strong>输入提示词（Prompt）</strong>的概率？（如果是 <code>only_response=False</code>，则连 Prompt 的概率也要算一遍，这通常用于计算 KL 散度）。</li>
+</ul>
+</li>
+<li>
+<p><strong>执行推理 (<code>self.llm.generate</code>)</strong>：</p>
+<ul>
+<li>输入 <code>prompt_token_ids</code>，模型开始跑，得到 <code>outputs</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>提取数据（For loop 处理 outputs）</strong>：</p>
+<ul>
+<li>代码遍历每一个输出结果。</li>
+<li><strong><code>responses</code></strong>: 拿到生成的 Token IDs。</li>
+<li><strong><code>teacher_topk_logprobs</code></strong>: 提取概率。<ul>
+<li>如果是 <code>only_response=True</code>: 只拿生成部分的概率。</li>
+<li>如果是 <code>only_response=False</code>: 把 Prompt 的概率和 Response 的概率拼起来 (<code>torch.vstack</code>)。这相当于拿到了一整句话（问题+回答）所有位置的老师打分。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结</strong>：输入 Prompt -&gt; 模型推理 -&gt; 拿到文本 + <strong>拿到详细的概率矩阵</strong>。</p>
+<hr />
+<h4>Task 5: 运行测试（<code>__main__</code> 模块）</h4>
+<p><strong>代码位置</strong>：文件最底部的 <code>if __name__ == "__main__":</code>。</p>
+<p><strong>解读</strong>：
+这是一个测试脚本，用来验证上面的代码能不能跑，以及跑得快不快。</p>
+<ol>
+<li><strong>解析参数</strong>：读取命令行参数（模型路径、显卡数量、Batch Size等）。</li>
+<li><strong>准备数据</strong>：<ul>
+<li>如果给了 <code>token-file</code>，就从文件读输入。</li>
+<li>否则，生成一堆随机的 Token ID 作为假输入（用于测速）。</li>
+</ul>
+</li>
+<li><strong>实例化引擎</strong>：<code>engine = VLLMEngine(...)</code>。</li>
+<li><strong>跑一次推理</strong>：调用 <code>engine.get_topk_logprobs(...)</code>。</li>
+<li><strong>计时</strong>：使用 <code>Timer</code> 看看这一步花了多久。</li>
+</ol>
+<hr />
+<h3>一句话总结全文</h3>
+<p>这个脚本通过<strong>修改 vLLM 内部逻辑</strong>，封装了一个<strong>高效的 Teacher 引擎</strong>，专门用于给定 Prompt 后，输出模型生成的回复以及<strong>该回复（甚至包含 Prompt）对应的详细概率分布张量</strong>，主要服务于模型蒸馏训练任务。</p>

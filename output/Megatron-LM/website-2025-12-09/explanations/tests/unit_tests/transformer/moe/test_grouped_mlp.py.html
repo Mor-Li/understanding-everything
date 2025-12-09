@@ -1,0 +1,76 @@
+<h1>tests/unit_tests/transformer/moe/test_grouped_mlp.py</h1>
+<p>这份代码是一个 <strong>单元测试（Unit Test）</strong> 文件。它的核心目的是为了验证 NVIDIA Megatron-Core 库中关于 <strong>MoE（混合专家模型）</strong> 的一个具体优化技术——<strong>Grouped GEMM（分组矩阵乘法）</strong> 是否实现正确。</p>
+<p>简单来说，它在做一件事：<strong>造了两个模型，一个是“普通版”，一个是“加速版”，然后对比它们是不是长得一样、算出来的结果是不是一样。</strong></p>
+<p>为了让你读懂，我把阅读这份代码的过程拆解成一个 <strong>Task List（任务清单）</strong>，带你一步步通关：</p>
+<hr />
+<h3>✅ Task 1: 理解背景概念 (Context)</h3>
+<p>在看代码前，你需要知道这两个名词，否则看不懂变量名：
+*   <strong>Sequential MLP (SMM)</strong>: 这是“普通版”。在 MoE 模型中，有多个专家（Experts）。普通做法是写个 <code>for</code> 循环，一个专家一个专家地计算。这很慢。
+*   <strong>Grouped MLP (GMM)</strong>: 这是“加速版”。利用 <code>Grouped GEMM</code> 技术，把所有专家的计算合并成一次或几次大的矩阵运算，不用写循环，速度飞快。</p>
+<p><strong>代码目的：</strong> 证明“加速版”虽然算得快，但结果和“普通版”是一模一样的（或者误差在允许范围内）。</p>
+<hr />
+<h3>✅ Task 2: 准备对照组 (Setup)</h3>
+<p><strong>代码位置：</strong> <code>setup_method</code> 函数
+<strong>讲了啥：</strong>
+就像做科学实验一样，要控制变量。
+1.  <strong>初始化环境</strong>：设置随机种子（Seed），确保每次运行生成的随机数都是一样的。
+2.  <strong>创建普通版 (self.sequential_mlp)</strong>：配置 <code>moe_grouped_gemm=False</code>。
+3.  <strong>创建加速版 (self.grouped_mlp)</strong>：配置 <code>moe_grouped_gemm=True</code>。
+4.  <strong>关键点</strong>：这两个模型除了“是否分组计算”这个开关不同，其他的层数、隐藏层大小（hidden_size）、专家数量（num_experts）全都一模一样。</p>
+<hr />
+<h3>✅ Task 3: 检查“身体构造” (Constructor Test)</h3>
+<p><strong>代码位置：</strong> <code>test_constructor</code> 函数
+<strong>讲了啥：</strong>
+虽然它们计算方式不同，但包含的参数（权重）数量应该是一样的。
+1.  <strong>数参数 (num_weights)</strong>：把两个模型里的所有参数个数加起来，看 <code>num_weights_smm</code> 是否等于 <code>num_weights_gmm</code>。如果不等，说明代码写错了。
+2.  <strong>看形状 (Shape)</strong>：
+    *   普通版是把权重分开存的。
+    *   加速版是把权重拼成一大块存的（为了一次性计算）。
+    *   这里在检查加速版的权重矩阵形状（Shape）是否符合预期（比如 <code>hidden_size</code> x <code>num_experts * width</code>）。</p>
+<hr />
+<h3>✅ Task 4: 检查“初始状态” (Init Value Test)</h3>
+<p><strong>代码位置：</strong> <code>test_weight_init_value_the_same</code> 函数
+<strong>讲了啥：</strong>
+光是参数数量一样不够，参数里面的<strong>数值</strong>也得一样，否则没法比对计算结果。
+1.  代码把加速版的大矩阵切片（View），切成一个个小块。
+2.  然后把这些小块和普通版里对应的专家权重进行逐一对比 (<code>torch.equal</code>)。
+3.  <strong>目的</strong>：确保两个模型在起跑线上是完全同步的。</p>
+<hr />
+<h3>✅ Task 5: 实际运行测试 (Forward Pass)</h3>
+<p><strong>代码位置：</strong> <code>test_gpu_forward</code> 函数
+<strong>讲了啥：</strong>
+终于开始跑数据了。
+1.  造一个假的输入数据 <code>hidden_states</code> (随机生成的张量)。
+2.  把这个数据喂给普通版，得到结果 <code>output_smm</code>。
+3.  把同样的数据喂给加速版，得到结果 <code>output_gmm</code>。
+4.  <strong>对比</strong>：理论上 <code>output_smm</code> 和 <code>output_gmm</code> 应该相等。
+    *   <em>注意：代码里最后一句 <code>assert</code> 被注释掉了，作者留了注释说因为初始化微小差异导致无法完全 <code>equal</code>，但在逻辑上这是测试的目标。</em></p>
+<hr />
+<h3>✅ Task 6: 极端情况测试 (Edge Cases)</h3>
+<p><strong>代码位置：</strong> <code>test_gpu_forward_with_no_tokens_allocated</code>
+<strong>讲了啥：</strong>
+MoE 有个特点，通过路由器（Router）分配任务。万一某个专家运气不好，<strong>一个 Token（任务）都没分到</strong>，加速版算法会崩吗？
+1.  这里故意造了一个空数据（Token数为0）。
+2.  尝试运行加速版算法。
+3.  <strong>预期</strong>：它应该抛出一个特定的错误提示（"Input batch_sizes should not be all zeros!"），或者在某些版本下能安全处理，而不是直接导致显存崩溃。</p>
+<hr />
+<h3>✅ Task 7: Transformer Engine (TE) 专项测试</h3>
+<p><strong>代码位置：</strong> <code>class TestTEGroupedMLP</code> (文件的下半部分)
+<strong>讲了啥：</strong>
+NVIDIA 有个很厉害的库叫 <strong>Transformer Engine (TE)</strong>。这部分测试是专门针对使用了 TE 库实现的 Grouped MLP。
+*   流程和上面几乎一样：建立对照组 -&gt; 检查权重 -&gt; 检查前向传播。
+*   <strong>多了一个检查：Backward (反向传播)</strong>。
+    *   <code>test_gpu_forward_backward</code>：不仅比对输出结果，还比对<strong>梯度（Gradients）</strong>。
+    *   计算完 Loss 后，检查加速版算出来的梯度，是否和普通版算出来的梯度一致。这对训练至关重要。</p>
+<hr />
+<h3>总结</h3>
+<p>你不需要看懂每一行矩阵切片的操作，只需要明白这个文件的逻辑链条：
+1.  <strong>我要优化 MoE 计算速度。</strong>
+2.  <strong>我写了个新算法（Grouped）。</strong>
+3.  <strong>我得证明新算法是对的：</strong>
+    *   参数数量对不对？(Constructor)
+    *   初始值对不对？(Init)
+    *   算出来结果对不对？(Forward)
+    *   反向传播梯度对不对？(Backward)
+    *   没数据的时候崩不崩？(Edge case)</p>
+<p>这就是这个文件的全部内容。</p>

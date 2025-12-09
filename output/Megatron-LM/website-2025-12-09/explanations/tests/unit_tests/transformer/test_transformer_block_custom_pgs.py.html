@@ -1,0 +1,130 @@
+<h1>tests/unit_tests/transformer/test_transformer_block_custom_pgs.py</h1>
+<p>这份代码确实非常硬核，它是 <strong>NVIDIA Megatron-Core</strong>（一个用于训练超大规模大模型的库）的单元测试代码。</p>
+<p>简单来说，这个文件的核心目的是：<strong>测试 Transformer 模块是否支持“自定义通信组（Custom Process Groups）”</strong>。</p>
+<p>为了让你读懂，我制定了一个 <strong>学习任务清单 (To-Do List)</strong>，我们将分 5 步，从概念到代码细节，像剥洋葱一样把这个文件讲清楚。</p>
+<hr />
+<h3>📋 任务清单：一步步读懂代码</h3>
+<ol>
+<li><strong>Task 1: 理解背景概念（为什么要这么做？）</strong></li>
+<li><strong>Task 2: 认识核心工具（<code>HyperCommGrid</code> 和 <code>ProcessGroupCollection</code>）</strong></li>
+<li><strong>Task 3: 分析特殊的“魔改”层（<code>HeterogenousTransformerLayer</code>）</strong></li>
+<li><strong>Task 4: 看懂第一个测试（基准测试：和标准版比对）</strong></li>
+<li><strong>Task 5: 看懂进阶测试（混合并行：Attention 和 MLP 用不同的并行度）</strong></li>
+</ol>
+<hr />
+<h3>🚀 Task 1: 理解背景概念</h3>
+<p>在看代码前，你得先懂它在解决什么问题。</p>
+<ul>
+<li><strong>现状</strong>：通常训练大模型时，整个模型的并行策略是固定的。比如全模型都是 Tensor Parallel (TP)=4。</li>
+<li><strong>痛点</strong>：有时候我们想要更灵活的配置。<ul>
+<li>比如：Attention 层计算量小，我想用 TP=2；但 MLP 层参数多，我想用 TP=4。</li>
+<li>或者：第一层用 TP=2，第二层用 TP=4。</li>
+</ul>
+</li>
+<li><strong>Process Group (通信组)</strong>：在分布式训练中，GPU 之间需要通信。TP=4 意味着 4 张卡组成一个“群聊”来交换数据。这个“群聊”就是 Process Group。</li>
+<li><strong>本代码的目标</strong>：验证 Megatron 是否允许我们<strong>手动传入自定义的通信组</strong>，而不是只能用全局默认的。</li>
+</ul>
+<hr />
+<h3>🛠️ Task 2: 认识核心工具</h3>
+<p>代码里反复出现了两个关键类，它们是实现“自定义”的基础：</p>
+<ol>
+<li>
+<p><strong><code>HyperCommGrid</code> (超通信网格)</strong>:</p>
+<ul>
+<li><strong>比喻</strong>：想象你有 8 张 GPU 卡。你可以把它们切成不同的形状。</li>
+<li><strong>代码行为</strong>：<code>grid = HyperCommGrid([2, 4], ["tp", "dp"])</code>。意思是把 8 张卡切成 2x4 的网格。</li>
+<li><strong>作用</strong>：它帮我们快速创建各种复杂的通信组（TP组、DP组、CP组等）。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>ProcessGroupCollection</code> (通信组集合)</strong>:</p>
+<ul>
+<li><strong>比喻</strong>：这是一个“通讯录”。</li>
+<li><strong>代码行为</strong>：它把上面创建好的 TP 组、DP 组打包在一起，传给 Transformer Block。</li>
+<li><strong>作用</strong>：告诉 Transformer 层：“嘿，如果你要做 Tensor Parallel，请在这个群里说话；如果你要做 Data Parallel，请在那个群里说话。”</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧩 Task 3: 分析特殊的“魔改”层</h3>
+<p>代码开头定义了一个类 <code>HeterogenousTransformerLayer</code>。</p>
+<ul>
+<li><strong>Heterogenous (异构)</strong>：意思是各部分构造不一样。</li>
+<li><strong>目的</strong>：这是一个测试专用的辅助类。普通的 Transformer 层，Attention 和 MLP 通常共用一套并行策略。这个类允许它们<strong>分家</strong>。</li>
+<li><strong>代码逻辑</strong>：
+    ```python
+    # 伪代码逻辑
+    def <strong>init</strong>(self, ...):
+        # 1. 暂时把 Attention 和 MLP 替换成空操作 (IdentityOp)，防止父类初始化时报错
+        submodules.attention = IdentityOp
+        submodules.mlp = IdentityOp
+        super().<strong>init</strong>(...) <div class="codehilite"><pre><span></span><code><span class="gh">#</span> 2. 手动构建 Attention，并传入专门的通信组 (attn_pg_collection)
+self.self_attention = build_module(..., pg_collection=attn_pg_collection)
+
+<span class="gh">#</span> 3. 手动构建 MLP，并传入专门的通信组 (mlp_tp_group)
+self.mlp = build_module(..., tp_group=mlp_tp_group)
+</code></pre></div>
+
+<p>```
+*   <strong>结论</strong>：这个类的存在，就是为了证明“我可以让 Attention 处于一个通信组，而 MLP 处于另一个完全不同的通信组”。</p>
+</li>
+</ul>
+<hr />
+<h3>🧪 Task 4: 看懂第一个测试（基准测试）</h3>
+<p><strong>测试函数</strong>：<code>test_params_and_grads_match_transformer_block</code></p>
+<p>这是最基础的“冒烟测试”（Smoke Test）。</p>
+<ol>
+<li><strong>目标</strong>：证明“自定义组”的方法算出来的结果，和“默认方法”是一模一样的。如果不一样，说明代码写错了。</li>
+<li><strong>步骤</strong>：<ul>
+<li><strong>Step A</strong>: 初始化一个 <code>default_block</code>（使用 Megatron 默认的全局并行设置）。</li>
+<li><strong>Step B</strong>: 初始化一个 <code>custom_block</code>（使用我们手动创建的 <code>HyperCommGrid</code> 和 <code>ProcessGroupCollection</code>）。</li>
+<li><strong>Step C</strong>: <strong>强行同步参数</strong>。把 default 模型的权重复制给 custom 模型，确保起点一致。</li>
+<li><strong>Step D</strong>: 给同样的输入数据 (<code>hidden_states</code>)。</li>
+<li><strong>Step E</strong>: 跑一次前向传播 (Forward) 和反向传播 (Backward)。</li>
+<li><strong>验证</strong>：<ul>
+<li><code>assert_close(output_default, output_custom)</code>：输出必须完全一致。</li>
+<li>检查梯度是否都有值。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结</strong>：这一步是为了确信“手动挡”和“自动挡”开起来效果一样。</p>
+<hr />
+<h3>🔬 Task 5: 看懂进阶测试（混合并行）</h3>
+<p>这才是这个文件真正的重头戏。</p>
+<p><strong>测试函数 1</strong>：<code>test_fwd_bwd_pass_non_uniform_transformer_block</code> (非均匀 Transformer)</p>
+<ul>
+<li><strong>场景</strong>：假设我有 8 张卡。<ul>
+<li>Attention 模块：我想用 TP=2, CP=1。</li>
+<li>MLP 模块：我想用 TP=4。</li>
+</ul>
+</li>
+<li><strong>操作</strong>：<ul>
+<li>使用 <code>HyperCommGrid</code> 切分 GPU，创建两套不同的组。</li>
+<li>用 <code>HeterogenousTransformerLayer</code> 组装层。</li>
+</ul>
+</li>
+<li><strong>验证</strong>：能不能跑通？输出形状对不对？梯度能不能传回去？</li>
+<li><strong>意义</strong>：证明了 Megatron 支持层内部的混合并行策略。</li>
+</ul>
+<p><strong>测试函数 2</strong>：<code>test_fwd_bwd_pass_mix_and_match_transformer_blocks</code> (混合搭配 Block)</p>
+<ul>
+<li><strong>场景</strong>：<ul>
+<li>第 1 层 Block：TP=4 (Context Parallel=2)</li>
+<li>第 2 层 Block：TP=2 (Context Parallel=2)</li>
+</ul>
+</li>
+<li><strong>操作</strong>：<ul>
+<li>先把数据输入给 Block 1。</li>
+<li>把 Block 1 的输出，作为 Block 2 的输入。</li>
+</ul>
+</li>
+<li><strong>验证</strong>：能不能跑通？</li>
+<li><strong>意义</strong>：证明了不同层之间可以使用不同的并行度，只要数据形状能对齐（或者通过通信对齐）。</li>
+</ul>
+<hr />
+<h3>💡 总结：这代码到底讲了啥？</h3>
+<p>这个文件在说：
+<strong>“兄弟们，Megatron 现在牛X了。我们不再局限于全模型统一的并行策略。通过 <code>ProcessGroupCollection</code> 接口，你可以极其灵活地定义：第一层怎么并行，第二层怎么并行，甚至层里面的 Attention 和 MLP 各自怎么并行。这个文件就是用来证明这种灵活性是可用的，而且算出来的数是对的。”</strong></p>
+<p>希望这个 List 能帮你理清思路！</p>

@@ -1,0 +1,110 @@
+<h1>examples/ppo_trainer/run_qwen2.5-32b.sh</h1>
+<p>这份脚本确实看起来很吓人，因为它把<strong>数据配置</strong>、<strong>模型加载</strong>、<strong>分布式训练</strong>和<strong>超参数</strong>全都堆在一起了。</p>
+<p>咱们把它想象成你在<strong>指挥一个巨大的工程项目</strong>。这个脚本就是你的“施工蓝图”。</p>
+<p>为了让你看懂，我把它拆解成 <strong>6 个待办任务 (Todo List)</strong>。我们一步步来完成这个“工程”。</p>
+<hr />
+<h3>任务 1：准备原材料 (数据)</h3>
+<p><strong>目标</strong>：告诉程序我们要学什么内容。</p>
+<p>在脚本的最开头，定义了数据的路径。
+*   <strong>代码对应</strong>：
+    <code>bash
+    gsm8k_train_path=$HOME/data/gsm8k/train.parquet
+    ...
+    train_files="['$gsm8k_train_path', '$math_train_path']"</code>
+*   <strong>讲解</strong>：
+    *   这里准备了两本“教科书”：<code>gsm8k</code> (小学数学题) 和 <code>math</code> (更难的数学竞赛题)。
+    *   程序会读取这些 <code>.parquet</code> 文件来训练模型。</p>
+<hr />
+<h3>任务 2：确定施工方案 (核心算法)</h3>
+<p><strong>目标</strong>：确定我们要用什么方法来训练模型。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>bash
+    python3 -m verl.trainer.main_ppo \
+        algorithm.adv_estimator=gae \</code></li>
+<li><strong>讲解</strong>：<ul>
+<li><code>main_ppo</code>：这是核心。我们使用的是 <strong>PPO (Proximal Policy Optimization)</strong> 算法。简单说，这是一种“强化学习”方法——模型做对了题，我们就给它奖励（Reward），让它下次更倾向于这样做。</li>
+<li><code>gae</code>：这是计算奖励的一种数学技巧，不用深究，知道它是用来算分数的就行。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>任务 3：分配角色 (模型配置)</h3>
+<p><strong>目标</strong>：PPO 训练就像一场舞台剧，需要三个角色。这部分配置最复杂，但逻辑很清晰。</p>
+<h4>角色 A：演员 (Actor/Rollout)</h4>
+<p>负责做题、写答案的模型。
+*   <strong>代码对应</strong>：
+    <code>bash
+    actor_rollout_ref.model.path=Qwen/Qwen2.5-32B-Instruct
+    actor_rollout_ref.rollout.name=vllm</code>
+*   <strong>讲解</strong>：
+    *   我们雇佣的演员是 <strong>Qwen2.5-32B</strong> (阿里通义千问 320亿参数模型)。
+    *   <code>vllm</code>：这是一个加速器。因为模型太大了，生成答案很慢，用 vLLM 可以让它写字飞快。</p>
+<h4>角色 B：参考系 (Reference)</h4>
+<p>负责监督演员不要“放飞自我”。
+*   <strong>代码对应</strong>：
+    *   (脚本中隐含在 <code>actor_rollout_ref</code> 里，通常和 Actor 是同一个模型初始化)。
+*   <strong>讲解</strong>：
+    *   我们需要保留一个原始模型，防止现在的模型为了拿高分而胡言乱语。</p>
+<h4>角色 C：评论家 (Critic)</h4>
+<p>负责给演员的答案打分。
+*   <strong>代码对应</strong>：
+    <code>bash
+    critic.model.path=Qwen/Qwen2.5-32B-Instruct</code>
+*   <strong>讲解</strong>：
+    *   评论家通常也用同样强大的模型（这里也是 Qwen 32B）来担任，它来判断当前状态好不好。</p>
+<hr />
+<h3>任务 4：解决硬件瓶颈 (显存与并行)</h3>
+<p><strong>目标</strong>：320亿参数的模型非常大，一张显卡根本装不下，必须切分。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>bash
+    actor_rollout_ref.rollout.tensor_model_parallel_size=4
+    trainer.n_gpus_per_node=8
+    trainer.nnodes=4</code></li>
+<li><strong>讲解</strong>：<ul>
+<li><code>tensor_model_parallel_size=4</code>：这是关键。意思是把<strong>一个模型切成 4 份</strong>，分别放在 4 张显卡上运行。不切的话，显存直接爆炸。</li>
+<li><code>nnodes=4</code> &amp; <code>n_gpus_per_node=8</code>：这是一个<strong>超级大工程</strong>。你一共动用了 4 台服务器，每台 8 张显卡，总共 <strong>32 张显卡</strong> 来训练这个模型。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>任务 5：设定训练强度 (超参数)</h3>
+<p><strong>目标</strong>：控制学习的速度和节奏。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>bash
+    data.train_batch_size=1024       # 一次学多少题
+    actor_rollout_ref.actor.optim.lr=1e-6  # 学习率 (步子迈多大)
+    trainer.total_epochs=15          # 总共学几轮</code></li>
+<li><strong>讲解</strong>：<ul>
+<li><code>lr=1e-6</code>：学习率非常小（0.000001）。因为 Qwen 32B 已经很聪明了，我们只需要微调，步子大了容易把模型“学傻”。</li>
+<li><code>batch_size=1024</code>：每次让模型看 1024 道题，算出平均梯度再更新。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>任务 6：后勤保障 (日志与保存)</h3>
+<p><strong>目标</strong>：记录进度，防止白干。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>bash
+    trainer.logger='["console","wandb"]'
+    trainer.project_name='verl_example'
+    trainer.save_freq=20</code></li>
+<li><strong>讲解</strong>：<ul>
+<li><code>wandb</code>：一个可视化的网页工具，你可以像看股票K线图一样看模型的训练曲线。</li>
+<li><code>save_freq=20</code>：每训练 20 步存个档。万一断电了，不用从头再来。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<p>一句话总结：
+<strong>这段脚本动用了 4 台服务器（32张显卡），使用 PPO 强化学习算法，让 Qwen2.5-32B 模型在数学题（GSM8K/MATH）上进行特训，目的是让它做数学题更厉害。</strong></p>
+<p>现在你再看回去，是不是大概知道每一块是干嘛的了？
+1.  <strong>开头</strong>：找数据。
+2.  <strong>data.</strong>：设置数据怎么喂进去。
+3.  <strong>actor...</strong>：设置干活的模型（怎么切分、用什么加速）。
+4.  <strong>critic...</strong>：设置打分的模型。
+5.  <strong>trainer...</strong>：设置用了多少机器、多久存一次盘。</p>

@@ -1,0 +1,102 @@
+<h1>verl/trainer/ppo/rollout_corr_helper.py</h1>
+<p>完全理解你的感受。强化学习（RL）特别是涉及工程优化的代码（比如 PPO 的 Off-policy 修正）由于涉及很多数学术语（Importance Sampling, KL Divergence 等），读起来非常晦涩。</p>
+<p>简单来说，这个文件的核心作用是<strong>“纠偏”</strong>和<strong>“质检”</strong>。</p>
+<p><strong>背景故事：</strong>
+在训练大模型时，负责“写作业”（生成数据/Rollout）的模型和负责“学习”（训练/Train）的模型之间往往存在<strong>时间差</strong>或<strong>精度差</strong>（比如一个用 FP32 算，一个用 BF16 算）。这就导致生成的数据对于当前的训练模型来说，可能有点“过时”或者“不准”。这就叫 <strong>Off-policy（异策略）</strong> 问题。</p>
+<p>如果不处理，模型可能会学偏，甚至训练崩溃。这个文件就是用来修补这个问题的。</p>
+<p>我把它拆解成一个 <strong>Task Todo List</strong>，带你一步步看它是怎么工作的：</p>
+<hr />
+<h3>🛠️ Task 1: 算出“新旧模型”的差异 (计算 Log Ratio)</h3>
+<p><strong>目标</strong>：首先得知道，生成数据的模型（Rollout Policy）和当前正在训练的模型（Training Policy）对同一句话的看法差了多少。
+<strong>代码对应</strong>：<code>log_ratio = old_log_prob - rollout_log_prob</code> (在 <code>compute_rollout_correction_and_rejection_mask</code> 函数中)</p>
+<ul>
+<li><strong>直觉</strong>：<ul>
+<li>如果两个模型完全一样，差值是 0。</li>
+<li>如果训练模型觉得这句话更有道理，差值是正数。</li>
+<li>如果训练模型觉得这句话很烂，差值是负数。</li>
+</ul>
+</li>
+<li><strong>Todo</strong>：计算这个差值，这是后续所有修正的基础。</li>
+</ul>
+<hr />
+<h3>📊 Task 2: 给数据做“体检” (计算 Metrics)</h3>
+<p><strong>目标</strong>：在开始修补之前，先看看这批数据的整体质量如何，有没有离谱的偏差。
+<strong>代码对应</strong>：<code>compute_offpolicy_metrics</code></p>
+<ul>
+<li><strong>直觉</strong>：就像医生看化验单。</li>
+<li><strong>Todo</strong>：<ul>
+<li><strong>KL 散度 (KL Divergence)</strong>：衡量两个模型分布差异有多大。太大说明模型变了太多，危险。</li>
+<li><strong>PPL (困惑度)</strong>：模型对生成的句子感到多“困惑”。</li>
+<li><strong>Chi2 (卡方)</strong>：另一种衡量差异的数学指标。</li>
+</ul>
+</li>
+<li>这个函数只负责算数并记录日志，不改动数据。</li>
+</ul>
+<hr />
+<h3>🗑️ Task 3: 扔掉“垃圾”数据 (Rejection Sampling - RS)</h3>
+<p><strong>目标</strong>：如果某条数据，新旧模型的看法差异<strong>过于巨大</strong>，说明这条数据可能是噪音，或者是老模型瞎蒙的，现在的模型根本不认。这种数据强行拿来训练会有害，不如直接扔掉。
+<strong>代码对应</strong>：<code>compute_rollout_rejection_mask</code></p>
+<ul>
+<li><strong>直觉</strong>：质检员把不合格的产品挑出来扔进垃圾桶。</li>
+<li><strong>Todo</strong>：<ul>
+<li>设定一个阈值（比如 <code>rollout_rs_threshold</code>）。</li>
+<li>如果差异（权重）超过这个范围，就把 <code>response_mask</code> 设为 0。</li>
+<li><strong>Mask 设为 0</strong> 意味着：后续计算 Loss 时，这部分数据会被当成空气，不参与更新。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🚫 Task 4: 紧急刹车 (Token Veto - 一票否决)</h3>
+<p><strong>目标</strong>：这是比 Task 3 更严格的一层过滤。防止“灾难性”更新。
+<strong>代码对应</strong>：<code>compute_rollout_correction_and_rejection_mask</code> 中的 <code>Step 4</code></p>
+<ul>
+<li><strong>直觉</strong>：如果一句话里，哪怕只有<strong>一个词</strong>极其离谱（训练模型认为这个词出现的概率接近 0），那么整句话都不要了。因为这个词可能会导致梯度爆炸。</li>
+<li><strong>Todo</strong>：<ul>
+<li>检查每一个 Token 的 Log Ratio。</li>
+<li>只要有一个 Token 低于 <code>rollout_token_veto_threshold</code>，整条数据的 Mask 全部置 0。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>⚖️ Task 5: 修正数据的“权重” (Importance Sampling - IS)</h3>
+<p><strong>目标</strong>：剩下的数据虽然能用，但毕竟是“旧模型”生成的。我们需要调整它们的权重，让它们看起来像是“新模型”生成的。
+<strong>代码对应</strong>：<code>compute_rollout_correction_weights</code></p>
+<ul>
+<li><strong>直觉</strong>：<ul>
+<li>如果新模型觉得这条数据很好，我们就<strong>加大</strong>它的权重（让模型多学一点）。</li>
+<li>如果新模型觉得这条数据一般，我们就<strong>减小</strong>它的权重（少学一点）。</li>
+<li>这就是 <strong>Importance Sampling (IS)</strong> 的核心。</li>
+</ul>
+</li>
+<li><strong>Todo</strong>：<ul>
+<li>计算权重 <code>exp(log_ratio)</code>。</li>
+<li><strong>截断 (Truncate)</strong>：如果权重太大（比如 1000倍），会把模型带偏。所以要限制最大值（比如最多 2.0 倍）。这叫 <strong>TIS (Truncated IS)</strong>。</li>
+<li><strong>归一化 (Normalize)</strong>：(可选) 保证一批数据的平均权重是 1.0，保持数值稳定。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📦 Task 6: 打包发货 (Main Pipeline)</h3>
+<p><strong>目标</strong>：把上面所有的步骤串起来，对外提供一个统一的接口。
+<strong>代码对应</strong>：<code>compute_rollout_correction_and_rejection_mask</code></p>
+<ul>
+<li><strong>Todo</strong>：<ol>
+<li>执行 Task 1 (算差值)。</li>
+<li>执行 Task 5 (算权重 IS)。</li>
+<li>执行 Task 3 (算拒绝掩码 RS)。</li>
+<li>执行 Task 4 (一票否决 Veto)。</li>
+<li>执行 Task 2 (记录指标 Metrics)。</li>
+<li><strong>输出</strong>：修正后的权重 (<code>rollout_is_weights</code>) 和 修正后的掩码 (<code>modified_response_mask</code>)。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件到底在干啥？</h3>
+<p>想象你在教一个学生（模型）写作文：
+1.  学生写了一篇作文（<strong>Rollout</strong>）。
+2.  但是你现在的评分标准（<strong>Training Policy</strong>）比他写的时候已经进化了。
+3.  <strong>Task 1</strong>: 你对比了一下新旧标准。
+4.  <strong>Task 3 &amp; 4</strong>: 如果某句话写得太离谱，完全不符合新标准，你直接把这句话划掉，不评分（<strong>Rejection / Veto</strong>）。
+5.  <strong>Task 5</strong>: 对于剩下的句子，如果符合新标准，你给它加分（加权重）；如果不怎么符合，你给它减分（减权重）（<strong>Importance Sampling</strong>）。
+6.  <strong>Task 2</strong>: 最后你统计一下，这个学生现在的水平和你的标准差了多少（<strong>Metrics</strong>）。</p>
+<p>这就是 <code>rollout_corr_helper.py</code> 的全部工作。</p>

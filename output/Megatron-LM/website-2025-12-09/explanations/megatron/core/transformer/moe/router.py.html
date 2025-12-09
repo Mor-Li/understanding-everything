@@ -1,0 +1,101 @@
+<h1>megatron/core/transformer/moe/router.py</h1>
+<p>这份代码确实比较硬核，因为它不仅仅是深度学习的算法逻辑，还混合了<strong>分布式训练（并行计算）</strong>和<strong>工程优化</strong>的细节。</p>
+<p>为了让你看懂，我把阅读这份代码拆解成一个 <strong>6步走的 Task List</strong>。我们把这个 <code>Router</code>（路由器）想象成一个<strong>繁忙的快递分拣中心的主管</strong>。</p>
+<p>这个文件的核心作用是：<strong>决定每一个输入的 Token（快递包裹），应该被送到哪几个 Expert（专家/分拣员）那里去处理。</strong></p>
+<hr />
+<h3>Task 1: 理解身份 —— 什么是 <code>Router</code> 类？</h3>
+<p><strong>目标</strong>：搞清楚这个类的基本职责。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>class Router(ABC, MegatronModule)</code> 和 <code>class TopKRouter(Router)</code></li>
+<li><strong>通俗解释</strong>：<ul>
+<li><code>Router</code> 是个基类（蓝图），定义了路由器必须得有“打分（gating）”和“分发（routing）”的能力。</li>
+<li><code>TopKRouter</code> 是具体的实施者。它的逻辑是：<strong>“谁分最高我就选谁”</strong>。比如 Top-2 路由，就是给每个 Token 选出分数最高的 2 个专家。</li>
+</ul>
+</li>
+<li><strong>初始化 (<code>__init__</code>)</strong>：<ul>
+<li>主管上任，需要知道有多少个专家 (<code>num_experts</code>)。</li>
+<li>主管手里得有一个打分器，也就是权重矩阵 (<code>self.weight</code>)。这是一个简单的线性层（Linear Layer）。</li>
+<li>它还拿到了很多通信群组 (<code>pg_collection</code>)，这是因为在超大模型中，专家可能分布在不同的显卡（GPU）上，大家需要通气。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 2: 第一步工作 —— 打分 (Gating)</h3>
+<p><strong>目标</strong>：理解 Token 是如何获得去往不同专家的“推荐分”的。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>def gating(self, input: torch.Tensor)</code></li>
+<li><strong>通俗解释</strong>：<ul>
+<li>快递（Input Token）来了。</li>
+<li>主管用手里的打分器（<code>self.weight</code>）看了一眼快递，给每个专家打个分（Logits）。</li>
+<li>比如有 8 个专家，输出就是 <code>[0.1, 2.5, -0.3, ...]</code> 这样一组 8 个数字。分数越高，说明这个专家越适合处理这个 Token。</li>
+</ul>
+</li>
+<li><strong>细节</strong>：代码里有 <code>router_gating_linear</code>，这就是个矩阵乘法。</li>
+</ul>
+<h3>Task 3: 核心决策 —— 谁是赢家？ (Top-K Routing)</h3>
+<p><strong>目标</strong>：理解如何根据分数选出专家。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>def routing(self, logits)</code> 和 <code>topk_routing_with_score_function</code></li>
+<li><strong>通俗解释</strong>：<ul>
+<li>拿到分数（Logits）后，不能直接用，通常要归一化（Softmax）。</li>
+<li><strong>Top-K 逻辑</strong>：如果 <code>topk=2</code>，就选分数最高的两个专家。</li>
+<li><strong>输出结果</strong>：这个函数会返回两个关键东西：<ol>
+<li><code>probs</code>（概率/权重）：选中的专家对这个 Token 的重要程度（比如专家A占60%，专家B占40%）。</li>
+<li><code>routing_map</code>（路线图）：一张表，标记了哪个 Token 去哪个专家。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 防止拥堵 —— 负载均衡 (Auxiliary Loss)</h3>
+<p><strong>目标</strong>：这是 MoE 最难也是最重要的部分。理解为什么代码里有一堆 <code>loss</code>。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>_apply_aux_loss</code>, <code>switch_load_balancing_loss_func</code>, <code>sinkhorn</code></li>
+<li><strong>通俗解释</strong>：<ul>
+<li><strong>问题</strong>：如果主管发现“专家1”最强，把所有快递都扔给“专家1”，那“专家1”会累死（显存爆了/计算慢），其他专家在摸鱼。这叫“负载不均衡”。</li>
+<li><strong>解决办法 (Aux Loss)</strong>：主管给自己定了个 KPI。如果分配得不均匀，就要扣分（增加 Loss）。<ul>
+<li><code>aux_loss</code>：强制要求在一个 Batch 内，分给每个专家的 Token 数量尽量平均。</li>
+<li><code>seq_aux_loss</code>：在序列级别做均衡。</li>
+<li><code>global_aux_loss</code>：在全局（跨所有 GPU）做均衡。</li>
+</ul>
+</li>
+<li><strong>Sinkhorn</strong>：这是一种特殊的算法（数学魔法），不通过 Loss 惩罚，而是直接通过迭代计算，强制把分数调整成均匀分布的形状。代码里的 <code>sinkhorn_load_balancing</code> 就是干这个的。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 5: 维稳手段 —— 增加稳定性 (Z-Loss &amp; Jitter)</h3>
+<p><strong>目标</strong>：理解代码里那些奇怪的“微操”。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>apply_z_loss</code>, <code>apply_input_jitter</code></li>
+<li><strong>通俗解释</strong>：<ul>
+<li><strong>Z-Loss</strong>：训练 MoE 时，有时候打分器会发疯，分数（Logits）变得特别大（比如 10000），导致计算溢出或梯度消失。Z-Loss 的作用是：<strong>“分数别太高，低调点”</strong>。它惩罚过大的 Logits 值。</li>
+<li><strong>Input Jitter</strong>：给输入的快递上撒点灰（加噪声）。防止路由器“认死理”，稍微变一点输入，看看能不能选出不同的专家，增加鲁棒性。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 6: 处理爆仓 —— 丢弃 Token (Token Dropping)</h3>
+<p><strong>目标</strong>：理解当专家真的处理不过来时该怎么办。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>apply_router_token_dropping</code></li>
+<li><strong>通俗解释</strong>：<ul>
+<li>每个专家在单次计算中能处理的 Token 数量是有上限的（Capacity）。</li>
+<li>虽然我们有了负载均衡（Task 4），但有时候还是会爆。</li>
+<li>如果去往“专家1”的 Token 超过了上限，<strong>超出的 Token 就会被直接丢掉（Drop）</strong>，不予计算（或者直接透传，不经过专家）。代码里这一步就是在计算哪些 Token 即使被选中了，也得被无情抛弃。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：整个 <code>forward</code> 函数的流程</h3>
+<p>当你看到最后的 <code>def forward(self, input)</code> 时，把上面的步骤串起来：</p>
+<ol>
+<li><strong>Input Jitter</strong>：给输入加点噪声（Task 5）。</li>
+<li><strong>Gating</strong>：算分，得到 Logits（Task 2）。</li>
+<li><strong>Routing</strong>：<ul>
+<li>先用 <strong>Z-Loss</strong> 压一下分数（Task 5）。</li>
+<li>选出 Top-K 专家，得到 <code>probs</code> 和 <code>routing_map</code>（Task 3）。</li>
+<li>如果专家满了，执行 <strong>Token Dropping</strong>（Task 6）。</li>
+<li>计算 <strong>Aux Loss</strong>（负载均衡），把这个 Loss 挂到 <code>probs</code> 上，这样反向传播时能更新参数（Task 4）。</li>
+</ul>
+</li>
+<li><strong>返回</strong>：把分配方案扔给下一层去真正执行计算。</li>
+</ol>
+<p>建议你按照这个顺序，从 <code>forward</code> 入手，遇到哪个函数不懂，就回过头来看它是属于上面 Task List 中的哪一步。这样就不会迷失在细节里了。</p>

@@ -1,0 +1,98 @@
+<h1>megatron/legacy/data/orqa_wiki_dataset.py</h1>
+<p>这份代码确实看起来有点枯燥，因为它属于<strong>数据预处理和加载</strong>的“脏活累活”部分，而且是针对 <strong>ORQA (Open Retrieval Question Answering，开放域问答)</strong> 任务的。</p>
+<p>简单来说，ORQA 任务就是：给模型一个问题，模型需要从海量的 Wikipedia（维基百科）文章中找到证据（Evidence）并回答。</p>
+<p><strong>这份代码的核心任务就是：把维基百科的文本文件，变成模型能读懂的数字（Tensor）。</strong></p>
+<p>我们可以把你理解这份代码的过程拆解成 <strong>6 个任务 (Task)</strong>。请按照这个 List 一步步来看：</p>
+<hr />
+<h3>📝 学习路径 List</h3>
+<h4>Task 1: 搞清楚“原材料”是什么</h4>
+<p><strong>代码对应部分：</strong> <code>process_samples_from_single_path</code> 函数 (底部)</p>
+<ul>
+<li><strong>目标</strong>：把存在硬盘上的 <code>tsv</code> 文件读到内存里。</li>
+<li><strong>讲解</strong>：<ul>
+<li>想象你有一个巨大的 Excel 表格（存为 TSV 格式），每一行是一篇维基百科文章。</li>
+<li>这个函数打开文件，跳过表头 (<code>next(reader, None)</code>)。</li>
+<li>它读取每一行，提取出三样东西：<ol>
+<li><code>doc_id</code>: 文章的身份证号。</li>
+<li><code>text</code>: 文章的正文内容。</li>
+<li><code>title</code>: 文章的标题。</li>
+</ol>
+</li>
+<li><strong>结果</strong>：它把这些信息存进了一个大列表 <code>rows</code> 里，每一项都是一个字典 <code>{'doc_id':..., 'text':..., 'title':...}</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 文本怎么变数字？(Tokenization)</h4>
+<p><strong>代码对应部分：</strong> <code>build_tokens_types_paddings_from_text</code> 函数 (中间)</p>
+<ul>
+<li><strong>目标</strong>：模型看不懂英文单词，只看懂数字 ID。我们需要把标题和正文切开并转成 ID。</li>
+<li><strong>讲解</strong>：<ul>
+<li><code>tokenizer.tokenize(row['title'])</code>: 把标题切成 token（词元）。</li>
+<li><code>tokenizer.tokenize(row['text'])</code>: 把正文切成 token。</li>
+<li><strong>关键拼接</strong>：<code>extended_context_ids = title_ids + [tokenizer.sep] + context_ids</code>。</li>
+<li><strong>含义</strong>：它把“标题”和“正文”拼在一起，中间加了一个 <code>[SEP]</code> (分隔符)。告诉模型：“前面是标题，后面是正文，别搞混了”。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 统一数据的长短 (Padding &amp; Truncation)</h4>
+<p><strong>代码对应部分：</strong> <code>build_tokens_types_paddings_from_ids</code> 函数 (中间)</p>
+<ul>
+<li><strong>目标</strong>：模型要求输入的数据长度必须整齐划一（比如都长 512）。但文章有长有短，怎么办？</li>
+<li><strong>讲解</strong>：<ul>
+<li><strong>加头</strong>：在最前面加一个 <code>[CLS]</code> 标记（这是 BERT 类模型的标准做法，表示句子的开始）。</li>
+<li><strong>截断 (Truncation)</strong>：如果文章太长，超过了 <code>max_seq_length</code>，就咔嚓一刀切掉 (<code>enc_ids = enc_ids[0: max_seq_length - 1]</code>)。</li>
+<li><strong>加尾</strong>：在最后加一个 <code>[SEP]</code>。</li>
+<li><strong>填充 (Padding)</strong>：如果文章太短，没填满 512，就在后面疯狂补 <code>0</code> (即 <code>pad_id</code>)，直到填满为止。</li>
+<li><strong>生成 Mask</strong>：记录哪些位置是有字的（标为1），哪些位置是补的0（标为0）。这样模型计算时就会忽略那些补上去的0。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 组装成最终样本</h4>
+<p><strong>代码对应部分：</strong> <code>build_sample</code> 函数</p>
+<ul>
+<li><strong>目标</strong>：把上面处理好的 ID、Mask 等打包成一个字典，方便 PyTorch 读取。</li>
+<li><strong>讲解</strong>：<ul>
+<li>它接收处理好的 <code>context_ids</code> (内容ID), <code>context_types</code> (类型ID), <code>context_pad_mask</code> (填充掩码)。</li>
+<li>它还调用了一个 <code>make_attention_mask</code>，这是为了生成 Transformer 模型需要的注意力矩阵。</li>
+<li><strong>结果</strong>：返回一个字典 <code>sample</code>，里面包含了模型训练需要的所有张量。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 建立 PyTorch 数据集类</h4>
+<p><strong>代码对应部分：</strong> <code>OpenRetrievalEvidenceDataset</code> 类 (底部)</p>
+<ul>
+<li><strong>目标</strong>：把上面所有步骤封装成一个标准的 PyTorch Dataset，这样就能用 <code>DataLoader</code> 来取数据了。</li>
+<li><strong>讲解</strong>：<ul>
+<li><code>__init__</code>：初始化时，它调用 Task 1 的函数读取所有数据到内存 (<code>self.samples</code>)。如果有需要，它还会进行随机采样 (<code>args.sample_rate</code>) 减少数据量。</li>
+<li><code>__len__</code>：告诉系统一共有多少条数据。</li>
+<li><code>__getitem__</code>：这是最关键的。当你请求第 <code>idx</code> 条数据时，它拿出原始文本，跑一遍 Task 2 和 Task 3 的流程，变成数字，然后返回 Task 4 的结果。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: 训练时怎么拿数据？(Batching)</h4>
+<p><strong>代码对应部分：</strong> <code>get_open_retrieval_batch</code> 函数 (顶部)</p>
+<ul>
+<li><strong>目标</strong>：在训练循环中，从数据迭代器里拿出一批数据（Batch），并处理并行训练的问题。</li>
+<li><strong>讲解</strong>：<ul>
+<li>这个函数通常在训练的主循环里被调用。</li>
+<li><code>data_b = tensor_parallel.broadcast_data(...)</code>: 这是 <strong>Megatron</strong> 特有的。因为是大模型训练，涉及多张显卡。这个操作确保所有显卡拿到的是同一份数据，或者数据被正确地分发了，防止不同显卡训练的数据对不上。</li>
+<li>最后，它把数据里的 <code>context_mask</code> 从浮点数转换成布尔值（<code>&lt; 0.5</code>），这是为了符合后续模型计算精度的要求。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (大白话版)</h3>
+<p><strong>这一整个文件的逻辑流是这样的：</strong></p>
+<ol>
+<li><strong>启动</strong>：调用 <code>get_open_retrieval_wiki_dataset</code>。</li>
+<li><strong>读盘</strong>：<code>OpenRetrievalEvidenceDataset</code> 把 TSV 里的维基百科文章全读进内存。</li>
+<li><strong>取货</strong>：当训练程序说“给我一条数据”时 (<code>__getitem__</code>)。</li>
+<li><strong>加工</strong>：<ul>
+<li>拿出一条文章。</li>
+<li>变成 <code>[CLS] 标题 [SEP] 正文 [SEP] [PAD] [PAD]...</code> 的数字序列。</li>
+<li>生成对应的“说明书”（Mask，告诉模型哪是字，哪是填充）。</li>
+</ul>
+</li>
+<li><strong>发货</strong>：<code>get_open_retrieval_batch</code> 把这些处理好的数字打包，分发给各个显卡去跑模型。</li>
+</ol>
+<p>现在你再回头看代码，是不是每一个函数的功能就清晰多了？</p>
