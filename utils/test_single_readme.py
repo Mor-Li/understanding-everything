@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 # Add parent directory to path to import from scripts
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.s2_generate_readme import (
     collect_folder_content,
