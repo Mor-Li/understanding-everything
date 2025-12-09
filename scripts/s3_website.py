@@ -266,7 +266,9 @@ body {
 .tree-container {
     flex: 1;
     overflow-y: auto;
+    overflow-x: auto;
     padding: 10px;
+    min-width: 0;
 }
 
 /* 文件树样式 */
@@ -277,12 +279,11 @@ body {
 .tree-label {
     display: flex;
     align-items: center;
-    padding: 8px 10px;
+    padding: 6px 8px;
     cursor: pointer;
     border-radius: 4px;
     transition: background 0.2s;
     user-select: none;
-    white-space: nowrap;
 }
 
 .tree-label:hover {
@@ -295,19 +296,25 @@ body {
 }
 
 .tree-icon {
-    margin-right: 8px;
-    font-size: 1.1em;
+    margin-right: 6px;
+    font-size: 1em;
+    flex-shrink: 0;
 }
 
 .tree-toggle {
-    margin-right: 5px;
-    font-size: 0.8em;
-    width: 16px;
+    margin-right: 4px;
+    font-size: 0.75em;
+    width: 14px;
     text-align: center;
+    flex-shrink: 0;
+}
+
+.tree-name {
+    white-space: nowrap;
 }
 
 .tree-children {
-    padding-left: 24px;
+    margin-left: 0;
     display: none;
 }
 
@@ -509,6 +516,8 @@ function renderTree(node) {
 function renderNode(node, level = 0) {
     const div = document.createElement('div');
     div.className = 'tree-node';
+    // Apply margin to the entire node instead of padding to label
+    div.style.marginLeft = `${level * 20}px`;
 
     const label = document.createElement('div');
     label.className = 'tree-label';
@@ -534,6 +543,7 @@ function renderNode(node, level = 0) {
 
     // 名称
     const name = document.createElement('span');
+    name.className = 'tree-name';
     name.textContent = node.name;
     label.appendChild(name);
 
