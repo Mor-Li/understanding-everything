@@ -33,8 +33,12 @@ def build_tree_structure(repo_path: Path, subdir: Path, explain_base: Path) -> d
 
     def build_node(current_path: Path, current_explain: Path) -> dict[str, Any]:
         """递归构建节点"""
+        # 根目录使用仓库名称，避免和子目录同名造成混淆
+        is_root = current_path == repo_folder
+        display_name = repo_path.name if is_root else current_path.name
+
         node = {
-            "name": current_path.name,
+            "name": display_name,
             "type": "folder",
             "path": str(current_path.relative_to(repo_path)),
             "children": []

@@ -32,14 +32,27 @@ logger = logging.getLogger(__name__)
 MAX_TOKENS = 200_000  # 200K token 限制
 
 # Prompt 模板
-README_PROMPT = """以下是 {folder_path} 目录下的内容：
+README_PROMPT = """以下是 {folder_path} 目录的结构和**直接内容**：
+
+## 📁 目录结构
+
+{tree_structure}
+
+## 📄 详细内容
 
 {content}
 
+⚠️ **重要提示**：
+- 请专注于描述 `{folder_path}` **这一层级**的功能和结构
+- 子文件夹（📁标记的）已经有各自的 README，这里只需概括性地提到它们的作用
+- **不要重复子文件夹内部的详细内容**（如具体文件名、详细实现）
+- 优先描述当前层级的直接文件（📄标记的）
+
 请你用最通俗易懂的语言、用比喻的方式描述一下：
-1. 当前这个文件夹主要负责什么功能？
-2. 这个文件夹下的各个文件/子文件夹分别是干什么的？
-3. 给我一个高层的认知，让我能快速理解这部分代码的作用。
+1. 当前这个文件夹（{folder_path}）主要负责什么功能？
+2. 这个文件夹下的各个**直接文件**分别是干什么的？
+3. 子文件夹的作用是什么？（概括即可，不要展开细节）
+4. 给我一个高层的认知，让我能快速理解这部分代码的作用。
 
 请用简洁、通俗、易懂的语气回答，说中文。"""
 
@@ -83,6 +96,59 @@ def truncate_content(contents: list[tuple[str, str, int]], target_tokens: int) -
     return truncated
 
 
+def generate_tree_structure(folder_path: Path, explain_base: Path, max_depth: int = 2) -> str:
+    """
+    生成当前文件夹的目录树结构（用于在 prompt 中提供上下文）
+
+    Args:
+        folder_path: 当前文件夹路径（相对于 repo 根目录）
+        explain_base: explain 输出的基础路径
+        max_depth: 最大递归深度
+
+    Returns:
+        目录树的文本表示
+    """
+    explain_folder = explain_base / folder_path
+
+    if not explain_folder.exists():
+        return ""
+
+    def build_tree(current_path: Path, prefix: str = "", depth: int = 0) -> list[str]:
+        """递归构建树结构"""
+        if depth >= max_depth:
+            return []
+
+        lines = []
+        items = []
+
+        # 收集所有项目（文件和文件夹）
+        for item in sorted(current_path.iterdir()):
+            if item.name == "README.md":
+                continue
+            items.append(item)
+
+        for idx, item in enumerate(items):
+            is_last = idx == len(items) - 1
+            current_prefix = "└── " if is_last else "├── "
+            next_prefix = prefix + ("    " if is_last else "│   ")
+
+            if item.is_dir():
+                lines.append(f"{prefix}{current_prefix}📁 {item.name}/")
+                # 递归子目录
+                lines.extend(build_tree(item, next_prefix, depth + 1))
+            else:
+                # 去掉 .md 后缀显示原始文件名
+                display_name = item.name[:-3] if item.name.endswith(".md") else item.name
+                lines.append(f"{prefix}{current_prefix}📄 {display_name}")
+
+        return lines
+
+    tree_lines = [f"📁 {folder_path if str(folder_path) != '.' else explain_base.parent.name}/"]
+    tree_lines.extend(build_tree(explain_folder))
+
+    return "\n".join(tree_lines)
+
+
 def collect_folder_content(folder_path: Path, explain_base: Path) -> str:
     """
     收集文件夹下的所有内容（文件的 .md + 子文件夹的 README.md）
@@ -113,7 +179,7 @@ def collect_folder_content(folder_path: Path, explain_base: Path) -> str:
             name = md_file.name[:-3] if md_file.name.endswith(".md") else md_file.name
             contents.append((f"📄 {name}", content, token_count))
 
-    # 收集子文件夹的 README.md
+    # 收集子文件夹的 README.md（截断以防止内容传播）
     for subfolder in sorted(explain_folder.iterdir()):
         if subfolder.is_dir():
             readme = subfolder / "README.md"
@@ -146,6 +212,7 @@ def collect_folder_content(folder_path: Path, explain_base: Path) -> str:
 async def ask_gemini_async(
     folder_path: str,
     content: str,
+    tree_structure: str,
     client: AsyncOpenAI,
     model: str = "gemini-3-pro-preview"
 ) -> str:
@@ -155,13 +222,18 @@ async def ask_gemini_async(
     Args:
         folder_path: 文件夹路径
         content: 文件夹内容
+        tree_structure: 目录树结构
         client: AsyncOpenAI 客户端
         model: 使用的模型
 
     Returns:
         README 内容（Markdown 格式）
     """
-    prompt = README_PROMPT.format(folder_path=folder_path, content=content)
+    prompt = README_PROMPT.format(
+        folder_path=folder_path,
+        tree_structure=tree_structure,
+        content=content
+    )
 
     try:
         response = await client.chat.completions.create(
@@ -242,9 +314,15 @@ async def _generate_readme_impl(
     if not content:
         return (folder_path, False)
 
+    # 生成目录树结构
+    tree_structure = generate_tree_structure(folder_path, explain_base)
+
     # 调用 Gemini（异步）
+    # 对于根目录，使用更有意义的名称
+    folder_display_name = explain_base.parent.name if str(folder_path) == "." else str(folder_path)
+
     try:
-        readme_content = await ask_gemini_async(str(folder_path), content, client, model)
+        readme_content = await ask_gemini_async(folder_display_name, content, tree_structure, client, model)
     except Exception as e:
         logger.error(f"❌ API 调用失败 {folder_path}: {e}")
         return (folder_path, False)
@@ -253,7 +331,7 @@ async def _generate_readme_impl(
     try:
         readme_path.parent.mkdir(parents=True, exist_ok=True)
         with open(readme_path, "w", encoding="utf-8") as f:
-            f.write(f"# {folder_path}\n\n")
+            f.write(f"# {folder_display_name}\n\n")
             f.write(readme_content)
         return (folder_path, True)
     except Exception as e:
