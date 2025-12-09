@@ -12,8 +12,11 @@ from pathlib import Path
 import git
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm as async_tqdm
+import sys
 
-from utils import get_output_path
+# Add parent directory to path to import utils
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils.utils import get_output_path
 
 
 # Prompt 模板
