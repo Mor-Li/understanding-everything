@@ -279,6 +279,7 @@ body {
     border-radius: 4px;
     transition: background 0.2s;
     user-select: none;
+    white-space: nowrap;
 }
 
 .tree-label:hover {
@@ -303,7 +304,7 @@ body {
 }
 
 .tree-children {
-    margin-left: 20px;
+    padding-left: 24px;
     display: none;
 }
 
