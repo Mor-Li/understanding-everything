@@ -79,7 +79,13 @@ def build_tree_structure(repo_path: Path, subdir: Path, explain_base: Path) -> d
             }
 
             # 检查是否有对应的解读 .md 文件
-            explain_md = current_explain / (file.name + ".md")
+            # 对于 .md 文件，解读文件名是 filename.md（不加额外后缀）
+            # 对于其他文件，解读文件名是 filename.ext.md
+            if file.suffix == ".md":
+                explain_md = current_explain / file.name
+            else:
+                explain_md = current_explain / (file.name + ".md")
+
             if explain_md.exists():
                 file_node["explanation"] = str(explain_md.relative_to(explain_base))
 
@@ -641,7 +647,11 @@ function loadContent(node) {
 // 加载 README
 async function loadReadme(readmePath, folderName) {
     try {
-        const htmlPath = readmePath.replace('.md', '.html');
+        // Convert .md to .html
+        let htmlPath = readmePath;
+        if (htmlPath.endsWith('.md')) {
+            htmlPath = htmlPath.slice(0, -3) + '.html';
+        }
         // Encode path components to handle special characters and dots
         const encodedPath = htmlPath.split('/').map(encodeURIComponent).join('/');
         const response = await fetch(`explanations/${encodedPath}`);
@@ -691,7 +701,12 @@ async function loadFile(node) {
 
         // 加载解读
         if (node.explanation) {
-            const htmlPath = node.explanation.replace('.md', '.html');
+            // Convert .md to .html, handling both regular files (.ext.md -> .ext.html)
+            // and markdown files (.md -> .html)
+            let htmlPath = node.explanation;
+            if (htmlPath.endsWith('.md')) {
+                htmlPath = htmlPath.slice(0, -3) + '.html';
+            }
             // Encode path components to handle special characters and dots
             const encodedPath = htmlPath.split('/').map(encodeURIComponent).join('/');
             const response = await fetch(`explanations/${encodedPath}`);

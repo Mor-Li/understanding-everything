@@ -138,7 +138,11 @@ function loadContent(node) {
 // 加载 README
 async function loadReadme(readmePath, folderName) {
     try {
-        const htmlPath = readmePath.replace('.md', '.html');
+        // Convert .md to .html
+        let htmlPath = readmePath;
+        if (htmlPath.endsWith('.md')) {
+            htmlPath = htmlPath.slice(0, -3) + '.html';
+        }
         // Encode path components to handle special characters and dots
         const encodedPath = htmlPath.split('/').map(encodeURIComponent).join('/');
         const response = await fetch(`explanations/${encodedPath}`);
@@ -188,7 +192,12 @@ async function loadFile(node) {
 
         // 加载解读
         if (node.explanation) {
-            const htmlPath = node.explanation.replace('.md', '.html');
+            // Convert .md to .html, handling both regular files (.ext.md -> .ext.html)
+            // and markdown files (.md -> .html)
+            let htmlPath = node.explanation;
+            if (htmlPath.endsWith('.md')) {
+                htmlPath = htmlPath.slice(0, -3) + '.html';
+            }
             // Encode path components to handle special characters and dots
             const encodedPath = htmlPath.split('/').map(encodeURIComponent).join('/');
             const response = await fetch(`explanations/${encodedPath}`);
