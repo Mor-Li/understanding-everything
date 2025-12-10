@@ -17,7 +17,7 @@
 ## 项目结构
 
 ```
-understanding-everything/
+understand-everything/
 ├── scripts/              # 3 个核心脚本（按执行顺序命名）
 │   ├── s1_explain_files.py        # AI 解读代码文件
 │   ├── s2_generate_readme.py      # 生成层级 README
