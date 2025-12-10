@@ -1,231 +1,215 @@
+<div align="center">
+
 # Understand Everything
 
 ![Understand Everything Banner](assets/promotional-banner.png)
 
-通过 Git 历史和 AI 分析，将任何代码仓库转换为通俗易懂的交互式文档。
+**Transform any code repository into easy-to-understand interactive documentation through Git history and AI analysis.**
 
-## 项目简介
+[🌐 Project Website](https://mor-li.github.io/understand-everything/) |
+[📖 verl Demo](https://mor-li.github.io/understand-everything/output/verl/website-2025-12-09/index.html) |
+[⚡ Megatron-LM Demo](https://mor-li.github.io/understand-everything/output/Megatron-LM/website-2025-12-09/index.html)
 
-这是一个用于深度理解代码仓库的工具链。它通过分析 Git 历史、使用 AI 解读代码、生成层级文档，最终创建一个交互式网站，让你能够轻松理解任何复杂的代码库。
+English | [简体中文](assets/README_zh.md)
 
-## 核心功能
+</div>
 
-✅ **可视化分析**：生成仓库结构热力图，直观展示文件修改频率
-✅ **智能统计**：分析代码规模、修改分布、Token 数量
-✅ **AI 解读**：使用 Gemini 3 Pro Preview 生成通俗易懂的代码解释
-✅ **层级文档**：自底向上递归生成各层级 README
-✅ **交互式网站**：Read the Docs 风格的静态网站，支持文件树导航
+## Overview
 
-## 项目结构
+A toolchain for deeply understanding code repositories. It analyzes Git history, uses AI to interpret code, generates hierarchical documentation, and creates an interactive website that helps you easily understand any complex codebase.
+
+## Key Features
+
+- **Visual Analysis**: Generate repository structure heatmaps showing file modification frequency
+- **Smart Statistics**: Analyze code size, modification distribution, and token counts
+- **AI Interpretation**: Use Gemini 3 Pro Preview to generate easy-to-understand code explanations
+- **Hierarchical Docs**: Recursively generate README files for each directory (bottom-up)
+- **Interactive Website**: Read the Docs style static website with file tree navigation
+
+## Project Structure
 
 ```
 understand-everything/
-├── scripts/              # 3 个核心脚本（按执行顺序命名）
-│   ├── s1_explain_files.py        # AI 解读代码文件
-│   ├── s2_generate_readme.py      # 生成层级 README
-│   └── s3_website.py              # 生成交互式网站
-├── utils/               # 工具脚本
-│   ├── s0_add_timestamps.py       # 添加时间戳
-│   ├── s1_repo_heatmap_tree.py    # 生成仓库结构热力图
-│   ├── s2_analyze_stats.py        # 分析统计信息
-│   └── utils.py                   # 通用工具函数
-├── repo/                # 待分析的仓库（.gitignore 已忽略）
-├── output/              # 生成的所有输出（.gitignore 已忽略）
+├── scripts/              # 3 core scripts (named by execution order)
+│   ├── s1_explain_files.py        # AI interprets code files
+│   ├── s2_generate_readme.py      # Generate hierarchical READMEs
+│   └── s3_website.py              # Generate interactive website
+├── utils/               # Utility scripts
+│   ├── s0_add_timestamps.py       # Add timestamps
+│   ├── s1_repo_heatmap_tree.py    # Generate repo structure heatmap
+│   ├── s2_analyze_stats.py        # Analyze statistics
+│   └── utils.py                   # Common utility functions
+├── repo/                # Repositories to analyze (.gitignore ignored)
+├── output/              # All generated output (.gitignore ignored)
 │   └── <repo_name>/
-│       ├── explain/              # AI 解读的 markdown
-│       └── website/              # 静态网站
-└── pyproject.toml       # 项目配置
+│       ├── explain/              # AI interpretation markdown
+│       └── website/              # Static website
+└── pyproject.toml       # Project configuration
 ```
 
-## 快速开始
+## Quick Start
 
-### 1. 环境设置
+### 1. Environment Setup
 
 ```bash
-# 创建虚拟环境
-uvpp 3.12
-sva
-uvpe
+# Create virtual environment
+uv venv --seed .venv --python 3.12
+source .venv/bin/activate
+uv pip install -e .
 ```
 
-### 2. 配置 API
+### 2. Configure API
 
-设置环境变量（用于 Gemini API）：
+Set environment variables (for Gemini API):
 ```bash
 export OPENAI_API_KEY="your-api-key"
 export OPENAI_BASE_URL="your-openai-base-url"
 ```
 
-### 3. 完整分析流程
+### 3. Complete Analysis Pipeline
 
-假设要分析 `repo/your-project` 仓库：
+Assuming you want to analyze `repo/your-project`:
 
 ```bash
-# Step 1: AI 解读文件（生成通俗解释）
+# Step 1: AI interprets files (generates explanations)
 python scripts/s1_explain_files.py repo/your-project --workers 8 --percent 100
 
-# Step 2: 生成层级 README（自底向上汇总）
+# Step 2: Generate hierarchical READMEs (bottom-up summarization)
 python scripts/s2_generate_readme.py repo/your-project
 
-# Step 3: 生成交互式网站（最终产物）
+# Step 3: Generate interactive website (final output)
 python scripts/s3_website.py repo/your-project
 ```
 
-**可选工具脚本**：
+**Optional utility scripts**:
 
 ```bash
-# 生成仓库热力图（可视化修改频率）
+# Generate repo heatmap (visualize modification frequency)
 python utils/s1_repo_heatmap_tree.py repo/your-project
 
-# 分析统计信息（了解代码规模）
+# Analyze statistics (understand code scale)
 python utils/s2_analyze_stats.py repo/your-project
 ```
 
-### 4. 查看结果
+### 4. View Results
 
-启动本地服务器查看网站：
+Start a local server to view the website:
 ```bash
 cd output/your-project/website-<date>
 python -m http.server 8000
-# 浏览器打开 http://localhost:8000
+# Open http://localhost:8000 in browser
 ```
 
----
+## Core Scripts
 
-## 核心脚本详细说明
+### S1 - AI Code Interpretation
 
-### S1 - AI 解读代码文件
+**Function**: Use Gemini 3 Pro Preview to generate easy-to-understand explanations for each file
 
-**功能**：使用 Gemini 3 Pro Preview 为每个文件生成通俗易懂的中文解释
+**Features**:
+- Async concurrent processing, supports `--workers N` to set concurrency (default 16)
+- Supports `--top N` or `--percent N` to select files to interpret
+- Automatically skips already interpreted files (use `--force` to regenerate)
+- Uses `tqdm` to show real-time progress bar
+- Prompt optimized for "step-by-step explanation" style
 
-**特点**：
-- 异步并发处理，支持 `--workers N` 设置并发数（默认 16）
-- 支持 `--top N` 或 `--percent N` 选择要解读的文件
-- 自动跳过已解读的文件（使用 `--force` 强制重新生成）
-- 使用 `tqdm` 显示实时进度条
-- Prompt 优化为"step-by-step 讲解"风格
-
-**使用**：
+**Usage**:
 ```bash
 python scripts/s1_explain_files.py <repo_path> [options]
 
-# 解读所有文件，使用 8 个并发
+# Interpret all files with 8 workers
 python scripts/s1_explain_files.py repo/your-project --workers 8 --percent 100
 
-# 解读前 50% 的文件
+# Interpret top 50% of files
 python scripts/s1_explain_files.py repo/your-project --percent 50
 
-# 强制重新生成
+# Force regenerate
 python scripts/s1_explain_files.py repo/your-project --percent 100 --force
 ```
 
-**输出**：`output/<repo_name>/explain-<date>/*.md`
+**Output**: `output/<repo_name>/explain-<date>/*.md`
 
----
+### S2 - Generate Hierarchical READMEs
 
-### S2 - 生成层级 README
+**Function**: Recursively generate summary READMEs for each folder (bottom-up)
 
-**功能**：递归地为每个文件夹生成汇总 README（自底向上）
+**Features**:
+- Starts from deepest folders, summarizes layer by layer upward
+- Subfolders represented by their READMEs, files by their interpretations
+- If content exceeds 200K tokens, proportionally truncated
+- Uses easy-to-understand prompts for summarization
 
-**特点**：
-- 从最底层文件夹开始，逐层向上汇总
-- 子文件夹用其 README 代表，文件用其解读代表
-- 如果内容超过 200K tokens，等比例截断
-- 使用通俗易懂的 Prompt 生成汇总
-
-**使用**：
+**Usage**:
 ```bash
 python scripts/s2_generate_readme.py <repo_path> [options]
 
-# 示例
+# Example
 python scripts/s2_generate_readme.py repo/your-project
 
-# 强制重新生成
+# Force regenerate
 python scripts/s2_generate_readme.py repo/your-project --force
 ```
 
-**输出**：在解读目录的每个文件夹下生成 `README.md`
+**Output**: Generates `README.md` in each folder of the interpretation directory
 
----
+### S3 - Generate Interactive Website
 
-### S3 - 生成交互式网站
+**Function**: Generate Read the Docs style static website
 
-**功能**：生成 Read the Docs 风格的静态网站
+**Features**:
+- Collapsible file tree navigation on the left, fixed indentation alignment
+- Click folder to show README summary
+- Click file to show AI interpretation + source code (with syntax highlighting)
+- Supports all file types (.py, .cu, .cpp, .h, .md, etc.)
+- Shows hidden files (except .git directory)
+- Uses Prism.js for code highlighting
+- Responsive design, mobile friendly
 
-**特点**：
-- 左侧可折叠文件树导航，固定缩进对齐
-- 点击文件夹显示 README 汇总
-- 点击文件显示 AI 解读 + 原始代码（带语法高亮）
-- 支持所有文件类型（.py, .cu, .cpp, .h, .md 等）
-- 显示隐藏文件（除 .git 目录外）
-- 使用 Prism.js 进行代码高亮
-- 响应式设计，移动端友好
-
-**使用**：
+**Usage**:
 ```bash
 python scripts/s3_website.py <repo_path> [options]
 
-# 示例
+# Example
 python scripts/s3_website.py repo/your-project
 ```
 
-**输出**：
+**Output**:
 - `output/<repo_name>/website/index.html`
 - `output/<repo_name>/website/styles.css`
 - `output/<repo_name>/website/app.js`
-- `output/<repo_name>/website/sources/` - 源代码
-- `output/<repo_name>/website/explanations/` - 解读（HTML）
+- `output/<repo_name>/website/sources/` - Source code
+- `output/<repo_name>/website/explanations/` - Interpretations (HTML)
 
-**查看网站**：
-```bash
-cd output/<repo_name>/website
-python -m http.server 8000
-```
+## Demo Projects
 
----
+Successfully analyzed open source projects:
+- **[verl](https://github.com/volcengine/verl)** (1100+ files) - ByteDance's large model reinforcement learning framework
+- **[Megatron-LM](https://github.com/NVIDIA/Megatron-LM)** (1330+ files) - NVIDIA's large-scale Transformer training framework
 
-## 示例项目
-
-本仓库包含以下公开项目的文档示例：
-
-- **[verl](https://github.com/volcengine/verl)** - 字节跳动开源的大模型强化学习框架
-- **[NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM)** - NVIDIA 开源的大规模 Transformer 训练框架
-
-> **注意**：`output/Megatron-LM` 目录中的内容是基于 NVIDIA 的公开仓库 [NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM) 生成的文档，不是内部版本。
-
----
-
-## 技术栈
+## Tech Stack
 
 - **Python 3.12+**
-- **GitPython** - Git 仓库操作
-- **Matplotlib** - 热力图可视化
-- **NumPy** - 数值计算
-- **Tiktoken** - Token 计数
-- **OpenAI SDK** - Gemini API 调用
-- **Markdown** - Markdown → HTML 转换
-- **Prism.js** - 代码语法高亮
-- **TQDM** - 进度条显示
+- **GitPython** - Git repository operations
+- **Matplotlib** - Heatmap visualization
+- **NumPy** - Numerical computation
+- **Tiktoken** - Token counting
+- **OpenAI SDK** - Gemini API calls
+- **Markdown** - Markdown → HTML conversion
+- **Prism.js** - Code syntax highlighting
+- **TQDM** - Progress bar display
 
-## 设计理念
+## Design Philosophy
 
-1. **极简主义**：每个脚本专注一件事，代码简洁明了
-2. **顺序清晰**：s1 → s2 → s3，按执行顺序命名
-3. **可中断**：每一步都可独立运行，支持增量更新
-4. **并发高效**：异步处理，支持多 worker 并发
+1. **Minimalism**: Each script focuses on one thing, code is clean and clear
+2. **Clear Order**: s1 → s2 → s3, named by execution order
+3. **Interruptible**: Each step runs independently, supports incremental updates
+4. **Concurrent & Efficient**: Async processing, supports multiple workers
 
-## 示例项目
-
-已成功分析的开源项目：
-- ✅ **Megatron-LM** (1330 files) - NVIDIA 大规模语言模型训练框架
-- ✅ **verl** (1100 files) - Volcano Engine 强化学习框架
-- ✅ **SELF-PARAM** (185 files) - LLM 对话推荐系统研究
-
-## 许可证
+## License
 
 MIT License
 
-## 致谢
+## Acknowledgments
 
-- **Gemini 3 Pro Preview** - 强大的代码理解能力
-- **Claude Code** - 优秀的编程助手
+- **Gemini 3 Pro Preview** - Powerful code understanding capabilities
+- **Claude Code** - Excellent programming assistant
