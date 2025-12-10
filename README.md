@@ -6,7 +6,7 @@
 
 **Transform any code repository into easy-to-understand interactive documentation through Git history and AI analysis.**
 
-[🌐 Project Website](https://mor-li.github.io/understand-everything/) |
+[🌐 Project Website](https://mor-li.github.io/understand-everything/index.html) |
 [📖 verl Demo](https://mor-li.github.io/understand-everything/output/verl/website-2025-12-09/index.html) |
 [⚡ Megatron-LM Demo](https://mor-li.github.io/understand-everything/output/Megatron-LM/website-2025-12-09/index.html)
 
