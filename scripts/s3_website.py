@@ -18,8 +18,8 @@ from utils.utils import get_output_path
 
 def sanitize_dotfile_path(path: Path) -> Path:
     """
-    将路径中以 . 开头的目录/文件名改为 _ 开头
-    GitHub Pages 不提供 .github 等 dotfile 目录的静态文件
+    将路径中以 . 开头的目录/文件名改为 dot- 前缀
+    GitHub Pages (Jekyll) 不提供 .xxx 和 _xxx 文件/目录的静态文件
 
     Args:
         path: 原始路径
@@ -30,7 +30,7 @@ def sanitize_dotfile_path(path: Path) -> Path:
     parts = []
     for part in path.parts:
         if part.startswith('.') and part != '.' and part != '..':
-            parts.append('_' + part[1:])  # .github -> _github
+            parts.append('dot-' + part[1:])  # .github -> dot-github
         else:
             parts.append(part)
     return Path(*parts) if parts else path
