@@ -26,7 +26,6 @@ understanding-everything/
 │   ├── s0_add_timestamps.py       # 添加时间戳
 │   ├── s1_repo_heatmap_tree.py    # 生成仓库结构热力图
 │   ├── s2_analyze_stats.py        # 分析统计信息
-│   ├── s4_fast_dir_search.py      # 快速目录搜索
 │   └── utils.py                   # 通用工具函数
 ├── repo/                # 待分析的仓库（.gitignore 已忽略）
 ├── output/              # 生成的所有输出（.gitignore 已忽略）
@@ -84,7 +83,7 @@ python utils/s2_analyze_stats.py repo/your-project
 
 启动本地服务器查看网站：
 ```bash
-cd output/verl/website
+cd output/your-project/website-<date>
 python -m http.server 8000
 # 浏览器打开 http://localhost:8000
 ```
@@ -109,13 +108,13 @@ python -m http.server 8000
 python scripts/s1_explain_files.py <repo_path> [options]
 
 # 解读所有文件，使用 8 个并发
-python scripts/s1_explain_files.py repo/Megatron-LM --workers 8 --percent 100
+python scripts/s1_explain_files.py repo/your-project --workers 8 --percent 100
 
 # 解读前 50% 的文件
-python scripts/s1_explain_files.py repo/verl --percent 50
+python scripts/s1_explain_files.py repo/your-project --percent 50
 
 # 强制重新生成
-python scripts/s1_explain_files.py repo/verl --percent 100 --force
+python scripts/s1_explain_files.py repo/your-project --percent 100 --force
 ```
 
 **输出**：`output/<repo_name>/explain-<date>/*.md`
@@ -137,10 +136,10 @@ python scripts/s1_explain_files.py repo/verl --percent 100 --force
 python scripts/s2_generate_readme.py <repo_path> [options]
 
 # 示例
-python scripts/s2_generate_readme.py repo/verl
+python scripts/s2_generate_readme.py repo/your-project
 
 # 强制重新生成
-python scripts/s2_generate_readme.py repo/Megatron-LM --force
+python scripts/s2_generate_readme.py repo/your-project --force
 ```
 
 **输出**：在解读目录的每个文件夹下生成 `README.md`
@@ -165,9 +164,7 @@ python scripts/s2_generate_readme.py repo/Megatron-LM --force
 python scripts/s3_website.py <repo_path> [options]
 
 # 示例
-python scripts/s3_website.py repo/verl
-python scripts/s3_website.py repo/Megatron-LM
-python scripts/s3_website.py repo/SELF-PARAM
+python scripts/s3_website.py repo/your-project
 ```
 
 **输出**：
@@ -182,6 +179,17 @@ python scripts/s3_website.py repo/SELF-PARAM
 cd output/<repo_name>/website
 python -m http.server 8000
 ```
+
+---
+
+## 示例项目
+
+本仓库包含以下公开项目的文档示例：
+
+- **[verl](https://github.com/volcengine/verl)** - 字节跳动开源的大模型强化学习框架
+- **[NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM)** - NVIDIA 开源的大规模 Transformer 训练框架
+
+> **注意**：`output/Megatron-LM` 目录中的内容是基于 NVIDIA 的公开仓库 [NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM) 生成的文档，不是内部版本。
 
 ---
 
