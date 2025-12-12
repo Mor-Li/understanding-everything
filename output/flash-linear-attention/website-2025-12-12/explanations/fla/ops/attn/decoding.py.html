@@ -1,0 +1,142 @@
+<h1>fla/ops/attn/decoding.py</h1>
+<p>这份代码确实比较硬核，它使用了 <strong>Triton</strong> 语言（一种专门用于编写高性能 GPU 内核的 Python DSL），目的是为了在 LLM（大语言模型）<strong>推理（Decoding）</strong> 阶段，极快地计算注意力机制（Attention）。</p>
+<p>简单来说，它的场景是：<strong>你已经有了一堆历史的记忆（K 和 V），现在来了一个新的词（Q），你要算出这个新词应该关注历史中的哪些部分，并输出结果（O）。</strong></p>
+<p>为了让你看懂，我把这段代码想象成一个<strong>流水线工人（GPU 线程）的操作手册</strong>。</p>
+<h3>核心任务清单 (Task To-Do List)</h3>
+<p>我们将整个过程拆解为以下几个步骤，代码就是在这个清单上一步步执行的：</p>
+<ol>
+<li>
+<p><strong>【准备工作】确定工位与材料</strong>：</p>
+<ul>
+<li>我是哪个工人？（线程 ID）</li>
+<li>我要负责处理哪个句子（Batch）、哪个注意力头（Head）？</li>
+<li>这个句子的历史有多长（T）？历史数据在哪里？</li>
+</ul>
+</li>
+<li>
+<p><strong>【获取当前任务】读取 Query (Q)</strong>：</p>
+<ul>
+<li>读取当前最新生成的那个 Token 的查询向量（Q）。</li>
+<li>给它乘上一个缩放系数（scale）。</li>
+</ul>
+</li>
+<li>
+<p><strong>【准备计算器】初始化累加器</strong>：</p>
+<ul>
+<li>准备一个空篮子 <code>b_o</code> 用来装最终结果。</li>
+<li>准备变量 <code>b_m</code> (记录最大值) 和 <code>b_acc</code> (记录分母总和)，这是为了计算 Softmax 用的（防止数值溢出）。</li>
+</ul>
+</li>
+<li>
+<p><strong>【循环作业】分块读取历史记忆 (KV Cache)</strong>：</p>
+<ul>
+<li>因为历史太长，不能一口气读完，要切成小块（Block）慢慢读。</li>
+<li><strong>Loop 循环开始</strong>：<ul>
+<li><strong>Task 4.1</strong>: 读取一小块历史 Key (K) 和 Value (V)。</li>
+<li><strong>Task 4.2</strong>: 计算相似度分数 (Score = Q × K)。</li>
+<li><strong>Task 4.3</strong>: (如果有 Gating) 加上位置衰减或门控信号 <code>g</code>。</li>
+<li><strong>Task 4.4</strong>: 这里的数学魔法 —— <strong>Online Softmax</strong>（边读边算 Softmax）。更新最大值 <code>b_m</code>，计算指数 <code>exp</code>，更新分母 <code>b_acc</code>。</li>
+<li><strong>Task 4.5</strong>: 将算好的权重乘上 V，累加到篮子 <code>b_o</code> 里。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>【收尾工作】归一化并输出</strong>：</p>
+<ul>
+<li>把篮子里的结果 <code>b_o</code> 除以总权重 <code>b_acc</code>（完成 Softmax 的最后一步）。</li>
+<li>把最终结果写回显存。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解 (结合代码)</h3>
+<p>现在我们对照着代码，把上面的清单展开讲。</p>
+<h4>1. Python 包装函数 (<code>attn_decoding_one_step</code>)</h4>
+<p>这部分是 CPU 上的指挥官，负责安排工作。
+*   <strong>作用</strong>：它计算出需要多少个 GPU 线程块（Block），设置好块的大小（<code>BS</code>, <code>BV</code>），然后启动 GPU 内核。
+*   <strong>关键点</strong>：<code>naive_attn_decoding_kernel[grid](...)</code> 这一行就是按下启动按钮。</p>
+<h4>2. Triton 内核 (<code>naive_attn_decoding_kernel</code>)</h4>
+<p>这是真正的 GPU 上的工人执行的逻辑。</p>
+<p><strong>Step 1: 【准备工作】确定工位</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">i_v</span><span class="p">,</span> <span class="n">i_bh</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+<span class="c1"># ... 计算 i_b (第几个句子), i_h (第几个头) ...</span>
+<span class="n">bos</span><span class="p">,</span> <span class="n">eos</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">cu_seqlens</span> <span class="o">+</span> <span class="n">i_b</span><span class="p">)</span><span class="o">...</span> <span class="c1"># 找到这个句子在显存里的起始和结束位置</span>
+<span class="n">T</span> <span class="o">=</span> <span class="n">eos</span> <span class="o">-</span> <span class="n">bos</span> <span class="c1"># 算出历史总长度</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：每个线程通过 <code>program_id</code> 知道自己该干啥。<code>cu_seqlens</code> 是为了处理变长序列（不同句子长度不一样）。</li>
+</ul>
+<p><strong>Step 2: 【获取当前任务】读取 Q</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">p_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">make_block_ptr</span><span class="p">(</span><span class="n">q</span> <span class="o">+</span> <span class="n">i_bh</span> <span class="o">*</span> <span class="n">K</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 定位 Q 的指针</span>
+<span class="n">b_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_q</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 读取 Q</span>
+<span class="n">b_q</span> <span class="o">=</span> <span class="p">(</span><span class="n">b_q</span> <span class="o">*</span> <span class="n">scale</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">b_q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="c1"># 乘上缩放系数 (比如 1/sqrt(d))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：把当前要推理的这个 Token 的向量拿出来。</li>
+</ul>
+<p><strong>Step 3: 【准备计算器】初始化</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">b_o</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="n">BV</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="c1"># 结果篮子清零</span>
+<span class="n">b_m</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">full</span><span class="p">([</span><span class="mi">1</span><span class="p">],</span> <span class="nb">float</span><span class="p">(</span><span class="s1">&#39;-inf&#39;</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># Max 初始化为负无穷</span>
+<span class="n">b_acc</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="mi">1</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="c1"># 分母初始化为 0</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是标准 Softmax 的准备动作。</li>
+</ul>
+<p><strong>Step 4: 【循环作业】遍历历史 (K, V)</strong>
+这是最核心的 Loop。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">i_s</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">BS</span><span class="p">):</span> <span class="c1"># 每次处理 BS (例如 32) 个历史 Token</span>
+    <span class="c1"># --- Task 4.1 读取 K 和 V ---</span>
+    <span class="n">p_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">make_block_ptr</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+    <span class="n">p_v</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">make_block_ptr</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">b_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_k</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> 
+    <span class="n">b_v</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_v</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># --- Task 4.2 计算分数 ---</span>
+    <span class="c1"># Q 乘以 K (转置)，得到注意力分数</span>
+    <span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_q</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">*</span> <span class="n">b_k</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> 
+
+    <span class="c1"># --- Task 4.3 处理门控 (Gating) ---</span>
+    <span class="k">if</span> <span class="n">USE_G</span><span class="p">:</span>
+        <span class="c1"># 这里实现了一种特殊的 Attention 变体（可能是 RetNet 或 GLA）</span>
+        <span class="c1"># 逻辑是：分数 += (当前位置的G - 历史位置的G)</span>
+        <span class="c1"># 这通常用于实现“距离衰减”，离得越远，G的差值越大，分数越低</span>
+        <span class="n">b_s</span> <span class="o">+=</span> <span class="p">(</span><span class="n">b_gq</span> <span class="o">-</span> <span class="n">b_gk</span><span class="p">)</span> <span class="o">*</span> <span class="n">gate_scale</span> 
+
+    <span class="c1"># --- Task 4.4 Online Softmax 核心逻辑 ---</span>
+    <span class="c1"># 这一段是为了数值稳定。因为 exp(x) 容易溢出，所以我们要减去最大值。</span>
+    <span class="c1"># b_m 是之前的最大值，tl.max(b_s) 是当前块的最大值</span>
+    <span class="n">b_m</span><span class="p">,</span> <span class="n">b_mp</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">b_m</span><span class="p">,</span> <span class="n">tl</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">b_s</span><span class="p">)),</span> <span class="n">b_m</span> 
+
+    <span class="c1"># b_r 是修正系数，用来修正之前的累加结果，因为最大值变了</span>
+    <span class="n">b_r</span> <span class="o">=</span> <span class="n">exp</span><span class="p">(</span><span class="n">b_mp</span> <span class="o">-</span> <span class="n">b_m</span><span class="p">)</span> 
+    <span class="c1"># b_p 是当前块的概率值 (未归一化)</span>
+    <span class="n">b_p</span> <span class="o">=</span> <span class="n">exp</span><span class="p">(</span><span class="n">b_s</span> <span class="o">-</span> <span class="n">b_m</span><span class="p">)</span>
+
+    <span class="c1"># --- Task 4.5 累加 ---</span>
+    <span class="c1"># 更新分母：之前的分母 * 修正系数 + 当前的分母</span>
+    <span class="n">b_acc</span> <span class="o">=</span> <span class="n">b_acc</span> <span class="o">*</span> <span class="n">b_r</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_p</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="c1"># 更新分子(输出)：之前的输出 * 修正系数 + 当前的(概率 * V)</span>
+    <span class="n">b_o</span> <span class="o">=</span> <span class="n">b_o</span> <span class="o">*</span> <span class="n">b_r</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_p</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">b_v</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Step 5: 【收尾工作】归一化</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">b_o</span> <span class="o">=</span> <span class="n">b_o</span> <span class="o">/</span> <span class="n">b_acc</span> <span class="c1"># 分子除以分母，得到最终加权平均值</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_o</span><span class="p">,</span> <span class="n">b_o</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 存回显存</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这就是 Softmax 公式的最后一步 $\frac{\sum e^{s_i} v_i}{\sum e^{s_i}}$。</li>
+</ul>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>这段代码实现了一个<strong>带门控机制（Gated）的注意力推理内核</strong>。</p>
+<ol>
+<li><strong>它不是训练</strong>，是<strong>推理</strong>（Decoding），所以它只看一个 Q，但要看所有的 K 和 V。</li>
+<li><strong>它做了优化</strong>：使用了 <strong>FlashAttention</strong> 的技巧（Online Softmax），不需要把巨大的注意力矩阵存下来，而是分块计算、边算边扔，极大地节省显存并提高速度。</li>
+<li><strong>它有特殊功能</strong>：那个 <code>USE_G</code> 的部分，说明它支持像 RetNet、GLA (Gated Linear Attention) 这种新型架构，允许通过 <code>g</code> 参数来控制注意力随距离的衰减。</li>
+</ol>
+<p>你看懂这个逻辑了吗？它本质上就是把数学公式 $O = \text{Softmax}(QK^T + \text{Decay})V$ 翻译成了高效的搬砖流水线。</p>

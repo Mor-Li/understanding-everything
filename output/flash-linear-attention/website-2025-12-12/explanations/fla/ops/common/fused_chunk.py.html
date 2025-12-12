@@ -1,0 +1,113 @@
+<h1>fla/ops/common/fused_chunk.py</h1>
+<p>这份代码确实比较硬核，它是一个用 <strong>Triton</strong> 语言编写的高性能 GPU 算子。</p>
+<p>简单来说，这是一个 <strong>“分块线性注意力机制” (Fused Chunk Linear Attention)</strong> 的实现。它的核心目的是在保持计算速度（像 Transformer）和节省显存（像 RNN）之间找到平衡。</p>
+<p>为了让你看懂，我们不要纠结具体的矩阵乘法公式，而是把它想象成一个 <strong>“流水线工作任务”</strong>。</p>
+<p>我们将重点放在 <code>fused_chunk_fwd_kernel</code>（前向传播核心函数）上，这是理解整个算法的关键。</p>
+<hr />
+<h3>核心概念：分块 (Chunking)</h3>
+<p>想象你在读一本很厚的书（序列长度 $T$ 很长）：
+1.  <strong>RNN (循环神经网络)</strong>：一个字一个字读，读完上一个字记住点东西传给下一个字。<strong>太慢，无法并行。</strong>
+2.  <strong>Transformer (标准注意力)</strong>：一眼看完所有字，两两比较。<strong>太占内存 ($T^2$)，显存爆炸。</strong>
+3.  <strong>Fused Chunk (这个代码做的)</strong>：把书分成很多“页”（Chunk）。
+    *   <strong>页内 (Intra-chunk)</strong>：这一页的内容，你可以一眼看完（并行计算）。
+    *   <strong>页间 (Inter-chunk)</strong>：读完这一页，把关键信息总结成一个“记忆状态” ($h$)，传给下一页。</p>
+<hr />
+<h3>任务清单 (Task To-Do List)</h3>
+<p>假设你是一个 GPU 线程（Thread），你的老板给你分配了一个任务，让你处理数据。以下是你执行 <code>fused_chunk_fwd_kernel</code> 代码时的<strong>逐行操作指南</strong>：</p>
+<h4>准备阶段：我是谁？我要读哪里？</h4>
+<ol>
+<li><strong>[定位身份]</strong> (<code>i_v, i_k, i_nh...</code>):<ul>
+<li>首先确认我负责哪个 Batch（第几本书），哪个 Head（哪种思维方式），以及具体的 K/V 维度分块。</li>
+</ul>
+</li>
+<li><strong>[确定任务范围]</strong> (<code>cu_seqlens</code> logic):<ul>
+<li>确认这行文本从哪里开始 (<code>bos</code>)，到哪里结束 (<code>eos</code>)。</li>
+</ul>
+</li>
+<li><strong>[加载初始记忆]</strong> (<code>h0</code> logic):<ul>
+<li><strong>代码对应</strong>：<code>if USE_INITIAL_STATE: ... b_h = tl.load(...)</code></li>
+<li><strong>动作</strong>：看看上一段任务有没有留下什么“记忆” ($h_0$)？如果有，把它从显存里加载到我的寄存器（高速缓存）里，作为当前的 <strong>Running State (b_h)</strong>。</li>
+</ul>
+</li>
+</ol>
+<h4>循环阶段：开始一页一页地读 (The Loop)</h4>
+<p>老板说：“把这本书切成每页 <code>BT</code> (比如64) 个字，一页一页处理。”
+<strong>代码对应</strong>：<code>for i_t in range(0, NT):</code></p>
+<ol>
+<li>
+<p><strong>[加载当前页数据]</strong> (<code>tl.load</code>):</p>
+<ul>
+<li><strong>动作</strong>：从显存里把这一页的 $Q$ (Query), $K$ (Key), $V$ (Value) 读进来。</li>
+<li>这相当于读了这一页的原文。</li>
+</ul>
+</li>
+<li>
+<p><strong>[计算页内关联]</strong> (<code>b_s = tl.dot(b_q, b_k)</code>):</p>
+<ul>
+<li><strong>动作</strong>：算出这一页里，字和字之间的关系（Attention Score）。</li>
+<li><strong>注意</strong>：这里只看这一页内部，不管前面的页。</li>
+</ul>
+</li>
+<li>
+<p><strong>[处理遗忘/衰减]</strong> (<code>USE_G</code> or <code>USE_G_GAMMA</code>):</p>
+<ul>
+<li><strong>代码对应</strong>：<code>b_gq = exp(b_g)</code>, <code>b_gk = ...</code></li>
+<li><strong>含义</strong>：这是 Linear Attention 的核心。随着时间流逝，旧的信息会变得不重要。</li>
+<li><strong>动作</strong>：<ul>
+<li>计算这一页里，后面的字对前面的字有多大的“遗忘” (Decay)。</li>
+<li>计算这一页读完后，要对“记忆状态” ($h$) 打几折（衰减多少）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[生成当前页输出]</strong> (<code>b_o = ...</code>):</p>
+<ul>
+<li>这是一个混合步骤，包含两部分信息：<ul>
+<li><strong>A. 页内贡献</strong>：<code>tl.dot(b_s, b_v)</code>。利用刚才算的页内关系，结合 $V$ 得到输出。</li>
+<li><strong>B. 历史贡献</strong>：<code>tl.dot(b_q, b_h)</code>。利用之前的“记忆” ($b_h$) 来辅助理解当前页。<strong>这里体现了 RNN 的特性，前面的记忆影响了现在的理解。</strong></li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[更新记忆状态]</strong> (<code>b_h = ...</code>):</p>
+<ul>
+<li><strong>代码对应</strong>：<code>b_h *= b_gn</code> (先让旧记忆衰减/淡忘) -&gt; <code>b_h += tl.dot(b_k, b_v)</code> (把这一页的新知识写入记忆)。</li>
+<li><strong>动作</strong>：在翻到下一页之前，我得更新我的脑子里的“总结” ($b_h$)。把这一页的 $K$ 和 $V$ 乘起来加进记忆里，供下一页使用。</li>
+</ul>
+</li>
+<li>
+<p><strong>[保存结果]</strong> (<code>tl.store(p_o, b_o...)</code>):</p>
+<ul>
+<li><strong>动作</strong>：把算好的这一页的输出 $O$ 写回显存。</li>
+</ul>
+</li>
+</ol>
+<h4>收尾阶段</h4>
+<ol>
+<li><strong>[保存最终记忆]</strong> (<code>STORE_FINAL_STATE</code>):<ul>
+<li><strong>代码对应</strong>：<code>if STORE_FINAL_STATE: ... tl.store(p_ht, b_h...)</code></li>
+<li><strong>动作</strong>：整本书读完了。如果老板需要，把我脑子里最后的“记忆状态” ($h_t$) 存回显存。这通常用于推理阶段生成下一个 token，或者用于长文本的下一段。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结一下代码里的变量名</h3>
+<p>为了帮你对应代码，这里有个简单的词典：</p>
+<ul>
+<li><strong><code>q, k, v</code></strong>: 输入的 Query, Key, Value 向量。</li>
+<li><strong><code>o</code></strong>: 输出 Output。</li>
+<li><strong><code>g</code> (Gate)</strong>: 门控机制，控制遗忘的程度（类似于 LSTM 的遗忘门）。代码里有用 <code>exp</code> 指数函数处理它，变成衰减系数。</li>
+<li><strong><code>h0 / ht</code></strong>: Hidden State。<code>h0</code> 是初始状态，<code>ht</code> 是最终状态。在循环中，<code>b_h</code> 就是在寄存器里流动的那个“记忆”。</li>
+<li><strong><code>BT</code></strong>: Block Time，就是“一页”有多少个字（Chunk size）。</li>
+<li><strong><code>BK, BV</code></strong>: 特征维度的大小，为了计算快，也被切块了。</li>
+</ul>
+<h3>为什么这个代码很难读？</h3>
+<ol>
+<li><strong>并行度极高</strong>：它不仅在时间轴（分块）上并行，还在特征维度（K, V）上并行。</li>
+<li><strong>指针算术</strong>：<code>tl.make_block_ptr</code> 这种是在手动计算显存地址，非常底层。</li>
+<li><strong>混合模式</strong>：它同时包含了 <strong>Standard Attention</strong> (在 Chunk 内部 $Q \times K^T$) 和 <strong>Linear Attention / RNN</strong> (在 Chunk 之间传递 $h$) 的数学逻辑。</li>
+</ol>
+<p><strong>一句话总结：</strong>
+这段代码把长序列切成小块，块内用并行矩阵乘法算（快），块间用循环神经网络的方式传导记忆（省显存），并加上了遗忘机制（<code>g</code>）来让模型更关注近期的信息。</p>

@@ -1,0 +1,121 @@
+<h1>tests/modules/test_activation.py</h1>
+<p>完全没问题。这段代码看起来很复杂，是因为它涉及了<strong>深度学习框架（PyTorch）的底层测试</strong>。</p>
+<p>简单来说，这个文件的作用是：<strong>“质检”</strong>。
+作者写了一套新的、可能跑得更快的数学函数（在 <code>fla</code> 库里），现在他需要写一个测试文件，来证明这套新函数算出来的结果，和 PyTorch 官方的标准结果是一模一样的。</p>
+<p>我们可以把理解这段代码的任务拆解成以下 <strong>5 个 Task</strong>。跟着这个 To-Do List 走，你就能看懂了。</p>
+<hr />
+<h3>✅ Task 1：搞懂核心逻辑——“大家找不同”</h3>
+<p>这段代码里所有的函数（<code>test_sigmoid</code>, <code>test_swish</code> 等）其实都在做同一件事：<strong>对比测试</strong>。</p>
+<p>你可以把它想象成<strong>老师批改作业</strong>：
+1.  <strong>参考答案 (<code>ref</code>)</strong>：用 PyTorch 官方自带的函数（绝对正确，但可能不够快）算一遍。
+2.  <strong>学生作业 (<code>tri</code>)</strong>：用作者自己写的 <code>fla</code> 库里的函数（可能很快，但需要验证对不对）算一遍。
+3.  <strong>比对 (<code>assert_close</code>)</strong>：对比两者的结果。如果误差极小（比如小于 0.001），就算通过；否则报错。</p>
+<p><strong>文中的关键变量名暗示：</strong>
+*   <code>_ref</code> (Reference): 指参考标准，即 PyTorch 官方结果。
+*   <code>_tri</code> (Triton/Trial): 指作者写的实现（通常用 Triton 语言写的高性能版本），即待测对象。</p>
+<hr />
+<h3>✅ Task 2：看懂测试配置——“不同场景都要测”</h3>
+<p>代码开头有很多 <code>@pytest.mark.parametrize</code>，这是什么意思？</p>
+<p>这是在模拟<strong>不同的数据规模</strong>。为了保证函数在各种情况下都好用，作者列出了一张清单：
+*   <code>B</code>: Batch size (一批有多少数据)
+*   <code>T</code>: Time/Sequence length (序列长度)
+*   <code>D</code>: Dimension (数据维度)
+*   <code>compile</code>: 是否使用 <code>torch.compile</code> (一种加速技术)</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span>
+    <span class="p">(</span><span class="s1">&#39;B&#39;</span><span class="p">,</span> <span class="s1">&#39;T&#39;</span><span class="p">,</span> <span class="s1">&#39;D&#39;</span><span class="p">,</span> <span class="s1">&#39;compile&#39;</span><span class="p">),</span>
+    <span class="p">[</span>
+        <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>       <span class="c1"># 场景1：数据量极小，不编译</span>
+        <span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">500</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>    <span class="c1"># 场景2：中等数据</span>
+        <span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="mi">2048</span><span class="p">,</span> <span class="mi">1200</span><span class="p">,</span> <span class="kc">True</span><span class="p">),</span>   <span class="c1"># 场景3：大数据，开启编译加速</span>
+    <span class="p">],</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p>这就像是说：“不管是算 1+1，还是算 1000+1000，你的计算器都得是对的。”</p>
+<hr />
+<h3>✅ Task 3：拆解一个具体的测试——以 <code>test_sigmoid</code> 为例</h3>
+<p>我们拿第一个函数 <code>test_sigmoid</code> 来“解剖”，看懂了它，后面所有的函数你都能看懂。</p>
+<p><strong>步骤拆解：</strong></p>
+<ol>
+<li>
+<p><strong>造假数据：</strong>
+    <code>python
+    # 随机生成一个 B*T*D 大小的张量，requires_grad=True 表示我们要测“梯度”（反向传播）
+    x = torch.randn(B, T, D, device=device, requires_grad=True)</code></p>
+</li>
+<li>
+<p><strong>算标准答案 (Forward)：</strong>
+    <code>python
+    y_ref = torch.sigmoid(x) # 用官方的 sigmoid 算</code></p>
+</li>
+<li>
+<p><strong>算待测答案 (Forward)：</strong>
+    <code>python
+    # 用 fla 库里的 sigmoid 算。如果开启 compile 就编译一下再算。
+    y_tri = sigmoid(x) if not compile else torch.compile(sigmoid)(x)</code></p>
+</li>
+<li>
+<p><strong>算梯度 (Backward/求导)：</strong>
+    深度学习不仅要算结果，还要算梯度（为了训练模型）。
+    <code>python
+    g = torch.randn_like(y_ref) # 生成一个随机的梯度信号
+    # 问：如果输出变化 g，输入 x 应该变化多少？
+    dx_ref = torch.autograd.grad(y_ref, x, g)[0] # 官方算出的导数
+    dx_tri = torch.autograd.grad(y_tri, x, g)[0] # 待测函数算出的导数</code></p>
+</li>
+<li>
+<p><strong>最终比对：</strong>
+    <code>python
+    assert_close('sigmoid fwd', y_ref, y_tri, 1e-3) # 结果必须一样
+    assert_close('sigmoid bwd', dx_ref, dx_tri, 1e-3) # 导数必须一样</code></p>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4：理解其他几个函数在测什么</h3>
+<p>看懂了 Task 3，剩下的只是换了不同的数学公式而已：</p>
+<ul>
+<li>
+<p><strong><code>test_logsigmoid</code></strong>:</p>
+<ul>
+<li>测 <code>logsigmoid</code> 函数。</li>
+<li>多了一个参数 <code>temperature</code> (温度)，这是作者加的一个除法系数。</li>
+<li>逻辑：<code>log(sigmoid(x))</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>test_swish</code></strong>:</p>
+<ul>
+<li>测 <code>swish</code> 激活函数（在 PyTorch 里叫 <code>silu</code>）。</li>
+<li>公式：$x \times \text{sigmoid}(x)$。</li>
+<li>这是现在大模型（如 LLaMA）常用的激活函数。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>test_swiglu</code></strong>:</p>
+<ul>
+<li>测 <code>swiglu</code>。这是一种更复杂的结构，输入有两个：<code>x</code> 和 <code>y</code>。</li>
+<li>公式：$\text{Swish}(x) \times y$。</li>
+<li>这里它同时检查了 <code>x</code> 的梯度 (<code>dx</code>) 和 <code>y</code> 的梯度 (<code>dy</code>)。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5：进阶测试——<code>test_swiglu_linear</code></h3>
+<p>最后一个函数 <code>test_swiglu_linear</code>稍微复杂一点点，它测试的是<strong>“融合算子”</strong>。</p>
+<ul>
+<li><strong>背景</strong>：在深度学习里，做完激活函数通常紧接着做一个“线性层”（Linear Layer，即矩阵乘法）。</li>
+<li><strong>目的</strong>：作者写了一个超级函数 <code>swiglu_linear</code>，把“激活函数”和“矩阵乘法”合二为一了，这样速度更快，显存占用更少。</li>
+<li><strong>测试内容</strong>：<ul>
+<li><strong>Ref</strong>：先算 <code>silu</code>，再乘 <code>y</code>，最后用 <code>F.linear</code> 乘权重 <code>w</code> 加偏置 <code>b</code>。一步步来。</li>
+<li><strong>Tri</strong>：直接调用 <code>swiglu_linear(x, y, w, b)</code> 一步到位。</li>
+<li><strong>比对</strong>：最后输出的结果、以及对 <code>x, y, w, b</code> 四个东西的梯度都要完全一致。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的<strong>中心思想</strong>就是：</p>
+<blockquote>
+<p><strong>“我写了一些新的加速函数（<code>fla</code> 库），我不确定写得对不对，所以我造了一堆随机数，跟 PyTorch 官方的标准结果比对。如果结果和梯度都一样，那我的代码就是稳的。”</strong></p>
+</blockquote>

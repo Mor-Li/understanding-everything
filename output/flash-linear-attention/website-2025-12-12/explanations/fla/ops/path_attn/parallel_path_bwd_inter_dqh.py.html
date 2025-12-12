@@ -1,0 +1,71 @@
+<h1>fla/ops/path_attn/parallel_path_bwd_inter_dqh.py</h1>
+<p>这份代码确实非常硬核，它是 <strong>Triton</strong> 编写的深度学习算子，专门用于 <strong>线性注意力（Linear Attention）</strong> 或类似架构（如 RetNet, GLA）的 <strong>反向传播（Backward Pass）</strong>。</p>
+<p>简单来说，这个文件的任务是：<strong>已知输出的梯度（<code>do</code>），倒推出 Query（<code>q</code>）的梯度（<code>dq</code>），以及更新历史状态的梯度（<code>dhc</code>）。</strong></p>
+<p>为了让你听懂，我们把这个 Kernel 想象成一个 <strong>“会计审计员”</strong>。他的任务是核查过去所有的账目（Attention 历史），找出当前的 Query 应该对误差负多少责任。</p>
+<p>下面是一个 <strong>Task Todo List</strong>，我们将代码逻辑拆解为 7 个步骤：</p>
+<hr />
+<h3>任务清单：计算 Query 的梯度 (dq)</h3>
+<h4>1. 【准备工作】工位打卡 (Indexing &amp; Setup)</h4>
+<p><strong>代码位置:</strong> 函数开头 <code>i_t, i_nh = ...</code> 到 <code>if IS_VARLEN ...</code>
+*   <strong>任务:</strong> 确定当前这个线程块（Block）负责审计哪一部分数据。
+*   <strong>解释:</strong>
+    *   我是谁？（负责哪个 Head，哪个 Batch，哪一段序列 Time step）。
+    *   数据在哪？（根据 <code>IS_VARLEN</code> 判断是长短不一的句子还是定长的，找到对应的内存地址）。
+*   <strong>通俗理解:</strong> 会计拿出工单：“好，我今天负责审计第 3 个句子的第 5 个时间段。”</p>
+<h4>2. 【加载目标】获取“误差指令” (Load Gradients &amp; Stats)</h4>
+<p><strong>代码位置:</strong> <code>p_do = ...</code> 到 <code>b_delta = ...</code>
+*   <strong>任务:</strong> 加载反向传播传回来的输出梯度 <code>do</code>，以及前向传播时算好的一些统计量 <code>L</code> (LogSumExp) 和 <code>D</code> (Delta)。
+*   <strong>解释:</strong>
+    *   <code>do</code>: 下一层告诉我们，输出结果偏了多少。
+    *   <code>L</code> 和 <code>D</code>: 这是前向传播留下的“小抄”，用于在算梯度时进行归一化修正。
+*   <strong>通俗理解:</strong> 会计拿到上级指令：“这笔账最后亏了 100 块（<code>do</code>），这是当时的汇率表（<code>L</code>, <code>D</code>），你算算 $Q$ 这一项该背多少锅。”</p>
+<h4>3. 【初始化】清空计算器 (Init Accumulators)</h4>
+<p><strong>代码位置:</strong> <code>b_dq = tl.zeros(...)</code>
+*   <strong>任务:</strong> 初始化一个全零的寄存器 <code>b_dq</code>，用来累加计算出来的梯度。
+*   <strong>通俗理解:</strong> 拿出空白的草稿纸，准备开始算账。</p>
+<h4>4. 【核心循环】追溯历史 (The Inter-Chunk Loop)</h4>
+<p><strong>代码位置:</strong> <code>for offset_outer in range(0, curr_end, S):</code>
+*   <strong>任务:</strong> 这是一个大循环。因为是线性注意力，当前的 Query 不仅和当前的 Key 交互，还和<strong>过去所有 Chunk（块）生成的“记忆状态”</strong>有关。
+*   <strong>逻辑:</strong> 我们要一段一段（Chunk by Chunk，大小为 <code>S</code>）地回顾历史。</p>
+<div class="codehilite"><pre><span></span><code><span class="o">**</span><span class="n">子任务</span><span class="w"> </span><span class="mf">4.1</span><span class="o">:</span><span class="w"> </span><span class="n">修正历史状态的梯度</span><span class="w"> </span><span class="p">(</span><span class="n">Gradient</span><span class="w"> </span><span class="k">to</span><span class="w"> </span><span class="n">Hidden</span><span class="w"> </span><span class="n">State</span><span class="p">)</span><span class="o">**</span>
+<span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">代码</span><span class="o">:**</span><span class="w"> </span><span class="n n-Quoted">`b_dh = -tl.dot(...)`</span><span class="w"> </span><span class="n">和</span><span class="w"> </span><span class="n n-Quoted">`tl.atomic_add(dhc_whole ...)`</span>
+<span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">解释</span><span class="o">:**</span><span class="w"> </span><span class="n">计算当前</span><span class="w"> </span><span class="k">Query</span><span class="w"> </span><span class="n">对</span><span class="o">**</span><span class="n">过去的历史状态</span><span class="o">**</span><span class="n">（</span><span class="n n-Quoted">`hc_whole`</span><span class="n">）造成了什么影响，把这个梯度写回到全局内存</span><span class="w"> </span><span class="n n-Quoted">`dhc_whole`</span><span class="w"> </span><span class="n">中。</span>
+<span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">通俗理解</span><span class="o">:**</span><span class="w"> </span><span class="n">“虽然我在算</span><span class="w"> </span><span class="n">$Q$</span><span class="w"> </span><span class="n">的锅，但我发现过去的‘记忆’也有问题，顺手把‘记忆’的修正单（</span><span class="n n-Quoted">`dhc`</span><span class="n">）填了并提交上去。”</span>
+
+<span class="o">**</span><span class="n">子任务</span><span class="w"> </span><span class="mf">4.2</span><span class="o">:</span><span class="w"> </span><span class="n">从历史中计算</span><span class="w"> </span><span class="k">Query</span><span class="w"> </span><span class="n">的梯度</span><span class="w"> </span><span class="p">(</span><span class="n">Gradient</span><span class="w"> </span><span class="k">from</span><span class="w"> </span><span class="n">Hidden</span><span class="w"> </span><span class="n">State</span><span class="p">)</span><span class="o">**</span>
+<span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">代码</span><span class="o">:**</span><span class="w"> </span><span class="n n-Quoted">`b_dq = b_dq - tl.dot(...)`</span>
+<span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">解释</span><span class="o">:**</span><span class="w"> </span><span class="n">加载过去那个</span><span class="w"> </span><span class="n">Chunk</span><span class="w"> </span><span class="n">的状态</span><span class="w"> </span><span class="n n-Quoted">`b_h`</span><span class="n">，计算它对当前</span><span class="w"> </span><span class="n n-Quoted">`b_dq`</span><span class="w"> </span><span class="n">的贡献。</span>
+<span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">通俗理解</span><span class="o">:**</span><span class="w"> </span><span class="n">“过去存下的那笔‘记忆’（Hidden</span><span class="w"> </span><span class="n">State），通过矩阵乘法影响了现在的</span><span class="w"> </span><span class="n">$Q$。所以要把这部分影响加到</span><span class="w"> </span><span class="n">$Q$</span><span class="w"> </span><span class="n">的责任清单（</span><span class="n n-Quoted">`dq`</span><span class="n">）里。”</span>
+</code></pre></div>
+
+<h4>5. 【内部循环】当前块内的精细审计 (The Intra-Chunk Loop)</h4>
+<p><strong>代码位置:</strong> <code>for offset in range(...)</code>
+*   <strong>任务:</strong> 在当前这个大 Chunk 内部，可能还有更细粒度的 Block（大小 <code>BS</code>）。这部分计算的是<strong>标准的 Attention</strong>（即 $Q \times K^T$）。
+*   <strong>逻辑:</strong>
+    1.  <strong>重算 Attention Score:</strong> <code>b_A = tl.dot(b_q, tl.trans(b_k)...)</code>。因为反向传播不存巨大的 Attention 矩阵，所以要现场重算一遍 $Q \times K$。
+    2.  <strong>加入 Gate (可选):</strong> 如果有 <code>USE_GATE</code>，加上位置编码或衰减项。
+    3.  <strong>计算偏导:</strong> <code>b_dA = (b_dp - b_delta[:, None]) * b_A * scale</code>。这是推导 Attention 公式的核心链式法则。
+    4.  <strong>累加到 dq:</strong> <code>b_dq += tl.dot(b_dA..., b_k)</code>。标准的 Attention 反向传播公式：$\partial Q = \partial A \cdot K$。</p>
+<h4>6. 【收尾】门控梯度的特殊处理 (Gate Gradient - Optional)</h4>
+<p><strong>代码位置:</strong> <code>if USE_GATE: b_dg_cumsum_q += ...</code>
+*   <strong>任务:</strong> 如果模型里用了 Gate（比如某种衰减机制），需要算出这个 Gate 参数的梯度 <code>dg</code>。
+*   <strong>通俗理解:</strong> “这笔账里有个‘衰减系数’，也要算算它该怎么调。”</p>
+<h4>7. 【存档】写回结果 (Store Result)</h4>
+<p><strong>代码位置:</strong> <code>tl.store(p_dq, ...)</code>
+*   <strong>任务:</strong> 把草稿纸上算好的最终 <code>b_dq</code> 写入显存中的 <code>dq</code> 数组。
+*   <strong>通俗理解:</strong> “算完了，这一块 $Q$ 的梯度是这些，填入总账本，收工。”</p>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>这段代码实现了一个<strong>高效的线性 Attention 反向传播</strong>。</p>
+<p>普通的 Attention 是 $O(N^2)$，需要存巨大的矩阵。
+这个算法利用了 <strong>Chunked（分块）</strong> 和 <strong>Recurrent（循环）</strong> 的性质：
+1.  <strong>Chunk 之间</strong>：看作 RNN，通过 Hidden State (<code>hc_whole</code>) 传递梯度（步骤 4）。
+2.  <strong>Chunk 内部</strong>：看作短距离的 Standard Attention，直接算矩阵乘法（步骤 5）。</p>
+<p><strong>为什么你看不懂？</strong>
+因为它把数学公式（链式法则）高度压缩进了 Triton 的内存操作里。
+*   它一边读 <code>do</code>（输出梯度）。
+*   一边重算 Attention（为了省显存）。
+*   一边更新 <code>dq</code>（Query 梯度）。
+*   一边原子更新 <code>dhc</code>（RNN 状态梯度）。</p>
+<p><strong>一句话概括：</strong>
+这是一个<strong>一边回溯历史状态，一边重算局部注意力，从而精准计算 Query 梯度</strong>的并行程序。</p>

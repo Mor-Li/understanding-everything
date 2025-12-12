@@ -1,0 +1,85 @@
+<h1>fla/ops/mesa_net/naive.py</h1>
+<p>这份代码确实涉及了比较深度的<strong>线性代数</strong>和<strong>Transformer底层优化</strong>的知识，直接看代码如果不了解背后的数学原理（主要是<strong>线性注意力机制</strong>和<strong>共轭梯度法</strong>），确实会像看天书一样。</p>
+<p>这个文件实现的是一种叫做 <strong>MesaNet</strong> 的模型的核心算子。简单来说，它是一种<strong>试图用更少的显存、更快的速度来模拟标准Attention效果</strong>的算法。</p>
+<p>为了让你读懂它，我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>，我们将代码拆解成 5 个步骤，由浅入深地讲解。</p>
+<hr />
+<h3>📝 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 01: 理解核心目标</strong> —— 这到底是在算什么？（背景：线性Attention与回归）</li>
+<li><strong>Task 02: 理解“记忆”的方式</strong> —— $H_{kk}$ 和 $H_{kv}$ 是什么？（状态更新）</li>
+<li><strong>Task 03: 理解“最难的那一步”</strong> —— 为什么要解方程？（Ridge Regression）</li>
+<li><strong>Task 04: 理解算法捷径</strong> —— 什么是 CG (Conjugate Gradient)？</li>
+<li><strong>Task 05: 代码分块阅读</strong> —— 对应代码中的三个函数。</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>✅ Task 01: 理解核心目标</h4>
+<p>在标准的 Transformer Attention 中，我们需要计算 $Q \times K^T$，这会生成一个巨大的注意力矩阵。
+MesaNet 的核心思想是：<strong>不要存所有的历史 $K$ 和 $V$，而是把历史信息压缩进一个固定大小的矩阵里。</strong></p>
+<p>但是，简单的压缩效果不好。MesaNet 引入了一个数学技巧：它不仅仅是加权求和，而是试图在每一步<strong>“求解一个最小二乘问题（Ridge Regression）”</strong>。</p>
+<ul>
+<li><strong>简单理解：</strong> 它试图根据当前的 Query，去历史的 Key 中找到最匹配的组合，然后输出对应的 Value。</li>
+</ul>
+<h4>✅ Task 02: 理解“记忆”的方式 ($H_{kk}$ 和 $H_{kv}$)</h4>
+<p>在代码中，你会反复看到 <code>h_kk</code> 和 <code>h_kv</code>。这是模型的“大脑”或“缓存”。</p>
+<ul>
+<li><strong>$H_{kk}$ (h_kk)</strong>: 记录了历史 Key 的相关性（Key 乘 Key）。相当于记录了“我过去看过了什么样的输入模式”。</li>
+<li><strong>$H_{kv}$ (h_kv)</strong>: 记录了历史 Key 和 Value 的关系（Key 乘 Value）。相当于记录了“某种输入模式对应了什么输出”。</li>
+</ul>
+<p><strong>代码对应逻辑：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这是一个累加（记忆）的过程</span>
+<span class="c1"># prev_h * decay + new_k * new_k</span>
+<span class="n">h_kk</span> <span class="o">=</span> <span class="n">prev_h_kk</span> <span class="o">*</span> <span class="n">g</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span> <span class="o">+</span> <span class="n">k</span> <span class="o">*</span> <span class="n">k</span><span class="o">.</span><span class="n">transpose</span><span class="p">()</span> 
+</code></pre></div>
+
+<p>这里 <code>g</code> 是遗忘门（decay），表示旧的记忆会逐渐淡去，新的记忆（当前的 $k$）会被加进来。</p>
+<h4>✅ Task 03: 理解“最难的那一步” (Ridge Regression)</h4>
+<p>这是这段代码最难懂的地方。
+普通的线性 Attention 输出是：$Output = Q \times H_{kv}$。
+<strong>MesaNet 的输出是：</strong>
+$$ Output = Q \times (H_{kk} + \lambda I)^{-1} \times H_{kv} $$</p>
+<p>注意中间多了个 $(H_{kk} + \lambda I)^{-1}$。
+*   <strong>为什么要加这个？</strong> 这相当于对历史信息做了一个“去噪”和“归一化”，让模型能更精准地提取信息，而不是简单地把所有东西加起来。
+*   <strong>数学含义：</strong> 这就是<strong>岭回归（Ridge Regression）</strong>的解析解形式。
+*   <strong>代码中的 <code>lamb</code>：</strong> 就是公式里的 $\lambda$（正则化项），防止除以零，保证数值稳定。</p>
+<h4>✅ Task 04: 理解算法捷径 (Conjugate Gradient)</h4>
+<p>公式里有 <strong>矩阵求逆</strong> $(...)^{-1}$。在计算机里，<strong>矩阵求逆是非常非常慢的</strong>，而且显存消耗巨大。</p>
+<p><strong>怎么解决？</strong>
+我们不直接求逆矩阵，而是把问题转化成解方程 $Ax = b$。
+数学家发明了一种迭代算法叫 <strong>共轭梯度法 (Conjugate Gradient, CG)</strong>。
+*   <strong>特点：</strong> 不需要真的求逆矩阵，只需要通过几次“猜”和“修正”，就能逼近真实答案。
+*   <strong>代码特征：</strong> 你会看到一个 <code>for</code> 循环，里面在更新 <code>x</code>, <code>r</code> (residual, 残差), <code>p</code> (direction, 方向)。这就是在一步步逼近答案。</p>
+<hr />
+<h4>✅ Task 05: 代码分块阅读</h4>
+<p>现在我们带着上面的知识，再看代码里的三个函数，就清晰多了。</p>
+<p><strong>1. <code>naive_mesa_net_exact</code> (最容易懂的基准)</strong>
+*   <strong>作用：</strong> 用<strong>笨办法</strong>（精确解）算一次，通常用来做测试基准，看看 CG 算法算得准不准。
+*   <strong>逻辑：</strong>
+    1.  循环 <code>range(L)</code>：一步步把 $k, v$ 累加到 <code>h_kk</code> 和 <code>h_kv</code> 里（状态更新）。
+    2.  <code>torch.linalg.solve(...)</code>：<strong>直接调用 PyTorch 的线性代数库解方程</strong>（相当于求逆）。这是最慢但最准的。</p>
+<p><strong>2. <code>naive_mesa_net_decoding_one_step</code> (推理模式)</strong>
+*   <strong>作用：</strong> 生成文本时用。每次只进来一个 token。
+*   <strong>逻辑：</strong>
+    1.  更新当前步的 <code>h_kk</code>, <code>h_kv</code>。
+    2.  <strong>CG 迭代循环 (<code>for i in range(max_CG_iteration)</code>)</strong>：
+        *   这里没有用 <code>linalg.solve</code>，而是手写了 CG 算法。
+        *   <code>q</code>, <code>p</code>, <code>r</code>, <code>x</code> 的更新公式全是 CG 算法的标准教科书公式。
+        *   目标是算出 $x \approx q (H_{kk} + \lambda)^{-1}$。
+    3.  最后计算 <code>o = x * h_kv</code>。</p>
+<p><strong>3. <code>naive_mesa_net_CG</code> (训练模式/并行模式)</strong>
+*   <strong>作用：</strong> 训练时用。为了加速，它把长序列切成了很多 <strong>Chunk (块)</strong>。
+*   <strong>逻辑：</strong>
+    1.  <code>chunk_fn</code>: 把数据切块。
+    2.  <strong>块内并行，块间串行</strong>：先算出每个 Chunk 结尾时的 <code>h_kk</code>, <code>h_kv</code> 状态。
+    3.  <strong>CG Solver</strong>：这里最复杂。它试图同时对所有 Chunk 进行解方程。
+        *   <code>r = ...</code> 这一大坨代码是在计算初始残差。
+        *   循环内的代码是在并行地对所有 Chunk 做共轭梯度下降。
+    4.  最后输出结果。</p>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<ul>
+<li><strong>这段代码在干嘛？</strong> 实现了一个自带“去噪”功能的线性 Attention。</li>
+<li><strong>为什么看不懂？</strong> 因为它手动实现了一个数学求解器（CG算法）来代替矩阵求逆，为了跑得更快。</li>
+<li><strong>核心公式：</strong> $Output = Q (H_{kk} + \lambda)^{-1} H_{kv}$。</li>
+<li><strong>Todo 建议：</strong> 先看 <code>naive_mesa_net_exact</code> 理解它想算什么数学公式，再看 <code>naive_mesa_net_decoding_one_step</code> 理解它是怎么用循环逼近这个公式的。</li>
+</ul>

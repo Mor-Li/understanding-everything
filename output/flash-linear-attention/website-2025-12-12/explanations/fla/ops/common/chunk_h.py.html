@@ -1,0 +1,98 @@
+<h1>fla/ops/common/chunk_h.py</h1>
+<p>这份代码确实非常硬核，它使用的是 <strong>Triton</strong> 语言，这是专门用于编写高性能 GPU 算子（Kernel）的语言。</p>
+<p>简单来说，这段代码实现的是 <strong>线性注意力机制（Linear Attention）</strong> 或 <strong>RNN</strong> 变体中的核心步骤：<strong>计算和更新隐藏状态（Hidden State, $h$）</strong>。</p>
+<p>为了让你看懂，我制定了一个 <strong>“从概念到代码”的 5 步学习清单 (Task List)</strong>。我们一步步来拆解。</p>
+<hr />
+<h3>✅ Task 1: 理解核心概念 —— "KV 累加"</h3>
+<p>首先，别看代码，先看数学逻辑。
+在 Transformer 的线性 Attention 或者现代 RNN（如 Mamba, RWKV, GLA）中，核心思想是维护一个“记忆矩阵” $h$。</p>
+<ul>
+<li><strong>输入</strong>：Key ($k$) 和 Value ($v$)。</li>
+<li><strong>过程</strong>：随着时间步 $t$ 的推移，我们将新的 $k$ 和 $v$ 写入记忆 $h$ 中。</li>
+<li><strong>公式</strong>（简化版）：
+    $$ h_t = h_{t-1} + k_t^T \cdot v_t $$
+    也就是：新的记忆 = 旧记忆 + 当前时刻的 KV 外积。</li>
+</ul>
+<p><strong>这个文件的作用就是：</strong> 在 GPU 上极快地算出这个 $h$ 矩阵序列。</p>
+<hr />
+<h3>✅ Task 2: 理解 "Chunk" (分块) 策略</h3>
+<p>如果一个个时间步去算（$t=1, t=2...$），在 GPU 上太慢了（串行计算效率低）。
+如果一次算整个序列，显存又不够。</p>
+<p><strong>Chunk（分块）策略</strong> 是两者的折中：
+1.  把长序列（比如长度 4096）切成很多小块（比如长度 64，代码里的 <code>BT</code> 或 <code>chunk_size</code>）。
+2.  <strong>这段代码 (<code>chunk_h.py</code>) 的核心任务是：</strong> 计算每一个 Chunk 结束时的<strong>累计状态 $h$</strong>。
+3.  这样，下一个 Chunk 就可以直接利用上一个 Chunk 算好的 $h$ 作为初始状态，继续计算。</p>
+<hr />
+<h3>✅ Task 3: 拆解 Forward Kernel (<code>chunk_fwd_kernel_h</code>)</h3>
+<p>这是代码中的第一个大函数。它的任务是：<strong>前向计算，生成状态 $h$</strong>。</p>
+<p><strong>逻辑流程如下：</strong></p>
+<ol>
+<li>
+<p><strong>定位坐标 (Grid Setup)</strong>:</p>
+<ul>
+<li>代码开头 <code>i_k, i_v, i_nh...</code> 是在确定当前 GPU 线程处理的是哪个 Batch、哪个 Head、以及矩阵 $h$ 的哪一块小切片（Tile）。</li>
+</ul>
+</li>
+<li>
+<p><strong>加载初始状态 (Initial State)</strong>:</p>
+<ul>
+<li><code>if USE_INITIAL_STATE:</code> 如果有初始状态 $h_0$，先把它加载进来作为当前的 <code>b_h</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>时间循环 (Time Loop)</strong>:</p>
+<ul>
+<li><code>for i_t in range(NT):</code> 这是一个循环，遍历序列中的每一个 Chunk。</li>
+<li><strong>加载数据</strong>: <code>b_k</code> 和 <code>b_v</code>。加载当前 Chunk 对应的 Key 和 Value。</li>
+<li><strong>核心计算 (Update)</strong>: <code>b_h += tl.dot(b_k, b_v)</code>。这就是 Task 1 里的公式 $h += k^T v$。</li>
+<li><strong>保存状态</strong>: <code>tl.store(p_h, ...)</code>。把当前算好的 $h$ 存回显存，供后续计算（如 Attention 算子）使用。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 理解复杂的 "Decay" (遗忘机制)</h3>
+<p>代码里有一大堆 <code>if USE_G</code>, <code>if USE_GK</code>, <code>if USE_GV</code>，这是啥？</p>
+<p>在线性 Attention 中，记忆不能无限累加，否则会爆炸。我们需要<strong>遗忘</strong>旧的信息。
+公式变成了：
+$$ h_t = h_{t-1} \cdot \text{Decay} + k_t^T \cdot v_t $$</p>
+<p>代码实现了多种遗忘方式（为了适配不同的模型架构，如 GLA, RetNet 等）：</p>
+<ul>
+<li><strong><code>USE_G</code> (Scalar Decay)</strong>: 整个 $h$ 矩阵乘以一个标量衰减系数 $e^{-g}$。</li>
+<li><strong><code>USE_GK</code> (Vector Decay on K)</strong>: 衰减作用在 Key 维度上。</li>
+<li><strong><code>USE_GV</code> (Vector Decay on V)</strong>: 衰减作用在 Value 维度上。</li>
+<li><strong><code>USE_G_GAMMA</code></strong>: 一种特殊的相对位置衰减。</li>
+</ul>
+<p><strong>代码片段解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">USE_G</span><span class="p">:</span>
+    <span class="c1"># 加载衰减系数</span>
+    <span class="n">b_g_last</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="c1"># 让旧的 h 衰减</span>
+    <span class="n">b_h</span> <span class="o">*=</span> <span class="n">exp</span><span class="p">(</span><span class="n">b_g_last</span><span class="p">)</span>
+    <span class="c1"># 让当前的 k, v 也根据相对位置进行衰减</span>
+    <span class="n">b_v</span> <span class="o">=</span> <span class="o">...</span>
+</code></pre></div>
+
+<p>这段就是在执行“旧记忆淡出，新记忆淡入”的过程。</p>
+<hr />
+<h3>✅ Task 5: 拆解 Backward Kernel (<code>chunk_bwd_kernel_dh</code>)</h3>
+<p>这是代码中的第二个大函数。它的任务是：<strong>反向传播，计算梯度</strong>。</p>
+<p>如果你在训练模型，你需要知道 $h$ 对 Loss 的梯度，以便更新参数。</p>
+<p><strong>逻辑流程（与 Forward 相反）：</strong>
+1.  <strong>时间倒流</strong>: <code>range(NT - 1, -1, -1)</code>。反向传播是从最后一个时间步往回推的。
+2.  <strong>加载梯度</strong>: 加载 $h$ 的梯度 <code>b_dh</code>。
+3.  <strong>链式法则</strong>:
+    *   利用当前的 Query ($q$) 和输出梯度 ($do$) 来更新 $h$ 的梯度。
+    *   公式逻辑大概是：$dh_{new} = dh_{old} \cdot \text{Decay} + q^T \cdot do$。
+4.  <strong>保存结果</strong>: 把算好的梯度存入 <code>dh</code>。</p>
+<hr />
+<h3>总结清单 (Takeaway)</h3>
+<p>如果让我用一句话总结这个文件：</p>
+<blockquote>
+<p><strong>这是一个针对 GPU 优化的算子，用于将长序列切成小块，高效地计算每一块的“记忆矩阵”($h$)，并支持多种复杂的“遗忘/衰减”数学机制。</strong></p>
+</blockquote>
+<p><strong>建议阅读顺序：</strong>
+1.  先看 <code>chunk_fwd_h</code> (Python 包装函数)：看输入输出是什么（输入 $k, v$，输出 $h$）。
+2.  再看 <code>chunk_fwd_kernel_h</code> (Triton 核心)：
+    *   忽略 <code>tl.make_block_ptr</code> 这种内存指针细节。
+    *   重点看 <code>for i_t</code> 循环里的 <code>tl.dot(b_k, b_v)</code> (累加) 和 <code>b_h *= ...</code> (衰减)。
+3.  最后看 <code>chunk_bwd...</code>：只有你需要研究如何训练这个模型时才需要看，逻辑是前向的镜像。</p>

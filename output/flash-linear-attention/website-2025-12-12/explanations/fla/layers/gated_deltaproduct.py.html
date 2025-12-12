@@ -1,0 +1,96 @@
+<h1>fla/layers/gated_deltaproduct.py</h1>
+<p>这份代码实现了一个名为 <code>GatedDeltaProduct</code> 的神经网络层。</p>
+<p>简单来说，这是一个<strong>线性注意力（Linear Attention）</strong>或者说<strong>现代 RNN（Recurrent Neural Network）</strong> 的变体。它的目标是替代传统的 Transformer Attention，在处理长序列时速度更快，显存占用更低，同时保持强大的性能。</p>
+<p>为了让你听懂，我们把这个层想象成一个 <strong>“信息加工流水线”</strong>。当一批数据（比如一句话的 Embedding）进入这个层时，它需要完成一系列任务。</p>
+<p>以下是这个流水线的 <strong>Task Todo List</strong>：</p>
+<h3>📋 Task Todo List (执行清单)</h3>
+<ol>
+<li><strong>准备素材 (Projection)</strong>: 把输入的隐藏状态拆解成 Query, Key, Value 和控制信号。</li>
+<li><strong>局部预热 (Short Convolution)</strong>: 先看看每个词“左邻右舍”的信息，不要只盯着自己。</li>
+<li><strong>格式调整 (Reshape &amp; Layout)</strong>: 把数据排好队，分成多个“头”（Heads），准备并行处理。</li>
+<li><strong>核心加工 (Gated Delta Rule)</strong>: <strong>这是最关键的一步</strong>。利用一种特殊的数学规则（Delta Rule / Householder变换）来更新一个“全局记忆矩阵”。<ul>
+<li><em>核心逻辑：用当前的 Key 和 Value 去更新记忆，用 Query 从记忆里读取信息。</em></li>
+</ul>
+</li>
+<li><strong>遗忘与门控 (Forget &amp; Output Gate)</strong>: 决定哪些旧记忆该扔掉，哪些新结果该输出。</li>
+<li><strong>最终包装 (Output Projection)</strong>: 把处理好的数据整合，变回原来的形状，传给下一层。</li>
+</ol>
+<hr />
+<h3>🧐 详细步骤解说</h3>
+<p>现在我们一步步对照代码来讲这个 List：</p>
+<h4>Step 1: 准备素材 (Projection)</h4>
+<blockquote>
+<p><strong>代码对应</strong>: <code>self.q_proj</code>, <code>self.k_proj</code>, <code>self.v_proj</code>, <code>self.b_proj</code></p>
+</blockquote>
+<ul>
+<li><strong>任务</strong>: 输入 <code>hidden_states</code> (比如一句话的信息)。</li>
+<li><strong>动作</strong>: 通过全连接层（Linear），把它变成几个不同的分身：<ul>
+<li><code>q</code> (Query): <strong>查询者</strong>。我想从记忆里找什么？</li>
+<li><code>k</code> (Key): <strong>索引</strong>。我要把什么信息存进记忆，存到哪？</li>
+<li><code>v</code> (Value): <strong>内容</strong>。具体要存的内容是什么？</li>
+<li><code>beta</code>: <strong>更新强度</strong>。这次更新要多用力？</li>
+</ul>
+</li>
+<li><strong>特殊点</strong>: 注意代码里的 <code>num_householder</code>。这是一种高级的数学技巧，你可以理解为：为了让记忆更新更准确，它一次性不仅仅做一次简单的加减，而是做了多次（<code>num_householder</code> 次）复杂的空间变换更新。</li>
+</ul>
+<h4>Step 2: 局部预热 (Short Convolution)</h4>
+<blockquote>
+<p><strong>代码对应</strong>: <code>if self.use_short_conv: ... self.q_conv1d(...)</code></p>
+</blockquote>
+<ul>
+<li><strong>任务</strong>: 防止模型“眼高手低”。</li>
+<li><strong>动作</strong>: 在做复杂的全局记忆检索之前，先用一个小的<strong>一维卷积 (Conv1d)</strong> 扫一遍数据。</li>
+<li><strong>目的</strong>: 比如处理单词 "apple"，不仅看 "apple" 本身，也顺便看看前面的词。这能增强模型对局部上下文的理解，通常能显著提升效果。</li>
+</ul>
+<h4>Step 3: 格式调整 (Reshape &amp; Layout)</h4>
+<blockquote>
+<p><strong>代码对应</strong>: <code>rearrange(q, ...)</code> 以及 <code>if self.num_v_heads &gt; self.num_heads...</code></p>
+</blockquote>
+<ul>
+<li><strong>任务</strong>: 把数据切分成多头注意力（Multi-head）。</li>
+<li><strong>动作</strong>: 调整 Tensor 的形状。</li>
+<li><strong>特殊点</strong>: 这里处理了 <code>num_householder</code> 带来的维度变化。它把这些额外的维度安排在正确的位置，以便稍后进行矩阵乘法。</li>
+</ul>
+<h4>Step 4: 核心加工 (Gated Delta Rule - 难点!)</h4>
+<blockquote>
+<p><strong>代码对应</strong>: <code>chunk_gated_delta_product</code> (训练时) 或 <code>fused_recurrent_gated_delta_rule</code> (推理时)</p>
+</blockquote>
+<ul>
+<li><strong>任务</strong>: <strong>这是整个文件的灵魂</strong>。</li>
+<li><strong>背景</strong>: 传统的 Attention 是 $O = Softmax(QK^T)V$，计算量是序列长度的平方 ($N^2$)。</li>
+<li><strong>这里的做法 (RNN 模式)</strong>:<ol>
+<li>维护一个<strong>记忆矩阵 (State)</strong>。</li>
+<li>对于每个时间步：<ul>
+<li>根据 <code>k</code> (Key) 和 <code>v</code> (Value) 以及 <code>beta</code> 计算出一个“变化量” (Delta)。</li>
+<li>把这个变化量应用到<strong>记忆矩阵</strong>上（这就叫 Delta Rule）。这里的数学原理用到了 Householder 变换，保证更新的数值稳定性。</li>
+</ul>
+</li>
+<li>用 <code>q</code> (Query) 去乘在这个<strong>记忆矩阵</strong>，得到输出 <code>o</code>。</li>
+</ol>
+</li>
+<li><strong>Chunk 模式</strong>: 为了训练快，它不是一步步算，而是把序列切成小块（Chunk），块内并行计算，块间串行传递记忆。这既保留了 RNN 的推理速度，又有了 Transformer 的训练速度。</li>
+</ul>
+<h4>Step 5: 遗忘与门控 (Forget &amp; Output Gate)</h4>
+<blockquote>
+<p><strong>代码对应</strong>: <code>if self.use_forget_gate: ...</code>, <code>if self.use_output_gate: ...</code></p>
+</blockquote>
+<ul>
+<li><strong>遗忘门 (Forget Gate)</strong>: 记忆矩阵不能只存不删，否则会爆掉或者充满噪声。代码计算了一个 <code>g</code> (decay rate)，用来指数级衰减旧的记忆信息（类似于 LSTM 的遗忘门）。</li>
+<li><strong>输出门 (Output Gate)</strong>: 计算出来的结果 <code>o</code>，再经过一个 <code>RMSNorm</code> 和一个门控信号 <code>g_proj</code>。这就像一个过滤器，决定最终多少信息能流向下一层。</li>
+</ul>
+<h4>Step 6: 最终包装 (Output Projection)</h4>
+<blockquote>
+<p><strong>代码对应</strong>: <code>self.o_proj(o)</code></p>
+</blockquote>
+<ul>
+<li><strong>任务</strong>: 还原。</li>
+<li><strong>动作</strong>: 把多头的结果拼起来，通过最后一个 Linear 层，把维度变回 <code>hidden_size</code>。这样下一层才能接得住。</li>
+</ul>
+<hr />
+<h3>💡 总结：这是个啥？</h3>
+<p><strong>Gated Delta Product</strong> 是一个<strong>带有显式记忆更新机制</strong>的层。</p>
+<ul>
+<li><strong>相比 Transformer</strong>: 它不需要存巨大的 $N \times N$ 注意力矩阵，推理时只需要更新一个固定大小的记忆状态（State），所以<strong>推理速度极快，显存占用极低</strong>。</li>
+<li><strong>相比传统 RNN</strong>: 它引入了 "Delta Rule" (基于 Householder 变换) 和 "Chunk" 并行训练技术，使得它<strong>记忆能力更强，训练速度更快</strong>。</li>
+</ul>
+<p><strong>一句话概括</strong>：这是一种高级的、数学上更精密的“线性注意力”机制，用来让大模型“读”得更快、“记”得更牢。</p>

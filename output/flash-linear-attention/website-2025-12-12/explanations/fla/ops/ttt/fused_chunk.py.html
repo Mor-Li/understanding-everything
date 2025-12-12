@@ -1,0 +1,112 @@
+<h1>fla/ops/ttt/fused_chunk.py</h1>
+<p>这份代码确实非常硬核，它是一个用 <strong>Triton</strong> 语言编写的高性能 GPU 算子。</p>
+<p>简单来说，这实现了一种叫做 <strong>TTT (Test-Time Training) Linear</strong> 的算法。它的核心思想是：<strong>在处理序列的过程中，实时地“训练”一个线性的隐藏状态（Hidden State），用这个不断更新的状态来预测输出。</strong></p>
+<p>为了让你看懂，我们把这段代码想象成一个<strong>流水线工人的“任务清单”（To-Do List）</strong>。这个工人（GPU线程）需要一步步处理数据。</p>
+<p>我们将重点放在最核心的 <code>fwd_kernel</code>（前向传播）上，这是理解算法逻辑的关键。</p>
+<hr />
+<h3>任务清单：TTT Linear 算子执行流程</h3>
+<h4>任务 0：准备工作 (Setup)</h4>
+<ul>
+<li><strong>目标</strong>：把长长的序列切成小块（Chunk），因为一次吃不下。</li>
+<li><strong>动作</strong>：<ul>
+<li>拿到输入数据：Query ($Q$), Key ($K$), Value ($V$)。</li>
+<li>拿到学习率：$\eta$ (<code>eta</code>)，这决定了我们“实时学习”的快慢。</li>
+<li>拿到归一化参数：$W, b$。</li>
+<li>初始化记忆：隐藏状态 $H$ (<code>h0</code>) 和偏置 $H_b$ (<code>hb0</code>)。如果是一开始，它们就是全 0。</li>
+</ul>
+</li>
+</ul>
+<h4>任务 1：进入循环，按块处理 (The Loop)</h4>
+<p>代码中的 <code>for i_t in range(NT):</code> 就是在遍历每一个时间块（Chunk）。假设块大小 <code>BT=16</code>。</p>
+<p><strong>以下是在这个循环内部发生的详细步骤：</strong></p>
+<h5>✅ 步骤 1.1：读取数据</h5>
+<ul>
+<li><strong>代码对应</strong>：<code>tl.load(p_q)</code>, <code>tl.load(p_k)</code>, <code>tl.load(p_v)</code></li>
+<li><strong>解释</strong>：从显存里把当前这一小块（比如第0到15个token）的 $Q, K, V$ 读到高速缓存里。</li>
+</ul>
+<h5>✅ 步骤 1.2：利用旧记忆进行“预测” (Reconstruction)</h5>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    b_kh = tl.dot(tl.trans(b_k), b_h...) + b_hb...</code></li>
+<li><strong>解释</strong>：用当前的 Key ($K$) 和上一时刻遗留下来的隐藏状态 ($H$) 做乘法。<ul>
+<li>逻辑是：$X_{recon} = K \times H_{old}$</li>
+<li>这相当于在问旧的记忆：“根据现在的线索 K，你觉得 V 应该是什么？”</li>
+</ul>
+</li>
+</ul>
+<h5>✅ 步骤 1.3：对预测结果做“归一化” (Normalization)</h5>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    mean = tl.sum(b_kh...) / V
+    var = ...
+    rstd = 1 / tl.sqrt(var + eps)
+    b_kh_hat = (b_kh - mean) * rstd</code></li>
+<li><strong>解释</strong>：这就像 LayerNorm。把刚才预测出来的结果减去均值、除以方差，让数据分布更稳定。这是 TTT 算法特有的步骤。</li>
+</ul>
+<h5>✅ 步骤 1.4：计算“误差” (Gradient Calculation)</h5>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    b_v = b_kh_hat * b_w... + b_b... - b_v...
+    b_v2 = ... # 复杂的梯度计算公式</code></li>
+<li><strong>解释</strong>：<ul>
+<li>把刚才归一化后的预测值，和<strong>真实</strong>的 $V$ 进行比较。</li>
+<li>算出差距（Residual/Error）。</li>
+<li>这个 <code>b_v2</code> 实际上就是<strong>梯度</strong>（Gradient）。它代表了：“为了让预测更准，我们需要把记忆 $H$ 向哪个方向调整”。</li>
+</ul>
+</li>
+</ul>
+<h5>✅ 步骤 1.5：计算当前块的输出 (Attention / Output)</h5>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    b_A = tl.dot(b_q, b_k...) # QK^T
+    b_o = - tl.dot(..., b_v2) # 这一步结合了梯度信息
+    b_o += ... # 加上各种残差连接</code></li>
+<li><strong>解释</strong>：<ul>
+<li>这部分有点像传统的 Attention，计算 $Q \times K^T$。</li>
+<li>但它不仅仅是查表，它利用刚才算出来的“梯度/误差”信息和当前的 $Q$ 来生成最终的输出 $O$。</li>
+</ul>
+</li>
+</ul>
+<h5>✅ 步骤 1.6：更新记忆，为下一块做准备 (Update State)</h5>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    b_h = b_h - tl.dot(b_e_last * b_k, b_v2...)</code></li>
+<li><strong>解释</strong>：<strong>这是最核心的一步！</strong><ul>
+<li>公式：$H_{new} = H_{old} - \eta \times \nabla L$</li>
+<li>这里的 <code>b_e_last</code> 就是学习率 $\eta$。</li>
+<li>这意味着：<strong>在这个算子内部，它正在执行“梯度下降”算法。</strong> 它根据刚才预测 $V$ 的误差，修改了隐藏状态 $H$，让 $H$ 记住这一块的信息。</li>
+<li>更新后的 $H$ 会被传给下一个循环（下一块 Chunk）。</li>
+</ul>
+</li>
+</ul>
+<h4>任务 2：保存现场 (Finalize)</h4>
+<ul>
+<li><strong>代码对应</strong>：<code>if STORE_FINAL_STATE: ... tl.store(p_ht, ...)</code></li>
+<li><strong>解释</strong>：循环结束后，把最后更新好的隐藏状态 $H$ 存回显存。这样如果有下一个 Batch 或者更长的序列，可以接着用。</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p>普通的 Attention 是：我看一遍 $K$ 和 $V$，直接算结果。</p>
+<p><strong>TTT (Test-Time Training) Linear 是：</strong>
+1.  我有一个大脑（矩阵 $H$）。
+2.  看到数据 $K$ 和 $V$ 时，我先试着用大脑预测 $V$。
+3.  发现预测得不对，我立刻计算误差。
+4.  <strong>我当场修改我的大脑连接（更新 $H$）</strong>。
+5.  用修改后的大脑和 $Q$ 配合，输出结果。
+6.  带着更新后的大脑进入下一个时间步。</p>
+<p><strong>为什么叫 "Fused Chunk"？</strong>
+*   <strong>Fused (融合)</strong>：上面说的预测、算误差、更新大脑、算输出，本来在 PyTorch 里要写成 4-5 个操作，显存读写很慢。这个代码用 Triton 把它们全部写在一个核函数里，数据读进去一次，全部算完再吐出来，速度极快。
+*   <strong>Chunk (分块)</strong>：为了并行加速，它不是一个 Token 一个 Token 串行算的，而是一小块一小块（Chunk）算的。</p>
+<h3>你需要关注的关键变量映射</h3>
+<ul>
+<li><code>b_h</code>: <strong>Hidden State</strong> (隐藏状态/记忆矩阵)。</li>
+<li><code>b_k</code>, <code>b_v</code>: <strong>Input</strong> (当前的键和值)。</li>
+<li><code>b_kh</code>: <strong>Prediction</strong> (用记忆预测的值)。</li>
+<li><code>b_v2</code>: <strong>Gradient</strong> (预测误差导出的梯度，用于更新记忆)。</li>
+<li><code>eta</code> (<code>b_e</code>): <strong>Learning Rate</strong> (学习率，决定更新幅度)。</li>
+</ul>

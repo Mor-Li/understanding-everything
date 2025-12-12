@@ -1,0 +1,79 @@
+<h1>benchmarks/ops/benchmark_rwkv.py</h1>
+<p>这份代码其实不是用来“跑模型”去预测什么的，而是一个<strong>性能测试脚本（Benchmark）</strong>。</p>
+<p>简单来说，它的作用是：<strong>让几个不同的AI算法（RWKV6, RWKV7, GLA, FlashAttention）在同一起跑线上赛跑，看谁处理长文本的速度更快，显存占用更优。</strong></p>
+<p>为了让你看懂，我把你当成这个“比赛”的<strong>裁判</strong>，我们把这份代码拆解成一个<strong>裁判的工作清单（Todo List）</strong>，一步步来看：</p>
+<hr />
+<h3>裁判任务清单 (Todo List)</h3>
+<h4>✅ Task 1: 确定比赛项目和规则 (配置图表)</h4>
+<p>代码的开头一大段 <code>@triton.testing.perf_report(...)</code> 实际上是在画那个最终的“折线统计图”的坐标轴。</p>
+<ul>
+<li><strong>X轴 (x_names=['T']):</strong> 代表“序列长度”（Context Length）。比如文章是128个字，还是256个字，还是一直到16384个字。代码里写了 <code>128 * 2 ** i</code>，意思是长度会翻倍增长（128, 256, 512...）。</li>
+<li><strong>参赛选手 (line_vals):</strong><ul>
+<li><code>rwkv6</code>, <code>rwkv7</code>: 新型的线性Attention模型。</li>
+<li><code>gla</code>: Gated Linear Attention，也是一种高效模型。</li>
+<li><code>flash</code>: FlashAttention，目前业界的标杆（速度最快）。</li>
+<li><strong>注意后缀 <code>_bwd</code></strong>: 这代表 "Backward"（反向传播）。不带后缀的是测<strong>推理速度</strong>（Forward），带 <code>_bwd</code> 是测<strong>训练速度</strong>（算梯度）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 准备比赛场地 (设置数据维度)</h4>
+<p>进入 <code>def benchmark(T, provider):</code> 函数内部。作为裁判，你得规定这次跑多大的数据量。</p>
+<ul>
+<li><strong>B (Batch size):</strong> 一次处理多少条句子（默认8）。</li>
+<li><strong>H (Heads):</strong> 注意力头的数量（默认64）。</li>
+<li><strong>D (Dimension):</strong> 每个头的维度（默认64）。</li>
+<li><strong>T:</strong> 这一轮测试的序列长度（由Task 1自动传入，比如先测128，再测256...）。</li>
+</ul>
+<p>代码片段：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">B</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s1">&#39;BENCH_B&#39;</span><span class="p">,</span> <span class="s1">&#39;8&#39;</span><span class="p">))</span>
+<span class="c1"># ...以此类推</span>
+</code></pre></div>
+
+<h4>✅ Task 3: 发放比赛道具 (生成随机张量)</h4>
+<p>不同的选手（模型）需要不同的输入数据。这一步是在显卡（GPU）上生成一堆随机数，模拟真实的神经网络输入。</p>
+<ul>
+<li><strong>通用道具:</strong> <code>q</code>, <code>k</code>, <code>v</code> (Query, Key, Value)。这是所有Attention机制都需要的基础数据。</li>
+<li><strong>RWKV6 专用:</strong> 需要 <code>w</code> (decay rates) 和 <code>u</code> (bonus)。</li>
+<li><strong>RWKV7 专用:</strong> 结构更复杂，需要 <code>w</code>, <code>a</code>, <code>b</code> 等额外参数。</li>
+<li><strong>GLA 专用:</strong> 需要 <code>g</code> (gate)。</li>
+</ul>
+<p>代码里有一大堆 <code>if provider.startswith...</code> 就是在根据当前是谁在跑，给它分配对应的随机数据。</p>
+<h4>✅ Task 4: 鸣枪起跑 (执行测试)</h4>
+<p>这是最核心的部分。裁判按下秒表，让模型跑起来。</p>
+<p>代码使用了 <code>triton.testing.do_bench</code>，这是一个专门用来测速的工具函数，它会运行多次取平均值，保证结果准确。</p>
+<ul>
+<li><strong>正向跑 (Forward):</strong><ul>
+<li>比如 <code>chunk_rwkv6(q, k, v, w, u)</code>：测试 RWKV6 算一遍结果要多久。</li>
+</ul>
+</li>
+<li><strong>反向跑 (Backward/Training):</strong><ul>
+<li>比如 <code>chunk_rwkv6(...).backward(do)</code>：测试 RWKV6 算一遍<strong>梯度</strong>（用于训练更新参数）要多久。</li>
+</ul>
+</li>
+</ul>
+<p>代码片段逻辑：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">provider</span> <span class="o">==</span> <span class="s1">&#39;rwkv6&#39;</span><span class="p">:</span>
+    <span class="c1"># 测 RWKV6 正向</span>
+    <span class="n">results</span> <span class="o">=</span> <span class="n">triton</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">do_bench</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">chunk_rwkv6</span><span class="p">(</span><span class="o">...</span><span class="p">))</span>
+<span class="k">elif</span> <span class="n">provider</span> <span class="o">==</span> <span class="s1">&#39;rwkv6_bwd&#39;</span><span class="p">:</span>
+    <span class="c1"># 测 RWKV6 反向 (训练)</span>
+    <span class="n">results</span> <span class="o">=</span> <span class="n">triton</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">do_bench</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">chunk_rwkv6</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">do</span><span class="p">))</span>
+<span class="c1"># ... 其他模型同理</span>
+</code></pre></div>
+
+<h4>✅ Task 5: 公布成绩 (打印结果)</h4>
+<p>最后一行：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">benchmark</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">print_data</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这行代码会把刚才所有比赛的数据汇总，画出一张图（或者打印出一个表格）。</p>
+<hr />
+<h3>总结一下文中的核心观点（隐含）</h3>
+<p>虽然这是一段代码，但它背后隐含了作者想要验证的观点：</p>
+<ol>
+<li><strong>RWKV7 vs RWKV6:</strong> 作者想看看新出的 RWKV7 在计算效率上，相比 RWKV6 有没有变慢？（因为 RWKV7 变复杂了，通常会慢一点，需要测试慢多少）。</li>
+<li><strong>Linear Attention vs FlashAttention:</strong> 作者想证明像 RWKV 和 GLA 这种“线性注意力”机制，在长序列（T很大时）下，速度是否能比肩甚至超越 FlashAttention。</li>
+<li><strong>训练 vs 推理:</strong> 通过对比 <code>_bwd</code> 和普通项，观察这些模型在训练和推理时的性能差异。</li>
+</ol>
+<p><strong>简单一句话概括这个文件：</strong>
+这是一个<strong>赛马场</strong>，用来测试 <strong>RWKV6、RWKV7、GLA</strong> 这些模型在不同长度的文本下，到底跑得有多快，并和标杆 <strong>FlashAttention</strong> 做对比。</p>

@@ -1,0 +1,100 @@
+<h1>fla/models/mom/modeling_mom.py</h1>
+<p>这份代码是用 PyTorch 实现的一个深度学习模型架构，名为 <strong>MOM (Mixture-of-Memory)</strong>。这通常是 Transformer 架构的一种变体，结合了线性注意力（Linear Attention）和类似混合专家（MoE）的路由机制。</p>
+<p>为了让你更容易理解，我们可以把阅读这份代码当成一个<strong>“组装机器人”</strong>的过程。</p>
+<p>这里是为你准备的 <strong>学习任务清单 (Todo List)</strong>：</p>
+<ol>
+<li><strong>Task 1：理解“调度员的绩效考核” (Helper Function)</strong><ul>
+<li>目标：看懂 <code>load_balancing_loss_func</code>。</li>
+</ul>
+</li>
+<li><strong>Task 2：组装“机器人的手臂关节” (The Layer)</strong><ul>
+<li>目标：看懂 <code>MomBlock</code> 类。</li>
+</ul>
+</li>
+<li><strong>Task 3：搭建“机器人的躯干” (The Backbone)</strong><ul>
+<li>目标：看懂 <code>MomModel</code> 类。</li>
+</ul>
+</li>
+<li><strong>Task 4：安装“大脑”并开始“训练” (The Head &amp; Loss)</strong><ul>
+<li>目标：看懂 <code>MomForCausalLM</code> 类及其 Loss 计算。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>Task 1: 理解“调度员的绩效考核” (<code>load_balancing_loss_func</code>)</h4>
+<p>这个模型的核心思想是“混合记忆 (Mixture of Memory)”。你可以想象模型里有很多块“记忆单元”（类似于 MoE 里的专家 Expert）。每次处理信息时，模型需要决定把任务派发给哪几块记忆单元。</p>
+<ul>
+<li><strong>问题：</strong> 如果调度机制不好，可能导致所有任务都发给同一个记忆单元（累死一个，闲死一堆），这叫“负载不均衡”。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li><code>gate_logits</code>: 这是调度员（Router）打出的分数，决定选谁。</li>
+<li><code>routing_weights</code>: 用 Softmax 把分数变成概率。</li>
+<li><code>topk</code>: 选出分数最高的 K 个专家/记忆。</li>
+<li><strong>核心计算：</strong> 这里的公式（参考了 Switch Transformer 论文）计算了一个 <strong>Auxiliary Loss (辅助损失)</strong>。</li>
+<li><strong>目的：</strong> 如果这个 Loss 很大，说明分配很不均匀。模型训练时会努力减小这个 Loss，从而强迫调度员<strong>均匀地</strong>使用所有的记忆单元。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 组装“机器人的手臂关节” (<code>MomBlock</code>)</h4>
+<p>这是模型最基本的重复单元，也就是 Transformer 的一层（Layer）。</p>
+<ul>
+<li><strong>结构 (三明治结构)：</strong><ol>
+<li><strong>Norm (归一化):</strong> <code>self.attn_norm</code>。</li>
+<li><strong>Attention (注意力机制):</strong> 重点是 <code>if config.mom_backend == 'gated_deltanet': ... MomAttention(...)</code>。<ul>
+<li>这里调用了 <code>MomAttention</code>（这是该模型独特的地方，支持路由和记忆选择）。</li>
+<li><strong>关键输出：</strong> 注意看 <code>forward</code> 函数里，它不仅输出了 <code>hidden_states</code>（特征），还输出了 <code>router_logits</code>（刚才说的调度员打分）。</li>
+</ul>
+</li>
+<li><strong>MLP (前馈神经网络):</strong> <code>self.mlp</code>，这里用的是 <code>GatedMLP</code>。</li>
+<li><strong>Residual (残差连接):</strong> <code>hidden_states = residual + hidden_states</code>，防止梯度消失。</li>
+</ol>
+</li>
+</ul>
+<p><strong>总结 Task 2：</strong> 这一层做的事情就是：输入数据 -&gt; 归一化 -&gt; <strong>挑选记忆并处理(Attention)</strong> -&gt; 归一化 -&gt; 进一步处理(MLP) -&gt; 输出。同时，它把“我刚才选了谁”的信息 (<code>router_logits</code>) 也传出去了。</p>
+<h4>Task 3: 搭建“机器人的躯干” (<code>MomModel</code>)</h4>
+<p>这个类把刚才的“关节”串起来，形成完整的身体。</p>
+<ul>
+<li><strong>初始化 (<code>__init__</code>)：</strong><ul>
+<li><code>self.embeddings</code>: 把输入的文字 ID 变成向量。</li>
+<li><code>self.layers</code>: 一个列表，里面装着几十个 <code>MomBlock</code>。</li>
+</ul>
+</li>
+<li><strong>前向传播 (<code>forward</code>)：</strong><ul>
+<li>是一个大的 <code>for</code> 循环：<code>for layer in self.layers:</code>。</li>
+<li>它让数据流过每一层。</li>
+<li><strong>收集器：</strong> 注意 <code>all_router_logits += (router_logits,)</code>。它把每一层的调度打分都收集起来，打包放在 <code>MomOutputWithPast</code> 里返回。这对于后面计算 Task 1 提到的 Loss 至关重要。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 安装“大脑”并开始“训练” (<code>MomForCausalLM</code>)</h4>
+<p>这是最终用户直接调用的类，用于<strong>因果语言模型 (Causal Language Modeling)</strong>，也就是像 GPT 那样“预测下一个词”。</p>
+<ul>
+<li><strong>结构：</strong><ul>
+<li>包含一个 <code>MomModel</code> (躯干)。</li>
+<li>包含一个 <code>lm_head</code> (线性层)：把躯干输出的向量映射回词表大小 (<code>vocab_size</code>)，算出下一个词是“苹果”还是“香蕉”的概率。</li>
+</ul>
+</li>
+<li><strong>核心逻辑 (<code>forward</code> 中的 Loss 计算)：</strong>
+    这里是整个文件的灵魂所在：<ol>
+<li><strong>主任务 Loss (预测词的准确度)：</strong>
+    <code>python
+    loss = loss_fct(logits..., labels...)</code>
+    这是标准的 CrossEntropyLoss，衡量模型预测下一个词准不准。</li>
+<li><strong>辅助 Loss (负载均衡)：</strong>
+    <code>python
+    aux_loss = load_balancing_loss_func(outputs.router_logits, ...)</code>
+    调用 Task 1 里的函数，检查每一层的记忆单元有没有被均匀使用。</li>
+<li><strong>总 Loss (加权求和)：</strong>
+    <code>python
+    loss += aux_loss.to(loss.device) * self.aux_loss_scale</code>
+    <strong>最终的 Loss = 预测错误的惩罚 + 资源分配不均的惩罚 × 系数。</strong></li>
+</ol>
+</li>
+</ul>
+<h3>全文总结</h3>
+<p>这段代码定义了一个<strong>带有“路由机制”的 Transformer 模型</strong>。
+- 它不像传统 Transformer 那样傻傻地计算所有东西，而是有一个 <code>MomAttention</code> 机制去选择性地使用“记忆”。
+- 为了防止模型偷懒只用某几个记忆，它引入了一个 <code>load_balancing_loss_func</code>。
+- <code>MomBlock</code> 负责产生路由分数。
+- <code>MomModel</code> 负责收集所有层的分数。
+- <code>MomForCausalLM</code> 负责把“预测准不准”和“分配均不均”结合起来，指导模型更新参数。</p>

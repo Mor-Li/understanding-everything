@@ -1,0 +1,81 @@
+<h1>tests/modules/test_conv.py</h1>
+<p>这份代码其实是一个<strong>测试文件</strong>（Test Suite）。它的作用不是“实现功能”，而是“<strong>检查作业</strong>”。</p>
+<p>它主要是在测试一个叫 <code>ShortConvolution</code>（短卷积）和 <code>causal_conv1d</code>（因果一维卷积）的模块。这些通常用于像 Mamba、RWKV 或者 RetNet 这样的现代大模型架构中，用来替代或辅助 Attention 机制。</p>
+<p>为了让你听懂，我把阅读这份代码的任务拆解成一个 <strong>To-Do List</strong>，我们一步步来打勾。</p>
+<hr />
+<h3>✅ Task 1：搞清楚“我们要测什么？”（核心概念）</h3>
+<p>首先，你要知道被测的主角是 <strong>“因果一维卷积” (Causal 1D Convolution)</strong>。</p>
+<ul>
+<li><strong>卷积 (Conv1d)</strong>：想象一个滑动窗口（比如窗口大小 <code>W=3</code>），在时间序列上滑过，提取局部特征。</li>
+<li><strong>因果 (Causal)</strong>：意味着“不能偷看未来”。你在处理第 5 个词的时候，卷积窗口只能看第 5 个及之前的词，不能看第 6 个词。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>causal_conv1d</code>: 这是作者写的高性能（可能是用 Triton 或 CUDA 写底层的）卷积函数。</li>
+<li><code>ShortConvolution</code>: 这是一个包装好的 PyTorch 层（Layer），方便你在模型里直接用。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 2：找到“标准答案” (Reference)</h3>
+<p>测试的核心逻辑是：<strong>拿“高性能但复杂的代码”的输出，去和“简单但慢的标准代码”的输出做对比。</strong> 如果两者一样，说明高性能代码写对了。</p>
+<ul>
+<li><strong>代码对应</strong>：<ul>
+<li><code>causal_conv1d_ref_torch</code>: 这是一个<strong>参照组（Reference）</strong>。作者用 PyTorch 自带的 <code>F.conv1d</code> 拼凑出了一个因果卷积。这个肯定是对的，但是速度慢。</li>
+<li><code>causal_conv1d_update_ref_torch</code>: 这是推理（生成）时的参照组。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 3：测试基本功能 (Forward &amp; Backward)</h3>
+<p><strong>任务目标</strong>：验证在普通的训练场景下，算出来的结果对不对，梯度（反向传播）对不对。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>def test_conv(...)</code></li>
+<li><strong>流程解读</strong>：<ol>
+<li>随机生成输入数据 <code>x</code> 和权重 <code>weight</code>。</li>
+<li><strong>跑标准答案</strong>：用 <code>causal_conv1d_ref_torch</code> 算一遍，得到 <code>ref</code>。</li>
+<li><strong>跑测试对象</strong>：用 <code>causal_conv1d</code> 算一遍，得到 <code>tri</code>。</li>
+<li><strong>对比</strong>：用 <code>assert_close</code> 检查 <code>ref</code> 和 <code>tri</code> 是否几乎一样（允许 0.001 的误差）。</li>
+<li><strong>查梯度</strong>：分别做 <code>.backward()</code>，检查 <code>x.grad</code>（输入的梯度）和 <code>weight.grad</code>（权重的梯度）是否一致。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 4：测试“变长序列” (Variable Length)</h3>
+<p><strong>任务目标</strong>：在大模型训练中，我们经常把好几句话拼成一个长条（Batch）塞进去。比如 "Hello" (长度1) 和 "How are you" (长度3) 拼在一起。卷积不能跨越这两句话的边界（不能把 "Hello" 的结尾卷到 "How" 的开头里去）。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>def test_conv_varlen(...)</code></li>
+<li><strong>关键词</strong>：<code>cu_seqlens</code> (Cumulative Sequence Lengths)。这是一个数组，告诉程序每一句话从哪开始、到哪结束。</li>
+<li><strong>逻辑</strong>：测试函数会根据 <code>cu_seqlens</code> 把数据切开，一段段算标准答案，然后和支持变长的 <code>causal_conv1d</code> 结果对比。</li>
+</ul>
+<h3>✅ Task 5：测试“一步步生成” (Decoding / Inference)</h3>
+<p><strong>任务目标</strong>：大模型生成文本时是一个字一个字蹦出来的。
+*   以前算过的东西，我们不想重算，所以要存起来，这叫 <strong>Cache（缓存/状态）</strong>。
+*   卷积的 Cache 就是最后那几个词（由窗口大小 <code>W</code> 决定）。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>def test_conv_decoding(...)</code></li>
+<li><strong>流程解读</strong>：<ol>
+<li><strong>Ref</strong>：用标准卷积一次性把整个序列算出来。</li>
+<li><strong>Tri</strong>：模拟生成过程。用 <code>for i in range(T)</code> 循环，每次只输进去<strong>一个时间步</strong>的数据，并更新 <code>cache</code>。</li>
+<li><strong>对比</strong>：最后拼起来的结果，应该和一次性算出来的结果一模一样。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 6：测试“混合后端” (Mixed Backend)</h3>
+<p><strong>任务目标</strong>：这个库可能支持多种底层加速（比如 <code>Triton</code> 语言写的，或者 <code>CUDA</code> C++ 写的）。在实际应用中，可能训练用一种，推理用一种，或者预填充（Prefill）用一种，解码（Decode）用一种。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>def test_mixed_backend(...)</code></li>
+<li><strong>逻辑</strong>：<ol>
+<li>先用 CUDA 模式算前半段（Prefill），得到一个中间状态 <code>final_state</code>。</li>
+<li>把这个状态传给 Triton 模式，算后半段（Decode）。</li>
+<li>把这两段拼起来，看看是不是和“全程用同一种模式”算出来的结果一样。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 7：测试“缓存的梯度” (Cache Backward)</h3>
+<p><strong>任务目标</strong>：这是一个很高级的测试。有些复杂的训练算法（比如 BPTT - 通过时间反向传播）需要让梯度穿过这个 Cache 状态流回上一段。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>def test_conv_cache_backward(...)</code></li>
+<li><strong>逻辑</strong>：验证当我们对 Cache 求导时，梯度能不能正确地传导回初始状态 <code>initial_state</code>。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇代码其实就在说一件事：</p>
+<blockquote>
+<p><strong>“我写了一个跑得很快的卷积函数（<code>causal_conv1d</code>），为了证明它是对的，我把它的输出、梯度、变长处理能力、以及缓存推理能力，全部和 PyTorch 自带的慢速函数对比了一遍，结果是一模一样的。”</strong></p>
+</blockquote>

@@ -1,0 +1,110 @@
+<h1>fla/ops/path_attn/cumprod_householder_bwd.py</h1>
+<p>这份代码确实非常硬核，它属于深度学习底层优化（Kernel fusion）的范畴，用 Triton 语言编写，专门为了加速 <strong>线性注意力（Linear Attention）</strong> 或 <strong>状态空间模型（SSM）</strong> 中某种特定的“Householder 变换累积乘积”的反向传播。</p>
+<p>简单来说，这是在算梯度的。</p>
+<p>为了让你看懂，我列了一个 <strong>Task List（任务清单）</strong>，我们一步步来拆解这个文件。</p>
+<hr />
+<h3>📝 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂背景 (Context)</strong> - 这到底是在算什么数学公式？</li>
+<li><strong>Task 2: 搞懂分块 (Tiling)</strong> - 为什么代码里全是 <code>S</code>, <code>BT</code>, <code>BK</code> 这种变量？</li>
+<li><strong>Task 3: 搞懂输入/输出 (I/O)</strong> - <code>w1</code>, <code>w2</code>, <code>dhc</code> 这些变量代表什么物理含义？</li>
+<li><strong>Task 4: 核心逻辑拆解 (The Loop)</strong> - 循环里到底在算什么？（最难的部分）</li>
+</ol>
+<hr />
+<h3>🔍 逐步讲解</h3>
+<h4>Task 1: 搞懂背景 (Context)</h4>
+<p>这个 Kernel 的名字叫 <code>cumprod_householder_bwd</code>。
+*   <strong>Cumprod</strong>: 累积乘积 (Cumulative Product)。类似于 $h_t = M_t \times h_{t-1}$。
+*   <strong>Householder</strong>: Householder 变换。这是一种特殊的矩阵，通常用来做旋转或反射，保持向量的模长不变（正交矩阵）。它的形式通常是 $I - 2vv^T$。
+*   <strong>Bwd</strong>: Backward，反向传播，也就是算梯度。</p>
+<p><strong>一句话总结：</strong>
+模型在前向传播时，把一连串的 Householder 矩阵乘在了一起。现在我们要反向传播，根据最终的误差，算出这些 Householder 矩阵参数（<code>w1</code>, <code>w2</code>）以及输入 <code>k</code> 的梯度。</p>
+<h4>Task 2: 搞懂分块 (Tiling)</h4>
+<p>GPU 编程的核心是“切蛋糕”。显存很大但很慢，SRAM（共享内存）很快但很小。
+代码里的这些参数就是在定义怎么切蛋糕：</p>
+<ul>
+<li><strong><code>T</code> (Time)</strong>: 序列的总长度（比如 2048）。</li>
+<li><strong><code>S</code> (Split Size/Large Chunk)</strong>: 把长序列切成大的块（比如 128）。</li>
+<li><strong><code>BT</code> (Block Time/Small Chunk)</strong>: 在大块里面再切成小块，给 Triton 的一个线程块（Block）处理（比如 32）。</li>
+<li><strong><code>K</code>, <code>BK</code></strong>: 特征维度（Hidden Dimension）。</li>
+</ul>
+<p><strong>代码逻辑：</strong>
+<code>chunk_cumprod_householder_bwd_kernel</code> 这个函数，一次只处理序列中的<strong>一个大块 (Chunk)</strong>。它利用并行的力量，同时处理很多个这样的块。</p>
+<h4>Task 3: 搞懂输入/输出 (I/O)</h4>
+<p>我们来看看核心变量，想象梯度的流动方向：</p>
+<ul>
+<li><strong><code>hc_suffix</code> (Hidden State)</strong>: 前向传播时存下来的中间状态（用于辅助计算）。</li>
+<li><strong><code>dhc_whole</code> (Gradient of Hidden State)</strong>: 这是<strong>从未来传回来的梯度</strong>。<ul>
+<li>想象一下：$h_t$ 影响了 $h_{t+1}$，所以 $h_{t+1}$ 的梯度会回传给 $h_t$。<code>dhc_whole</code> 就是这个块结束时，后面所有时刻对当前状态的“总梯度”。</li>
+</ul>
+</li>
+<li><strong><code>w1</code>, <code>w2</code></strong>: 定义 Householder 矩阵的向量参数。</li>
+<li><strong><code>dw1</code>, <code>dw2</code></strong>: 我们要求的目标！<code>w1</code> 和 <code>w2</code> 的梯度。</li>
+<li><strong><code>k</code></strong>: 输入的 Key 向量。</li>
+<li><strong><code>dk</code></strong>: 输入 Key 的梯度。</li>
+<li><strong><code>dk_new</code></strong>: 修正后的 Key 梯度。</li>
+</ul>
+<h4>Task 4: 核心逻辑拆解 (The Loop)</h4>
+<p>这是代码最核心的部分，我们看 <code>chunk_cumprod_householder_bwd_kernel</code> 内部。</p>
+<p><strong>第一步：初始化梯度 (Load Gradient)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 加载该块结束时的总梯度</span>
+<span class="n">p_dhc_whole</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">make_block_ptr</span><span class="p">(</span><span class="n">dhc_whole</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="n">b_dhc</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_dhc_whole</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><code>b_dhc</code> 是一个累积的梯度变量。最开始，它等于“这一块之后所有时刻传回来的梯度”。</p>
+<p><strong>第二步：循环计算 (The Loop)</strong>
+代码里有一个 <code>for i_t_small in range(0, NT_small):</code>。
+虽然是在循环时间 $t$，但因为是 Householder 变换，数学上它在利用链式法则“剥洋葱”。</p>
+<p>在循环内部，发生了三件大事：</p>
+<ol>
+<li>
+<p><strong>加载数据</strong>:
+    把当前时刻 $t$ 的 <code>k</code>, <code>dk</code>, <code>w1</code>, <code>w2</code>, <code>hc</code> 都读进来。</p>
+</li>
+<li>
+<p><strong>计算梯度 (Math Magic)</strong>:
+    这里用到了 Householder 的性质。Householder 矩阵是对称且正交的。</p>
+<ul>
+<li>
+<p><strong>更新 <code>dk</code></strong>:
+    <code>python
+    b_dk_new = b_dk - tl.dot(b_dk... b_hc)</code>
+    这步是在修正输入 <code>k</code> 的梯度。</p>
+</li>
+<li>
+<p><strong>计算 <code>dw1</code>, <code>dw2</code> (参数梯度)</strong>:
+    <code>python
+    b_dh = b_dhc - tl.dot(...) # 中间变量
+    b_dw2 = tl.dot(b_w1, b_dh...)
+    b_dw1 = tl.dot(b_w2, ...)</code>
+    这是链式法则的核心。
+    公式大概逻辑是：$\frac{\partial Loss}{\partial w} = \frac{\partial Loss}{\partial h} \times \frac{\partial h}{\partial w}$。
+    因为 $h_{out} = (I - 2w_1 w_2^T) h_{in}$，所以 $w$ 的梯度取决于当前的梯度流 <code>b_dhc</code> 和当前的输入。
+    代码计算出 <code>dw1</code>, <code>dw2</code> 后直接存回显存 (<code>tl.store</code>)。</p>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>更新梯度流 <code>b_dhc</code> (Propagate Gradient)</strong>:
+    <code>python
+    b_dhc = b_dhc - tl.dot(...) 
+    b_dhc -= tl.dot(...)</code>
+    <strong>这是最关键的一步！</strong>
+    我们处理完当前时刻 $t$ 后，梯度流 <code>b_dhc</code> 需要被“更新”，以便传给下一个时刻（或者说，剥离掉当前层的影响，还原成上一层的梯度）。
+    因为 Householder 矩阵 $H = I - 2vv^T$，乘以梯度 $g$ 等于 $g - 2vv^T g$。代码里的减法操作就是在模拟这个过程，把梯度穿过 Householder 矩阵传到前一时刻。</p>
+</li>
+</ol>
+<h3>总结 (Summary)</h3>
+<p>这段代码在做的事情是：</p>
+<ol>
+<li>拿到这一段序列（Chunk）<strong>最末尾</strong>传回来的总梯度 <code>dhc_whole</code>。</li>
+<li>进入循环，遍历这个 Chunk 里的每一个小时间步。</li>
+<li>在每一步，利用当前的梯度流 <code>b_dhc</code> 和当前的参数 <code>w</code>，算出这一步参数的梯度 <code>dw</code>。</li>
+<li>然后，让梯度流 <code>b_dhc</code> <strong>穿过</strong> 当前的 Householder 变换（更新 <code>b_dhc</code>），变成“上一时刻”的梯度，准备给下一次循环使用。</li>
+</ol>
+<p><strong>简单比喻：</strong>
+你在剥一个洋葱（反向传播）。
+<code>dhc_whole</code> 是你手里的刀。
+循环里的每一步是剥掉一层皮。
+每剥一层，你都记录下这层皮的大小（计算 <code>dw</code>），然后刀的位置往里进一层（更新 <code>b_dhc</code>），准备剥下一层。</p>

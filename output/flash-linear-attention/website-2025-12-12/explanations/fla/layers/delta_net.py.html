@@ -1,0 +1,99 @@
+<h1>fla/layers/delta_net.py</h1>
+<p>这份代码确实比较硬核，它属于 <strong>线性 Attention（Linear Attention）</strong> 或者说 <strong>现代 RNN（Recurrent Neural Network）</strong> 的前沿研究领域。</p>
+<p>简单来说，它的目的是<strong>替代传统 Transformer 中的 Attention 层</strong>，让模型在推理时更快（省显存），同时保持高性能。</p>
+<p>为了让你看懂，我把你“阅读并理解这份代码”的任务拆解成一个 <strong>5步走的 To-Do List</strong>，我们一步步来划钩。</p>
+<hr />
+<h3>✅ Task 1: 搞清楚它的身份 (Identity)</h3>
+<p><strong>目标</strong>：理解 <code>DeltaNet</code> 是什么，为什么要用它。</p>
+<ul>
+<li><strong>它的名字</strong>：DeltaNet。</li>
+<li><strong>它的对手</strong>：传统的 Softmax Attention (也就是 ChatGPT 用的那种)。</li>
+<li><strong>它的优势</strong>：<ul>
+<li>传统 Attention 的计算量随着字数增加是<strong>平方级</strong>爆炸的 ($O(N^2)$)。</li>
+<li>DeltaNet 是<strong>线性</strong>的 ($O(N)$)。这意味着它可以处理无限长的上下文，且推理速度极快。</li>
+</ul>
+</li>
+<li><strong>核心原理</strong>：它不像 Attention 那样保留所有历史记录，而是维护一个“记忆矩阵”（State）。每读入一个新词，就用“Delta Rule”（增量规则）去更新这个记忆。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 准备“食材” (Input Processing)</h3>
+<p><strong>目标</strong>：看懂 <code>__init__</code> 和 <code>forward</code> 前半部分在做什么。</p>
+<p>就像做菜前要切菜一样，DeltaNet 先把输入数据 (<code>hidden_states</code>) 转化成它需要的形式。</p>
+<ol>
+<li><strong>Q, K, V 投影</strong>：<ul>
+<li>代码：<code>self.q_proj</code>, <code>self.k_proj</code>, <code>self.v_proj</code>。</li>
+<li>解释：这和标准 Transformer 一样，把输入向量变成 Query (查询), Key (键), Value (值)。</li>
+</ul>
+</li>
+<li><strong>短卷积 (Short Convolution)</strong>：<ul>
+<li>代码：<code>self.use_short_conv</code>, <code>ShortConvolution</code>。</li>
+<li>解释：<strong>这是现代线性 Attention 的标配</strong>。在做复杂的记忆更新前，先用一个小卷积核（比如窗口大小为4）扫一遍，捕捉一下“邻居”的信息。这能极大提升模型对局部信息的敏感度。</li>
+<li><em>文中警告</em>：代码里特意写了 warning，叫你不要关掉它，因为它对性能至关重要。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 核心魔法 —— Delta Rule (The Mechanism)</h3>
+<p><strong>目标</strong>：理解它是怎么“记忆”东西的。这是全篇最难也是最核心的地方。</p>
+<p>在标准 Attention 里，Q 和 K 算相似度。在这里，我们用 <strong>Delta Rule</strong> 来更新记忆。</p>
+<ol>
+<li><strong>Beta ($\beta$) 的作用</strong>：<ul>
+<li>代码：<code>self.b_proj</code>, <code>beta</code>。</li>
+<li>解释：Beta 可以理解为<strong>学习率</strong>或者<strong>写入强度</strong>。模型会自己学习针对当前的输入，应该把多少信息写入记忆，或者遗忘多少旧信息。</li>
+</ul>
+</li>
+<li><strong>记忆更新公式 (核心逻辑)</strong>：<ul>
+<li>虽然代码里封装在 <code>chunk_delta_rule</code> 或 <code>fused_recurrent_delta_rule</code> 里，但逻辑是这样的：<ul>
+<li><strong>预测</strong>：先用旧的记忆去预测当前的 Value。</li>
+<li><strong>找差值 (Delta)</strong>：看预测出来的 Value 和真实的 Value 差多少。</li>
+<li><strong>修正</strong>：把这个“差值”乘以 Key 和 Beta，更新进记忆里。</li>
+</ul>
+</li>
+<li><strong>通俗理解</strong>：这就像你在背书。你先试着背一句（预测），看漏了哪些字（找差值），然后重点去记漏掉的那些字（修正记忆）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 两种形态切换 (Chunk vs. Recurrent)</h3>
+<p><strong>目标</strong>：理解代码中 <code>mode</code> 的作用。</p>
+<p>DeltaNet 有两个“形态”，代码会根据情况自动或手动切换：</p>
+<ol>
+<li><strong>Chunk 模式 (训练时用)</strong>：<ul>
+<li>代码：<code>mode='chunk'</code>, <code>chunk_delta_rule</code>。</li>
+<li>解释：为了训练快，它利用 GPU 并行计算的能力。它把长序列切成小块（Chunk），块内并行计算，块间传递记忆。这让它训练起来像 Transformer 一样快。</li>
+</ul>
+</li>
+<li><strong>Recurrent 模式 (推理时用)</strong>：<ul>
+<li>代码：<code>mode='fused_recurrent'</code>, <code>fused_recurrent_delta_rule</code>。</li>
+<li>解释：在生成文字时（推理），它变成了一个 RNN。它不需要看以前所有的字，只需要这就上一步留下的那个“记忆状态” (<code>last_state</code>)，就能算出下一个字。这让它生成速度极快，且显存占用极低。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 出锅装盘 (Output)</h3>
+<p><strong>目标</strong>：理解 <code>forward</code> 函数的最后部分。</p>
+<p>记忆更新完了，计算出了结果 <code>o</code>，最后还要做一点修饰。</p>
+<ol>
+<li><strong>归一化 (Norm)</strong>：<ul>
+<li>代码：<code>self.o_norm</code> (RMSNorm)。</li>
+<li>解释：防止数值过大或过小，稳定输出。</li>
+</ul>
+</li>
+<li><strong>门控 (Gate) (可选)</strong>：<ul>
+<li>代码：<code>self.use_gate</code>, <code>self.g_proj</code>。</li>
+<li>解释：给输出加一个“阀门”，决定输出多少信息。这是一种增强模型表达能力的技巧。</li>
+</ul>
+</li>
+<li><strong>最终投影</strong>：<ul>
+<li>代码：<code>self.o_proj</code>。</li>
+<li>解释：把维度变回模型原本的 <code>hidden_size</code>，以便传给下一层。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>如果你要给别人讲这段代码，你可以这样概括：</p>
+<blockquote>
+<p>“这是一个 <strong>DeltaNet</strong> 层。它先对输入做<strong>局部卷积</strong>提取特征，然后通过计算 Query、Key、Value 和 Beta，利用 <strong>Delta Rule（增量学习规则）</strong> 来更新一个隐式的记忆矩阵。它支持 <strong>Chunk 并行模式</strong>（为了训练快）和 <strong>RNN 循环模式</strong>（为了推理快），是一个高效的线性 Attention 变体。”</p>
+</blockquote>
+<p>现在，再回去看代码里的 <code>q_proj</code>, <code>ShortConvolution</code>, <code>chunk_delta_rule</code>, <code>o_norm</code>，是不是感觉逻辑清晰多了？</p>

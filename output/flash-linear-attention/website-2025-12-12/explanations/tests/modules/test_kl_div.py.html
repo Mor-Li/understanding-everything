@@ -1,0 +1,103 @@
+<h1>tests/modules/test_kl_div.py</h1>
+<p>这段代码其实是一个<strong>自动化测试脚本</strong>（Unit Test）。</p>
+<p>简单来说，它的目的是：<strong>验证一个新的、优化过的算法（叫 <code>FusedKLDivLoss</code>）算出来的结果，是不是和 PyTorch 原生标准算法算出来的结果一模一样。</strong></p>
+<p>如果把这看作一个“任务”，我们可以把它拆解成以下 <strong>5 个步骤（ToDo List）</strong>。让我们一步步来看：</p>
+<hr />
+<h3>📋 任务清单 (ToDo List)</h3>
+<ol>
+<li><strong>准备阶段：设定考题难度 (Parameters)</strong></li>
+<li><strong>造数据：准备输入素材 (Data Initialization)</strong></li>
+<li><strong>标准解法：用笨办法算一遍 (Reference Run)</strong></li>
+<li><strong>优化解法：用新办法算一遍 (Fused Run)</strong></li>
+<li><strong>阅卷：对比两个答案 (Assertion)</strong></li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>1. 准备阶段：设定考题难度</h4>
+<p>代码开头的一堆 <code>@pytest.mark.parametrize</code> 就是在设定不同的“考题难度”和“考场环境”。</p>
+<ul>
+<li><strong>代码：</strong>
+    <code>python
+    @pytest.mark.parametrize("B", [2])          # Batch size (批次大小)
+    @pytest.mark.parametrize("T", [16, 32])     # Time/Sequence length (序列长度)
+    @pytest.mark.parametrize("D", [1024, 2048]) # Dimension (隐藏层维度)
+    @pytest.mark.parametrize("V", [32000...])   # Vocab size (词表大小)</code></li>
+<li><strong>解读：</strong> 测试程序会排列组合这些参数。比如“当 B=2, T=16, D=1024...”时，程序能不能跑通？这模拟了在大语言模型（LLM）训练中常见的数据形状。</li>
+</ul>
+<h4>2. 造数据：准备输入素材</h4>
+<p>有了参数，接下来要随机生成一些数字作为输入。</p>
+<ul>
+<li>
+<p><strong>代码：</strong>
+    ```python
+    # 学生模型的输出 (x) 和 最后一层的权重 (x_weight)
+    x = torch.randn(B * T, D)...requires_grad_()
+    x_weight = torch.randn(V, D)...requires_grad_()</p>
+<h1>老师模型/目标数据的输出 (target_x) 和 权重 (target_weight)</h1>
+<p>target_x = torch.randn(B * T, D)...
+target_weight = torch.randn(V, D)...
+<code>``
+*   **解读：**
+*   这里模拟的是**知识蒸馏**或**KL散度损失**的场景。
+*</code>x<code>是当前模型算出来的特征，</code>target_x<code>是目标（比如更强的模型）算出来的特征。
+*</code>requires_grad_()` 表示我们需要对这些变量求导（反向传播），看看算法能不能正确计算梯度。</p>
+</li>
+</ul>
+<h4>3. 标准解法：用笨办法算一遍 (Reference)</h4>
+<p>这是“对照组”。使用 PyTorch 自带的、最稳健但可能比较慢的方法来计算。</p>
+<ul>
+<li>
+<p><strong>代码：</strong>
+    ```python
+    # 1. 算出预测值的概率分布 (Linear层 -&gt; LogSoftmax)
+    pred = F.linear(x, x_weight).log_softmax(-1)
+    # 2. 算出目标值的概率分布 (Linear层 -&gt; Softmax)
+    target = F.linear(target_x, target_weight).softmax(-1)
+    # 3. 计算两者之间的 KL 散度 (差异)
+    ref = F.kl_div(pred, target, reduction=reduction)</p>
+<h1>4. 反向传播，算出梯度</h1>
+<p>ref.backward(do)
+```
+*   <strong>解读：</strong>
+*   这里把所有步骤拆得很细：先做矩阵乘法（Linear），再转成概率（Softmax），最后算差距（KL Div）。
+*   <strong>重点</strong>：这是标准答案，我们假设它是绝对正确的。</p>
+</li>
+</ul>
+<h4>4. 优化解法：用新办法算一遍 (Fused)</h4>
+<p>这是“实验组”。测试的主角 <code>FusedKLDivLoss</code>。</p>
+<ul>
+<li>
+<p><strong>代码：</strong>
+    ```python
+    # 直接调用融合后的模块，一步到位
+    tri = FusedKLDivLoss(reduction)(x, target_x, x_weight, target_weight)</p>
+<h1>反向传播，算出梯度</h1>
+<p>tri.backward(do)
+<code>``
+*   **解读：**
+*</code>Fused`（融合）的意思是把上面“标准解法”里的矩阵乘法、Softmax、KL散度计算全部合并成一个“内核”操作（通常是为了由 GPU 加速，节省显存和时间）。
+*   代码看起来更短，但内部逻辑很复杂。</p>
+</li>
+</ul>
+<h4>5. 阅卷：对比两个答案 (Assertion)</h4>
+<p>最后，也是最关键的一步。如果新办法算出来的结果和笨办法不一样，测试就失败了。</p>
+<ul>
+<li><strong>代码：</strong>
+    <code>python
+    # 1. 对比最终的 Loss 值 (o)
+    assert_close("  o", ref, tri, 1e-2)
+    # 2. 对比输入 x 的梯度 (dx)
+    assert_close(" dx", ref_dx, tri_dx, 1e-2)
+    # 3. 对比权重 weight 的梯度 (dw)
+    assert_close(" dw", ref_dw, tri_dw, 1e-2)</code></li>
+<li><strong>解读：</strong><ul>
+<li><code>assert_close</code> 意思就是：“这两个数必须非常接近（允许 0.01 的误差）”。</li>
+<li>如果 <strong>Loss值</strong> 一样，且 <strong>梯度（反向传播的方向）</strong> 也一样，说明这个新的 <code>FusedKLDivLoss</code> 写得没问题，可以放心使用。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这篇文章（代码）实际上是在说：</p>
+<blockquote>
+<p>“嘿，我写了一个超快的 KL散度计算模块（FusedKLDivLoss）。为了证明它是对的，我造了一些随机数据，分别用 PyTorch 原生方法和我的新方法算了一遍。结果显示，两者的<strong>计算结果</strong>和<strong>反向传播的梯度</strong>是一模一样的！”</p>
+</blockquote>

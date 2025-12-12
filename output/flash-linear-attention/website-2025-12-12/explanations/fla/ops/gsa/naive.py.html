@@ -1,0 +1,122 @@
+<h1>fla/ops/gsa/naive.py</h1>
+<p>这份代码实现的是 <strong>GSA (Gated Slot Attention)</strong> 的“朴素（Naive）”循环版本。</p>
+<p>之所以叫“朴素”，是因为它用 Python 的 <code>for</code> 循环一步一步写出来的（为了让人看懂逻辑），而不是为了跑得快（跑得快通常需要写 CUDA 内核）。</p>
+<p>这段代码的核心思想是：<strong>把 Attention（注意力机制）拆解成两个串联的 RNN（循环神经网络）过程</strong>。</p>
+<p>为了让你看懂，我把阅读这份代码拆解成 <strong>6 个 Task（任务清单）</strong>，我们一步步来通关。</p>
+<hr />
+<h3>Task 1：搞懂核心角色（输入变量）</h3>
+<p>首先，我们要知道这场戏里的演员是谁。
+代码开头定义了输入：<code>q, k, v, s, g</code>。</p>
+<ul>
+<li><strong>Q, K, V</strong>: 老朋友了，Transformer 里的 Query, Key, Value。</li>
+<li><strong>S (Slots)</strong>: 这是 GSA 的特色。你可以把它理解为一组<strong>“记忆槽位” (Memory Slots)</strong> 或者“桶”。</li>
+<li><strong>G (Gate)</strong>: 门控机制，也就是“遗忘率”。它决定了每一时刻我们要保留多少旧的记忆，忘掉多少。</li>
+</ul>
+<p><strong>你的理解重点：</strong>
+这不仅仅是 $Q \times K$ 找相似度，而是引入了一个中间媒介 $S$（槽位）。</p>
+<hr />
+<h3>Task 2：预处理与门控初始化（准备工作）</h3>
+<p>看代码的这一部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 处理 GQA (Grouped Query Attention) 逻辑，把 k, v, s, g 复制多份以匹配 q 的头数</span>
+<span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">g</span> <span class="o">=</span> <span class="nb">map</span><span class="p">(</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">repeat</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="s1">&#39;b h t d -&gt; b (h g) t d&#39;</span><span class="p">,</span> <span class="n">g</span><span class="o">=</span><span class="n">NG</span><span class="p">),</span> <span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">g</span><span class="p">))</span>
+
+<span class="c1"># 如果没有提供门控 g，就自己算一个</span>
+<span class="k">if</span> <span class="n">g</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">z</span> <span class="o">=</span> <span class="n">s</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">logcumsumexp</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+    <span class="n">g</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="o">...</span> <span class="c1"># 这里是在计算某种归一化的衰减系数</span>
+</code></pre></div>
+
+<p><strong>这一步在干嘛？</strong>
+1.  <strong>对齐数据</strong>：通过 <code>repeat</code> 让 K, V, S 的头数跟 Q 一样多（这是为了支持多头注意力的一种优化变体）。
+2.  <strong>计算遗忘门</strong>：如果没有外部传入 <code>g</code>，它会基于输入 <code>s</code> 自动计算出一个衰减曲线。简单理解就是：<strong>离当前时刻越远的信息，权重越低</strong>。</p>
+<hr />
+<h3>Task 3：第一个 RNN 循环 —— 寻找“槽位”的注意力</h3>
+<p>这是代码中最核心的<strong>第一个 <code>for</code> 循环</strong>。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 初始化隐藏状态 hk (记忆容器)</span>
+<span class="n">hk</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">T</span><span class="p">):</span> <span class="c1"># 遍历每一个时间步 i</span>
+    <span class="c1"># 1. 取出当前时刻的输入</span>
+    <span class="n">q_i</span> <span class="o">=</span> <span class="n">q</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">*</span> <span class="n">scale</span>
+    <span class="n">k_i</span> <span class="o">=</span> <span class="n">k</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>
+    <span class="n">v_i</span> <span class="o">=</span> <span class="n">s</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>  <span class="c1"># 注意！这里把 s 当作 value 用</span>
+    <span class="n">g_i</span> <span class="o">=</span> <span class="n">g</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span> <span class="c1"># 当前的遗忘门</span>
+
+    <span class="c1"># 2. 更新记忆 (RNN 核心公式)</span>
+    <span class="c1"># 新记忆 = 旧记忆 * 衰减 + 新信息</span>
+    <span class="n">hk</span> <span class="o">=</span> <span class="n">hk</span> <span class="o">*</span> <span class="n">g_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">+</span> <span class="n">k_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">v_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>
+
+    <span class="c1"># 3. 计算输出</span>
+    <span class="c1"># 用 Query 去查询当前的记忆 hk</span>
+    <span class="n">ok</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">q_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">hk</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>通俗解释：</strong>
+*   这是一个 <strong>线性 Attention</strong> 的过程。
+*   它在计算 <strong>Query (Q)</strong> 和 <strong>Key (K)</strong> 之间的关系，但是中间通过 <strong>Slot (S)</strong> 进行了中转。
+*   <strong>输出 <code>ok</code></strong>：代表了 Query 对每个“槽位”的关注程度（分数）。</p>
+<hr />
+<h3>Task 4：中间层 —— 归一化 (Softmax)</h3>
+<div class="codehilite"><pre><span></span><code><span class="n">qv</span> <span class="o">=</span> <span class="n">ok</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>这一步在干嘛？</strong>
+*   上一步算出来的 <code>ok</code> 只是原始分数。
+*   这里用 <code>softmax</code> 把分数变成了<strong>概率</strong>。
+*   现在的 <code>qv</code> 变成了新的 Query，它代表：“我有多大的概率去读每一个槽位”。</p>
+<hr />
+<h3>Task 5：第二个 RNN 循环 —— 从“槽位”中提取 Value</h3>
+<p>这是代码里的<strong>第二个 <code>for</code> 循环</strong>。结构和第一个几乎一模一样，但输入变了。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 初始化第二个隐藏状态 hv</span>
+<span class="n">hv</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">T</span><span class="p">):</span>
+    <span class="c1"># 1. 取出输入</span>
+    <span class="n">q_i</span> <span class="o">=</span> <span class="n">qv</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="c1"># 使用刚才 Softmax 算出来的概率作为 Query</span>
+    <span class="n">k_i</span> <span class="o">=</span> <span class="n">s</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>  <span class="c1"># 注意！这里把 s 当作 Key 用</span>
+    <span class="n">v_i</span> <span class="o">=</span> <span class="n">v</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>  <span class="c1"># 这里才是真正的 Value</span>
+    <span class="n">g_i</span> <span class="o">=</span> <span class="n">g</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span>
+
+    <span class="c1"># 2. 更新记忆 (往槽位里存 Value)</span>
+    <span class="c1"># 槽位记忆 = 旧记忆 * 衰减 + 当前的 Value 存入对应的 Slot</span>
+    <span class="n">hv</span> <span class="o">=</span> <span class="n">hv</span> <span class="o">*</span> <span class="n">g_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="p">:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">+</span> <span class="n">k_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">v_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>
+
+    <span class="c1"># 3. 计算输出</span>
+    <span class="c1"># 根据概率 q_i 从槽位记忆 hv 中读取最终结果</span>
+    <span class="n">ov</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">q_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">hv</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>通俗解释：</strong>
+*   在这个循环里，我们把真正的 <strong>Value (V)</strong> 存进了 <strong>Slot (S)</strong> 对应的记忆里。
+*   然后，利用 Task 4 算出来的“槽位关注度” (<code>qv</code>)，把这些 Value 加权提取出来。</p>
+<hr />
+<h3>Task 6：总结全流程 (The Big Picture)</h3>
+<p>把上面两步连起来，这个算法的逻辑链条是这样的：</p>
+<ol>
+<li>
+<p><strong>第一步 (K-S Loop)</strong>：</p>
+<ul>
+<li>输入：$Q, K, S$</li>
+<li>逻辑：$Q$ 询问 $K$：“这一时刻，哪个 $S$ (槽位) 比较重要？”</li>
+<li>结果：得到了对槽位的注意力分布。</li>
+</ul>
+</li>
+<li>
+<p><strong>第二步 (S-V Loop)</strong>：</p>
+<ul>
+<li>输入：(上一步的结果), $S, V$</li>
+<li>逻辑：根据槽位的重要性，去对应的槽位里把 $V$ (内容) 取出来。</li>
+<li>结果：最终的输出。</li>
+</ul>
+</li>
+</ol>
+<p><strong>为什么要这么做？</strong>
+标准的 Attention 是 $O(T^2)$ 复杂度（随着序列长度平方增长，很慢）。
+这个算法通过引入中间状态（RNN 的写法），把复杂度降到了 $O(T)$（线性增长，很快），同时利用 $S$ (Slot) 保持了较强的信息提取能力。</p>
+<h3>总结 Checklist</h3>
+<p>如果你想彻底看懂，请按这个顺序回顾代码：
+1.  [ ] 看到 <code>transpose</code> 和 <code>repeat</code>，知道这是在整理数据格式。
+2.  [ ] 看到第一个 <code>for</code> 循环，知道这是 <strong>Q 和 K 互动</strong>，算出对 Slot 的打分。
+3.  [ ] 看到 <code>softmax</code>，知道这是把打分变成概率。
+4.  [ ] 看到第二个 <code>for</code> 循环，知道这是 <strong>根据概率去取 V</strong>。
+5.  [ ] 看到 <code>hk = hk * g + ...</code>，知道这是标准的 RNN 更新公式（遗忘 + 写入）。</p>

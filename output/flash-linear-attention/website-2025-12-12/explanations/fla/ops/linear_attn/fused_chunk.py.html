@@ -1,0 +1,107 @@
+<h1>fla/ops/linear_attn/fused_chunk.py</h1>
+<p>这份代码确实非常抽象，因为它是一个<strong>高性能深度学习库（Fast Linear Attention - FLA）</strong>的底层实现片段。它主要是在做一个“包装”（Wrapper）的工作，把复杂的数学运算隐藏在更底层的函数里了。</p>
+<p>为了让你看懂，我制定了一个<strong>四步走的 Task List（任务清单）</strong>。我们像剥洋葱一样，一步步揭开它的面纱。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1：搞懂背景 —— 什么是“线性注意力” (Linear Attention)？</strong><ul>
+<li><em>目标：理解为什么要用这个，而不是普通的 Attention。</em></li>
+</ul>
+</li>
+<li><strong>Task 2：搞懂策略 —— 什么是“Fused Chunk” (融合分块)？</strong><ul>
+<li><em>目标：理解为了加速，代码在计算逻辑上做了什么手脚。</em></li>
+</ul>
+</li>
+<li><strong>Task 3：搞懂数据 —— 输入的 Q, K, V 长什么样？</strong><ul>
+<li><em>目标：看懂函数参数里的 shape <code>[B, T, H, K]</code> 是什么意思。</em></li>
+</ul>
+</li>
+<li><strong>Task 4：逐行代码解析 —— 这个函数到底干了啥？</strong><ul>
+<li><em>目标：看懂代码内部的逻辑流（其实只有两步）。</em></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 详细讲解</h3>
+<h4>☑️ Task 1：搞懂背景 —— 什么是“线性注意力”？</h4>
+<ul>
+<li><strong>普通 Attention (Transformer):</strong> 计算量是 $O(N^2)$。如果你有一本书那么长的字，计算量会爆炸，显存会撑爆。</li>
+<li><strong>线性 Attention (Linear Attention):</strong> 这是一种优化变体。它通过数学技巧（改变计算顺序），把计算量降低到了 $O(N)$（线性）。<ul>
+<li><strong>直观理解：</strong> 普通 Attention 是“每一个词都要看一眼之前所有的词”；线性 Attention 更像是一个 RNN（循环神经网络），它维护一个“记忆状态”（State），读一个词，更新一下记忆，输出一个结果。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论：</strong> 这个文件的目的是实现一个<strong>省显存、速度快</strong>的 Attention 版本。</p>
+<h4>☑️ Task 2：搞懂策略 —— 什么是“Fused Chunk”？</h4>
+<p>为了让线性 Attention 在 GPU 上跑得极快，科学家们发明了 <strong>Chunk（分块）</strong> 技术：</p>
+<ol>
+<li><strong>纯 RNN 模式：</strong> 一个词一个词串行处理，在 GPU 上很慢（GPU 喜欢并行）。</li>
+<li><strong>Chunk 模式：</strong> 把长序列切成很多小块（比如每块 128 个词）。<ul>
+<li><strong>块内</strong>：使用并行计算（像 Transformer）。</li>
+<li><strong>块间</strong>：使用串行传递记忆（像 RNN）。</li>
+</ul>
+</li>
+<li><strong>Fused (融合)：</strong> 指的是代码实现层面，把很多小的计算步骤写成一个大的 CUDA/Triton 核函数（Kernel），一次性算完，减少数据搬运。</li>
+</ol>
+<p><strong>结论：</strong> 文件名 <code>fused_chunk</code> 告诉你，这是一种结合了并行和串行优势的、经过底层编译优化的算法。</p>
+<h4>☑️ Task 3：搞懂数据 —— 输入参数解析</h4>
+<p>让我们看代码中的 <code>Args</code> 部分，这决定了我们要喂给它什么数据：</p>
+<ul>
+<li><strong><code>q, k</code> (Query, Key):</strong> 形状是 <code>[B, T, H, K]</code>。<ul>
+<li><code>B</code>: Batch size (一次处理几句话)。</li>
+<li><code>T</code>: Time / Sequence length (句子的长度)。</li>
+<li><code>H</code>: Heads (多头注意力的头数)。</li>
+<li><code>K</code>: Key dimension (每个头的特征维度，比如 64 或 128)。</li>
+</ul>
+</li>
+<li><strong><code>v</code> (Value):</strong> 形状是 <code>[B, T, H, V]</code>。注意这里的 <code>V</code> 可以和 <code>K</code> 不一样，通常是输出的维度。</li>
+<li><strong><code>initial_state</code>:</strong> 形状 <code>[B, H, K, V]</code>。<ul>
+<li>这就是 Task 1 提到的“记忆”。如果你把长文章切成两段，算第二段时，可以把第一段算出来的 <code>final_state</code> 传进来作为 <code>initial_state</code>，这样模型就“记得”前文了。</li>
+</ul>
+</li>
+</ul>
+<h4>☑️ Task 4：逐行代码解析 —— 这个函数到底干了啥？</h4>
+<p>现在我们来看核心代码，你会发现它其实是一个“中间商”。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这是一个装饰器，告诉 PyTorch 编译器不要在这里搞事情，按原样运行</span>
+<span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">fused_chunk_linear_attn</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... (省略参数定义) ...</span>
+
+    <span class="c1"># [第一步]：借鸡生蛋</span>
+    <span class="c1"># 这个函数本身并没有重写复杂的 CUDA 逻辑。</span>
+    <span class="c1"># 它是直接调用了 `fused_chunk_simple_gla`。</span>
+    <span class="c1"># GLA (Gated Linear Attention) 是更高级的版本。</span>
+    <span class="c1"># 标准的 Linear Attention 可以看作是 GLA 的一个特例（Gate 为 1 或者特定形式）。</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">final_state</span> <span class="o">=</span> <span class="n">fused_chunk_simple_gla</span><span class="p">(</span>
+        <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span>
+        <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span>
+        <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span>
+        <span class="n">scale</span><span class="o">=</span><span class="n">scale</span><span class="p">,</span>
+        <span class="n">initial_state</span><span class="o">=</span><span class="n">initial_state</span><span class="p">,</span>
+        <span class="n">output_final_state</span><span class="o">=</span><span class="n">output_final_state</span><span class="p">,</span>
+        <span class="n">cu_seqlens</span><span class="o">=</span><span class="n">cu_seqlens</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="c1"># [第二步]：归一化 (Normalization)</span>
+    <span class="c1"># 线性注意力在数学上通常需要除以一个归一化项（分母）。</span>
+    <span class="c1"># 公式类似于：Output = (Q * State) / (Q * k_cumsum)</span>
+    <span class="k">if</span> <span class="n">normalize</span><span class="p">:</span>
+        <span class="c1"># scale 通常是 1/sqrt(K)</span>
+        <span class="c1"># 这里计算分母并让输出 o 除以这个分母</span>
+        <span class="n">o</span> <span class="o">=</span> <span class="n">normalize_output</span><span class="p">(</span><span class="n">q</span> <span class="o">*</span> <span class="n">scale</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">o</span><span class="p">)</span>
+
+    <span class="c1"># [第三步]：返回结果</span>
+    <span class="c1"># o: 注意力计算后的输出</span>
+    <span class="c1"># final_state: 这一段算完后的“记忆”，可以传给下一段用</span>
+    <span class="k">return</span> <span class="n">o</span><span class="p">,</span> <span class="n">final_state</span>
+</code></pre></div>
+
+<h3>📝 总结 (Summary)</h3>
+<p>这个脚本的作用是：</p>
+<ol>
+<li><strong>对外提供接口</strong>：它叫 <code>linear_attn</code>，给用户提供标准的线性注意力功能。</li>
+<li><strong>内部复用代码</strong>：它发现线性注意力和 <code>simple_gla</code>（一种带门控的注意力）计算逻辑很像，所以直接调用了 <code>simple_gla</code> 的底层算子来计算核心乘法。</li>
+<li><strong>数学修正</strong>：计算完核心乘法后，它执行了 <code>normalize_output</code>，这是线性注意力公式中必须的一步（除以分母），保证数值稳定。</li>
+</ol>
+<p><strong>简单一句话：</strong>
+这就是个<strong>外壳函数</strong>，它利用现有的高性能 GLA 算子算出了中间结果，然后做了一个除法归一化，就完成了标准的线性注意力计算。</p>

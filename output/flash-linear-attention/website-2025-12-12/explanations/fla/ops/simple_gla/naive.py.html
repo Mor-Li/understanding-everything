@@ -1,0 +1,154 @@
+<h1>fla/ops/simple_gla/naive.py</h1>
+<p>这份代码确实比较硬核，它实现的是 <strong>Gated Linear Attention (GLA)</strong> 的朴素（Naive）版本。简单来说，它是为了让 Transformer 处理长序列时更快、更省显存而设计的一种机制。</p>
+<p>为了让你看懂，我制定了一个 <strong>“学习任务清单 (Todo List)”</strong>。我们将把代码拆解成 4 个任务，由浅入深，一步步攻克。</p>
+<hr />
+<h3>📝 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂核心概念</strong> —— 这里的 Q, K, V, g 到底是在干什么？</li>
+<li><strong>Task 2: 看懂 <code>naive_parallel_simple_gla</code></strong> —— 上帝视角（并行模式）：一次性算完所有关联。</li>
+<li><strong>Task 3: 看懂 <code>naive_recurrent_simple_gla</code></strong> —— 蚂蚁视角（循环模式）：一步一步往前走。</li>
+<li><strong>Task 4: 看懂 <code>naive_chunk_simple_gla</code></strong> —— 混合视角（分块模式）：既要并行又要循环（这是最难也是最常用的部分）。</li>
+</ol>
+<hr />
+<h3>✅ Task 1: 搞懂核心概念</h3>
+<p>在看代码前，先建立一个直觉：
+*   <strong>Q, K, V</strong>: 和标准 Transformer 一样。Query（查询），Key（索引），Value（内容）。
+*   <strong>g (Gate/Decay)</strong>: 这是 GLA 的特色。它是一个<strong>衰减系数</strong>。
+    *   在标准 Attention 里，所有之前的 token 都能被看到。
+    *   在 GLA 里，越久远的信息，会被 $g$ 逐渐“遗忘”。
+*   <strong>三种模式的区别</strong>：
+    *   <strong>Parallel（并行）</strong>: 训练时用。像矩阵乘法一样，一次算出所有结果。
+    *   <strong>Recurrent（循环）</strong>: 推理（生成文本）时用。像 RNN 一样，存一个状态 $S$，来一个词算一次。
+    *   <strong>Chunk（分块）</strong>: 混合体。把长序列切成小块，块内并行，块间循环。为了兼顾训练速度和显存。</p>
+<hr />
+<h3>✅ Task 2: 看懂 <code>naive_parallel_simple_gla</code> (上帝视角)</h3>
+<p>这个函数最符合直觉，因为它和普通 Attention 最像。</p>
+<p><strong>核心逻辑：</strong> Output = (Q * K) * V，但是中间加了个衰减 $D$。</p>
+<p><strong>代码拆解：</strong></p>
+<ol>
+<li>
+<p><strong>计算注意力分数矩阵 <code>A</code></strong>:
+    <code>python
+    A = (q @ k.transpose(-1, -2) * scale)</code>
+    这和普通 Attention 一样，算出 Query 和 Key 的相似度。</p>
+</li>
+<li>
+<p><strong>计算衰减矩阵 <code>D</code> (关键点)</strong>:
+    <code>python
+    g = g.cumsum(-1) # 在时间轴上累加
+    D = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().tril()</code></p>
+<ul>
+<li>这里利用了对数性质：乘法衰减在对数域变成了加减法。</li>
+<li><code>g.cumsum</code> 算出了每个位置的累积衰减量。</li>
+<li><code>g[i] - g[j]</code> 表示从时刻 $j$ 到时刻 $i$ 经历了多少衰减。</li>
+<li><code>.exp()</code> 把它变回乘法系数。</li>
+<li><code>.tril()</code> 保证因果性（只能看过去，不能看未来）。</li>
+</ul>
+</li>
+<li>
+<p><strong>应用衰减并输出</strong>:
+    <code>python
+    A = A * D  # 给注意力分数乘上衰减系数
+    o = A @ v  # 加权求和 Value</code></p>
+</li>
+</ol>
+<p><strong>总结 Task 2</strong>: 并行模式就是 <strong>“带衰减掩码（Mask）的矩阵乘法”</strong>。</p>
+<hr />
+<h3>✅ Task 3: 看懂 <code>naive_recurrent_simple_gla</code> (蚂蚁视角)</h3>
+<p>这个函数像 RNN。如果你懂 RNN，这个很好理解。它维护一个记忆状态 $S$。</p>
+<p><strong>核心逻辑：</strong>
+*   新记忆 $S_t$ = 旧记忆 $S_{t-1} \times \text{衰减} + \text{当前时刻的新知识}(K_t, V_t)$
+*   输出 $O_t$ = $Q_t \times S_t$</p>
+<p><strong>代码拆解：</strong></p>
+<ol>
+<li>
+<p><strong>初始化状态 <code>S</code></strong>:
+    <code>python
+    S = q.new_zeros(B, H, K, V) # 一个 [Key维度, Value维度] 的矩阵</code>
+    这就相当于 RNN 的 Hidden State。</p>
+</li>
+<li>
+<p><strong>时间步循环 (Loop)</strong>:
+    ```python
+    for i in range(T):
+        # 1. 准备门控和KV
+        gate = g[:, :, i].exp() # 当前时刻的遗忘门
+        kv = k... * v...        # 当前时刻产生的新信息 (K * V)</p>
+<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 2. 更新记忆状态 S (核心公式)
+<span class="gh">#</span> S_new = S_old * gate + new_kv
+S = S <span class="gs">* gate... + kv</span>
+
+<span class="gs"># 3. 计算输出</span>
+<span class="gs"># Output = Q *</span> S
+o_i = (q_i... * S).sum(-2)
+</code></pre></div>
+
+<p>```</p>
+</li>
+</ol>
+<p><strong>总结 Task 3</strong>: 循环模式就是 <strong>“一边走，一边忘(乘gate)，一边记(加KV)，一边读(乘Q)”</strong>。</p>
+<hr />
+<h3>✅ Task 4: 看懂 <code>naive_chunk_simple_gla</code> (大魔王：分块视角)</h3>
+<p>这是最复杂的，也是 <code>naive.py</code> 里第一个函数。它把 Task 2 和 Task 3 结合了。
+假设序列长度 1000，chunk_size=64。它把序列切成 16 块。</p>
+<p><strong>核心逻辑：</strong>
+*   <strong>块内（Intra-chunk）</strong>: 用 Task 2 的并行方法算（快）。
+*   <strong>块间（Inter-chunk）</strong>: 用 Task 3 的循环方法传递状态 $S$（省显存）。</p>
+<p><strong>代码逐步拆解：</strong></p>
+<ol>
+<li>
+<p><strong>重排数据 (Reshape)</strong>:
+    <code>python
+    # 把时间 T 拆成 n 个块，每个块长 c (chunk_size)
+    q = rearrange(x, 'b h (n c) d -&gt; b h n c d', c=chunk_size)</code>
+    现在数据变成了 5 维：<code>[Batch, Head, 块数量n, 块大小c, 维度d]</code>。</p>
+</li>
+<li>
+<p><strong>准备块内的衰减掩码 <code>L_mask</code></strong>:
+    <code>python
+    # 这部分逻辑和 Task 2 的并行衰减矩阵 D 一模一样
+    # 只不过是针对每个小块内部计算
+    L_mask = ((decay... - decay...).tril().exp().float()).tril()</code></p>
+</li>
+<li>
+<p><strong>遍历每一个块 (Loop over chunks)</strong>:
+    <code>python
+    for i in range(0, T1 // chunk_size):
+        # 取出第 i 个块的数据
+        q_i, k_i, v_i = ...</code></p>
+</li>
+<li>
+<p><strong>计算块内的输出 (Intra-chunk Attention)</strong>:
+    <code>python
+    # 这就是 Task 2 的逻辑：Q * K^T * Mask * V
+    attn = (q_i @ k_i.transpose(-1, -2) * L_mask[:, :, i])
+    # attn @ v_i 是这部分对输出的贡献</code></p>
+</li>
+<li>
+<p><strong>计算历史记忆对当前块的影响 (Inter-chunk)</strong>:
+    <code>python
+    # S 是上一个块传过来的记忆状态 (类似 Task 3)
+    # 当前的 Q 乘以 衰减后的历史 S
+    o_inter = (q_i * decay[:, :, i, :, None].exp()) @ S</code></p>
+</li>
+<li>
+<p><strong>合并结果并更新状态</strong>:
+    ```python
+    # 总输出 = 历史贡献 + 块内贡献
+    o[:, :, i] = o_inter + attn @ v_i</p>
+<h1>更新 S，准备传给下一个块 (类似 Task 3 的更新公式)</h1>
+<h1>S_new = S_old * 整个块的衰减 + 当前块累积的KV信息</h1>
+<p>S = S * ... + (k_i * ...).transpose(-1, -2) @ v_i
+```</p>
+</li>
+</ol>
+<hr />
+<h3>🏁 总结</h3>
+<p>这个文件其实就是用三种不同的数学等价形式实现了同一个算法：</p>
+<ol>
+<li><strong><code>naive_parallel</code></strong>: 暴力矩阵乘法，公式简单，长序列显存爆炸。</li>
+<li><strong><code>naive_recurrent</code></strong>: 写循环，显存极小，但是 Python <code>for</code> 循环太慢，训练跑不动。</li>
+<li><strong><code>naive_chunk</code></strong>: <strong>这是你要重点理解的</strong>。它把序列切段，段内用矩阵乘法加速，段间传状态省显存。这是目前线性 Attention 实现的主流方式。</li>
+</ol>
+<p><strong>建议阅读顺序：</strong>
+先看 <code>recurrent</code> 理解原理（状态更新），再看 <code>parallel</code> 理解矩阵形式，最后硬着头皮看 <code>chunk</code> 的维度变换。</p>

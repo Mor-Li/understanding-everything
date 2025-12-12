@@ -1,0 +1,113 @@
+<h1>fla/ops/mesa_net/chunk_cg_solver_fwd.py</h1>
+<p>这份代码确实非常硬核，因为它不仅仅是一个简单的神经网络层，而是一个<strong>线性方程组求解器（Solver）</strong>的GPU实现。</p>
+<p>简单来说，普通的Attention是直接算 $Q \times K$，而这里是在解一个方程 $A \cdot x = Q$，试图找到最优的 $x$。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“任务清单 (Todo List)”</strong>，我们一步步来完成这个算法的逻辑。</p>
+<hr />
+<h3>核心任务：Mesa-Attention 的前向传播</h3>
+<p><strong>目标</strong>：在一个序列数据流中（比如处理一段文本），对于当前的这一小块数据（Chunk），我们要结合<strong>之前的历史记忆</strong>和<strong>当前的信息</strong>，算出一个输出。</p>
+<p><strong>难点</strong>：这里不是直接乘法，而是用 <strong>共轭梯度法 (Conjugate Gradient, CG)</strong> 迭代求解一个隐藏状态。</p>
+<hr />
+<h3>✅ Step 1: 准备工作 (数据加载)</h3>
+<p>在开始计算之前，我们需要把数据从显存搬到计算单元（SRAM）里。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>chunk_fwd_mesa_cg_dim64_kernel</code> 函数的前半部分。</li>
+<li><strong>动作</strong>：<ol>
+<li><strong>定位</strong>：确定当前处理的是第几个 Batch (<code>i_b</code>) 的第几块数据 (<code>i_t</code>) 以及第几个注意力头 (<code>i_h</code>)。</li>
+<li><strong>加载 Q (Query)</strong>：这里的 <code>b_q</code> 实际上是方程 $Ax=b$ 中的 $b$（目标值）。</li>
+<li><strong>加载 K (Key)</strong>：用于构建系数矩阵。</li>
+<li><strong>加载 H (History)</strong>：这是上一个 Chunk 传过来的“记忆状态”。</li>
+<li><strong>加载 G (Gate/Decay)</strong>：<code>b_g</code> 和 <code>b_beta</code> 是用来控制遗忘的（类似于 LSTM 的门控），决定以前的信息保留多少。</li>
+<li><strong>加载 Lambda</strong>：<code>b_lamb</code> 是正则化项，防止数值不稳定。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>白话解释</strong>：厨师把今天要用的食材（Q, K）、老汤底（H）和调料（G, Lambda）都摆到了案板上。</p>
+</blockquote>
+<hr />
+<h3>✅ Step 2: 定义“规则” (矩阵乘法逻辑)</h3>
+<p>共轭梯度法（CG）不需要显式地把巨大的矩阵 $A$ 写出来，只需要定义“向量 $v$ 乘矩阵 $A$ 会得到什么”。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>chunk_update_once</code> 函数。</li>
+<li><strong>公式逻辑</strong>：$Output = (Local_Attention) + (History_Attention) + (Regularization)$<ul>
+<li><code>tl.dot(b_p... b_k) * b_m</code>: <strong>局部项</strong>。当前 Chunk 内部，向量 $p$ 和 $K$ 的相互作用。</li>
+<li><code>tl.dot(... b_h)</code>: <strong>历史项</strong>。向量 $p$ 和历史记忆 $H$ 的相互作用。</li>
+<li><code>b_lamb * b_p</code>: <strong>正则项</strong>。加上一点自身的值，保证矩阵可逆（对角线加值）。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>白话解释</strong>：这是定义了一个“黑盒机器”。你给它一个输入向量，它告诉你经过当前的 Key 和历史记忆混合后，输出了什么。CG 算法会反复调用这个黑盒。</p>
+</blockquote>
+<hr />
+<h3>✅ Step 3: 核心求解 (共轭梯度循环)</h3>
+<p>这是整个文件最难懂的部分，也就是 <code>for i in range(max_CG_iteration):</code> 这个循环。
+我们要解方程 $A \cdot x = Q$，求 $x$。</p>
+<ul>
+<li>
+<p><strong>初始化</strong>：</p>
+<ul>
+<li><code>b_x</code> (解)：一开始设为 0。</li>
+<li><code>b_r</code> (残差/误差)：一开始误差就是 $Q$ (因为 $Q - A \cdot 0 = Q$)。</li>
+<li><code>b_p</code> (搜索方向)：一开始沿着误差方向走。</li>
+</ul>
+</li>
+<li>
+<p><strong>循环迭代 (Todo List)</strong>：</p>
+<ol>
+<li><strong>试探</strong>：调用 Step 2 的黑盒 (<code>chunk_update_once</code>)，计算当前方向 <code>b_p</code> 经过矩阵 $A$ 变换后的结果 <code>b_o</code>。</li>
+<li><strong>计算步长 (alpha)</strong>：计算我们要在这个方向走多远才能最大程度减小误差。</li>
+<li><strong>更新解 (b_x)</strong>：<code>b_x += alpha * b_p</code>。我们在寻找的那个神秘向量 $x$ 变得更精确了。</li>
+<li><strong>更新残差 (b_r)</strong>：减去刚刚消除的误差，看看还剩多少误差。</li>
+<li><strong>修正方向 (b_p)</strong>：根据新的误差，调整下一次搜索的方向（这就是“共轭”的意思，不走回头路）。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>白话解释</strong>：这就像在雾中射击。
+1. 第一枪打偏了（有残差）。
+2. 根据偏差调整角度（修正方向）。
+3. 再开一枪，看弹着点（调用 <code>chunk_update_once</code>）。
+4. 重复这个过程 30 次 (<code>max_CG_iteration</code>)，直到准星几乎完美对准目标。
+<strong>最终得到的 <code>b_x</code> 就是我们修正后的 Query，代码里叫 <code>q_final</code>。</strong></p>
+</blockquote>
+<hr />
+<h3>✅ Step 4: 生成最终输出 (Output)</h3>
+<p>现在我们解出了最优的 $x$ (即 <code>b_x</code>)，最后一步就是用它来生成 Attention 的输出。</p>
+<ul>
+<li><strong>代码位置</strong>：循环结束后。</li>
+<li><strong>动作</strong>：<ol>
+<li><strong>保存 q_final</strong>：把辛苦算出来的 <code>b_x</code> 存回显存，供反向传播使用。</li>
+<li><strong>加载 V (Value)</strong>：加载 Value 矩阵。</li>
+<li><strong>加载 H_KV</strong>：这是专门用于 Key-Value 的历史状态（注意跟之前的 H 略有不同，之前是 Key-Key）。</li>
+<li><strong>最后一次计算</strong>：
+    再次调用 <code>chunk_update_once</code>，但是这次参数变了：<ul>
+<li>输入是刚刚算出的最优解 <code>b_x</code>。</li>
+<li>要把结果映射到 <code>b_v</code> (Value) 上。</li>
+<li>公式变成了：$Output = (Attention_Score) \times V$。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>白话解释</strong>：我们费劲算出 <code>b_x</code> 只是为了得到准确的“注意力权重”。现在权重有了，直接拿去乘 Value ($V$)，就得到了最终的输出结果 $O$。</p>
+</blockquote>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑流是：</p>
+<ol>
+<li><strong>Input</strong>: 拿到 $Q, K, V$ 和历史记忆 $H$。</li>
+<li><strong>Solver (CG Loop)</strong>:<ul>
+<li>不要直接用 $Q$。</li>
+<li>我们要找一个向量 $x$，使得 $x$ 和 $K$ 结合后最接近 $Q$。</li>
+<li>通过 30 次迭代，把 $Q$ “打磨”成了 $x$ (<code>q_final</code>)。</li>
+</ul>
+</li>
+<li><strong>Output</strong>:<ul>
+<li>用打磨好的 $x$ 去乘 $V$，得到最终输出。</li>
+</ul>
+</li>
+</ol>
+<p><strong>为什么要这么做？</strong>
+Mesa-Attention 认为直接的 Attention 容易过拟合或者捕捉不到深层关系。它通过把“计算注意力”变成“解一个线性系统（最小二乘法）”，让模型能更鲁棒地处理长序列信息。</p>

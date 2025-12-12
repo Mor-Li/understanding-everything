@@ -1,0 +1,55 @@
+<h1>benchmarks/modules/benchmark_tokenshift.py</h1>
+<p>这份代码其实是一个<strong>性能测试（Benchmark）脚本</strong>。</p>
+<p>它的核心目的是：<strong>比较两种不同的“Token Shift（令牌移位）”算法实现方式，看看谁跑得更快。</strong></p>
+<p>为了让你彻底搞懂，我为你列了一个由浅入深的学习 List（任务清单）。我们一步步把这个文件拆解开来。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<h4>✅ Task 1: 搞懂“Token Shift”在算什么 (核心数学逻辑)</h4>
+<p>首先我们要知道这个脚本测试的数学公式是什么。
+请看代码中的 <code>token_shift_ref</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">token_shift_ref</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
+    <span class="c1"># 1. 把数据 x 进行填充和移位</span>
+    <span class="n">shifted</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">pad</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+    <span class="c1"># 2. 用移位后的数据减去原数据</span>
+    <span class="n">delta</span> <span class="o">=</span> <span class="n">shifted</span> <span class="o">-</span> <span class="n">x</span>
+    <span class="k">return</span> <span class="n">delta</span>
+</code></pre></div>
+
+<ul>
+<li><strong>直白解释</strong>：这其实是在计算<strong>当前时刻的数据与上一时刻数据的差值</strong>。</li>
+<li><strong>类比</strong>：就像计算股票今天的价格比昨天涨了还是跌了多少。</li>
+<li><strong>术语</strong>：这叫“Naive（朴素/原生）实现”，因为它直接使用了 PyTorch 自带的基础函数拼凑而成。</li>
+</ul>
+<h4>✅ Task 2: 认识两位“参赛选手” (对比对象)</h4>
+<p>这个脚本是为了让两个选手赛跑：
+1.  <strong>选手 A (Naive)</strong>: 就是上面提到的 <code>token_shift_ref</code>。它是用 PyTorch 标准积木搭出来的，简单但可能不够快。
+2.  <strong>选手 B (Fused)</strong>: 代码里导入的 <code>from fla.modules.token_shift import token_shift</code>。
+    *   <strong>重点</strong>：<code>Fused</code> 意味着“融合算子”。这通常是用更底层的语言（如 Triton 或 CUDA）专门写的高性能代码，它把“移位”和“相减”这两个动作合并在一次内存读取中完成了。
+    *   <strong>预期</strong>：选手 B 应该比选手 A 快很多。</p>
+<h4>✅ Task 3: 设定比赛规则 (Benchmark 配置)</h4>
+<p>看 <code>@triton.testing.perf_report</code> 这一大段装饰器，这是比赛的设置：
+*   <strong>跑道长度 (<code>x_names=['T']</code>)</strong>: 比赛主要变量是序列长度 $T$（Sequence Length）。
+*   <strong>具体赛程 (<code>x_vals</code>)</strong>: $T$ 从 $128$ 开始，每次翻倍，一直测到 $128 \times 2^8$。这意味着会测试短文本处理速度，也会测试长文本。
+*   <strong>参赛项目 (<code>line_vals</code>)</strong>:
+    1.  <code>naive_token_shift</code>: 选手 A 的前向传播（算结果）。
+    2.  <code>fused_token_shift</code>: 选手 B 的前向传播（算结果）。
+    3.  <code>naive_token_shift_bwd</code>: 选手 A 的反向传播（算梯度，用于训练）。
+    4.  <code>fused_token_shift_bwd</code>: 选手 B 的反向传播。</p>
+<h4>✅ Task 4: 理解比赛过程 (Benchmark 函数)</h4>
+<p>看 <code>def benchmark(T, provider):</code> 函数内部：
+1.  <strong>准备数据</strong>:
+    *   <code>B, D = 8, 4096</code>: 设定 Batch Size 为 8，隐藏层维度为 4096。
+    *   <code>x = torch.randn(...)</code>: 生成随机的输入数据。
+2.  <strong>开始计时</strong>:
+    *   代码中有四个 <code>if</code>，根据当前的 <code>provider</code>（选手名字），调用 <code>triton.testing.do_bench</code>。
+    *   <code>do_bench</code> 是一个专门的计时器，它会运行函数很多次，然后取平均时间。
+3.  <strong>反向传播测试 (<code>_bwd</code>)</strong>:
+    *   如果是测试 <code>bwd</code> (backward)，代码会先生成一个梯度 <code>grad_output</code>，然后运行 <code>.backward()</code>。这是为了模拟神经网络训练时的开销。</p>
+<h4>✅ Task 5: 总结结果</h4>
+<ul>
+<li><strong>目的</strong>: 这个脚本运行后，会生成一张图表（或者打印出数据）。</li>
+<li><strong>看点</strong>: 随着序列长度 $T$ 越来越长（横轴），“Fused”（融合算子）的时间（纵轴）应该比 “Naive”（原生算子）更低，曲线更平缓。这证明了优化后的代码效率更高。</li>
+</ul>
+<hr />
+<h3>总结 (一句话概括)</h3>
+<p><strong>这个文件就是为了证明：作者写的 <code>fused_token_shift</code>（融合移位算子）比 PyTorch 自带的写法在处理长序列时速度更快、性能更好。</strong></p>

@@ -1,0 +1,123 @@
+<h1>fla/modules/l2norm.py</h1>
+<p>这份代码确实看起来比较硬核，因为它不仅仅是 PyTorch 代码，还包含了 <strong>Triton</strong>（一种用于编写 GPU 高性能算子的语言）。</p>
+<p>简单来说，这个文件的目的是：<strong>手写了一个在 GPU 上运行极快的 L2 Normalization（L2 归一化）算子，用来替代 PyTorch 原生的实现，以提高训练/推理速度。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>学习任务清单 (Task List)</strong>，我们一步步来通关。</p>
+<hr />
+<h3>Task 1: 理解这一层的数学原理 (Math Concept)</h3>
+<p>在看代码前，先搞懂它在算什么。
+<strong>L2 Normalization</strong> 的公式非常简单。假设输入向量是 $x$：</p>
+<ol>
+<li><strong>计算模长（范数）</strong>：算出向量长度。
+    $$ \text{Norm} = \sqrt{\sum x^2 + \epsilon} $$
+    <em>(其中 $\epsilon$ 是为了防止除以 0 的微小数值)</em></li>
+<li><strong>归一化</strong>：把向量除以它的模长，使其长度变为 1。
+    $$ y = \frac{x}{\text{Norm}} $$</li>
+</ol>
+<p>代码中还会保存一个 <code>rstd</code> (reciprocal standard deviation)，其实就是 $\frac{1}{\text{Norm}}$，为了反向传播时计算方便。</p>
+<hr />
+<h3>Task 2: 理解 Triton 的两种“流派” (The Two Strategies)</h3>
+<p>你会发现代码里有两组 kernel（内核函数）：
+1.  <code>l2norm_fwd_kernel1</code> 和 <code>l2norm_bwd_kernel1</code>
+2.  <code>l2norm_fwd_kernel</code> 和 <code>l2norm_bwd_kernel</code> (没有数字 1)</p>
+<p><strong>为什么要写两套？</strong>
+这是为了性能优化。
+*   <strong>策略 1 (Kernel 1)</strong>：适用于特征维度 <strong>D 比较大</strong> 的情况（比如 D &gt; 512）。它的逻辑是：<strong>一个 GPU 线程块（Block）处理一行数据</strong>。
+*   <strong>策略 2 (Kernel)</strong>：适用于特征维度 <strong>D 比较小</strong> 的情况（比如 D &lt;= 512）。它的逻辑是：<strong>一个 GPU 线程块同时处理多行数据（BT行）</strong>，使用了 Triton 的高级特性 <code>Block Pointer</code> 来加速内存读写。</p>
+<hr />
+<h3>Task 3: 解析简单版前向传播 (Kernel 1: Large D)</h3>
+<p>让我们看 <code>l2norm_fwd_kernel1</code>，这是最直观的实现。</p>
+<ul>
+<li><strong>输入参数</strong>：<code>x</code> (输入), <code>y</code> (输出), <code>rstd</code> (中间变量), <code>D</code> (维度)。</li>
+<li><strong>逻辑拆解</strong>：<ol>
+<li><code>i_t = tl.program_id(0)</code>: 我当前是第几个 GPU 程序块？这对应数据的第几行。</li>
+<li><code>x += i_t * D</code>: 把指针移动到当前这行数据的开头。</li>
+<li><code>cols = tl.arange(0, BD)</code>: 生成 0 到 BD 的索引（BD 是 D 的 2 的幂次圆整，用来对齐内存）。</li>
+<li><code>b_x = tl.load(...)</code>: <strong>读取</strong> 这一行数据。</li>
+<li><code>b_rstd = 1 / tl.sqrt(tl.sum(b_x * b_x) + eps)</code>: <strong>核心计算</strong>。先平方 <code>b_x * b_x</code>，再求和 <code>sum</code>，再开根号 <code>sqrt</code>，最后取倒数。</li>
+<li><code>b_y = b_x * b_rstd</code>: <strong>归一化</strong>。原数据乘以倒数。</li>
+<li><code>tl.store(...)</code>: <strong>保存</strong> 结果 <code>y</code> 和 <code>rstd</code>。</li>
+</ol>
+</li>
+</ul>
+<p><strong>总结</strong>：这就是把数学公式直译成了 GPU 代码，一行一行地处理。</p>
+<hr />
+<h3>Task 4: 解析进阶版前向传播 (Kernel: Small D)</h3>
+<p>现在看 <code>l2norm_fwd_kernel</code>（没有数字1的那个）。这个比较难，因为它用了 <code>Block Pointer</code>。</p>
+<ul>
+<li><strong>核心差异</strong>：<ul>
+<li>这里多了一个参数 <code>BT</code> (Block Time/Tokens)。意思是这个 Kernel 一次不只处理 1 行，而是处理 <code>BT</code> 行（例如一次处理 128 行）。</li>
+<li><code>tl.make_block_ptr</code>: 这是 Triton 的高级功能。它创建了一个“数据块指针”。<ul>
+<li>它告诉 GPU：数据是二维的 <code>(T, D)</code>。</li>
+<li>我要切一块 <code>(BT, BD)</code> 大小的矩形出来。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>逻辑拆解</strong>：<ol>
+<li><code>b_x = tl.load(p_x, ...)</code>: 一次性加载 <code>BT</code> 行、<code>BD</code> 列的一个大矩阵块。</li>
+<li><code>tl.sum(b_x * b_x, 1)</code>: 沿着维度 1（列方向）求平方和。结果是一个长度为 <code>BT</code> 的向量。</li>
+<li><code>b_rstd = ...</code>: 计算这 <code>BT</code> 行每一行的模长倒数。</li>
+<li><code>b_y = b_x * b_rstd[:, None]</code>: 利用广播机制，让 <code>BT</code> 行数据分别乘以它们对应的 <code>rstd</code>。</li>
+<li><code>tl.store</code>: 把这一大块计算好的数据存回去。</li>
+</ol>
+</li>
+</ul>
+<p><strong>总结</strong>：为了处理小维度数据（因为太小的话，开太多线程不划算），把多行数据打包在一起计算，提高 GPU 利用率。</p>
+<hr />
+<h3>Task 5: Python 调度层 (The Dispatcher)</h3>
+<p>看 <code>l2norm_fwd</code> 这个 Python 函数。它是指挥官。</p>
+<ol>
+<li><strong>数据整形</strong>：<code>x = x.view(-1, x.shape[-1])</code>。不管输入是 <code>(Batch, Seq, D)</code> 还是什么，统统压扁成 <code>(Total_Rows, D)</code>，也就是代码里的 <code>(T, D)</code>。</li>
+<li><strong>判断 D 的大小</strong>：
+    <code>python
+    if D &lt;= 512:
+        # 维度小，用进阶版 Kernel (打包多行)
+        l2norm_fwd_kernel[grid](..., NB=NB)
+    else:
+        # 维度大，用简单版 Kernel (一行一个Block)
+        l2norm_fwd_kernel1[(T,)](...)</code></li>
+<li><strong>返回结果</strong>：把算好的 <code>y</code> 变回原来的形状返回。</li>
+</ol>
+<hr />
+<h3>Task 6: 反向传播 (Backward Pass)</h3>
+<p><code>l2norm_bwd</code> 和对应的 kernels (<code>bwd_kernel</code>)。</p>
+<ul>
+<li>这是给神经网络训练用的。当计算 Loss 后，需要求梯度。</li>
+<li>数学上，需要计算 $y = x / ||x||$ 的导数。</li>
+<li>代码中的公式：
+    <code>b_dx = b_dy * b_rstd - tl.sum(b_dy * b_y) * b_y * b_rstd</code>
+    这是链式法则推导出来的结果。<ul>
+<li><code>dy</code>: 上一层传回来的梯度。</li>
+<li><code>dx</code>: 我们要传给下一层的梯度。</li>
+</ul>
+</li>
+<li>逻辑和前向传播一样，也分了“大 D”和“小 D”两种策略。</li>
+</ul>
+<hr />
+<h3>Task 7: PyTorch 封装 (The Wrapper)</h3>
+<p>最后看 <code>class L2NormFunction(torch.autograd.Function)</code> 和 <code>class L2Norm(nn.Module)</code>。</p>
+<ul>
+<li><strong><code>L2NormFunction</code></strong>: 这是连接 Triton 代码和 PyTorch 自动求导系统的桥梁。<ul>
+<li><code>forward</code>: 也就是 <code>ctx.save_for_backward(y, rstd)</code>，它把前向计算的结果存起来，因为反向传播算梯度时需要用到 <code>y</code> 和 <code>rstd</code>。</li>
+<li><code>backward</code>: 也就是调用 <code>l2norm_bwd</code>。</li>
+</ul>
+</li>
+<li><strong><code>L2Norm</code></strong>: 这是一个标准的 PyTorch 层（Layer）。<ul>
+<li>让用户可以像使用 <code>nn.LayerNorm</code> 一样使用 <code>L2Norm(...)</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>全文总结 (Recap)</h3>
+<p>这个文件做的事情列表：</p>
+<ol>
+<li><strong>定义算子</strong>：实现了 L2 归一化。</li>
+<li><strong>Triton 加速</strong>：<ul>
+<li>写了 <strong>Kernel 1</strong>：针对大维度，单行并行处理。</li>
+<li>写了 <strong>Kernel 2</strong>：针对小维度，多行打包处理（Block Pointer）。</li>
+</ul>
+</li>
+<li><strong>智能调度</strong>：在 Python 端根据输入维度 <code>D</code> 自动选择用哪个 Kernel。</li>
+<li><strong>接入 PyTorch</strong>：封装成 <code>autograd.Function</code> 和 <code>nn.Module</code>，让你可以直接在模型里 <code>self.norm = L2Norm()</code> 这样用。</li>
+</ol>
+<p>你看不懂是因为它混合了底层 GPU 编程逻辑（Triton）和高层封装。只要知道它是为了<strong>更快地算 $\frac{x}{||x||_2}$</strong> 这一件事，就容易理解多了。</p>

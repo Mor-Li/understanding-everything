@@ -1,0 +1,62 @@
+<h1>fla/layers/mom.py</h1>
+<p>这份代码实现了一个叫做 <strong>MoM (Mixture-of-Memories)</strong> 的模型层。</p>
+<p>简单来说，它的核心思想是：<strong>不要用一个巨大的大脑（Attention）去处理所有的词，而是把词分门别类，扔给几个不同的小大脑（Memory/Experts）去处理，最后再把结果拼起来。</strong> 这样做既能保持线性注意力的速度（快），又能增加模型的容量（聪明）。</p>
+<p>别被那一堆 <code>pad</code>, <code>unpad</code>, <code>indices</code> 吓到了，那些大都是为了在 GPU 上加速运算做的“杂活”。</p>
+<p>我们把这个复杂的代码拆解成一个 <strong>“流水线任务清单 (Todo List)”</strong>，一步一步带你看懂数据是怎么流动的：</p>
+<hr />
+<h3>任务清单：MoM Layer 的工作流程</h3>
+<h4>✅ Task 1: 决定去向 (Routing / Gating)</h4>
+<p><strong>代码位置：</strong> <code>MomAttention.forward</code> 开头部分 (<code>self.gate(...)</code>, <code>torch.topk</code>)
+<strong>观点：</strong> 并不是所有的词都需要同样的“记忆”来处理。
+*   <strong>动作：</strong> 每一层的输入 <code>hidden_states</code> 进来后，先过一个 <code>gate</code>（大门）。
+*   <strong>逻辑：</strong> 这个门会给每个 token（词）打分，决定把它分给哪几个“记忆单元”（Memory Experts）。这里用了 <code>topk</code>，也就是选出分数最高的 $k$ 个专家。
+*   <strong>产出：</strong> <code>routing_mask</code> 和 <code>selected_memories</code>。这就好比给每个快递包裹贴上了“发往北京”或“发往上海”的标签。</p>
+<h4>✅ Task 2: 分组重排 (Transform / Grouping)</h4>
+<p><strong>代码位置：</strong> <code>transform</code> 函数
+<strong>观点：</strong> 为了让 GPU 批量处理得更快，我们需要把去往同一个地方的包裹堆在一起。
+*   <strong>动作：</strong> 根据刚才贴的标签，把原本按顺序排列的句子打散。
+*   <strong>逻辑：</strong> 比如句子是“A B C D”，A和C去一号记忆，B和D去二号记忆。这一步会把数据变成 <code>[A, C]</code> 和 <code>[B, D]</code> 这样的两组。
+*   <strong>细节：</strong> 代码里有很多 <code>argsort</code> 和 <code>gather</code>，就是在做这个物理上的“搬运”工作。</p>
+<h4>✅ Task 3: 预处理与“短时记忆” (Short Convolution)</h4>
+<p><strong>代码位置：</strong> <code>ShortConvolution</code>, <code>self.q_conv1d</code>, <code>self.k_conv1d</code>...
+<strong>观点：</strong> 在存入长期记忆之前，先看看这个词左右两边是什么（局部上下文）。
+*   <strong>动作：</strong> 对分组后的数据，进行一个很短的卷积操作（Conv1d，窗口通常大小为4）。
+*   <strong>逻辑：</strong> 线性注意力有时候太关注“过去”而忽略了“当下”的邻居。加个小卷积是为了增强局部特征提取。</p>
+<h4>✅ Task 4: 核心记忆更新 (The "Memory" / Gated Delta Rule)</h4>
+<p><strong>代码位置：</strong> <code>chunk_gated_delta_rule</code> 或 <code>fused_recurrent_gated_delta_rule</code>
+<strong>观点：</strong> 这是整个算法的灵魂——<strong>线性注意力（Linear Attention）</strong>。
+*   <strong>动作：</strong> 这是一个 $O(N)$ 复杂度的操作，而不是传统 Transformer 的 $O(N^2)$。
+*   <strong>逻辑：</strong>
+    *   把它想象成写日记。
+    *   <strong>K (Key)</strong> 和 <strong>V (Value)</strong> 是新进来的信息，用来更新“日记本”（Recurrent State / KV Cache）。
+    *   <strong>Q (Query)</strong> 是查询，根据当前的“日记本”内容生成输出。
+    *   <strong>Beta / Decay</strong>：遗忘门，决定要忘掉多少旧的日记内容。
+    *   <strong>区别：</strong> 传统的 Attention 是每次都要回头把以前所有的书看一遍；这个算法是看一眼现在的笔记就能输出，效率极高。</p>
+<h4>✅ Task 5: 还原顺序 (Reconstruct)</h4>
+<p><strong>代码位置：</strong> <code>reconstruct</code> 函数
+<strong>观点：</strong> 刚才为了处理方便把句子打散了，现在输出给下一层之前必须拼回去。
+*   <strong>动作：</strong> 这是一个“逆向工程”。
+*   <strong>逻辑：</strong> 刚才 A和C 是一组，B和D 是一组。处理完变成了 A' C' 和 B' D'。这一步根据最开始记录的索引（indices），把它们重新拼成 A' B' C' D' 的顺序。同时，如果一个词被分给了多个专家，这里会把多个专家的结果加权求和（Weighted Sum）。</p>
+<h4>✅ Task 6: 共享记忆 (Shared Memory - Optional)</h4>
+<p><strong>代码位置：</strong> <code>shared_o</code> 函数
+<strong>观点：</strong> 有些基础知识是所有词都通用的，不需要分流。
+*   <strong>动作：</strong> 除了上面那套复杂的“分流-处理-还原”流程外，代码里还有一个 <code>self.shared_mem</code> 开关。
+*   <strong>逻辑：</strong> 如果开启，会有一条旁路。所有的词都会通过这个共享的记忆单元处理一遍。
+*   <strong>最终结果：</strong> <code>MoE结果 + 共享结果 = 最终输出</code>。</p>
+<hr />
+<h3>总结：这代码到底在干啥？</h3>
+<p>把这个文件看作一个<strong>高级分拣工厂</strong>：</p>
+<ol>
+<li><strong>进货</strong>：一句话进来。</li>
+<li><strong>分拣 (Routing)</strong>：主管看一眼每个词，决定它该去哪个车间（Memory）。</li>
+<li><strong>运输 (Transform)</strong>：把去往同一个车间的词打包在一起。</li>
+<li><strong>加工 (Conv + Delta Rule)</strong>：车间工人先简单擦拭一下（Conv），然后根据操作手册（State）加工这个词，并更新操作手册。</li>
+<li><strong>组装 (Reconstruct)</strong>：把加工好的零件按原来的顺序拼回成一句话。</li>
+<li><strong>出货</strong>：输出处理后的向量。</li>
+</ol>
+<h3>为什么代码看着这么乱？</h3>
+<p>大部分代码行数（<code>_upad_input</code>, <code>pad_for_conv</code>, <code>cu2pad</code> 等）都是在处理 <strong>Padding（填充）</strong> 和 <strong>变长序列</strong> 的问题。
+*   因为 Transformer 训练时，不同长度的句子拼在一个 Batch 里，短的要补 0。
+*   对于这种基于状态（State）的线性注意力，补 0 会干扰记忆的更新（你不想把“无意义的0”记在日记本里）。
+*   所以作者写了极其繁琐的代码来剔除 Padding，算完后再把 Padding 塞回去，保证计算的数学正确性。</p>
+<p><strong>你只需要关注 <code>forward</code> 函数中的主干逻辑，即：Gate -&gt; Transform -&gt; Conv -&gt; Delta Rule -&gt; Reconstruct 这一条线即可。</strong></p>

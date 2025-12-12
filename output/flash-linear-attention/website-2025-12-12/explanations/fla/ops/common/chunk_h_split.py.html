@@ -1,0 +1,113 @@
+<h1>fla/ops/common/chunk_h_split.py</h1>
+<p>这份代码确实非常硬核，它使用了 OpenAI 的 <strong>Triton</strong> 语言编写，目的是为了在 GPU 上极度高效地计算<strong>线性注意力机制（Linear Attention）</strong>或者<strong>RNN</strong>类模型中的“隐藏状态（Hidden State, $h$）”更新。</p>
+<p>简单来说，它的核心数学公式大概长这样（简化版）：
+$$ h_t = \text{decay} \cdot h_{t-1} + K_t^T V_t $$</p>
+<p>普通的 RNN 是一步一步算的（$t=1$, 然后 $t=2$...），无法并行，速度慢。
+<strong>这份代码的目的是：</strong> 通过“分块（Chunking）”技术，把长序列切成一段一段，先各自并行计算，最后再把结果串起来。</p>
+<p>为了让你听懂，我把这个过程想象成一个<strong>接力跑的任务</strong>，我们列一个 Todo List 来拆解它。</p>
+<hr />
+<h3>核心任务清单 (Todo List)</h3>
+<p>我们要完成的目标是：算出整个序列每一步的记忆状态 $h$。</p>
+<p><strong>Forward Pass (前向传播 - 算结果):</strong>
+1.  <strong>[准备]</strong> 把长序列切成若干个大块（Split），比如长度 1000 的序列切成 4 块，每块 250。
+2.  <strong>[并行计算 - Split Kernel]</strong> 让 4 个工人同时开工，每个人只负责算自己那 250 步内的“局部累加值”（只看自己这一段，$h$ 变成了多少）。
+3.  <strong>[串联修正 - Reduction Kernel]</strong> 第 2 块的工人其实不知道第 1 块留下了什么。现在把第 1 块的结尾传给第 2 块，第 2 块传给第 3 块……修正每一块的起始状态。</p>
+<p><strong>Backward Pass (反向传播 - 算梯度):</strong>
+4.  <strong>[并行计算 - Split Backward]</strong> 同样分块，并行计算每一块内部的梯度。
+5.  <strong>[串联修正 - Reduction Backward]</strong> 把后一块传回来的梯度累加到前一块去。</p>
+<hr />
+<h3>逐步代码详解</h3>
+<p>下面我按照上面的 List，结合代码中的函数给你一步步讲。</p>
+<h4>1. 输入是什么？</h4>
+<p>在 Python 包装函数 <code>chunk_fwd_h</code> 中可以看到：
+*   <code>k</code>, <code>v</code>: 输入的 Key 和 Value 向量。
+*   <code>g</code>, <code>gk</code>, <code>gv</code>: 这些是<strong>衰减率（Decay）</strong>。你可以理解为“遗忘门”，决定了每一步要保留多少旧记忆。
+    *   <code>g</code>: 标量衰减。
+    *   <code>gk</code>, <code>gv</code>: 向量衰减（更高级的遗忘机制）。
+*   <code>h0</code>: 初始状态（比如上一句话留下的记忆）。</p>
+<h4>2. 第一步：分块并行计算 (<code>chunk_fwd_kernel_h_split</code>)</h4>
+<p>这是代码中的第一个 Triton kernel。</p>
+<ul>
+<li><strong>任务</strong>：不管前一段发生了什么，先算出当前这一段（Split）内部，$K$ 和 $V$ 撞击产生了多少新的记忆，以及衰减了多少。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>i_s</code>: 当前是第几个 Split（第几块）。</li>
+<li><code>b_h</code>: 初始化一个全 0 的矩阵，用来存这一块累积的状态。</li>
+<li><strong>循环 <code>for i_t ...</code></strong>: 在这一大块内部，再分成更小的 <code>BT</code>（Chunk）进行循环。<ul>
+<li><code>b_k</code>, <code>b_v</code>: 加载当前的 K 和 V。</li>
+<li><code>exp(b_g...)</code>: 计算衰减率。</li>
+<li><code>b_h *= decay</code>: 先把之前的记忆衰减一下。</li>
+<li><code>b_h += dot(b_k, b_v)</code>: 加上当前时刻新产生的记忆 ($K \times V$)。</li>
+</ul>
+</li>
+<li><strong>存盘</strong>:<ul>
+<li>如果是第一块 (<code>i_s == 0</code>)：它不需要等别人，直接把结果存到最终结果 <code>hr</code> 里。</li>
+<li>如果是后面的块：把它算出的“半成品”（未修正的局部状态）存到 <code>hs</code> (Hidden State Split) 里。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>这一步做完后</strong>：每块都知道了自己内部发生了什么，但第 2 块还不知道第 1 块传给它什么，所以第 2 块现在的状态是不完整的。</p>
+</blockquote>
+<h4>3. 第二步：跨块串联 (<code>chunk_fwd_kernel_h_reduction</code>)</h4>
+<p>这是代码中的第二个 Triton kernel。</p>
+<ul>
+<li><strong>任务</strong>：把断开的链条接上。把 Split 1 的结尾传给 Split 2，Split 2 修正后再传给 Split 3...</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><strong>循环 <code>for i_s in range(1, NS)</code></strong>: 从第 2 块开始遍历到最后一块。</li>
+<li><code>tl.load(p_hs)</code>: 读取上一块结束时的状态。</li>
+<li><code>b_h += ...</code>: 把上一块传下来的记忆，加到当前块的起始位置。</li>
+<li><strong>重算衰减</strong>: 代码中间有一段 <code>for i_t ...</code> 看起来很复杂，其实它是在计算“从上一块结尾到当前这一块结尾”中间经历了多少衰减，用来更新状态。</li>
+<li><code>tl.store(p_hr)</code>: 修正完毕，保存到 <code>hr</code> (Hidden State Result)，这就是最终可用的正确状态。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>这一步做完后</strong>：前向传播结束，我们得到了正确的 <code>hr</code> 和最终状态 <code>ht</code>。</p>
+</blockquote>
+<h4>4. 第三步：反向传播 (<code>chunk_bwd_kernel_dh_split</code> &amp; <code>reduction</code>)</h4>
+<p>这部分逻辑和前向传播完全是对称的，但是方向相反（从未来向过去传）。</p>
+<ul>
+<li>
+<p><strong><code>chunk_bwd_kernel_dh_split</code></strong>:</p>
+<ul>
+<li>计算梯度 <code>dh</code>。</li>
+<li>公式变成了 $dK = dH \cdot V$, $dV = K \cdot dH$ 等等。</li>
+<li>同样是先在 Split 内部并行算梯度的“局部贡献”。</li>
+<li>这里是从时间轴的<strong>最后</strong>往前算（<code>range(..., -1)</code>）。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>chunk_bwd_kernel_dh_reduction</code></strong>:</p>
+<ul>
+<li>把后一块产生的梯度误差，经过衰减后，传回给前一块。</li>
+<li>确保梯度能够流经整个长序列，而不是断在中间。</li>
+</ul>
+</li>
+</ul>
+<h3>总结关键点</h3>
+<ol>
+<li>
+<p><strong>为什么有两个 Kernel (Split 和 Reduction)?</strong></p>
+<ul>
+<li>为了并行。如果只有 Reduction，就变成串行了（必须等前一步算完）。</li>
+<li>Split Kernel 负责做 $90\%$ 的繁重计算（矩阵乘法），因为各块独立，所以可以几千个核心同时跑。</li>
+<li>Reduction Kernel 负责做剩下的 $10\%$ 串联工作，虽然有点串行依赖，但数据量小，很快。</li>
+</ul>
+</li>
+<li>
+<p><strong>变量名速查</strong>:</p>
+<ul>
+<li><code>h</code>: hidden state (隐藏状态/记忆)。</li>
+<li><code>s</code>: split (分块)。</li>
+<li><code>r</code>: reduced (归约/修正后的最终结果)。</li>
+<li><code>t</code>: total/tail (最终时刻的状态)。</li>
+<li><code>cu_seqlens</code>: 变长序列的长度索引（处理 batch 中句子长短不一的情况）。</li>
+</ul>
+</li>
+<li>
+<p><strong>一句话概括</strong>:
+    这个文件实现了一种<strong>并行化的线性注意力计算方法</strong>，通过“先分块独立算，再把首尾接起来”的策略，在 GPU 上极大地加速了长序列的处理速度。</p>
+</li>
+</ol>

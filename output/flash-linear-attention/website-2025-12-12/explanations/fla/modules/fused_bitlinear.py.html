@@ -1,0 +1,92 @@
+<h1>fla/modules/fused_bitlinear.py</h1>
+<p>这份代码确实非常硬核，因为它涉及到深度学习中最底层的<strong>算子优化（Kernel Optimization）</strong>。</p>
+<p>简单来说，这个文件的目的是<strong>实现一种极低精度的线性层（BitLinear）</strong>，用于构建像 "1-bit LLM" 这样高效的模型，并且为了速度，它使用 <strong>Triton</strong> 语言手动写了 GPU 加速代码，把多个操作“融合（Fused）”在了一起。</p>
+<p>为了让你读懂，我制定了一个 <strong>5步走的 Task List（学习清单）</strong>，带你一层层剥开它的逻辑：</p>
+<hr />
+<h3>📋 阅读任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心背景</strong> —— 什么是 BitLinear？为什么要搞这个？</li>
+<li><strong>Task 2: 理解量化逻辑</strong> —— 怎么把复杂的浮点数变成简单的整数？(Python 函数部分)</li>
+<li><strong>Task 3: 理解“融合” (Fusion)</strong> —— 为什么要写那些难懂的 <code>triton.jit</code> 代码？</li>
+<li><strong>Task 4: 显存优化技巧</strong> —— 这里的 <code>Recompute</code> 是在干什么？</li>
+<li><strong>Task 5: 最终封装</strong> —— <code>BitLinear</code> 和 <code>FusedBitLinear</code> 类的区别。</li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>Task 1: 理解核心背景 (什么是 BitLinear?)</h4>
+<ul>
+<li><strong>背景</strong>：现在的 LLM（大模型）通常用 FP16（16位浮点数）计算，计算量大，显存占用高。</li>
+<li><strong>目标</strong>：这篇代码基于论文《The Era of 1-bit LLMs》，通过把权重（Weight）压缩到只有 <strong>1.58 bit</strong>（即只有 -1, 0, +1 三种值），把输入（Activation）压缩到 <strong>8 bit</strong>。</li>
+<li><strong>好处</strong>：这使得矩阵乘法（MatMul）变成了简单的加减法，速度极快，且显存占用极低。</li>
+</ul>
+<h4>Task 2: 理解量化逻辑 (Python 函数部分)</h4>
+<p>看文件开头的两个普通 Python 函数，这是整个算法的数学核心：</p>
+<ol>
+<li><strong><code>activation_quant(x)</code></strong>:<ul>
+<li><strong>作用</strong>：处理输入数据。</li>
+<li><strong>逻辑</strong>：找到输入数据的最大绝对值 -&gt; 计算缩放比例 -&gt; 把数据压缩到 <code>[-128, 127]</code> 的整数范围内（int8）。</li>
+</ul>
+</li>
+<li><strong><code>weight_quant(w)</code></strong>:<ul>
+<li><strong>作用</strong>：处理模型权重。</li>
+<li><strong>逻辑</strong>：计算权重的平均值 -&gt; 缩放 -&gt; 强制把权重变成 <code>{-1, 0, 1}</code> 这三个数。这就是所谓的 "1.58 bit"。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 3: 理解“融合” (Fusion) —— 难点所在</h4>
+<p>你看到那一大坨 <code>@triton.jit</code> 装饰的函数（<code>layer_norm_fwd_kernel_quant</code>），这是为了<strong>速度</strong>。</p>
+<ul>
+<li>
+<p><strong>普通做法 (慢)</strong>：</p>
+<ol>
+<li>从显存读取数据 -&gt; 做 LayerNorm -&gt; 存回显存。</li>
+<li>从显存读取数据 -&gt; 做 Quantization (量化) -&gt; 存回显存。</li>
+<li>从显存读取数据 -&gt; 做 Linear 计算。</li>
+<li><em>问题</em>：显存读写（IO）太慢了，是瓶颈。</li>
+</ol>
+</li>
+<li>
+<p><strong>融合做法 (Fused, 快)</strong>：</p>
+<ul>
+<li>这个文件写的 Triton Kernel 把 <strong>LayerNorm (归一化)</strong> 和 <strong>Quantization (量化)</strong> 两个步骤合并成了一个内核。</li>
+<li><strong>逻辑</strong>：从显存读一次数据 -&gt; 在芯片上算完 Norm -&gt; 紧接着算完 Quant -&gt; 最后只写回一次结果。</li>
+<li><strong>代码对应</strong>：<code>layer_norm_fwd_kernel_quant</code> 就是干这个的。它同时计算了均值、方差（用于Norm），然后直接计算量化后的 <code>y</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 显存优化技巧 (Recompute)</h4>
+<p>在 <code>layer_norm_bwd_kernel</code>（反向传播内核）和 <code>LayerNormLinearQuantFn</code> 中，有一个很高级的技巧。</p>
+<ul>
+<li><strong>问题</strong>：为了训练，通常需要保存前向传播的输出 <code>y</code>，这很占显存。</li>
+<li><strong>策略 (Recomputation)</strong>：<ul>
+<li>在前向传播时，<strong>不保存</strong>那个巨大的量化后矩阵 <code>y</code>，只保存轻量级的 <code>mean</code> (均值) 和 <code>rstd</code> (标准差)。</li>
+<li>在反向传播（Backward）时，利用保存的 <code>mean</code> 和 <code>rstd</code> 以及输入 <code>x</code>，<strong>重新计算</strong>一遍 <code>y</code>，然后再算梯度。</li>
+<li><strong>代码证据</strong>：<code>ctx.save_for_backward(...)</code> 里没有保存 <code>y</code>，而在 <code>backward</code> 函数里调用了 <code>recompute_output=True</code>。</li>
+<li><strong>收益</strong>：用一点点额外的计算时间，换取了巨大的显存节省。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 最终封装 (怎么用？)</h4>
+<p>文件最后定义了两个类，给用户直接调用：</p>
+<ol>
+<li>
+<p><strong><code>BitLinear(nn.Linear)</code></strong>:</p>
+<ul>
+<li>这是<strong>教学版/参考版</strong>。</li>
+<li>它直接用 PyTorch 原生算子实现了逻辑（调用 <code>activation_quant</code> 等）。</li>
+<li><em>特点</em>：代码好懂，但速度慢，显存占用高。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>FusedBitLinear(BitLinear)</code></strong>:</p>
+<ul>
+<li>这是<strong>实战版/加速版</strong>。</li>
+<li>它的 <code>forward</code> 函数直接调用了上面写的 Triton 融合算子 <code>layer_norm_linear_quant_fn</code>。</li>
+<li><em>特点</em>：代码复杂，但速度极快，显存效率高。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件其实就在做一件事：
+<strong>为了让 "1-bit LLM" 跑得快，手动写了一个 GPU 内核，把“归一化”和“量化”这两个步骤合二为一，并且利用“重计算”技巧省显存。</strong></p>
+<p>如果你只是想<strong>使用</strong>它，只需要关注最后的 <code>FusedBitLinear</code> 类，把它当成普通的 <code>nn.Linear</code> 用就行了，它会自动帮你把模型变成低精度的版本。</p>

@@ -1,0 +1,113 @@
+<h1>fla/ops/rwkv6/recurrent_naive.py</h1>
+<p>这份代码确实涉及了比较底层的深度学习操作，特别是 RWKV 这种线性 Attention（Linear Attention）架构的实现。如果不熟悉 RNN 或者 Attention 的底层数学，看起来确实像天书。</p>
+<p>别担心，我们把它拆解成一个 <strong>“学习任务清单” (To-Do List)</strong>，一共分为 5 个任务。我们一步一步来，像剥洋葱一样把它的逻辑理清楚。</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂背景</strong> —— 这段代码到底是干嘛的？</li>
+<li><strong>Task 2: 搞懂角色</strong> —— 输入的 <code>q, k, v, w, u</code> 分别代表什么？</li>
+<li><strong>Task 3: 搞懂核心机制</strong> —— 什么是“状态” ($h$)？</li>
+<li><strong>Task 4: 逐行拆解前向传播</strong> —— 它是怎么一步步算出结果的？</li>
+<li><strong>Task 5: 略读反向传播</strong> —— 这一大坨代码是用来干嘛的？</li>
+</ol>
+<hr />
+<h3>Task 1: 搞懂背景</h3>
+<p><strong>目标：</strong> 知道这段代码在模型里的定位。</p>
+<ul>
+<li><strong>这是什么？</strong> 这是 <strong>RWKV-6</strong> 模型的核心算子实现。</li>
+<li><strong>Recurrent Naive 是什么意思？</strong><ul>
+<li><strong>Recurrent (循环):</strong> 说明它是像 RNN 一样工作的。它一次只看一个词，算完后把记忆传给下一个词，而不是像 Transformer 那样一次把所有词都算一遍。</li>
+<li><strong>Naive (朴素):</strong> 说明这是用纯 Python/PyTorch 写的“慢速版”参考代码。在实际生产中，这部分通常会用 CUDA（显卡底层代码）重写以加速，但逻辑是一样的。这个版本主要是为了让人看懂逻辑，或者用来检查 CUDA 代码算得对不对。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 2: 搞懂角色 (输入变量)</h3>
+<p><strong>目标：</strong> 理解函数 <code>naive_recurrent_rwkv6</code> 的输入参数。</p>
+<p>想象你在读一本书，每个字是一个时间步（Time Step）。</p>
+<ul>
+<li><strong><code>q</code> (Query):</strong> 当前这个字想要查询什么信息？</li>
+<li><strong><code>k</code> (Key):</strong> 当前这个字包含什么关键特征（用来被未来的字查询）？</li>
+<li><strong><code>v</code> (Value):</strong> 当前这个字具体的内容信息是什么？<ul>
+<li><em>注：Q, K, V 是 Attention 机制的三大金刚。</em></li>
+</ul>
+</li>
+<li><strong><code>w</code> (Decay/Weight):</strong> <strong>遗忘率</strong>。RWKV 的核心特性。它决定了过去的记忆要保留多少。<code>w</code> 的值经过 <code>exp()</code> 后通常在 0 到 1 之间。</li>
+<li><strong><code>u</code> (Bonus):</strong> <strong>当前奖励</strong>。这是一个特殊的参数，允许模型在计算当前输出时，给“当前刚刚进来的这个字”一个特殊的加权，而不只是依赖历史记忆。</li>
+<li><strong><code>T</code> (Time):</strong> 序列长度（句子的字数）。</li>
+</ul>
+<hr />
+<h3>Task 3: 搞懂核心机制 (状态 $h$)</h3>
+<p><strong>目标：</strong> 理解代码中的 <code>h</code>。</p>
+<p>在代码里你会看到：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">h</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>什么是 <code>h</code>？</strong>
+    它是 <strong>Hidden State (隐藏状态)</strong>，你可以把它看作是一个 <strong>“记忆桶”</strong>。</li>
+<li><strong>它的形状是 <code>K x V</code>：</strong>
+    这是一个矩阵。在传统的 RNN 里，状态通常是一个向量；但在 RWKV (Linear Attention) 里，状态是一个矩阵。</li>
+<li><strong>它的作用：</strong>
+    随着时间推移（循环进行），新的信息 ($k$ 和 $v$) 会被扔进这个桶里，旧的信息会根据 <code>w</code> (遗忘率) 慢慢变淡。</li>
+</ul>
+<hr />
+<h3>Task 4: 逐行拆解前向传播 (Forward)</h3>
+<p><strong>目标：</strong> 看懂 <code>naive_recurrent_rwkv6</code> 里的 <code>for</code> 循环。这是最关键的部分。</p>
+<p>我们将逻辑翻译成人话：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 初始化记忆桶 h 为全 0</span>
+<span class="n">h</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 2. 开始时间循环：从第 1 个字读到第 T 个字</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">T</span><span class="p">):</span>
+    <span class="c1"># 取出当前时刻的参数</span>
+    <span class="n">q_i</span> <span class="o">=</span> <span class="o">...</span>
+    <span class="n">k_i</span> <span class="o">=</span> <span class="o">...</span>
+    <span class="n">v_i</span> <span class="o">=</span> <span class="o">...</span>
+    <span class="n">w_i</span> <span class="o">=</span> <span class="n">w</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span> <span class="c1"># 计算遗忘系数 (变成 0-1 之间的数)</span>
+
+    <span class="c1"># 【关键步骤 A】：计算当前时刻要存入的信息 (kv_i)</span>
+    <span class="c1"># 这里的操作是外积 (Outer Product)。</span>
+    <span class="c1"># 比如 k是[1, 2], v是[3, 4]，结果就是一个矩阵。</span>
+    <span class="n">kv_i</span> <span class="o">=</span> <span class="n">k_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">v_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>
+
+    <span class="c1"># 【关键步骤 B】：计算输出 (o_i)</span>
+    <span class="c1"># 公式： 输出 = (旧记忆 + 当前信息的特殊加权) * 查询向量</span>
+    <span class="c1"># h: 之前的记忆</span>
+    <span class="c1"># u * kv_i: 当前这个字的信息，乘以一个特殊系数 u (Bonus)</span>
+    <span class="c1"># * q_i: 用 Query 去在这个混合记忆里找答案</span>
+    <span class="n">o_i</span> <span class="o">=</span> <span class="p">(</span><span class="n">h</span> <span class="o">+</span> <span class="n">u</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">kv_i</span><span class="p">)</span> <span class="o">*</span> <span class="n">q_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span>
+
+    <span class="c1"># 把结果存起来</span>
+    <span class="n">o</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">o_i</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+
+    <span class="c1"># 【关键步骤 C】：更新记忆桶 (h)</span>
+    <span class="c1"># 新记忆 = 旧记忆 * 遗忘率 + 当前新信息</span>
+    <span class="n">h</span> <span class="o">=</span> <span class="n">h</span> <span class="o">*</span> <span class="n">w_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">+</span> <span class="n">kv_i</span>
+</code></pre></div>
+
+<p><strong>总结这个循环做了啥：</strong>
+1.  <strong>看一眼</strong>：看看当前字 (<code>kv_i</code>) 和 历史记忆 (<code>h</code>)。
+2.  <strong>算输出</strong>：结合历史和当前字，回答 <code>q</code> 的问题，得到 <code>o</code>。
+3.  <strong>存记忆</strong>：把当前字存入 <code>h</code>，同时让旧记忆淡忘一点点 (<code>* w</code>)。</p>
+<hr />
+<h3>Task 5: 略读反向传播 (Backward)</h3>
+<p><strong>目标：</strong> 理解 <code>naive_recurrent_rwkv6_bwd</code> 是干嘛的。</p>
+<ul>
+<li><strong>为什么有这个函数？</strong>
+    神经网络需要<strong>训练</strong>。训练需要<strong>梯度</strong>。这个函数就是用来手动计算梯度的。通常 PyTorch 的 <code>autograd</code> 会自动做，但为了性能或显存优化，RWKV 作者手写了梯度的计算过程。</li>
+<li><strong>它的逻辑是反着的：</strong>
+    你会看到 <code>range(T - 1, -1, -1)</code>。它是从句子的最后一个字，倒着推回第一个字。</li>
+<li><strong>它在算什么？</strong>
+    它接收一个 <code>do</code> (输出的误差/梯度)，然后算出 <code>dq, dk, dv, dw, du</code>。意思是：为了让输出更准确，我应该怎么微调 <code>q, k, v, w, u</code> 这些参数？</li>
+<li><strong>不用深究细节：</strong>
+    除非你要开发新的 CUDA 算子，否则你只需要知道：<strong>这是为了训练模型而存在的数学公式的逆运算实现。</strong></li>
+</ul>
+<h3>总结</h3>
+<p>这篇代码其实就讲了一件事：<strong>RWKV-6 模型是如何处理序列数据的。</strong></p>
+<ol>
+<li>它维护一个记忆矩阵 <code>h</code>。</li>
+<li>每来一个词，它先利用 <code>h</code> 和当前词计算输出。</li>
+<li>然后把当前词的信息“加”进 <code>h</code> 里，并把 <code>h</code> 里旧的信息“忘”掉一点。</li>
+<li>一直循环直到句子结束。</li>
+</ol>

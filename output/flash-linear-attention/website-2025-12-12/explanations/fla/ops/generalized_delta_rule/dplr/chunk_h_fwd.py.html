@@ -1,0 +1,109 @@
+<h1>fla/ops/generalized_delta_rule/dplr/chunk_h_fwd.py</h1>
+<p>这份代码是用 <strong>Triton</strong> 编写的，用于加速大模型（特别是线性 Attention 或 SSM/RNN 类模型）的底层算子。看不懂很正常，因为 Triton 是一种面向 GPU 硬件编程的语言，和普通的 Python 逻辑差异很大。</p>
+<p>这份文件的核心功能是：<strong>在一个分块（Chunk）的算法中，计算并更新隐藏状态（Hidden State, $h$）。</strong></p>
+<p>为了让你理解，我把理解这份代码的过程拆解成 <strong>5 个 Task</strong> 的 Todo List，我们一步步来通关。</p>
+<hr />
+<h3>✅ Task 1: 理解背景 —— 我们在做什么？</h3>
+<p><strong>概念：</strong> 这属于 <strong>线性 Attention (Linear Attention)</strong> 或 <strong>状态空间模型 (SSM)</strong> 的范畴（比如 Mamba, RWKV, RetNet 等）。
+<strong>核心逻辑：</strong> 这类模型像 RNN 一样，有一个“记忆状态” $h$。
+*   每读入一个 token，$h$ 就会更新一次。
+*   公式大致是：$h_{new} = \text{Decay} \cdot h_{old} + \text{New_Info}$。</p>
+<p><strong>为什么要写这个代码？</strong>
+普通的 PyTorch 写循环太慢了（串行）。为了加速，我们把长序列切成很多小块（<strong>Chunk</strong>）。
+*   块<strong>内部</strong>并行计算。
+*   块<strong>之间</strong>传递状态 $h$。</p>
+<p><strong>结论：</strong> 这个文件 <code>chunk_h_fwd.py</code> 负责的就是 <strong>“计算每个块结束时的那个记忆状态 $h$，并传给下一个块”</strong>。</p>
+<hr />
+<h3>✅ Task 2: 搞懂输入变量 (变量字典)</h3>
+<p>在看逻辑前，先认一下人（变量）。不要被缩写吓到：</p>
+<ul>
+<li><strong><code>h</code> (Hidden State):</strong> 记忆矩阵。形状通常是 $[K, V]$。这是我们最关心的东西。</li>
+<li><strong><code>v</code> (Value):</strong> 输入的 Value 向量。</li>
+<li><strong><code>u</code>:</strong> 另一种输入（在 Delta Rule 算法中特有的项，类似修正项）。</li>
+<li><strong><code>w</code>, <code>kg</code> (Key Gate), <code>bg</code> (Beta Gate):</strong> 这些都是用来控制怎么更新记忆的权重或门控。</li>
+<li><strong><code>gk</code> (Gate K cumulative):</strong> 这是一个由于“衰减” (Decay) 产生的累积量。你可以把它理解为“遗忘门”的对数形式。</li>
+<li><strong><code>v_new</code>:</strong> 计算过程中产生的一个中间结果，后面反向传播或其他算子会用到。</li>
+<li><strong><code>BT</code> (Block Time):</strong> 时间维度的块大小（Chunk Size），比如 64。</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 理解核心算法 (数学逻辑)</h3>
+<p>这个 Kernel 实现的特定算法叫 <strong>Generalized Delta Rule (广义 Delta 规则)</strong>。
+它的更新逻辑比普通 RNN 稍微复杂一点点，大致如下（简化版）：</p>
+<ol>
+<li><strong>利用旧记忆预测：</strong> 用当前的记忆 $h$ 和权重 $w$ 算出一个预测值，加上输入 $u$，得到 <code>v_new</code> (代码里的 <code>b_v2</code>)。</li>
+<li><strong>计算更新量：</strong> 基于输入 <code>v</code> 和上面的 <code>v_new</code>，算出这个时刻要往记忆里“写入”多少新东西（代码里的 <code>b_hc</code>）。</li>
+<li><strong>遗忘与融合：</strong><ul>
+<li>旧记忆 $h$ 乘以衰减系数（<code>exp(b_g_last)</code>，即遗忘一部分）。</li>
+<li>加上新的写入量 <code>b_hc</code>。</li>
+<li>得到新的 $h$。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 拆解 Triton Kernel (代码流程)</h3>
+<p>现在我们看 <code>chunk_dplr_fwd_kernel_h</code> 这个函数，这是在 GPU 上跑的核函数。</p>
+<p><strong>步骤 1：定位坐标 (Grid)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">i_k</span><span class="p">,</span> <span class="n">i_v</span><span class="p">,</span> <span class="n">i_nh</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+</code></pre></div>
+
+<p>GPU 是多线程并行的。这里每个线程块负责处理 $h$ 矩阵的一部分（$K$ 维度的一小块，$V$ 维度的一小块，以及第几个 Head）。</p>
+<p><strong>步骤 2：加载初始状态</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">USE_INITIAL_STATE</span><span class="p">:</span>
+    <span class="c1"># ... 从 h0 加载初始记忆</span>
+    <span class="n">b_h</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_h0</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p>如果这是序列的开头，或者接着上一段生成的，先读入之前的记忆。</p>
+<p><strong>步骤 3：时间循环 (最重要的一步)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">i_t</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">NT</span><span class="p">):</span> <span class="c1"># 遍历每一个 Chunk (块)</span>
+</code></pre></div>
+
+<p>这是一个循环，沿着时间轴，一个块一个块地走。</p>
+<p><strong>步骤 4：块内累积 (Sub-chunk 循环)</strong>
+在每个 Chunk 内部，为了节省显存（SRAM），它又切成了更小的 <code>BC</code> (Block Chunk)。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="n">b_hc</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 初始化当前块的增量</span>
+    <span class="k">for</span> <span class="n">i_c</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+        <span class="c1"># 1. 加载各种数据 kg, v, w, bg, u</span>
+        <span class="c1"># 2. 计算 v2 (v_new)</span>
+        <span class="n">b_v2</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_w</span><span class="p">,</span> <span class="n">b_h</span><span class="p">)</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_u</span><span class="p">)</span> 
+
+        <span class="c1"># 3. 累加要更新到 h 的内容到 b_hc</span>
+        <span class="n">b_hc</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_kg</span><span class="p">,</span> <span class="n">b_v</span><span class="p">)</span>
+        <span class="n">b_hc</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_bg</span><span class="p">,</span> <span class="n">b_v2</span><span class="p">)</span>
+
+        <span class="c1"># 4. 把 v_new 存回显存，给别的算子用</span>
+        <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_v_new</span><span class="p">,</span> <span class="n">b_v2</span><span class="p">)</span>
+</code></pre></div>
+
+<p><em>注意：</em> 在这个小循环里，<code>b_h</code> (旧记忆) 保持不变，我们只是在算“在这个块里，我们积累了多少新信息 <code>b_hc</code>”。</p>
+<p><strong>步骤 5：跨块更新 (State Update)</strong>
+当一个小块 (Chunk) 跑完后，我们要把积累的信息更新进 $h$，并应用衰减。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 加载这个块最后的衰减系数 (Gate)</span>
+    <span class="n">b_g_last</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">gk</span> <span class="o">+</span> <span class="o">...</span><span class="p">)</span> 
+
+    <span class="c1"># 核心公式：h = h * decay + accumulation</span>
+    <span class="n">b_h</span> <span class="o">*=</span> <span class="n">exp</span><span class="p">(</span><span class="n">b_g_last</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">])</span> <span class="c1"># 旧记忆衰减</span>
+    <span class="n">b_h</span> <span class="o">+=</span> <span class="n">b_hc</span>                   <span class="c1"># 加上新积累的记忆</span>
+</code></pre></div>
+
+<p><strong>步骤 6：保存状态</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 把更新后的 h 存入全局显存 (Global Memory)，供下一个 Chunk 使用</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_h</span><span class="p">,</span> <span class="n">b_h</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>✅ Task 5: 总结全貌 (The Big Picture)</h3>
+<p>把上面所有的串起来，这个文件的逻辑是：</p>
+<ol>
+<li><strong>准备阶段</strong>：Python 函数 <code>chunk_dplr_fwd_h</code> 准备好张量形状，计算好网格大小，启动 GPU Kernel。</li>
+<li><strong>GPU 执行</strong>：<ul>
+<li>每个线程拿着一块 $h$ (记忆碎片)。</li>
+<li>沿着时间轴，一段一段地走 (Chunk by Chunk)。</li>
+<li>在每一段里，根据输入 $u, v$ 和权重 $w$，算出这一段积累了什么新知识 ($h_c$)。</li>
+<li>算完这一段后，把手里的老记忆 $h$ 忘掉一点 (乘 decay)，加上新知识 ($h_c$)。</li>
+<li>把新的 $h$ 存下来，留给下一段用。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这是一个<strong>显存高效</strong>的算子，用于计算线性 Attention 模型中，记忆状态 $h$ 随时间 $T$ 的演变过程。它利用了 Chunking 技术，在保持递归特性的同时，尽可能利用 GPU 的并行能力。</p>

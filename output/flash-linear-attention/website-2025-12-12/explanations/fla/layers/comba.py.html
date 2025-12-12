@@ -1,0 +1,122 @@
+<h1>fla/layers/comba.py</h1>
+<p>这份代码实现了一个名为 <strong>Comba</strong> 的神经网络层。你可以把它理解为一种新型的“注意力机制”或者“RNN（循环神经网络）层”，它的目标是像 Transformer 一样强大，但像 RNN 一样推理速度快（省显存）。</p>
+<p>为了让你看懂，我把这个层 <code>forward</code> 函数（即数据流向）的工作流程拆解成一个 <strong>“待办事项清单 (Todo List)”</strong>。模型每执行一次前向传播，其实就是按顺序完成了下面这 6 个任务。</p>
+<hr />
+<h3>📝 Comba Layer 工作流程 Todo List</h3>
+<ol>
+<li><strong>【准备工作】原材料切分与映射 (Projections)</strong><ul>
+<li>把输入的隐藏状态变成 Q, K, V 以及控制信号。</li>
+</ul>
+</li>
+<li><strong>【局部感知】短卷积处理 (Short Convolution)</strong><ul>
+<li>让每个词“瞥一眼”它旁边的词，获取局部信息。</li>
+</ul>
+</li>
+<li><strong>【核心创新】闭环控制修正 (Correction &amp; Decay)</strong><ul>
+<li>这是 Comba 的特色，对 Q 和 K 进行特殊的数学修正。</li>
+</ul>
+</li>
+<li><strong>【计算门控】生成遗忘与输入门 (Gate Computation)</strong><ul>
+<li>计算该记住多少历史信息，该放入多少新信息。</li>
+</ul>
+</li>
+<li><strong>【混合搅拌】核心状态空间计算 (Core SSM/RNN)</strong><ul>
+<li>这是最核心的一步，把历史记忆和当前输入融合。</li>
+</ul>
+</li>
+<li><strong>【最终包装】输出门控与还原 (Output Gating &amp; Projection)</strong><ul>
+<li>整理数据格式，输出给下一层。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解</h3>
+<p>下面我对应代码中的关键部分，一步步给你解释这 6 个 Task 是怎么完成的。</p>
+<h4>Task 1: 【准备工作】原材料切分与映射</h4>
+<p><strong>代码位置：</strong> <code>__init__</code> 中的 <code>self.q_proj</code>, <code>self.k_proj</code> 等，以及 <code>forward</code> 开头。
+<strong>目的：</strong> 输入的 <code>hidden_states</code> 是一个通用的特征向量，我们需要把它拆解成不同的功能分量。</p>
+<ul>
+<li><strong>Q (Query), K (Key), V (Value):</strong> 经典的三剑客。</li>
+<li><strong>A, B:</strong> 这是 Comba 特有的控制信号，用来计算后面的门控。</li>
+</ul>
+<blockquote>
+<p><strong>比喻：</strong> 就像炒菜前，先把一块肉（Input）切成肉丝（Q）、肉片（K）、肉丁（V），备用。</p>
+</blockquote>
+<h4>Task 2: 【局部感知】短卷积处理</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_short_conv</span><span class="p">:</span>
+    <span class="n">q</span><span class="p">,</span> <span class="n">conv_state_q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_conv1d</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">k</span><span class="p">,</span> <span class="n">conv_state_k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">k_conv1d</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">v</span><span class="p">,</span> <span class="n">conv_state_v</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">v_conv1d</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>目的：</strong> 在进入复杂的长期记忆处理前，先用一个很小的卷积核（比如窗口大小为 4）扫一遍数据。
+<strong>作用：</strong> 捕捉<strong>局部上下文</strong>。比如理解 "not happy"，模型需要同时看到 "not" 和 "happy" 才能知道是贬义。如果不做这一步，RNN 有时候反应会迟钝。</p>
+<h4>Task 3: 【核心创新】闭环控制修正 (Comba 特色)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 计算 p (一种衰减后的 Key)</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_inner_decay</span><span class="p">:</span>
+    <span class="n">p</span> <span class="o">=</span> <span class="n">k</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">decay</span><span class="p">[</span><span class="o">...</span><span class="p">]</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">()</span>
+
+<span class="c1"># 2. 修正 Q (Output Correction)</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_output_correction</span><span class="p">:</span>
+    <span class="n">q</span> <span class="o">=</span> <span class="n">q</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">D</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">*</span> <span class="n">p</span>
+</code></pre></div>
+
+<p><strong>目的：</strong> 这是这篇论文（Comba）的核心观点。
+*   它认为传统的线性 RNN (如 Mamba) 容易发散或者控制不稳。
+*   它引入了一个反馈机制：<strong>用当前的 Key (K) 去修正当前的 Query (Q)</strong>。
+*   <code>self.D</code> 是一个可学习的参数，控制修正的力度。</p>
+<blockquote>
+<p><strong>通俗理解：</strong> 以前的模型是“我想查什么(Q)就查什么”，现在变成了“根据我刚才存进去的东西(K)，调整一下我要查的东西(Q)”，这是一种<strong>负反馈机制</strong>，让模型更稳定。</p>
+</blockquote>
+<h4>Task 4: 【计算门控】生成遗忘与输入门</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算 beta (输入门/混合比例)</span>
+<span class="n">beta</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">b_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">()</span>
+
+<span class="c1"># 计算 g (decay rate，遗忘门)</span>
+<span class="n">g</span> <span class="o">=</span> <span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">A_log</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span> <span class="o">*</span> <span class="n">F</span><span class="o">.</span><span class="n">softplus</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>目的：</strong> 决定记忆的去留。
+*   <strong><code>beta</code></strong>: 决定当前的输入有多少能进入长期记忆。
+*   <strong><code>g</code> (Gamma)</strong>: 决定历史记忆要遗忘多少（衰减率）。</p>
+<h4>Task 5: 【混合搅拌】核心状态空间计算</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;chunk&#39;</span><span class="p">:</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">chunk_comba</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="k">elif</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;fused_recurrent&#39;</span><span class="p">:</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">fused_recurrent_comba</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>目的：</strong> 这是计算量最大的一步，调用了底层的 CUDA 加速算子（<code>fla.ops.comba</code>）。
+*   <strong>Chunk Mode (训练时用):</strong> 并行计算，速度极快。把长序列切成小块同时算。
+*   <strong>Recurrent Mode (推理时用):</strong> 像传统 RNN 一样，一步一步算，省内存，生成文本时用这个。
+*   <strong>输入：</strong> 修正后的 Q, K, V，以及门控 g, beta。
+*   <strong>输出：</strong> 混合后的结果 <code>o</code> 和新的记忆状态 <code>recurrent_state</code>。</p>
+<h4>Task 6: 【最终包装】输出门控与还原</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_output_gate</span><span class="p">:</span>
+    <span class="c1"># 计算输出门</span>
+    <span class="n">g</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">g_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+    <span class="c1"># 归一化并通过门控</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_norm</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="n">g</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_norm</span><span class="p">(</span><span class="n">o</span><span class="p">)</span>
+
+<span class="c1"># 映射回原来的维度</span>
+<span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="p">(</span><span class="n">o</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>目的：</strong>
+1.  <strong>Output Gate:</strong> 最后再过滤一次信息，类似于 LSTM 的输出门。
+2.  <strong>Norm:</strong> 归一化，防止数值爆炸。
+3.  <strong>Projection:</strong> 把数据的维度变回 <code>hidden_size</code>，以便传给网络的下一层。</p>
+<hr />
+<h3>💡 总结：这代码到底在干啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个改进版的 Mamba/线性 RNN 层。它通过引入 <strong>"Short Convolution" (局部卷积)</strong> 增强局部理解能力，并通过 <strong>"Output Correction" (用 K 修正 Q)</strong> 这种闭环控制手段来增强模型的稳定性和表达能力，最后通过高效的 CUDA 算子完成计算。</p>
+<p><strong>你只需要记住它比普通 Attention 做了两个改动：</strong>
+1.  <strong>加了卷积：</strong> 先看清局部。
+2.  <strong>加了反馈：</strong> 查字典（Query）的时候，会参考刚才存字典（Key）的行为，自我修正一下。</p>

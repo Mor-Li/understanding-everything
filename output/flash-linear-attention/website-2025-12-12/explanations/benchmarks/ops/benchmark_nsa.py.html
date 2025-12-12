@@ -1,0 +1,88 @@
+<h1>benchmarks/ops/benchmark_nsa.py</h1>
+<p>这份代码其实就是一个<strong>性能测试（Benchmark）脚本</strong>。</p>
+<p>简单来说，它的目的是：<strong>让一种新的注意力机制算法（叫 NSA）和业界标杆（Flash Attention）赛跑，看看谁跑得快，并画出图表。</strong></p>
+<p>为了让你彻底看懂，我把阅读这份代码拆解成 <strong>5 个待办任务（Todo List）</strong>，我们一步步来完成。</p>
+<hr />
+<h3>✅ Task 1: 搞清楚“比赛”的规则 (宏观逻辑)</h3>
+<p>首先不要看细节，先看代码最外层的结构。</p>
+<ul>
+<li><strong>目标</strong>：测试不同序列长度（Sequence Length, <code>T</code>）下的运行时间。</li>
+<li><strong>X轴</strong>：<code>T</code> (文本长度)，从 128 开始，每次翻倍，一直到 128 * 2^7。</li>
+<li><strong>参赛选手 (Lines)</strong>：<ol>
+<li><code>nsa</code> (NSA 算法的前向传播/推理)</li>
+<li><code>nsa_bwd</code> (NSA 算法的反向传播/训练)</li>
+<li><code>flash</code> (Flash Attention 的前向传播)</li>
+<li><code>flash_bwd</code> (Flash Attention 的反向传播)</li>
+</ol>
+</li>
+</ul>
+<p><strong>代码对应位置：</strong>
+文件开头的 <code>@triton.testing.perf_report</code> 装饰器。它告诉程序：“我要画个图，X轴是T，不同的线条代表不同的 provider”。</p>
+<hr />
+<h3>✅ Task 2: 准备“比赛用具” (数据初始化)</h3>
+<p>比赛开始前，需要造一些假数据（Tensor）。</p>
+<ul>
+<li><strong>维度设置</strong>：<ul>
+<li><code>B=4</code>: Batch size (一次处理4句话)。</li>
+<li><code>T</code>: 序列长度 (由 Task 1 中的循环动态传入)。</li>
+<li><code>HQ=64, H=4</code>: 注意这里 Query 的头数(64) 和 Key/Value 的头数(4) 不一样。这叫 <strong>GQA (Grouped Query Attention)</strong>，是现在大模型（如 Llama 3）常用的技术。</li>
+<li><code>D=128</code>: 每个词向量的维度。</li>
+</ul>
+</li>
+<li><strong>造数据</strong>：<ul>
+<li><code>q, k, v</code>: 随机生成的输入数据。</li>
+<li><code>do</code>: 梯度数据（用于测试反向传播）。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码对应位置：</strong>
+<code>benchmark</code> 函数的前几行 (<code>B, H, HQ...</code> 到 <code>do = ...</code>)。</p>
+<hr />
+<h3>✅ Task 3: 理解 NSA 的“特殊技能” (难点解析)</h3>
+<p>这是代码里最难懂的一段。Flash Attention 是“全对全”的计算，而 NSA (Native Sparse Attention，推测是某种稀疏注意力) 需要通过<strong>索引 (indices)</strong> 来指定“我看哪些块”。</p>
+<ul>
+<li><strong>逻辑解读</strong>：<ul>
+<li>代码创建了一个 <code>indices</code> 张量。</li>
+<li>它用了一个三重循环 (<code>B, T, H</code>) 加上 <code>torch.randperm</code>。</li>
+<li><strong>人话翻译</strong>：它在模拟一种<strong>稀疏关注</strong>的场景。在这个场景下，每个 token 不需要看之前所有的 token，只需要看<strong>随机选中的 S 个块 (Block)</strong>。</li>
+<li><code>indices</code> 就是一张地图，告诉 NSA 算法：“嘿，对于第 b 句话、第 t 个词、第 h 个头，你只需要去计算这些特定的块，别的不用管。”</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码对应位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">indices</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">B</span><span class="p">):</span>
+    <span class="o">...</span>
+        <span class="n">i_i</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randperm</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 随机选块</span>
+        <span class="n">indices</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">i_i</span>        <span class="c1"># 填入地图</span>
+</code></pre></div>
+
+<hr />
+<h3>✅ Task 4: 让选手开跑 (核心测试逻辑)</h3>
+<p>现在数据有了，地图也有了，开始计时。</p>
+<ul>
+<li><strong><code>provider</code> 参数</strong>：这是 Task 1 传进来的，决定这一轮测谁。</li>
+<li><strong><code>triton.testing.do_bench</code></strong>：这是 Triton 库自带的秒表。它会把里面的函数运行很多次，取平均值，算出毫秒数。</li>
+<li><strong>比赛分组</strong>：<ul>
+<li><strong>NSA 组</strong>：调用 <code>parallel_nsa(..., block_indices=indices)</code>。注意它传了 <code>indices</code>，说明它是稀疏计算。</li>
+<li><strong>Flash 组</strong>：调用 <code>flash_attn_func</code>。这是标准的稠密计算（虽然设了 <code>causal=True</code>，但它还是要算所有下三角区域）。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码对应位置：</strong>
+<code>if provider == 'nsa': ... elif provider == 'flash': ...</code> 这一大段 if-else 判断。</p>
+<hr />
+<h3>✅ Task 5: 总结与输出</h3>
+<p>最后一步，脚本运行起来会发生什么？</p>
+<ol>
+<li><strong><code>benchmark.run</code></strong>：启动整个流程。</li>
+<li>它会按照 Task 1 定义的 X 轴，从小到大改变 <code>T</code> (128, 256, 512...)。</li>
+<li>对于每个 <code>T</code>，它轮流让 NSA 和 Flash Attention 跑一遍。</li>
+<li><strong><code>save_path='.'</code></strong>：最后会生成一张图片或者数据表保存在当前目录下，名字叫 <code>Performance.png</code> (由 <code>plot_name</code> 定义)。</li>
+</ol>
+<hr />
+<h3>总结：这篇文章到底在讲啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个用来证明 <strong>“在特定的稀疏关注模式下（只看部分块），我们写的这个 NSA 算子比标准的 Flash Attention 算子要快多少”</strong> 的测试代码。</p>
+<p><strong>预期结果：</strong>
+随着序列长度 <code>T</code> 变长，Flash Attention 的计算量通常是平方级增长的（越来越慢），而 NSA 如果是稀疏的，它的计算量增长会慢很多。作者希望看到代表 <code>nsa</code> 的线条在 <code>flash</code> 的线条下方（也就是耗时更短）。</p>

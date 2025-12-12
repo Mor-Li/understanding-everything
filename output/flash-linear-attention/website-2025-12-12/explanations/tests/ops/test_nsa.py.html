@@ -1,0 +1,138 @@
+<h1>tests/ops/test_nsa.py</h1>
+<p>这份代码是一个<strong>单元测试（Unit Test）</strong>文件。</p>
+<p>简单来说，它的目的是：<strong>验证一个新的、运行速度更快的算法（NSA - Native Sparse Attention），算出来的结果是否和标准（虽然慢但准确）的算法一致。</strong></p>
+<p>为了让你听懂，我们可以把这个过程想象成<strong>老师批改作业</strong>：
+*   <strong>Naive (朴素版) 实现</strong>：这是“标准答案”。代码写得很简单直白，虽然运行慢，但绝对是算得对的。
+*   <strong>Parallel (并行版) 实现</strong>：这是“学生作业”。代码写得很复杂（用了 Triton 加速），目的是为了跑得飞快。
+*   <strong>测试过程</strong>：给同样的题目（随机数据），分别让“标准答案”和“学生作业”算一遍，然后对比结果。如果结果一样，说明“学生作业”写对了。</p>
+<hr />
+<h3>✅ 任务清单 (Task Todo List)</h3>
+<p>如果我们要把这段代码拆解成一个工作流，大概是这几步：</p>
+<ol>
+<li><strong>[准备] 设置参数</strong>：设定好测试的规模（比如句子有多长、有多少个注意力头、向量维度是多少）。</li>
+<li><strong>[造数] 生成随机输入</strong>：造一些随机的 Q (Query), K (Key), V (Value) 矩阵，以及对应的梯度 <code>do</code>。</li>
+<li><strong>[核心] 构造稀疏索引 (Block Indices)</strong>：这是 NSA (稀疏注意力) 的关键。因为不是看所有的词，而是只看一部分，所以要随机生成“我们要看哪些块”的索引。</li>
+<li><strong>[基准] 跑“标准答案”</strong>：用 <code>naive_nsa</code> 跑一遍前向传播（算结果）和反向传播（算梯度），把结果存起来作为 Reference (参考)。</li>
+<li><strong>[测试] 跑“学生作业”</strong>：用 <code>parallel_nsa</code> (待测试的加速版) 跑一遍前向和反向传播。</li>
+<li><strong>[对比] 校验结果</strong>：对比两者的输出结果 (<code>o</code>) 和梯度 (<code>dq</code>, <code>dk</code>, <code>dv</code>)。如果误差在允许范围内（比如 0.005），则测试通过。</li>
+</ol>
+<hr />
+<h3>📖 逐步讲解 (Step-by-Step)</h3>
+<p>我们以第一个函数 <code>test_parallel</code> 为例，一步步看代码在干嘛。</p>
+<h4>第一步：设置测试参数 (Pytest Parametrize)</h4>
+<div class="codehilite"><pre><span></span><code><span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span>
+    <span class="p">(</span><span class="s1">&#39;B&#39;</span><span class="p">,</span> <span class="s1">&#39;T&#39;</span><span class="p">,</span> <span class="s1">&#39;H&#39;</span><span class="p">,</span> <span class="s1">&#39;HQ&#39;</span><span class="p">,</span> <span class="s1">&#39;D&#39;</span><span class="p">,</span> <span class="s1">&#39;S&#39;</span><span class="p">,</span> <span class="s1">&#39;block_size&#39;</span><span class="p">,</span> <span class="s1">&#39;scale&#39;</span><span class="p">,</span> <span class="s1">&#39;dtype&#39;</span><span class="p">),</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_parallel</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：为了保证算法在各种情况下都对，作者列出了一堆不同的参数组合。</li>
+<li><strong>解释</strong>：<ul>
+<li><code>B</code>: Batch size (一批有多少个句子)。</li>
+<li><code>T</code>: Time steps (句子长度)。</li>
+<li><code>HQ</code>: Query 的头数。</li>
+<li><code>H</code>: Key/Value 的头数 (这里允许 <code>H != HQ</code>，即 GQA/MQA 机制)。</li>
+<li><code>D</code>: 向量维度。</li>
+<li><code>S</code>: 选多少个 Block (稀疏度)。</li>
+<li><code>dtype</code>: 数据类型 (如 float16)。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：生成随机输入数据</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 固定随机种子，保证每次跑结果一样</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">42</span><span class="p">)</span>
+
+    <span class="c1"># 生成 Q, K, V</span>
+    <span class="c1"># requires_grad=True 表示我们需要测试反向传播（算梯度）</span>
+    <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">((</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">HQ</span><span class="p">,</span> <span class="n">D</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">((</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">D</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">((</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">D</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+
+    <span class="c1"># 生成输出端的梯度，用于测试反向传播</span>
+    <span class="n">do</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">((</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">HQ</span><span class="p">,</span> <span class="n">D</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：测试深度学习算子时，输入的内容是什么不重要（全是随机噪声），重要的是数学运算逻辑对不对。</li>
+</ul>
+<h4>第三步：构造稀疏索引 (Block Indices)</h4>
+<p>这是这段代码里最“特有”的部分，对应 <strong>NSA (Native Sparse Attention)</strong> 的逻辑。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 初始化索引矩阵，填满 T (意为默认不选中任何有效块)</span>
+    <span class="n">block_indices</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">),</span> <span class="n">T</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+
+    <span class="c1"># 双重循环构造稀疏模式</span>
+    <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">B</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">T</span><span class="p">):</span>
+            <span class="k">for</span> <span class="n">h</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">H</span><span class="p">):</span>
+                <span class="c1"># 随机选 S 个块作为我们要关注的区域</span>
+                <span class="n">i_i</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randperm</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">triton</span><span class="o">.</span><span class="n">cdiv</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="n">block_size</span><span class="p">)))[:</span><span class="n">S</span><span class="p">]</span>
+                <span class="n">block_indices</span><span class="p">[</span><span class="n">b</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">h</span><span class="p">,</span> <span class="p">:</span><span class="nb">len</span><span class="p">(</span><span class="n">i_i</span><span class="p">)]</span> <span class="o">=</span> <span class="n">i_i</span>
+
+    <span class="c1"># 排序，因为算法通常要求索引有序</span>
+    <span class="n">block_indices</span> <span class="o">=</span> <span class="n">block_indices</span><span class="o">.</span><span class="n">sort</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：NSA 不是像标准 Attention 那样看前面所有的词，而是把前面的词分成很多块 (Block)，只挑其中几个块 (<code>S</code>个) 来看。</li>
+<li>这段代码就是在模拟“随机挑选几个块”的过程，生成了一张“藏宝图” (<code>block_indices</code>)，告诉算法去哪里找信息。</li>
+</ul>
+<h4>第四步：跑“标准答案” (Reference)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 运行朴素版 (Naive)</span>
+    <span class="n">ref</span> <span class="o">=</span> <span class="n">naive_nsa</span><span class="p">(</span><span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span> <span class="n">block_indices</span><span class="o">=</span><span class="n">block_indices</span><span class="p">,</span> <span class="n">block_size</span><span class="o">=</span><span class="n">block_size</span><span class="p">,</span> <span class="n">scale</span><span class="o">=</span><span class="n">scale</span><span class="p">)</span>
+
+    <span class="c1"># 运行反向传播</span>
+    <span class="n">ref</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">do</span><span class="p">)</span>
+
+    <span class="c1"># 保存算出来的梯度 (clone一下，防止被覆盖)</span>
+    <span class="n">ref_dq</span><span class="p">,</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="kc">None</span>
+    <span class="n">ref_dk</span><span class="p">,</span> <span class="n">k</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="kc">None</span>
+    <span class="n">ref_dv</span><span class="p">,</span> <span class="n">v</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="kc">None</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：<code>naive_nsa</code> 是用纯 PyTorch 写的，逻辑简单，用来当真理。算出结果后，我们需要手动把梯度存下来 (<code>ref_dq</code> 等)，并清空 <code>q.grad</code>，以便给下一次测试腾地方。</li>
+</ul>
+<h4>第五步：跑“学生作业” (Target)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 运行并行版 (Parallel - Triton kernel)</span>
+    <span class="n">tri</span> <span class="o">=</span> <span class="n">parallel_nsa</span><span class="p">(</span><span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span> <span class="n">block_indices</span><span class="o">=</span><span class="n">block_indices</span><span class="p">,</span> <span class="n">block_size</span><span class="o">=</span><span class="n">block_size</span><span class="p">,</span> <span class="n">scale</span><span class="o">=</span><span class="n">scale</span><span class="p">)</span>
+
+    <span class="c1"># 运行反向传播</span>
+    <span class="n">tri</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">do</span><span class="p">)</span>
+
+    <span class="c1"># 保存算出来的梯度</span>
+    <span class="n">tri_dq</span><span class="p">,</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="kc">None</span>
+    <span class="n">tri_dk</span><span class="p">,</span> <span class="n">k</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="kc">None</span>
+    <span class="n">tri_dv</span><span class="p">,</span> <span class="n">v</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="kc">None</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：<code>parallel_nsa</code> 是实际要发布的高性能算子。流程和上面完全一样，只是调用的函数变了。</li>
+</ul>
+<h4>第六步：对比打分</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 对比输出结果 (o)</span>
+    <span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot; o&quot;</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tri</span><span class="p">,</span> <span class="mf">0.005</span><span class="p">)</span>
+
+    <span class="c1"># 对比 Q 的梯度</span>
+    <span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;dq&quot;</span><span class="p">,</span> <span class="n">ref_dq</span><span class="p">,</span> <span class="n">tri_dq</span><span class="p">,</span> <span class="mf">0.005</span><span class="p">)</span>
+    <span class="c1"># 对比 K 的梯度</span>
+    <span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;dk&quot;</span><span class="p">,</span> <span class="n">ref_dk</span><span class="p">,</span> <span class="n">tri_dk</span><span class="p">,</span> <span class="mf">0.005</span><span class="p">)</span>
+    <span class="c1"># 对比 V 的梯度</span>
+    <span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;dv&quot;</span><span class="p">,</span> <span class="n">ref_dv</span><span class="p">,</span> <span class="n">tri_dv</span><span class="p">,</span> <span class="mf">0.005</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：<code>assert_close</code> 会检查两个张量每一个数值的差距。如果差距超过 <code>0.005</code>，程序就会报错 (Test Failed)。如果全部通过，说明优化版的算子是正确的。</li>
+</ul>
+<hr />
+<h3>补充：关于 <code>test_parallel_varlen</code></h3>
+<p>文件下半部分还有一个 <code>test_parallel_varlen</code>。
+*   <strong>观点</strong>：这是测试 <strong>Variable Length (变长序列)</strong> 的情况。
+*   <strong>区别</strong>：
+    *   在 <code>test_parallel</code> 里，所有句子的长度都是固定的 <code>T</code>，或者用 Padding 补齐。
+    *   在 <code>test_parallel_varlen</code> 里，多个不同长度的句子被拼接成了一个超长的一维数组（这在 FlashAttention 等高效训练中很常见）。
+    *   它使用了 <code>cu_seqlens</code> (Cumulative Sequence Lengths，累积序列长度) 来标记每个句子在哪里开始、在哪里结束。
+    *   逻辑依然是：<strong>造数 -&gt; 跑Naive -&gt; 跑Parallel -&gt; 对比</strong>。</p>
+<h3>总结</h3>
+<p>这个文件不是在讲算法原理，而是在<strong>做质检</strong>。它确保了 <code>fla</code> 这个库里提供的 <code>parallel_nsa</code> 算子，在算得飞快的同时，结果和普通算子是一模一样的。</p>

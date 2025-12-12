@@ -1,0 +1,117 @@
+<h1>fla/layers/multiscale_retention.py</h1>
+<p>这份代码实现的是 <strong>RetNet (Retentive Network)</strong> 中的核心层：<code>MultiScaleRetention</code>。</p>
+<p>你可以把它看作是 Transformer 中 <strong>"Self-Attention"（自注意力机制）的替代品</strong>。它的目的是让模型既能像 Transformer 一样并行训练（快），又能像 RNN 一样推理生成（省显存、速度快）。</p>
+<p>为了让你看懂，我把这个代码的运行逻辑拆解成一个 <strong>"流水线工人的任务清单 (Todo List)"</strong>。</p>
+<p>想象有一个名叫 <strong>RetNet</strong> 的工人，他手里拿到了一段文本（比如 "我爱吃苹果"），他的任务是处理这段文本并输出新的特征。</p>
+<hr />
+<h3>第一阶段：准备工具 (对应 <code>__init__</code> 函数)</h3>
+<p>在开工之前，RetNet 工人先要把工具摆好。</p>
+<ul>
+<li><strong>Task 1: 确定规格</strong><ul>
+<li>设定 <code>hidden_size</code>（每个词向量多长）。</li>
+<li>设定 <code>num_heads</code>（把向量切成几份并行处理）。</li>
+</ul>
+</li>
+<li><strong>Task 2: 准备投影仪 (Linear Layers)</strong><ul>
+<li>准备 <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>：用来把输入的词向量转换成 Query (查询), Key (索引), Value (内容)。</li>
+<li>准备 <code>g_proj</code>：这是一个“门控”投影（Gate），后面用来控制流量。</li>
+</ul>
+</li>
+<li><strong>Task 3: 准备局部放大镜 (Short Convolution)</strong><ul>
+<li>对应代码 <code>use_short_conv</code>。</li>
+<li>这是一个小的 1D 卷积层。它的作用是：在看长距离关系之前，先专门看看<strong>相邻</strong>的几个词（比如“吃”和“苹果”挨得近，先处理一下它们的关系）。</li>
+</ul>
+</li>
+<li><strong>Task 4: 准备位置标记器 (RotaryEmbedding)</strong><ul>
+<li>对应代码 <code>self.rotary</code>。</li>
+<li>用来给向量打上位置标签（你是第1个词，他是第2个词）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第二阶段：开始干活 (对应 <code>forward</code> 函数)</h3>
+<p>现在数据 <code>hidden_states</code> 进来了（比如 shape 是 <code>[batch, 序列长度, 维度]</code>）。</p>
+<h4>✅ Step 1: 预处理与“看过去” (Handling Cache)</h4>
+<ul>
+<li><strong>动作</strong>：检查 <code>past_key_values</code>。</li>
+<li><strong>目的</strong>：如果是像 GPT 一样一个字一个字生成（推理模式），我不需要重新计算以前看过的词，直接从缓存里拿上一次的状态 (<code>last_state</code>) 接着算。</li>
+<li><strong>代码对应</strong>：<code>if past_key_values is not None...</code></li>
+</ul>
+<h4>✅ Step 2: 变换身份 (Projections)</h4>
+<ul>
+<li><strong>动作</strong>：把输入的 <code>hidden_states</code> 分别通过三个全连接层。</li>
+<li><strong>产出</strong>：<ul>
+<li><strong>Q (Query)</strong>：我想找什么？</li>
+<li><strong>K (Key)</strong>：我有什么特征？</li>
+<li><strong>V (Value)</strong>：我的实际内容是什么？</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<code>q = self.q_proj(...)</code>, <code>k = ...</code>, <code>v = ...</code></li>
+</ul>
+<h4>✅ Step 3: 局部平滑 (Short Convolution - 可选)</h4>
+<ul>
+<li><strong>动作</strong>：如果开启了 <code>use_short_conv</code>，拿着刚才生成的 Q, K, V，用那个“局部放大镜”扫一遍。</li>
+<li><strong>目的</strong>：让每个词先和它左右两边的词混合一下，增强局部信息的捕捉能力。</li>
+<li><strong>代码对应</strong>：<code>self.q_conv1d(...)</code></li>
+</ul>
+<h4>✅ Step 4: 打上位置标签 (RoPE)</h4>
+<ul>
+<li><strong>动作</strong>：给 Q 和 K 加上旋转位置编码。</li>
+<li><strong>目的</strong>：让模型知道“苹果”是在“吃”的后面。</li>
+<li><strong>代码对应</strong>：<code>self.rotary(q, k, ...)</code></li>
+</ul>
+<h4>✅ Step 5: <strong>核心任务 - 计算保留 (Retention)</strong></h4>
+<p>这是整个文件最难也最重要的部分。它计算词与词之间的关系。这里有几种<strong>模式 (Mode)</strong>，就像工人有几种干活的姿势：</p>
+<ul>
+<li><strong>模式 A: Parallel (并行模式)</strong><ul>
+<li><strong>场景</strong>：训练时用。</li>
+<li><strong>动作</strong>：一次性把所有词的关系算出来（像 Transformer）。</li>
+</ul>
+</li>
+<li><strong>模式 B: Fused Recurrent (融合循环模式)</strong><ul>
+<li><strong>场景</strong>：推理生成时用。</li>
+<li><strong>动作</strong>：像 RNN 一样，看一个词，更新一下记忆状态，输出一个词。<strong>内存占用极低，速度极快</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>模式 C: Chunk (分块模式)</strong></p>
+<ul>
+<li><strong>场景</strong>：处理超长文本时用。</li>
+<li><strong>动作</strong>：把长文切成小块，块内并行，块间循环。</li>
+</ul>
+</li>
+<li>
+<p><strong>代码对应</strong>：
+    <code>python
+    if mode == 'chunk': ...
+    elif mode == 'parallel': ...
+    elif mode == 'fused_recurrent': ...</code>
+    <em>最终得到了输出 <code>o</code> (output)。</em></p>
+</li>
+</ul>
+<h4>✅ Step 6: 记忆存档 (Update Cache)</h4>
+<ul>
+<li><strong>动作</strong>：把当前的计算状态（<code>recurrent_state</code>）存进 <code>past_key_values</code>。</li>
+<li><strong>目的</strong>：为了处理下一个词时不用从头算。</li>
+</ul>
+<h4>✅ Step 7: 门控与修整 (Gating &amp; Norm)</h4>
+<ul>
+<li><strong>动作</strong>：<ol>
+<li>计算门控信号 <code>g = self.g_proj(hidden_states)</code>。</li>
+<li>把 Retention 的输出 <code>o</code> 进行归一化 (RMSNorm)。</li>
+<li><strong>关键一步</strong>：<code>o = o * swish(g)</code>。</li>
+</ol>
+</li>
+<li><strong>解释</strong>：这里的 <code>g</code> 就像一个水龙头（Gate）。神经网络觉得某些信息不重要，就通过 <code>g</code> 把它关小（乘以一个接近0的数）；觉得重要就开大。</li>
+<li><strong>代码对应</strong>：<code>self.g_norm_swish_gate(...)</code> 或 <code>o * self.gate_fn(g)</code></li>
+</ul>
+<h4>✅ Step 8: 最终输出 (Output Projection)</h4>
+<ul>
+<li><strong>动作</strong>：最后过一层全连接层 <code>o_proj</code>，把维度调整回原来的大小，方便传给下一层。</li>
+<li><strong>代码对应</strong>：<code>o = self.o_proj(o)</code></li>
+</ul>
+<hr />
+<h3>总结：这个文件到底在干啥？</h3>
+<p>简单来说，这个 <code>MultiScaleRetention</code> 层就是在做一件事：</p>
+<p><strong>它接收一串向量，先看局部邻居（Conv），再根据位置（RoPE）和历史记忆（Retention）混合全局信息，最后通过一个开关（Gate）决定输出多少信息。</strong></p>
+<p>它最厉害的地方在于 <strong>Step 5</strong>，它允许你在训练时像 Transformer 一样快（并行），在生成时像 RNN 一样省资源（循环），这是 Transformer 做不到的。</p>

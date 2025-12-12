@@ -1,0 +1,98 @@
+<h1>fla/layers/gla.py</h1>
+<p>这份代码实现的是 <strong>Gated Linear Attention (GLA)</strong>。</p>
+<p>简单来说，GLA 是一种试图结合 <strong>Transformer 的并行训练能力</strong> 和 <strong>RNN (循环神经网络) 的快速推理能力</strong> 的模型架构。它不像传统的 Attention 那样需要计算庞大的 $N \times N$ 矩阵，而是通过一种“线性”的方式来处理序列，速度更快，显存占用更低。</p>
+<p>为了让你看懂，我把这个 <code>forward</code> 函数（数据流向）拆解成一个 <strong>“数据处理流水线”的 Todo List</strong>。</p>
+<p>想象你是一组输入数据（<code>hidden_states</code>），你需要经过以下 <strong>6 个步骤</strong> 才能变成最终的输出：</p>
+<hr />
+<h3>📋 GLA 数据处理 Todo List</h3>
+<h4>1. Task: 准备与预处理 (Prepare)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>forward</code> 函数开头 到 <code>if self.use_short_conv:</code> 之前。</li>
+<li><strong>任务:</strong><ul>
+<li>检查有没有 <code>attention_mask</code>（比如填充符 pad 需不需要处理）。</li>
+<li>如果有 mask，把数据里的 pad 去掉，压扁成一长串（<code>get_unpad_data</code>），方便后续计算。</li>
+<li><strong>直觉:</strong> 就像进工厂前先安检，把不需要包装的废料（padding）先剔除掉。</li>
+</ul>
+</li>
+</ul>
+<h4>2. Task: 生成基础特征 Q, K, V (Projections)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>self.q_proj</code>, <code>self.k_proj</code>, <code>self.v_proj</code> 相关部分。</li>
+<li><strong>任务:</strong><ul>
+<li>把输入 $X$ 变成 Query ($Q$), Key ($K$), Value ($V$)。</li>
+<li><strong>如果有 <code>use_short_conv</code> (短卷积):</strong><ul>
+<li>在做线性投影后，先过一个 <strong>1D 卷积</strong> (<code>ShortConvolution</code>)。</li>
+<li><strong>直觉:</strong> 这一步是为了捕捉<strong>局部上下文</strong>。比如处理单词 "apple" 时，先看一眼它左右两边的词，把局部信息融合进来，再去做长距离的 Attention。这能增强模型的稳定性。</li>
+</ul>
+</li>
+<li><strong>如果没有短卷积:</strong> 直接做线性变换（Linear）。</li>
+</ul>
+</li>
+</ul>
+<h4>3. Task: 计算“遗忘门” (Calculate the Decay Gate)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>gk = self.gk_proj(hidden_states)</code> 及后续 <code>F.logsigmoid</code>。</li>
+<li><strong>任务:</strong><ul>
+<li>这是 GLA 的<strong>核心灵魂</strong>。它计算了一个 <code>gk</code> (Gate for Keys)。</li>
+<li><code>gk</code> 经过 <code>logsigmoid</code> 处理。</li>
+<li><strong>直觉:</strong> 这个门控决定了<strong>“我们要遗忘多少过去的信息”</strong>。<ul>
+<li>在传统 Attention 里，我们要看所有历史 token。</li>
+<li>在 GLA 里，这个门控告诉模型：“这个信息很重要，记下来；那个信息没用，把它忘掉（衰减掉）”。这让模型可以用类似 RNN 的方式一直往前走，而不需要回头看所有历史。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>4. Task: 多头重组 (Reshape for Heads)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>rearrange</code> 和 <code>repeat</code> 相关代码。</li>
+<li><strong>任务:</strong><ul>
+<li>把 $Q, K, V, g_k$ 按照 <code>num_heads</code>（头数）拆开。</li>
+<li>如果使用了 MQA/GQA (多查询/分组查询注意力)，这里会把 $K$ 和 $V$ 复制几份，让它们和 $Q$ 的头数对齐。</li>
+<li><strong>直觉:</strong> 把大任务拆给几个小组（Heads）并行处理，或者让多个小组共享同一份资料（GQA）。</li>
+</ul>
+</li>
+</ul>
+<h4>5. Task: 核心线性注意力计算 (The Core Kernel)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>chunk_gla</code>, <code>fused_chunk_gla</code>, 或 <code>fused_recurrent_gla</code>。</li>
+<li><strong>任务:</strong><ul>
+<li>这是最复杂的数学部分，代码里直接调用了底层的 CUDA 算子（ops）。</li>
+<li><strong>Mode 模式选择:</strong><ul>
+<li><code>chunk</code>: <strong>训练时用</strong>。把长序列切成小块（Chunk），块内并行计算，块间串行传递记忆。既快又省显存。</li>
+<li><code>fused_recurrent</code>: <strong>推理时或短序列用</strong>。像 RNN 一样一步步处理，生成下一个词非常快，不需要重新计算前面的。</li>
+</ul>
+</li>
+<li><strong>直觉:</strong> 输入 $Q, K, V$ 和 遗忘门 $g_k$，输出注意力结果 $O$。它利用遗忘门动态地更新记忆状态，计算出当前时刻的输出。</li>
+</ul>
+</li>
+</ul>
+<h4>6. Task: 输出门控与归一化 (Output Gating &amp; Norm)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>if self.use_output_gate:</code> 及其后。</li>
+<li><strong>任务:</strong><ul>
+<li>计算一个输出门 <code>g = self.g_proj(hidden_states)</code>。</li>
+<li>把注意力计算的结果 $O$ 进行归一化（RMSNorm）。</li>
+<li>把归一化后的 $O$ 和 输出门 $g$ 相乘。</li>
+<li>最后通过 <code>o_proj</code> 映射回原来的维度。</li>
+<li><strong>直觉:</strong><ul>
+<li>Attention 算出来的结果不一定全都要用。</li>
+<li><strong>输出门</strong>就像一个过滤器，决定最终输出里保留多少 Attention 的结果。</li>
+<li>这能进一步增强模型的非线性表达能力。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这代码到底在干嘛？</h3>
+<p>如果不看细节，这个类做的事情就是：</p>
+<ol>
+<li><strong>输入</strong>一个序列。</li>
+<li><strong>局部混合</strong>：先看看每个词周围的邻居（Short Conv）。</li>
+<li><strong>动态遗忘</strong>：计算一个“遗忘率”（Gate），决定保留多少历史记忆。</li>
+<li><strong>线性计算</strong>：用一种不用算 $N \times N$ 大矩阵的高效算法，算出 Attention 结果。</li>
+<li><strong>输出筛选</strong>：最后再过一个门，整理好输出。</li>
+</ol>
+<p><strong>它的核心优势</strong>：
+你看代码里有 <code>mode</code> 切换（chunk vs recurrent）。这意味着它<strong>训练时像 Transformer 一样并行（快）</strong>，<strong>推理（生成文本）时像 RNN 一样只需存一个很小的状态（省内存、推理快）</strong>。</p>

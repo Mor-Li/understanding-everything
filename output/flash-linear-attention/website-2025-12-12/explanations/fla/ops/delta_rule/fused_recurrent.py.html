@@ -1,0 +1,136 @@
+<h1>fla/ops/delta_rule/fused_recurrent.py</h1>
+<p>这份代码确实非常硬核，因为它不是普通的 PyTorch 模型代码，而是用 <strong>Triton</strong> 编写的<strong>高性能 GPU 算子（Kernel）</strong>。</p>
+<p>简单来说，这是一个<strong>线性注意力（Linear Attention）</strong>或<strong>RNN</strong>的变体，专门实现了一种叫做 <strong>"Delta Rule"</strong> 的更新机制。它的目的是为了让大模型处理长序列时更快、显存占用更小。</p>
+<p>为了让你读懂，我制定了一个 <strong>学习任务清单（Todo List）</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>📋 学习任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>Task 1：搞懂核心概念</strong> —— 什么是 "Fused Recurrent" 和 "Delta Rule"？</li>
+<li><strong>Task 2：看懂数学原理</strong> —— 代码里那个 <code>for</code> 循环到底在算什么公式？</li>
+<li><strong>Task 3：理解输入输出</strong> —— <code>q, k, v, beta</code> 分别代表什么？</li>
+<li><strong>Task 4：代码逻辑拆解</strong> —— 逐行分析 <code>fwd_kernel</code>（前向传播）。</li>
+<li><strong>Task 5：宏观架构</strong> —— 它是怎么被 PyTorch 调用的？</li>
+</ol>
+<hr />
+<h3>✅ Task 1: 搞懂核心概念</h3>
+<ul>
+<li><strong>Recurrent (循环):</strong> 这是一个 RNN 风格的计算。传统的 Transformer Attention 需要看所有历史 token（$O(N^2)$），而这个算法维护一个“记忆状态” $H$（Hidden State）。每读入一个 token，就更新一下 $H$，然后输出结果。复杂度是 $O(N)$，非常快。</li>
+<li><strong>Fused (融合):</strong> 在 GPU 上，如果每一步循环都启动一个 PyTorch 操作，速度会慢如蜗牛。这个文件用 Triton 把整个循环逻辑“融合”成了一个单一的 GPU 函数（Kernel），极大地减少了开销。</li>
+<li><strong>Delta Rule (Delta 规则):</strong> 这是核心算法。普通的线性 Attention 是直接把新的信息 $K, V$ 加到记忆 $H$ 里。而 Delta Rule 认为：<strong>不要重复记忆已经记住的东西</strong>。在更新前，先看 $H$ 已经记住了多少 $V$，只把“没记住的差异部分（Delta）”加进去。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 看懂数学原理 (对应代码逻辑)</h3>
+<p>在代码的循环里，数学逻辑如下。假设 $h_{t-1}$ 是上一步的记忆矩阵，$q_t, k_t, v_t$ 是当前的输入。</p>
+<ol>
+<li><strong>预测 (Recall):</strong> 用当前的 Key ($k_t$) 去查询记忆 ($h_{t-1}$)，看看能预测出什么 Value。
+    $$ v_{pred} = h_{t-1} \cdot k_t $$</li>
+<li><strong>计算差异 (Delta):</strong> 真实的 $v_t$ 减去预测的 $v_{pred}$，得到“新知识”。
+    $$ \Delta v = v_t - v_{pred} $$</li>
+<li><strong>更新记忆 (Update):</strong> 把这个“新知识”存入记忆 $h$。
+    $$ h_t = h_{t-1} + \Delta v \cdot k_t^T $$
+    <em>(注意：代码里还乘了一个 <code>beta</code>，作为遗忘门控/衰减)</em></li>
+<li><strong>计算输出 (Output):</strong> 用 Query ($q_t$) 从更新后的记忆里读取结果。
+    $$ o_t = h_t \cdot q_t $$</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 理解输入输出</h3>
+<p>看函数 <code>fused_recurrent_delta_rule</code> 的参数：</p>
+<ul>
+<li><strong><code>q, k</code> (Query, Key):</strong> 形状 <code>[B, T, H, K]</code>。B是Batch，T是序列长度，H是多头数量，K是特征维度。</li>
+<li><strong><code>v</code> (Value):</strong> 形状 <code>[B, T, H, V]</code>。实际要记忆的内容。</li>
+<li><strong><code>beta</code>:</strong> 形状 <code>[B, T, H]</code>。<strong>衰减系数</strong>。决定了旧的记忆 $h$ 保留多少，或者新信息 $v$ 写入多少。</li>
+<li><strong><code>initial_state</code> (h0):</strong> 初始记忆状态。</li>
+<li><strong><code>scale</code>:</strong> 缩放因子（类似 Attention 里的 $\frac{1}{\sqrt{d}}$）。</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 代码逻辑拆解 (核心中的核心)</h3>
+<p>请聚焦在 <code>fused_recurrent_delta_rule_fwd_kernel</code> 这个函数。这是在 GPU 上实际跑的代码。</p>
+<p><strong>代码片段解读：</strong></p>
+<ol>
+<li>
+<p><strong>定位坐标：</strong>
+    <code>python
+    i_v, i_k, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)</code>
+    Triton 是并行计算的。这里在计算当前线程负责处理哪个 Batch、哪个 Head、哪一部分特征块。</p>
+</li>
+<li>
+<p><strong>加载初始状态：</strong>
+    <code>python
+    if USE_INITIAL_STATE:
+        # ... 从内存加载 h0 到寄存器 b_h ...
+        b_h += tl.load(...)</code>
+    <code>b_h</code> 就是当前线程维护的<strong>记忆矩阵</strong>（Hidden State）。</p>
+</li>
+<li>
+<p><strong>时间步循环 (最重要的部分)：</strong>
+    ```python
+    for _ in range(0, T): # 遍历序列长度 T
+        # 1. 加载当前时刻的 k, v, q, beta
+        b_k = tl.load(p_k, ...).to(tl.float32)
+        b_v = tl.load(p_v, ...).to(tl.float32)
+        b_q = tl.load(p_q, ...).to(tl.float32) * scale</p>
+<div class="codehilite"><pre><span></span><code><span class="err">#</span><span class="w"> </span><span class="mi">2</span><span class="p">.</span><span class="w"> </span><span class="err">【</span><span class="nx">Delta</span><span class="w"> </span><span class="nx">Rule</span><span class="w"> </span><span class="nx">核心</span><span class="err">】</span><span class="nx">计算</span><span class="w"> </span><span class="nx">h</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">k</span><span class="w"> </span><span class="p">(</span><span class="nx">预测值</span><span class="p">)</span>
+<span class="err">#</span><span class="w"> </span><span class="nx">对应数学</span><span class="err">：</span><span class="nx">v_pred</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">h_</span><span class="p">{</span><span class="nx">t</span><span class="o">-</span><span class="mi">1</span><span class="p">}</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">k_t</span>
+<span class="nx">b_v_minus</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">tl</span><span class="p">.</span><span class="nx">sum</span><span class="p">(</span><span class="nx">b_h</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">b_k</span><span class="p">[</span><span class="nx">None</span><span class="p">,</span><span class="w"> </span><span class="p">:],</span><span class="w"> </span><span class="nx">axis</span><span class="p">=</span><span class="mi">1</span><span class="p">)</span>
+
+<span class="err">#</span><span class="w"> </span><span class="mi">3</span><span class="p">.</span><span class="w"> </span><span class="err">【</span><span class="nx">Delta</span><span class="w"> </span><span class="nx">Rule</span><span class="w"> </span><span class="nx">核心</span><span class="err">】</span><span class="nx">计算</span><span class="w"> </span><span class="nx">v</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nx">v_pred</span>
+<span class="err">#</span><span class="w"> </span><span class="nx">对应数学</span><span class="err">：</span><span class="nx">Delta</span><span class="w"> </span><span class="nx">v</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">v_t</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nx">v_pred</span>
+<span class="nx">b_v</span><span class="w"> </span><span class="o">-=</span><span class="w"> </span><span class="nx">b_v_minus</span>
+
+<span class="err">#</span><span class="w"> </span><span class="mi">4</span><span class="p">.</span><span class="w"> </span><span class="nx">这里的</span><span class="w"> </span><span class="nx">b_v</span><span class="w"> </span><span class="nx">变成了</span><span class="w"> </span><span class="s">&quot;残差/Delta&quot;</span><span class="err">。</span><span class="nx">先存下来用于反向传播</span><span class="p">(</span><span class="nx">p_u</span><span class="p">)</span>
+<span class="nx">tl</span><span class="p">.</span><span class="nx">store</span><span class="p">(</span><span class="nx">p_u</span><span class="p">,</span><span class="w"> </span><span class="nx">b_v</span><span class="p">.</span><span class="nx">to</span><span class="p">(</span><span class="nx">p_v</span><span class="p">.</span><span class="nx">dtype</span><span class="p">.</span><span class="nx">element_ty</span><span class="p">),</span><span class="w"> </span><span class="nx">mask</span><span class="p">=</span><span class="nx">mask_v</span><span class="p">)</span>
+
+<span class="err">#</span><span class="w"> </span><span class="mi">5</span><span class="p">.</span><span class="w"> </span><span class="nx">应用</span><span class="w"> </span><span class="nx">Beta</span><span class="w"> </span><span class="p">(</span><span class="nx">衰减</span><span class="o">/</span><span class="nx">门控</span><span class="p">)</span>
+<span class="nx">b_v</span><span class="w"> </span><span class="o">*=</span><span class="w"> </span><span class="nx">b_beta</span>
+
+<span class="err">#</span><span class="w"> </span><span class="mi">6</span><span class="p">.</span><span class="w"> </span><span class="nx">更新记忆矩阵</span><span class="w"> </span><span class="nx">h</span>
+<span class="err">#</span><span class="w"> </span><span class="nx">对应数学</span><span class="err">：</span><span class="nx">h_t</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">h_</span><span class="p">{</span><span class="nx">t</span><span class="o">-</span><span class="mi">1</span><span class="p">}</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="p">(</span><span class="nx">Delta</span><span class="w"> </span><span class="nx">v</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">beta</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">k_t</span>
+<span class="nx">b_h</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="nx">b_k</span><span class="p">[</span><span class="nx">None</span><span class="p">,</span><span class="w"> </span><span class="p">:]</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">b_v</span><span class="p">[:,</span><span class="w"> </span><span class="nx">None</span><span class="p">]</span>
+
+<span class="err">#</span><span class="w"> </span><span class="mi">7</span><span class="p">.</span><span class="w"> </span><span class="nx">计算输出</span><span class="w"> </span><span class="nx">o</span>
+<span class="err">#</span><span class="w"> </span><span class="nx">对应数学</span><span class="err">：</span><span class="nx">o_t</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">h_t</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">q_t</span>
+<span class="nx">b_o</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">b_h</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">b_q</span><span class="p">[</span><span class="nx">None</span><span class="p">,</span><span class="w"> </span><span class="p">:]</span>
+<span class="nx">b_o</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">tl</span><span class="p">.</span><span class="nx">sum</span><span class="p">(</span><span class="nx">b_o</span><span class="p">,</span><span class="w"> </span><span class="nx">axis</span><span class="p">=</span><span class="mi">1</span><span class="p">)</span>
+
+<span class="err">#</span><span class="w"> </span><span class="mi">8</span><span class="p">.</span><span class="w"> </span><span class="nx">存入结果</span><span class="err">，</span><span class="nx">指针移动到下一个时间步</span>
+<span class="nx">tl</span><span class="p">.</span><span class="nx">store</span><span class="p">(</span><span class="nx">p_o</span><span class="p">,</span><span class="w"> </span><span class="nx">b_o</span><span class="o">...</span><span class="p">)</span>
+<span class="nx">p_q</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="nx">H</span><span class="o">*</span><span class="nx">K</span><span class="w"> </span><span class="err">#</span><span class="w"> </span><span class="nx">指针后移</span>
+<span class="err">#</span><span class="w"> </span><span class="o">...</span>
+</code></pre></div>
+
+<p>```</p>
+</li>
+</ol>
+<p><strong>总结这个循环在干嘛：</strong>
+它就像一个贪吃蛇，吃进 <code>k</code> 和 <code>v</code>，算出它们和肚子里记忆 <code>h</code> 的差值，更新记忆 <code>h</code>，然后用 <code>q</code> 问一下肚子里的 <code>h</code> 得到输出 <code>o</code>。</p>
+<hr />
+<h3>✅ Task 5: 宏观架构 (PyTorch 包装)</h3>
+<p>文件下半部分的 <code>FusedRecurrentFunction</code> 和 <code>fused_recurrent_delta_rule</code> 是给 Python 调用的接口。</p>
+<ol>
+<li>
+<p><strong><code>FusedRecurrentFunction</code>:</strong></p>
+<ul>
+<li>这是一个 <code>torch.autograd.Function</code>。</li>
+<li><strong><code>forward</code></strong>: 准备数据，计算 Grid 大小，调用上面的 Triton Kernel (<code>fwd_kernel</code>)。</li>
+<li><strong><code>backward</code></strong>: 自动微分无法自动处理 Triton 代码，所以作者必须手写反向传播逻辑 (<code>bwd_kernel</code>)。这部分代码极其复杂（Task 4 中循环的逆过程），主要用于训练时计算梯度。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>fused_recurrent_delta_rule</code>:</strong></p>
+<ul>
+<li>这是用户直接调用的函数。</li>
+<li>它处理了一些杂活：检查参数、设置默认值、处理变长序列 (<code>cu_seqlens</code>)。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 总结：这代码到底讲了啥？</h3>
+<p>这个文件实现了一个<strong>极速版的、带“差分更新”机制的线性注意力算子</strong>。</p>
+<ul>
+<li><strong>如果你是使用者</strong>：你只需要调用 <code>fused_recurrent_delta_rule(q, k, v, beta)</code>，把它当成一个更强的 Attention 层用。</li>
+<li><strong>如果你是开发者</strong>：这个文件展示了如何用 Triton 手写 GPU 算子来融合 RNN 的循环步骤，把显存读写降到最低，从而把原本很慢的逐行计算加速几十倍。</li>
+</ul>
+<p><strong>一句话概括逻辑：</strong></p>
+<blockquote>
+<p>在 GPU 上开一个核函数，维护一个片上缓存的矩阵 $H$，每一个时间步算出 $V$ 和 $H \cdot K$ 的差值，把差值更新进 $H$，再输出 $H \cdot Q$。</p>
+</blockquote>

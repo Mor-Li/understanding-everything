@@ -1,0 +1,86 @@
+<h1>benchmarks/ops/benchmark_retention.py</h1>
+<p>这份代码其实是一个 <strong>“性能测试（Benchmark）”</strong> 脚本。简单来说，它组织了一场比赛，让几个不同的算法在同一个跑道上赛跑，看看谁跑得快。</p>
+<p>为了让你彻底搞懂，我制定了一个 <strong>5步走的 Task List（任务清单）</strong>，我们一步一步来拆解这个文件：</p>
+<h3>📋 Task List: 读懂性能测试脚本</h3>
+<ol>
+<li><strong>Task 1：搞清楚“比赛”的目的是什么？（核心功能）</strong></li>
+<li><strong>Task 2：认识“参赛选手”是谁？（核心变量）</strong></li>
+<li><strong>Task 3：看懂“赛道”是怎么设计的？（输入数据）</strong></li>
+<li><strong>Task 4：理解“裁判”是怎么计时的？（核心逻辑）</strong></li>
+<li><strong>Task 5：预测“比赛结果”长什么样？（输出图表）</strong></li>
+</ol>
+<hr />
+<h3>💡 详细讲解</h3>
+<h4>Task 1：搞清楚“比赛”的目的是什么？</h4>
+<p><strong>观点：</strong> 这段代码不是用来训练模型的，也不是用来推理的，它是用来 <strong>画图表对比速度</strong> 的。</p>
+<ul>
+<li><strong>代码证据：</strong> 文件名叫 <code>benchmark_retention.py</code>，且引入了 <code>triton.testing.Benchmark</code>。</li>
+<li><strong>解释：</strong> 它的作用是运行不同的算法，记录它们运行了多少毫秒，最后生成一张折线图。Y轴是“执行时间（Execution Time）”，越低越好。</li>
+</ul>
+<h4>Task 2：认识“参赛选手”是谁？</h4>
+<p><strong>观点：</strong> 这场比赛有三位主要选手，每位选手都要跑两轮（正向传播和反向传播）。</p>
+<ul>
+<li><strong>代码证据：</strong> 看 <code>line_vals</code> 和 <code>benchmark</code> 函数里的 <code>if provider == ...</code> 判断逻辑。</li>
+<li><strong>选手名单：</strong><ol>
+<li><strong>Chunk Retention (<code>chunk</code>)</strong>: <code>fla</code> 库提供的一种分块计算 Retention 的算法。</li>
+<li><strong>Parallel Retention (<code>parallel</code>)</strong>: <code>fla</code> 库提供的另一种并行计算 Retention 的算法。</li>
+<li><strong>Flash Attention (<code>flash</code>)</strong>: 业内著名的 Flash Attention 算法（作为基准参考对象，看看新算法有没有比它快）。</li>
+</ol>
+</li>
+</ul>
+<p>每位选手都有 <strong>Fwd</strong> (前向/推理) 和 <strong>Bwd</strong> (反向/训练求导) 两种模式。</p>
+<h4>Task 3：看懂“赛道”是怎么设计的？</h4>
+<p><strong>观点：</strong> 比赛的难度是逐渐增加的，主要体现在 <strong>序列长度（Sequence Length, T）</strong> 越来越长。</p>
+<ul>
+<li><strong>代码证据：</strong>
+    <code>python
+    x_names=['T'],
+    x_vals=[128 * 2 ** i for i in range(0, 8)],</code></li>
+<li><strong>解释：</strong><ul>
+<li><code>T</code> 代表文本序列的长度。</li>
+<li>代码会让 T 从 128 开始，每次翻倍（128, 256, 512 ... 直到 16384）。</li>
+<li>这就像赛跑，先跑100米，再跑200米，再跑400米... 看看随着距离变长，谁的速度掉得最慢。</li>
+<li>其他维度如 Batch Size (<code>B=4</code>), Head (<code>H=8</code>), Dimension (<code>D=256</code>) 是固定的。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4：理解“裁判”是怎么计时的？</h4>
+<p><strong>观点：</strong> 核心函数 <code>benchmark</code> 负责准备数据并按下秒表。</p>
+<ul>
+<li><strong>代码证据：</strong> <code>benchmark(T, provider)</code> 函数内部。</li>
+<li><strong>步骤拆解：</strong><ol>
+<li><strong>造数据：</strong> 使用 <code>torch.randn</code> 生成随机的 <code>q</code> (Query), <code>k</code> (Key), <code>v</code> (Value)。这些就是喂给算法的输入。</li>
+<li><strong>热身与计时：</strong>
+    <code>python
+    results = triton.testing.do_bench(lambda: ..., quantiles=...)</code>
+    <code>do_bench</code> 是 Triton 提供的工具，它会把你的函数运行很多次，去掉最高分和最低分，算出一个稳定的平均耗时。</li>
+<li><strong>分流测试：</strong><ul>
+<li>如果是 <code>chunk</code>，就测 <code>chunk_retention(q, k, v)</code>。</li>
+<li>如果是 <code>chunk_bwd</code>，就测 <code>chunk_retention(...).backward(do)</code>（测算梯度的速度）。</li>
+<li>以此类推。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 5：预测“比赛结果”长什么样？</h4>
+<p><strong>观点：</strong> 代码运行结束后，会生成一张图表，告诉你哪个算法在长序列下更具优势。</p>
+<ul>
+<li><strong>代码证据：</strong>
+    <code>python
+    line_names=['chunk_fwd', 'parallel_fwd', ...],
+    styles=[('green', '-'), ('blue', '-'), ...],
+    ylabel="Execution Time (ms)",
+    plot_name="Performance"</code></li>
+<li><strong>画面感：</strong><ul>
+<li>你会看到一张图。</li>
+<li><strong>横轴</strong>是 T (128 到 16k)。</li>
+<li><strong>纵轴</strong>是毫秒数。</li>
+<li><strong>绿线</strong>代表 Chunk 算法，<strong>蓝线</strong>代表 Parallel 算法，<strong>红线</strong>代表 Flash Attention。</li>
+<li><strong>实线</strong>是前向传播（推理），<strong>虚线</strong>是反向传播（训练）。</li>
+</ul>
+</li>
+</ul>
+<h3>📝 总结</h3>
+<p>这段代码就是为了证明：<strong>“虽然我实现了 Retention 机制（Chunk/Parallel），但在序列变长时，我的速度和显存效率对比 Flash Attention 到底怎么样？”</strong></p>
+<p>你不需要看懂 <code>chunk_retention</code> 内部的数学公式，只需要知道这个脚本是在<strong>测速</strong>。</p>

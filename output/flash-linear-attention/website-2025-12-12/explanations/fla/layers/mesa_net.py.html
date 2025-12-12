@@ -1,0 +1,160 @@
+<h1>fla/layers/mesa_net.py</h1>
+<p>这份代码确实比较硬核，因为它实现的是一种<strong>线性注意力（Linear Attention）</strong>的变体，而且结合了<strong>测试时训练（Test-Time Training, TTT）</strong>的思想。</p>
+<p>简单来说，这个 <code>MesaNet</code> 是一个用来<strong>替代</strong>传统 Transformer 中 <code>Self-Attention</code> 层的模块。它的目的是在保持高性能的同时，让推理速度更快（像 RNN 一样生成），并且显存占用更低。</p>
+<p>为了让你看懂，我把它想象成一个<strong>“流水线工厂”</strong>，把 <code>forward</code> 函数拆解成一个 <strong>Task List (待办清单)</strong>。</p>
+<hr />
+<h3>📋 MesaNet 任务清单 (Task To-Do List)</h3>
+<p>想象数据（<code>hidden_states</code>）进入这个层，需要按顺序完成以下 6 个步骤：</p>
+<ol>
+<li><strong>[预处理]</strong>：检查数据形状，处理 Padding（填充），确保护照（Mask）没问题。</li>
+<li><strong>[素材准备]</strong>：把输入数据通过全连接层（Linear）变成 Q, K, V，就像 Transformer 那样。</li>
+<li><strong>[局部润色]</strong>：在 Q 和 K 上做一个“短卷积”（Short Conv），让它们先看看“邻居”的信息。</li>
+<li><strong>[控制信号生成]</strong>：计算特殊的控制参数（$\alpha, \beta, \lambda$），这些参数决定了要“记住”多少历史信息，“遗忘”多少旧信息。</li>
+<li><strong>[核心压缩]</strong>：这是最难的一步。将 Q, K, V 和控制信号送入 <strong>MesaNet 核心算法</strong>。<ul>
+<li><em>训练时</em>：并行处理所有 Token（Chunk mode）。</li>
+<li><em>推理时</em>：像 RNN 一样一步步更新状态（Recurrent mode）。</li>
+</ul>
+</li>
+<li><strong>[打包出厂]</strong>：把结果进行归一化（Norm），再映射回原来的维度，输出。</li>
+</ol>
+<hr />
+<h3>🧐 逐步代码详解</h3>
+<p>现在我们对照代码，把上面的 List 一步步走一遍。</p>
+<h4>Task 1: [预处理] 整理队形</h4>
+<p><strong>代码位置：</strong> <code>forward</code> 函数开头</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 检查 Mask 形状</span>
+<span class="k">if</span> <span class="n">attention_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">attention_mask</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span> <span class="o">==</span> <span class="mi">2</span><span class="p">,</span> <span class="o">...</span>
+
+<span class="c1"># 处理变长序列（去 Padding），为了计算加速</span>
+<span class="k">if</span> <span class="n">attention_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">indices</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">get_unpad_data</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">index_first_axis</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：这一步主要是为了技术上的加速。如果一个 Batch 里句子长短不一，它会把 Padding 去掉，把所有有效 Token 拼成一条长龙，方便后面 CUDA 核心计算。</li>
+</ul>
+<h4>Task 2: [素材准备] 生成 Q, K, V</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 将输入分别映射成 Key, Value</span>
+<span class="c1"># 注意：这里 Q 的生成在后面和卷积合在一起了，这里先看 K 和 V</span>
+<span class="n">v</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：标准的神经网络操作。把输入的向量投影到不同的特征空间。</li>
+</ul>
+<h4>Task 3: [局部润色] 短卷积 (Short Convolution)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 先投影生成 Q 和 K 的原始数据</span>
+<span class="c1"># 然后立刻过一个 Conv1d (一维卷积)</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">conv_state_q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_conv1d</span><span class="p">(</span>
+    <span class="n">x</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> 
+    <span class="n">cache</span><span class="o">=</span><span class="n">conv_state_q</span><span class="p">,</span> <span class="o">...</span>
+<span class="p">)</span>
+<span class="n">k</span><span class="p">,</span> <span class="n">conv_state_k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">k_conv1d</span><span class="p">(</span>
+    <span class="n">x</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> 
+    <span class="n">cache</span><span class="o">=</span><span class="n">conv_state_k</span><span class="p">,</span> <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：<ul>
+<li>普通的 Transformer 是直接拿 Q 和 K 算。</li>
+<li>MesaNet 认为：<strong>“在看全局历史之前，先看看前后几个词”</strong>。</li>
+<li><code>ShortConvolution</code> 就是一个窗口大小为 4 (默认 <code>conv_size=4</code>) 的滑窗，让 Q 和 K 包含一点局部上下文信息。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: [控制信号生成] 决定遗忘与记忆</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># beta: 一个 0 到 1 之间的门控信号 (sigmoid)</span>
+<span class="n">beta</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">b_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">()</span>
+<span class="c1"># g: 输入依赖的衰减率 (logsigmoid)</span>
+<span class="n">g</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">logsigmoid</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">a_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">())</span>
+<span class="c1"># lamb: 一个可学习的参数，控制长期记忆的衰减下界</span>
+<span class="n">lamb</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softplus</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">lambda_params</span><span class="o">.</span><span class="n">float</span><span class="p">())</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">lambda_lower_bound</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：这是线性注意力（Linear Attention）或 RNN 的精髓。<ul>
+<li>在标准 Attention 里，所有词都同等重要（通过 Softmax 算权重）。</li>
+<li>在这里，模型计算出 <code>g</code> (decay) 和 <code>beta</code>。意思是：<strong>“对于当前的这个词，我要在这个记忆状态里保留多少？以前的记忆要忘掉多少？”</strong></li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: [核心压缩] MesaNet 核心计算</h4>
+<p>这是整个文件最核心的部分，分两种情况。</p>
+<p><strong>情况 A：训练模式 (Training/Prefilling)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">last_state</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">h_kk</span><span class="p">,</span> <span class="n">h_kv</span> <span class="o">=</span> <span class="n">chunk_mesa_net</span><span class="p">(</span>
+        <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span>
+        <span class="n">g</span><span class="o">=</span><span class="n">g</span><span class="p">,</span> <span class="n">beta</span><span class="o">=</span><span class="n">beta</span><span class="p">,</span> <span class="n">lamb</span><span class="o">=</span><span class="n">lamb</span><span class="p">,</span>
+        <span class="o">...</span>
+        <span class="n">max_CG_iteration</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_cg_step_training</span><span class="p">,</span> <span class="c1"># 重点</span>
+        <span class="o">...</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：<ul>
+<li>这里调用了 <code>chunk_mesa_net</code>（通常是 CUDA 写的底层算子）。</li>
+<li><strong>原理</strong>：它不像标准 Attention 那样算 $QK^T$ 的 $N \times N$ 矩阵（太慢）。它利用数学技巧，把 Key 和 Value 压缩成一个状态 $H$。</li>
+<li><strong>Max CG Iteration</strong>：这里提到了 <code>CG</code> (Conjugate Gradient，共轭梯度法)。MesaNet 的特点是它在内部解一个<strong>最小二乘问题</strong>来更新记忆。你可以理解为：<strong>它在这一层里，进行了一次微型的“训练”迭代，让记忆状态更精准</strong>。</li>
+</ul>
+</li>
+</ul>
+<p><strong>情况 B：推理模式 (Decoding)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">else</span><span class="p">:</span>
+    <span class="c1"># 对 Q, K 做 L2 归一化（为了数值稳定）</span>
+    <span class="n">q</span> <span class="o">=</span> <span class="n">l2_norm</span><span class="p">(</span><span class="n">q</span><span class="p">)</span>
+    <span class="n">k</span> <span class="o">=</span> <span class="n">l2_norm</span><span class="p">(</span><span class="n">k</span><span class="p">)</span>
+    <span class="c1"># 单步更新</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">h_kk</span><span class="p">,</span> <span class="n">h_kv</span> <span class="o">=</span> <span class="n">mesa_net_decoding_one_step</span><span class="p">(</span>
+        <span class="o">...</span><span class="p">,</span>
+        <span class="n">prev_h_kk</span><span class="o">=</span><span class="n">last_h_kk</span><span class="p">,</span> <span class="c1"># 上一步的记忆状态</span>
+        <span class="n">prev_h_kv</span><span class="o">=</span><span class="n">last_h_kv</span><span class="p">,</span>
+        <span class="n">max_CG_iteration</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_cg_step_decoding</span><span class="p">,</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：<ul>
+<li>这是生成文本时用的。</li>
+<li>输入当前的词，拿出上一步存下的“记忆” (<code>prev_h_kk</code>, <code>prev_h_kv</code>)。</li>
+<li>更新记忆，算出当前的输出，然后把新记忆存回去。</li>
+<li><strong>优点</strong>：不管之前的文章有多长，这里计算量都是固定的（O(1)），而不像标准 Transformer 越长越慢。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: [打包出厂] 归一化与输出</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 o 是 output</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_output_gate</span><span class="p">:</span>
+    <span class="c1"># 如果开了门控，再乘个门</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_norm</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="n">g</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="c1"># 标准 RMSNorm</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_norm</span><span class="p">(</span><span class="n">o</span><span class="p">)</span>
+
+<span class="c1"># 变回原来的形状 (Batch, Time, Hidden)</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="s1">&#39;b t h d -&gt; b t (h d)&#39;</span><span class="p">)</span>
+<span class="c1"># 最后过一个线性层</span>
+<span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="p">(</span><span class="n">o</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：把计算好的结果整理一下，调整回 <code>hidden_size</code> 的大小，传给下一层网络。</li>
+</ul>
+<hr />
+<h3>💡 总结：这个文件到底在干啥？</h3>
+<ol>
+<li>它定义了一个神经网络层 <code>MesaNet</code>。</li>
+<li>它试图解决 Transformer <strong>推理慢、显存大</strong>的问题。</li>
+<li><strong>核心魔法</strong>：它不存储所有的 Key 和 Value 历史（那是 Transformer 做的），而是把历史信息<strong>压缩</strong>进两个矩阵状态 (<code>h_kk</code>, <code>h_kv</code>) 中。</li>
+<li><strong>独特之处</strong>：为了保证压缩后的记忆质量，它在内部使用了一种优化算法（共轭梯度法 CG），相当于在推理的时候，模型也在动态地“学习”如何最好地表示当前的上下文。</li>
+</ol>
+<p>这就像：
+*   <strong>Transformer</strong>：考试时把整本书（所有历史 Token）都摊在桌上看。
+*   <strong>RNN/MesaNet</strong>：考试时只允许带一张小纸条（State），但 MesaNet 在写这张小纸条时，用了一种非常高级的数学方法（CG），确保纸条上记的都是最关键的考点。</p>

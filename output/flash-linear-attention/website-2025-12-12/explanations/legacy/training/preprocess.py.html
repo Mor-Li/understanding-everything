@@ -1,0 +1,78 @@
+<h1>legacy/training/preprocess.py</h1>
+<p>这份代码确实涉及很多大模型训练的数据处理细节，乍一看很晕是很正常的。</p>
+<p>简单来说，这段代码是一个<strong>“数据加工流水线”</strong>。它的核心目的是：<strong>把各种长短不一的文本，转换成大模型训练时需要的、长度整齐划一的数字序列（Token IDs）。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>5步走的 Task Todo List</strong>，我们一步步来完成这个“数据加工任务”。</p>
+<hr />
+<h3>📋 Task Todo List：数据预处理流水线</h3>
+<h4>✅ Task 1: 准备原材料和工具 (Setup)</h4>
+<p><strong>代码对应位置：</strong> <code>preprocess</code> 函数的前半部分。</p>
+<ul>
+<li><strong>目标：</strong> 也就是你要训练什么数据？用什么字典？</li>
+<li><strong>动作：</strong><ol>
+<li><strong>加载分词器 (Tokenizer)：</strong> 这是“字典”。大模型不认识中文或英文，只认识数字。分词器负责把“你好”变成 <code>[101, 235]</code> 这样的数字。</li>
+<li><strong>加载数据集 (Load Dataset)：</strong> 比如加载 <code>Fineweb-edu</code> 这个数据集，里面全是原始的文本文章。</li>
+<li><strong>打乱顺序 (Shuffle)：</strong> 为了训练效果好，先把数据的顺序打乱。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 2: 把文字变成数字 (Tokenization)</h4>
+<p><strong>代码对应位置：</strong> <code>tokenize</code> 函数的第一行 <code>tokenizer(text)['input_ids']</code>。</p>
+<ul>
+<li><strong>目标：</strong> 把人类语言翻译成机器语言。</li>
+<li><strong>动作：</strong><ul>
+<li>拿出数据集里的文本（比如一篇文章），通过分词器变成一串数字列表（List of Ints）。</li>
+<li><em>现状：</em> 现在的每一行数据代表一篇文章，有的文章长（5000字），有的文章短（100字）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 【关键】把短数据拼成长条，再切成固定长度 (Concatenation &amp; Slicing)</h4>
+<p><strong>代码对应位置：</strong> <code>tokenize</code> 函数的核心逻辑（<code>chain</code>, <code>range</code> 等部分）。</p>
+<ul>
+<li><strong>这是最难懂的部分，也是这个脚本的核心观点：Packed Training（拼接训练）。</strong></li>
+<li><strong>问题：</strong> 训练模型时，我们需要固定的输入长度（比如 <code>seq_len = 2048</code>）。<ul>
+<li>如果文章只有 100 个字，剩下的 1948 个位置填 0 (Padding) 极其浪费算力。</li>
+<li>如果文章有 5000 个字，一次塞不进去。</li>
+</ul>
+</li>
+<li><strong>解决方案（流水线操作）：</strong><ol>
+<li><strong>拼接 (Chain)：</strong> 不管文章原来是啥样，把所有文章的数字 ID <strong>首尾相连</strong>，拼成一条超级长的贪吃蛇（比如把 100 篇文章拼成一条几万个 Token 的长链）。</li>
+<li><strong>切割 (Slice)：</strong> 拿着这把“尺子”（长度为 <code>seq_len</code>，比如 2048），在这条贪吃蛇上咔咔切。<ul>
+<li>第一刀：切下 0-2048。</li>
+<li>第二刀：切下 2048-4096。</li>
+<li>...</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>结果：</strong> 现在每一条数据都是填得满满当当的 2048 个数字，没有浪费。<strong>注意：</strong> 这样切完后，一条数据里可能包含“文章A的后半段”和“文章B的前半段”。</li>
+</ul>
+<h4>✅ Task 4: (可选) 记录每篇文章的边界 (Offsets)</h4>
+<p><strong>代码对应位置：</strong> <code>tokenize</code> 函数中 <code>if return_offsets:</code> 之后的部分。</p>
+<ul>
+<li><strong>目标：</strong> 防止模型“读串行”。</li>
+<li><strong>问题：</strong> 在 Task 3 中，我们把“文章A”和“文章B”拼在了一起。如果模型在训练时，让“文章A”的字去参考“文章B”的内容，逻辑就乱了。</li>
+<li><strong>动作：</strong><ul>
+<li>计算并记录每一小段文章在 2048 长度里的<strong>起始和结束位置</strong>。</li>
+<li>这叫 <code>offsets</code>。后续训练时，模型会利用这个信息，通过 Mask（掩码）机制，保证文章A只看文章A，文章B只看文章B，互不干扰。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 批量执行并存盘 (Map &amp; Save)</h4>
+<p><strong>代码对应位置：</strong> <code>preprocess</code> 函数的后半部分 (<code>dataset.map</code>, <code>save_to_disk</code>)。</p>
+<ul>
+<li><strong>目标：</strong> 只有几行代码能跑通不行，要处理几百 GB 的数据。</li>
+<li><strong>动作：</strong><ul>
+<li><strong>多进程处理 (<code>num_proc</code>)：</strong> 动用你 CPU 的 64 个核（代码默认值），同时干 Task 2/3/4 的活。</li>
+<li><strong>保存 (<code>save_to_disk</code>)：</strong> 把处理好、切分好、全是数字的数据存到硬盘上的 <code>data/</code> 目录下。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下文中的核心观点</h3>
+<p>这段代码不仅仅是“清洗数据”，它通过 <strong>Packed Dataset（拼接数据集）</strong> 的方式优化了训练效率。</p>
+<ul>
+<li><strong>普通做法：</strong> 一篇文章不够长就补零 -&gt; <strong>浪费显卡显存</strong>。</li>
+<li><strong>这段代码的做法：</strong> 把文章拼起来切块 -&gt; <strong>显卡时刻满载，训练速度最快</strong>。</li>
+<li><strong>代价：</strong> 需要额外计算 <code>offsets</code>（偏移量），告诉模型哪儿是哪儿。</li>
+</ul>
+<p>现在你再回头看 <code>tokenize</code> 函数里的 <code>chain(*input_ids)</code>（拼接）和 <code>range(0, total_len, seq_len)</code>（按固定长度切割），是不是清晰多了？</p>

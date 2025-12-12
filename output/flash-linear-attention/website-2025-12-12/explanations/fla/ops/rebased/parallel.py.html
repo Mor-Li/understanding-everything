@@ -1,0 +1,144 @@
+<h1>fla/ops/rebased/parallel.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了 <strong>Triton 算子开发</strong>、<strong>线性 Attention 的变体（Rebased）</strong> 以及 <strong>GPU 并行计算的优化技巧</strong>。</p>
+<p>看不懂是很正常的，因为这属于深度学习工程优化的底层（Kernel Level）。</p>
+<p>为了帮你理解，我制定了一个 <strong>“学习任务清单 (To-Do List)”</strong>，我们一步一步来拆解这个文件。</p>
+<hr />
+<h3>📋 任务清单：一步步读懂 <code>parallel.py</code></h3>
+<ol>
+<li><strong>Task 1: 搞懂“它想干什么” (核心数学原理)</strong></li>
+<li><strong>Task 2: 理解“怎么切蛋糕” (Triton 的分块策略)</strong></li>
+<li><strong>Task 3: 拆解 Forward Kernel (前向传播逻辑)</strong></li>
+<li><strong>Task 4: 理解 Python 包装层 (输入输出处理)</strong></li>
+</ol>
+<hr />
+<h3>✅ Task 1: 搞懂“它想干什么” (核心数学原理)</h3>
+<p><strong>目标</strong>：这个文件实现的是论文《Rebased: Linear Transformers with Learnable Kernel Functions are Better In-Context Models》中的核心算法。</p>
+<p><strong>普通 Attention vs. Rebased Attention：</strong></p>
+<ul>
+<li>
+<p><strong>普通 Attention (Softmax):</strong>
+    $$Attention(Q, K, V) = \text{softmax}(\frac{QK^T}{\sqrt{d}})V$$
+    计算量是 $O(N^2)$，序列长了跑不动。</p>
+</li>
+<li>
+<p><strong>Rebased (Linear) Attention (本文实现的):</strong>
+    它去掉了 Softmax，改用一个简单的非线性函数（这里是<strong>平方</strong>）。
+    $$Score(q, k) = (q \cdot k)^2$$
+    公式变成了：
+    $$O = \frac{\sum (q \cdot k)^2 \cdot v}{\sum (q \cdot k)^2}$$
+    <em>注意：代码中分别计算了分子（<code>o</code>）和分母（<code>z</code>），最后在 Python 层做除法。</em></p>
+</li>
+</ul>
+<p><strong>结论</strong>：这个文件的核心任务就是<strong>高效地计算 $(QK^T)^2 V$</strong>。</p>
+<hr />
+<h3>✅ Task 2: 理解“怎么切蛋糕” (Triton 的分块策略)</h3>
+<p><strong>目标</strong>：理解代码中 <code>BTL</code>, <code>BTS</code>, <code>BK</code>, <code>BV</code> 这些变量的含义。GPU 显存有限，不能一次性把所有数据算完，必须切成小块（Tiling）。</p>
+<ul>
+<li><strong><code>T</code></strong>: 序列总长度 (Sequence Length)。</li>
+<li><strong><code>BTL</code> (Block Size T - Large)</strong>: Query (Q) 在时间维度上的切块大小（例如 128）。</li>
+<li><strong><code>BTS</code> (Block Size T - Small)</strong>: Key/Value (K, V) 在时间维度上的切块大小（例如 32）。</li>
+<li><strong><code>i_c</code></strong>: 当前处理的是第几个 Q 的块 (Chunk index)。</li>
+</ul>
+<p><strong>并行策略</strong>：
+这个 Kernel 采用了 <strong>Sequence Parallelism (序列并行)</strong>。
+想象一个大矩阵乘法，每个 GPU 线程块（Block）负责计算结果矩阵中的一小块（大小为 <code>BTL x BV</code>）。</p>
+<hr />
+<h3>✅ Task 3: 拆解 Forward Kernel (前向传播逻辑)</h3>
+<p>这是文件中最重要的函数 <code>parallel_rebased_fwd_kernel</code>。我们跟着代码走一遍逻辑：</p>
+<h4>第一步：准备工作</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 定位当前线程负责的数据块</span>
+<span class="n">i_kv</span><span class="p">,</span> <span class="n">i_c</span><span class="p">,</span> <span class="n">i_bh</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+<span class="c1"># ... 初始化指针 p_q, p_k, p_v ...</span>
+<span class="c1"># 加载 Q 的一块数据到 SRAM (高速缓存)</span>
+<span class="n">b_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_q</span><span class="p">,</span> <span class="n">boundary_check</span><span class="o">=</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
+<span class="n">b_q</span> <span class="o">=</span> <span class="p">(</span><span class="n">b_q</span> <span class="o">*</span> <span class="n">scale</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">b_q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="c1"># 缩放 Q</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这里把当前负责的一小块 Query (<code>b_q</code>) 加载进来了，它在整个计算过程中保持不变。</li>
+</ul>
+<h4>第二步：计算非因果部分 (Off-Diagonal / History)</h4>
+<p>代码中第一个 <code>for</code> 循环：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 遍历之前所有的 K 和 V 块 (从 0 到 当前块的起始位置)</span>
+<span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">i_c</span><span class="o">*</span><span class="n">BTL</span><span class="p">,</span> <span class="n">BTS</span><span class="p">):</span>
+    <span class="n">b_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_k</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 加载一小块 K</span>
+    <span class="n">b_v</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_v</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 加载一小块 V</span>
+
+    <span class="c1"># 1. 计算 Q * K^T</span>
+    <span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span><span class="p">,</span> <span class="p">(</span><span class="n">b_k</span><span class="p">),</span> <span class="n">allow_tf32</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="c1"># 2. 核心魔法：平方！ (Rebased 的特征)</span>
+    <span class="n">b_s</span> <span class="o">=</span> <span class="n">b_s</span> <span class="o">*</span> <span class="n">b_s</span> 
+    <span class="c1"># 3. 累加分母 Z (用于归一化)</span>
+    <span class="n">b_z</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_s</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+
+    <span class="c1"># 4. 计算 Score * V 并累加到输出 O</span>
+    <span class="n">b_o</span> <span class="o">=</span> <span class="n">b_o</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_s</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">b_v</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span> <span class="n">b_v</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 指针移动到下一个 K, V 块</span>
+    <span class="n">p_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">advance</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">p_v</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">advance</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是计算“过去的信息”。因为是 Causal (因果) 的，Q 可以看它之前所有的 K。这部分不需要 Mask（掩码），因为这里的 K 都在 Q 之前。</li>
+</ul>
+<h4>第三步：计算对角线部分 (On-Diagonal / Current)</h4>
+<p>代码中第二个 <code>for</code> 循环：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 遍历当前 Q 块覆盖的时间范围</span>
+<span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">i_c</span><span class="o">*</span><span class="n">BTL</span><span class="p">,</span> <span class="p">(</span><span class="n">i_c</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">BTL</span><span class="p">,</span> <span class="n">BTS</span><span class="p">):</span>
+    <span class="c1"># ... 加载 K, V ...</span>
+
+    <span class="c1"># 1. 生成 Mask (因为 Q 不能看未来的 K)</span>
+    <span class="n">m_s</span> <span class="o">=</span> <span class="n">o_q</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="n">o_k</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> 
+
+    <span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span><span class="p">,</span> <span class="n">b_k</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">b_s</span> <span class="o">=</span> <span class="n">b_s</span> <span class="o">*</span> <span class="n">b_s</span> <span class="c1"># 平方</span>
+
+    <span class="c1"># 2. 应用 Mask：未来的位置设为 0</span>
+    <span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">m_s</span><span class="p">,</span> <span class="n">b_s</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> 
+
+    <span class="n">b_z</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_s</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span> <span class="c1"># 累加分母</span>
+    <span class="n">b_o</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_s</span><span class="o">...</span><span class="p">,</span> <span class="n">b_v</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 累加分子</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是计算“当下的信息”。在一个块内部，Q 有些位置比 K 早，有些比 K 晚，所以必须用 <code>m_s</code> (Mask) 把未来的信息遮住。</li>
+</ul>
+<h4>第四步：保存结果</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_o</span><span class="p">,</span> <span class="n">b_o</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 保存分子</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_z</span><span class="p">,</span> <span class="n">b_z</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 保存分母</span>
+</code></pre></div>
+
+<hr />
+<h3>✅ Task 4: 理解 Python 包装层 (输入输出处理)</h3>
+<p>看文件底部的 <code>parallel_rebased</code> 函数。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">parallel_rebased</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 维度处理 ...</span>
+
+    <span class="c1"># 1. 调用 Triton Kernel 计算分子 o 和分母 z</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">z</span> <span class="o">=</span> <span class="n">ParallelBasedFunction</span><span class="o">.</span><span class="n">apply</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">scale</span><span class="p">)</span>
+
+    <span class="c1"># 2. 正则化 (Normalization)</span>
+    <span class="k">if</span> <span class="n">use_normalize</span><span class="p">:</span>
+        <span class="n">o</span> <span class="o">=</span> <span class="n">o</span> <span class="o">/</span> <span class="p">(</span><span class="n">z</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">+</span> <span class="n">eps</span><span class="p">)</span> <span class="c1"># 分子除以分母</span>
+
+    <span class="k">return</span> <span class="n">o</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<ul>
+<li>Triton Kernel 只负责算累加和。</li>
+<li>Python 层负责最后的除法操作（$Output = \frac{\sum Score \cdot V}{\sum Score}$）。这是为了数值稳定性，防止溢出。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在讲啥？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>手写的 GPU 加速算子</strong>，它把原本计算量巨大的 Attention 机制，改成了一种<strong>先平方再累加</strong>的形式（Rebased Linear Attention），并通过<strong>分块并行</strong>的方式在显卡上极快地算出结果。</p>
+<p><strong>你的学习路线建议</strong>：
+1.  先别管 Backward (反向传播) 代码，那全是链式法则求导，逻辑和 Forward 一样但是反着来，非常绕。
+2.  重点看 <code>parallel_rebased_fwd_kernel</code> 中的两个循环：
+    *   第一个循环：<strong>扫历史</strong>（无 Mask，纯矩阵乘法）。
+    *   第二个循环：<strong>扫当前</strong>（有 Mask，处理因果关系）。
+3.  记住核心公式：<code>b_s = b_s * b_s</code> (这就是 Rebased 的灵魂)。</p>

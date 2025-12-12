@@ -1,0 +1,117 @@
+<h1>tests/modules/test_cross_entropy.py</h1>
+<p>这段代码确实容易让人晕，因为它不是在“训练模型”，而是在<strong>“测试代码”</strong>（Unit Test）。</p>
+<p>它属于一个叫 <code>fla</code> 的高性能深度学习库。简单来说，这个文件的作用是：<strong>“证明我写的新算法（跑得快/省显存）算出来的结果，和 PyTorch 官方的标准算法算出来的结果是一模一样的。”</strong></p>
+<p>为了让你看懂，我列了一个 <strong>5步走的 To-Do List</strong>，我们一步步来拆解：</p>
+<hr />
+<h3>✅ Task 1: 理解背景（我们在测什么？）</h3>
+<ul>
+<li><strong>概念</strong>：深度学习里最常用的损失函数是 <strong>Cross Entropy（交叉熵）</strong>，用来衡量预测准不准。</li>
+<li><strong>痛点</strong>：标准的 PyTorch 写法虽然好用，但在处理超长文本（比如 GPT-4 这种大模型）时，显存占用大，速度不够快。</li>
+<li><strong>解决方案</strong>：<code>fla</code> 库写了一个 <strong>Fused（融合）</strong> 版本。<ul>
+<li><em>普通版</em>：计算 Logits -&gt; 存入显存 -&gt; 读出 -&gt; 算 Softmax -&gt; 存入 -&gt; 读出 -&gt; 算 Loss。</li>
+<li><em>Fused版</em>：把上面几步合成一步，在显卡核心里一次做完，不反复读写显存。</li>
+</ul>
+</li>
+<li><strong>本文件目的</strong>：确保“Fused版”算出来的数字，和“普通版”完全一致（误差极小）。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 看懂测试配置（<code>@pytest.mark</code> 是啥？）</h3>
+<p>代码开头那一堆 <code>@pytest.mark.parametrize</code> 不需要深究，它们只是在<strong>穷举不同的配置</strong>。</p>
+<ul>
+<li><strong>B</strong>: Batch size（每次测几句话）。</li>
+<li><strong>T</strong>: Sequence length（每句话多长，这里测了 512 和 1024）。</li>
+<li><strong>V</strong>: Vocabulary size（词表大小，比如 32000 个词）。</li>
+<li><strong>D</strong>: Dimension（隐藏层维度）。</li>
+<li><strong>dtype</strong>: 数据类型（这里用的是 <code>bfloat16</code>，一种省显存的半精度格式）。</li>
+</ul>
+<p><strong>一句话总结</strong>：测试脚本会自动排列组合这些参数，跑很多轮，确保在各种情况下都没 bug。</p>
+<hr />
+<h3>✅ Task 3: 拆解第一个测试函数 <code>test_fused_cross_entropy</code></h3>
+<p>这个函数测试的是：<strong>纯粹的 Loss 计算</strong>。</p>
+<ol>
+<li>
+<p><strong>造数据 (Setup)</strong>:</p>
+<ul>
+<li><code>logits</code>: 随机生成模型的预测值（模拟 GPT 的输出）。</li>
+<li><code>target</code>: 随机生成正确答案（标签）。</li>
+<li><em>注意</em>：代码里有一行 <code>target[..., :1] = -100</code>，这是为了模拟真实训练中掩盖掉（mask）某些不需要计算 Loss 的位置（比如 padding 或者起始符）。</li>
+</ul>
+</li>
+<li>
+<p><strong>跑标准答案 (Ref / Reference)</strong>:</p>
+<ul>
+<li><code>ref = nn.CrossEntropyLoss(...)</code></li>
+<li>这是 PyTorch 官方的方法，我们认为它是绝对正确的“标准答案”。</li>
+<li><code>ref.backward(do)</code>: 算出标准答案的<strong>梯度</strong>（gradient）。</li>
+</ul>
+</li>
+<li>
+<p><strong>跑新算法 (Tri / Triton)</strong>:</p>
+<ul>
+<li><code>tri = FusedCrossEntropyLoss(...)</code></li>
+<li>这是 <code>fla</code> 库自己写的高性能版本。</li>
+<li><code>tri.backward(do)</code>: 算出新算法的<strong>梯度</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>比对 (Assert)</strong>:</p>
+<ul>
+<li><code>assert_close(" o", ref, tri)</code>: 比较 Loss 值（Output）是否一样。</li>
+<li><code>assert_close("dl", ref_d, tri_d)</code>: 比较 Logits 的梯度（Gradient）是否一样。</li>
+<li>如果两者差距小于 1%，测试通过；否则报错。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 拆解第二个测试函数 <code>test_fused_linear_cross_entropy</code></h3>
+<p>这个函数更进阶，它测试的是：<strong>最后一层全连接层 (Linear) + Loss 计算 的大融合</strong>。</p>
+<p>在大模型中，最后一层通常是把 <code>[Batch, Time, Dim]</code> 映射到 <code>[Batch, Time, Vocab]</code>，这个矩阵乘法非常大。这个测试是为了验证把“矩阵乘法”和“算 Loss”融合在一起算对不对。</p>
+<ol>
+<li>
+<p><strong>造数据</strong>:</p>
+<ul>
+<li><code>x</code>: 模型的中间层输出。</li>
+<li><code>weight</code>, <code>bias</code>: 最后一层全连接层的权重和偏置。</li>
+</ul>
+</li>
+<li>
+<p><strong>跑标准答案 (Ref)</strong>:</p>
+<ul>
+<li>这里分了两步走：<ol>
+<li><code>logits = F.linear(x, weight, bias)</code>: 先手动算矩阵乘法。</li>
+<li><code>ref = FusedCrossEntropyLoss(...)</code>: 再算 Loss。</li>
+</ol>
+</li>
+<li>然后算出 <code>x</code>, <code>weight</code>, <code>bias</code> 三者的梯度。</li>
+</ul>
+</li>
+<li>
+<p><strong>跑新算法 (Tri)</strong>:</p>
+<ul>
+<li><code>tri = FusedLinearCrossEntropyLoss(...)</code></li>
+<li><strong>注意</strong>：这里直接把 <code>x</code>, <code>target</code>, <code>weight</code>, <code>bias</code> 全塞进去了。它在内部一边做矩阵乘法，一边算 Loss，极其节省显存。</li>
+</ul>
+</li>
+<li>
+<p><strong>比对</strong>:</p>
+<ul>
+<li>除了比对 Loss (<code>o</code>)，还要比对三个梯度：<ul>
+<li><code>dx</code>: 输入数据的梯度。</li>
+<li><code>dw</code>: 权重的梯度。</li>
+<li><code>db</code>: 偏置的梯度。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 总结核心逻辑</h3>
+<p>如果你要给老板或同事讲这个文件在干嘛，你可以这样说：</p>
+<blockquote>
+<p>"这是一个单元测试文件。它对比了 <code>fla</code> 库提供的<strong>融合算子</strong>（Fused Operator）和 <strong>PyTorch 原生实现</strong>。</p>
+<p>它测试了两个场景：
+1. 单纯的 CrossEntropyLoss。
+2. 融合了 Linear 层和 CrossEntropyLoss 的极速版本。</p>
+<p>它通过对比两者的<strong>前向 Loss 值</strong>和<strong>反向传播的梯度</strong>，来确保新开发的加速算法在数学上是准确无误的。"</p>
+</blockquote>
+<p><strong>现在看这个文件是不是清晰多了？它本质上就是一个“找茬”脚本，用来保证新写的代码没算错数。</strong></p>

@@ -1,0 +1,104 @@
+<h1>fla/modules/layernorm_gated.py</h1>
+<p>这份代码确实比较硬核，因为它不仅仅是普通的 PyTorch 代码，而是混合了 <strong>Triton</strong>（一种用于编写高性能 GPU 内核的语言）。它的目的是为了在深度学习模型（特别是像 Llama 这样的大模型）中实现极致优化的 <strong>Layer Normalization (层归一化)</strong>。</p>
+<p>别担心，我们把这个过程想象成一个<strong>“学习任务清单” (Task List)</strong>。我们一步一步来拆解它，从最基本的数学概念到最底层的代码实现。</p>
+<hr />
+<h3>📝 学习任务清单 (Task List)</h3>
+<h4>✅ Task 1: 搞懂核心数学概念 (这是做什么的？)</h4>
+<p>在看代码之前，先明白我们在算什么。这个文件实现了两种归一化，外加一个“门控”机制。</p>
+<ol>
+<li><strong>LayerNorm (层归一化):</strong><ul>
+<li><strong>原理</strong>: 把一行数据（一个 token 的特征）减去均值，除以标准差。目的是让数据分布稳定。</li>
+<li><strong>公式</strong>: $y = \frac{x - \mu}{\sigma} \cdot w + b$</li>
+</ul>
+</li>
+<li><strong>RMSNorm (均方根归一化):</strong><ul>
+<li><strong>原理</strong>: LayerNorm 的简化版（Llama 模型在用）。不减均值，只除以均方根。计算更快。</li>
+<li><strong>公式</strong>: $y = \frac{x}{\text{RMS}(x)} \cdot w$</li>
+</ul>
+</li>
+<li><strong>Gated Mechanism (门控机制):</strong><ul>
+<li><strong>原理</strong>: 这就是文件名里 <code>gated</code> 的含义。除了输入 <code>x</code>，还有一个输入 <code>z</code>。<code>z</code> 经过激活函数（通常是 SiLU）后，像一个“门”一样控制 <code>x</code> 的输出量。</li>
+<li><strong>代码中的体现</strong>: <code>out = norm(x) * silu(z)</code>。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 2: 理解为什么要用 Triton (为什么要重写？)</h4>
+<p>既然 PyTorch 自带 <code>torch.nn.LayerNorm</code>，作者为什么要重写？</p>
+<ul>
+<li><strong>融合 (Fusion)</strong>: PyTorch 原生操作可能需要多次读写显存（先算均值，存下来；再算方差，存下来；再归一化...）。Triton 可以把这些步骤<strong>融合</strong>成一个“内核 (Kernel)”，一次性读入数据，算完直接写出结果。</li>
+<li><strong>速度</strong>: 代码开头的注释写了：“<em>This backward pass is faster for dimensions up to 8k</em>”。这意味着作者针对 8k 隐藏层维度（Llama 70B 的规格）进行了专门的显存读写优化。</li>
+</ul>
+<h4>✅ Task 3: 拆解前向传播 (Forward Pass)</h4>
+<p>我们来看 <code>layer_norm_fwd_kernel</code> 这个函数。这是 GPU 实际执行的代码。</p>
+<ul>
+<li><strong>Step 3.1: 准备数据</strong><ul>
+<li>代码：<code>row = tl.program_id(0)</code></li>
+<li>解释：GPU 是并行计算的。这里确定当前的“核”负责计算哪一行数据。</li>
+</ul>
+</li>
+<li><strong>Step 3.2: 计算统计量 (Mean &amp; Var)</strong><ul>
+<li>代码：
+    <code>python
+    if not IS_RMS_NORM:
+         mean = tl.sum(x, axis=0) / N
+         # ... 算方差
+    else:
+         # ... 只算均方和 (RMS)</code></li>
+<li>解释：根据是 LayerNorm 还是 RMSNorm，计算相应的统计数据。</li>
+</ul>
+</li>
+<li><strong>Step 3.3: 归一化与线性变换</strong><ul>
+<li>代码：<code>y = x_hat * w + b</code></li>
+<li>解释：把数据标准化，然后乘以可学习的参数 <code>weight</code> (w) 和 <code>bias</code> (b)。</li>
+</ul>
+</li>
+<li><strong>Step 3.4: 门控 (Gating)</strong><ul>
+<li>代码：
+    <code>python
+    if HAS_Z and NORM_BEFORE_GATE:
+        y *= z * tl.sigmoid(z) # silu(z) = z * sigmoid(z)</code></li>
+<li>解释：如果提供了 <code>z</code>，就在最后把归一化后的结果乘以 <code>silu(z)</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 拆解反向传播 (Backward Pass) - 最难的部分</h4>
+<p>这是 <code>layer_norm_bwd_kernel</code>。这是训练时算梯度用的。</p>
+<ul>
+<li><strong>Step 4.1: 优化的核心 (Register Accumulation)</strong><ul>
+<li>代码注释提到：<code>keep weight_grad and bias_grad in registers</code>。</li>
+<li><strong>白话解释</strong>: 通常算梯度时，需要频繁把中间结果写回显存（VRAM）。显存很慢。作者的优化是：把权重 (<code>w</code>) 和偏置 (<code>b</code>) 的梯度累加值一直放在<strong>寄存器</strong>（GPU 核心里最快的缓存，相当于背包）里，直到算完这一大块数据，才一次性写回显存。</li>
+<li><strong>代价</strong>: 寄存器空间很小。如果数据维度太大（超过 8k），背包就装不下了，反而会变慢（Spilling）。</li>
+</ul>
+</li>
+<li><strong>Step 4.2: 重新计算 (Recompute)</strong><ul>
+<li>代码里有很多 <code>if RECOMPUTE_OUTPUT</code>。</li>
+<li>解释：为了省显存，有时候前向传播的结果不存下来，反向传播时根据输入再算一遍。这是典型的“时间换空间”策略。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 封装与接口 (Python API)</h4>
+<p>最后看文件底部的 <code>LayerNormGated</code> 和 <code>RMSNormGated</code> 类。</p>
+<ul>
+<li><strong>这些是给谁用的？</strong> 给你（开发者）用的。</li>
+<li><strong>LayerNormFn</strong>: 这是一个 <code>torch.autograd.Function</code>。它把刚才那两个复杂的 Triton kernel 包装成 PyTorch 能识别的“函数”，告诉 PyTorch：“前向传播调 <code>fwd_kernel</code>，反向传播调 <code>bwd_kernel</code>”。</li>
+<li><strong>nn.Module</strong>:<ul>
+<li><code>LayerNormGated</code>: 标准带减均值的层归一化。</li>
+<li><code>RMSNormGated</code>: Llama 风格的，不减均值，参数里没有 bias（通常 RMSNorm 不用 bias）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码的“剧情”流程</h3>
+<ol>
+<li><strong>输入</strong>: 你的模型给出一堆数据 <code>x</code> (比如 transformer 的输出) 和一个门控信号 <code>z</code>。</li>
+<li><strong>调用</strong>: 你调用了 <code>RMSNormGated(x, z)</code>。</li>
+<li><strong>底层</strong>:<ul>
+<li>Python 把它扔给了 Triton。</li>
+<li><strong>Forward</strong>: Triton 启动 GPU 核，快速计算出归一化结果，并顺手乘以了 <code>silu(z)</code>。</li>
+<li><strong>Backward</strong>: 当你训练（<code>loss.backward()</code>）时，Triton 启动优化过的内核，利用寄存器快速累加梯度，算出权重该怎么更新。</li>
+</ul>
+</li>
+<li><strong>输出</strong>: 得到干净、归一化且经过门控处理的数据。</li>
+</ol>
+<h3>为什么这一步步讲很重要？</h3>
+<p>因为这个文件主要就是为了<strong>性能</strong>。它的逻辑和普通的 PyTorch <code>LayerNorm</code> 一样，但它通过手写 GPU 代码，把这一步做得极快，特别适合像 Llama-70B 这种隐藏层维度巨大（8192）的模型。</p>

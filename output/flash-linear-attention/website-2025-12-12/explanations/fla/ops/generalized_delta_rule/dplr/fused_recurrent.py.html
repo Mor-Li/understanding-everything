@@ -1,0 +1,104 @@
+<h1>fla/ops/generalized_delta_rule/dplr/fused_recurrent.py</h1>
+<p>这份代码确实比较硬核，它涉及到了<strong>线性Attention（Linear Attention）</strong>的变种、<strong>Triton GPU编程</strong>以及<strong>循环神经网络（RNN）</strong>的推理优化。</p>
+<p>完全看不懂是很正常的，因为它把数学公式直接写成了高性能的GPU汇编级代码。</p>
+<p>为了让你读懂，我制定了一个 <strong>“五步走”的学习任务清单 (To-Do List)</strong>。我们将从宏观概念到微观代码，一层层剥开它的洋葱皮。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 搞清楚这代码是干嘛的？（定位）</strong></li>
+<li><strong>Task 2: 理解核心数学公式（DPLR Delta Rule）</strong></li>
+<li><strong>Task 3: 认识输入的“字母表” (Q, K, V, A, B, G)</strong></li>
+<li><strong>Task 4: 拆解核心循环逻辑 (Triton Kernel 内部)</strong></li>
+<li><strong>Task 5: 明白为什么要这么写 (Fused &amp; Inference)</strong></li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>✅ Task 1: 搞清楚这代码是干嘛的？</h4>
+<p><strong>结论：</strong> 这是一个用于<strong>模型推理（Inference）</strong>的加速代码。</p>
+<ul>
+<li><strong>背景：</strong> 现在的很多大模型（如 Mamba, RWKV, RetNet 等）试图取代 Transformer。它们在训练时可以像 Transformer 一样并行，但在推理（生成文本）时可以像 RNN 一样，每一步只看上一步的状态，速度极快，内存占用极小。</li>
+<li><strong>功能：</strong> 这个文件实现了一个特殊的 RNN 单元，叫做 <strong>"DPLR Delta Rule"</strong>。</li>
+<li><strong>证据：</strong> 代码中 <code>backward</code> 函数直接抛出错误 <code>NotImplementedError</code>，并说 "This kernel is only for inference"（此内核仅用于推理）。</li>
+</ul>
+<h4>✅ Task 2: 理解核心数学公式 (DPLR Delta Rule)</h4>
+<p>这段代码的核心是维护一个<strong>记忆矩阵（State）</strong>，我们记作 $S$（代码里叫 <code>h</code>）。
+在每一步 $t$，记忆矩阵 $S_t$ 是怎么更新的？</p>
+<p>代码文档里写了公式：
+$$S_t = S_{t-1} @ (\text{Diag}(g_t) + a_t b_t^T) + v_t k_t^T$$</p>
+<p>别被公式吓到，我们用人话翻译一下：</p>
+<ol>
+<li><strong>$S_{t-1}$</strong>：上一时刻的记忆。</li>
+<li><strong>$\text{Diag}(g_t)$</strong>：<strong>遗忘门/衰减</strong>。决定要忘记多少旧信息（$g$ 是 decay）。</li>
+<li><strong>$a_t b_t^T$</strong>：<strong>低秩更新 (Low-Rank Update)</strong>。这是 Delta Rule 的核心，它不仅仅是简单的衰减，还对记忆矩阵进行了某种“旋转”或复杂的调整。</li>
+<li><strong>$v_t k_t^T$</strong>：<strong>写入新信息</strong>。把当前的 Key ($k$) 和 Value ($v$) 写入记忆。</li>
+<li><strong>$@$</strong>：矩阵乘法。</li>
+</ol>
+<p><strong>简单总结：</strong></p>
+<blockquote>
+<p>新记忆 = (旧记忆 经过 衰减和调整) + 新写入的信息</p>
+</blockquote>
+<h4>✅ Task 3: 认识输入的“字母表” (Q, K, V, A, B, G)</h4>
+<p>在函数 <code>fused_recurrent_dplr_delta_rule_fwd</code> 中，有这么多输入变量，它们分别扮演什么角色？</p>
+<ul>
+<li><strong><code>q</code> (Query)</strong>: 查询向量。用来从记忆矩阵 $S$ 中读取信息，生成当前的输出 $o$。</li>
+<li><strong><code>k</code> (Key), <code>v</code> (Value)</strong>: 键值对。代表当前时刻要写入记忆的新内容。</li>
+<li><strong><code>gk</code> (Gate/Decay)</strong>: 对应公式里的 $g$。控制记忆的衰减率（通常是 log 空间，所以代码里用了 <code>exp</code>）。</li>
+<li><strong><code>a</code>, <code>b</code></strong>: 对应公式里的 $a, b$。它们用来构造那个“复杂的调整项”，控制记忆如何演变。</li>
+<li><strong><code>h0</code> / <code>initial_state</code></strong>: 初始的记忆状态（比如聊天的上下文）。</li>
+<li><strong><code>o</code> (Output)</strong>: 这一步计算完输出的结果。</li>
+</ul>
+<h4>✅ Task 4: 拆解核心循环逻辑 (Triton Kernel 内部)</h4>
+<p>这是最难懂的部分，也就是 <code>fused_recurrent_dplr_delta_rule_fwd_kernel</code> 函数里的 <code>for</code> 循环。</p>
+<p>Triton 是让 Python 代码在 GPU 上跑并行的语言。
+*   <strong>外层并行</strong>：代码会自动并行处理不同的 Batch 和不同的 Head（多头注意力）。
+*   <strong>内层循环</strong>：<code>for _ in range(0, T):</code> 这是<strong>时间步</strong>的循环。因为是 RNN，必须一步一步算。</p>
+<p>让我们逐行翻译循环内部的逻辑：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 加载当前时刻 t 的数据</span>
+<span class="n">b_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+<span class="n">b_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># ... 加载 a, b, gk, v 等</span>
+
+<span class="c1"># 2. 更新记忆状态 b_h (这就是 Task 2 的公式代码实现！)</span>
+<span class="c1"># b_h = exp(b_gk) * b_h  &lt;-- 第一步：衰减旧记忆</span>
+<span class="c1">#     + b_b * sum(b_a * b_h) &lt;-- 第二步：加上 DPLR 的调整项 (a 和 b 的作用)</span>
+<span class="n">b_h</span> <span class="o">=</span> <span class="n">exp</span><span class="p">(</span><span class="n">b_gk</span><span class="p">)[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">b_h</span> <span class="o">+</span> <span class="n">b_b</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_a</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">b_h</span><span class="p">,</span> <span class="mi">0</span><span class="p">)[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>
+
+<span class="c1"># 3. 写入新信息</span>
+<span class="c1"># b_h += b_k * b_v       &lt;-- 第三步：写入当前的 KV</span>
+<span class="n">b_h</span> <span class="o">+=</span> <span class="n">b_k</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">b_v</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>
+
+<span class="c1"># 4. 计算输出</span>
+<span class="c1"># 输出 = 记忆矩阵 * Query</span>
+<span class="n">b_o</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_h</span> <span class="o">*</span> <span class="n">b_q</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">],</span> <span class="mi">0</span><span class="p">)</span>
+
+<span class="c1"># 5. 保存输出并移动指针到下一个时刻</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_o</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="n">p_q</span> <span class="o">+=</span> <span class="o">...</span> <span class="c1"># 指针移动</span>
+</code></pre></div>
+
+<p><strong>关键点：</strong> 代码利用了 GPU 的片上内存（SRAM）一直保留着 <code>b_h</code>（记忆状态），避免了反复读写显存（HBM），这就是它为什么快的原因。</p>
+<h4>✅ Task 5: 明白为什么要这么写 (Fused &amp; Inference)</h4>
+<p>你可能会问：<em>“为什么不用 PyTorch 的 <code>for</code> 循环写？”</em></p>
+<ol>
+<li><strong>Python 循环太慢</strong>：在 Python 里写 <code>for</code> 循环处理几十万个 token 会慢到爆炸。</li>
+<li><strong>显存带宽瓶颈</strong>：如果用 PyTorch 的原生算子（比如 <code>torch.matmul</code>），每一步都要把巨大的记忆矩阵从显存读出来，算完再存回去。</li>
+<li><strong>Fused（融合）的意义</strong>：这个 Triton Kernel 把整个时间序列的循环“融合”成了一个 GPU 内核。<ul>
+<li>它把 <code>h</code> (状态) 一直放在 GPU 的<strong>寄存器/高速缓存</strong>里。</li>
+<li>它只读取一次 Q, K, V, A, B。</li>
+<li>它只写入一次 O (输出)。</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结：</strong> 这是一个为了<strong>极致推理速度</strong>而手写的 GPU 核心代码。它不做训练（因为没有反向传播），专门用来让基于 Delta Rule 的模型在生成文本时飞快地运行。</p>
+<hr />
+<h3>🧠 你的下一步</h3>
+<p>如果你想验证自己是否懂了，试着回答这个问题：</p>
+<blockquote>
+<p><strong>“这段代码里，记忆状态 <code>h</code> 是怎么随着时间变化的？是被谁影响的？”</strong></p>
+</blockquote>
+<p><strong>答案：</strong>
+记忆状态 <code>h</code> 随着时间循环不断更新。
+1.  它先被 <code>gk</code> 衰减。
+2.  然后被 <code>a</code> 和 <code>b</code> 扭转/修正。
+3.  最后加上了当前的 <code>k</code> 和 <code>v</code> 的外积。
+4.  这个新的 <code>h</code> 被用来和 <code>q</code> 计算得到当前的输出。</p>

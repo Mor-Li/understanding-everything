@@ -1,0 +1,95 @@
+<h1>fla/ops/based/fused_chunk.py</h1>
+<p>这份代码确实很难懂，因为它结合了 <strong>Triton（高性能GPU编程）</strong>、<strong>线性Attention的数学原理</strong> 以及 <strong>Chunkwise（分块）算法</strong>。</p>
+<p>简单来说，这段代码实现了 <strong>Based 架构</strong>（一种线性 Attention 变体）的核心算子。</p>
+<p>为了让你看懂，我列了一个 <strong>“学习任务清单 (Todo List)”</strong>，我们一步步拆解，不涉及复杂的代码语法，只讲它在干什么。</p>
+<hr />
+<h3>任务 1：搞懂核心数学原理（泰勒展开）</h3>
+<p><strong>目标：</strong> 理解为什么代码里会有 <code>0o</code>, <code>1o</code>, <code>2o</code> 这种奇怪的变量名。</p>
+<ul>
+<li><strong>传统 Attention：</strong> 计算 $Softmax(QK^T)$，本质是计算 $e^{QK^T}$。这很慢，显存占用大。</li>
+<li><strong>Based 架构的想法：</strong> 用 <strong>泰勒展开 (Taylor Expansion)</strong> 近似 $e^x$。<ul>
+<li>公式：$e^x \approx 1 + x + \frac{1}{2}x^2$</li>
+<li>对应代码里的逻辑：$Attention \approx 1 + (QK^T) + 0.5(QK^T)^2$</li>
+</ul>
+</li>
+<li><strong>对应代码：</strong><ul>
+<li><code>_0o</code> (Zero-order)：对应公式里的 <code>1</code>。</li>
+<li><code>_1o</code> (First-order)：对应公式里的 <code>x</code> (即 $QK^T$)。</li>
+<li><code>_2o</code> (Second-order)：对应公式里的 $x^2$ (即二次项)。</li>
+</ul>
+</li>
+</ul>
+<h3>任务 2：搞懂计算结构（Fused Chunk）</h3>
+<p><strong>目标：</strong> 理解代码为什么要把数据切成一块一块的 (<code>BT</code>)。</p>
+<ul>
+<li><strong>问题：</strong> 序列长度 $T$ 很长，直接算太慢。</li>
+<li><strong>解决：</strong> 混合模式（Chunkwise）。<ol>
+<li><strong>分块 (Chunking)：</strong> 把长序列切成小块（代码中 <code>BT=16</code>）。</li>
+<li><strong>块内 (Intra-chunk)：</strong> 块内部像传统 Attention 一样直接算矩阵乘法（并行计算，快）。</li>
+<li><strong>块间 (Inter-chunk)：</strong> 块与块之间像 RNN 一样传递一个“记忆状态”（Hidden State），这样不用存巨大的 Attention 矩阵（省显存）。</li>
+</ol>
+</li>
+</ul>
+<h3>任务 3：拆解 Forward Kernel (前向传播)</h3>
+<p><strong>目标：</strong> 读懂 <code>fused_chunk_based_fwd_kernel</code> 函数的主循环在干嘛。</p>
+<p>这个函数是核心，我们按步骤看循环 <code>for i in range(0, tl.cdiv(T, BT)):</code> 内部发生了什么：</p>
+<ol>
+<li><strong>加载数据：</strong><ul>
+<li>加载当前块的 Q, K, V。</li>
+</ul>
+</li>
+<li><strong>计算“历史记忆”的影响 (Inter-chunk)：</strong><ul>
+<li>代码：<code>b_o += b_h_0o</code> ... <code>b_o += tl.dot(b_q, b_h_1o...)</code></li>
+<li>含义：当前块的输出，首先要加上“之前所有块”积累下来的信息。</li>
+<li>这里用到了泰勒展开的原理，分别计算 0阶、1阶、2阶 的历史贡献。</li>
+</ul>
+</li>
+<li><strong>更新“历史记忆” (Update Hidden State)：</strong><ul>
+<li>代码：<code>b_h_1o += ...</code>, <code>b_h_2o += ...</code></li>
+<li>含义：把当前块的 K 和 V 压缩进记忆状态里，传给下一个块用。</li>
+<li><code>b_h_1o</code> 存的是 $K \cdot V$ 的累加。</li>
+<li><code>b_h_2o</code> 存的是 $(K \otimes K) \cdot V$ 的累加（二次项）。</li>
+</ul>
+</li>
+<li><strong>计算“当前块内”的注意力 (Intra-chunk)：</strong><ul>
+<li>代码：<code>b_s = tl.dot(b_q, b_k...)</code> 然后 <code>b_s = 1 + b_s + 0.5 * b_s * b_s</code></li>
+<li>含义：这完全就是上面说的泰勒展开公式！算出当前块内部 Q 和 K 的关系，然后乘上 V。</li>
+</ul>
+</li>
+<li><strong>保存结果：</strong><ul>
+<li>把算出来的 $O$ (输出) 和 $Z$ (归一化因子) 存回显存。</li>
+</ul>
+</li>
+</ol>
+<h3>任务 4：理解归一化 (Z)</h3>
+<p><strong>目标：</strong> 理解为什么输出有两个：<code>o</code> 和 <code>z</code>。</p>
+<ul>
+<li>线性 Attention 的公式通常是：$\frac{\sum (Sim(Q, K) \cdot V)}{\sum Sim(Q, K)}$。</li>
+<li>分母就是归一化因子。</li>
+<li>代码里的 <code>z</code> 就是分母。它把 V 换成全是 1 的矩阵走了一遍同样的流程。</li>
+<li><strong>Python 包装函数 (<code>fused_chunk_based</code>) 最后一步：</strong><ul>
+<li><code>o = o / (z[..., None] + 1e-6)</code></li>
+<li>这就是在做最后的除法归一化。</li>
+</ul>
+</li>
+</ul>
+<h3>任务 5：Backward Kernel (反向传播)</h3>
+<p><strong>目标：</strong> 知道 <code>fused_chunk_based_bwd_kernel</code> 是干嘛的。</p>
+<ul>
+<li>这是给神经网络训练用的。</li>
+<li>它执行的操作和 Forward 几乎是<strong>反着来</strong>的。</li>
+<li>Forward 是从第 1 块算到最后一块。</li>
+<li>Backward 是从最后一块算回第 1 块，计算梯度（Gradients），用于更新模型参数。</li>
+<li>逻辑极其复杂（涉及链式法则和泰勒展开的导数），如果只是为了使用或理解原理，<strong>可以先跳过不看</strong>。</li>
+</ul>
+<hr />
+<h3>总结：这段代码讲了个什么故事？</h3>
+<p>这是一个<strong>高性能算子</strong>，它告诉 GPU：</p>
+<ol>
+<li>把长文本切成小段。</li>
+<li>每一段内部，用 $1 + x + 0.5x^2$ 的公式快速算注意力。</li>
+<li>算完一段，把 K 和 V 的信息压缩打包（0阶、1阶、2阶项），扔给下一段。</li>
+<li>下一段拿到压缩包，先解压加上去，再算自己的。</li>
+<li>最后别忘了除以归一化因子 $Z$。</li>
+</ol>
+<p><strong>一句话概括：</strong> 这是一个利用 Triton 实现的、基于泰勒展开近似的、分块计算的线性 Attention 算法（Based Architecture）。</p>

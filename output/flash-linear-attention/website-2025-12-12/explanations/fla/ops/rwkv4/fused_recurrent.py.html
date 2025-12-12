@@ -1,0 +1,120 @@
+<h1>fla/ops/rwkv4/fused_recurrent.py</h1>
+<p>这份代码确实比较硬核，因为它不是普通的Python业务逻辑，而是用 <strong>Triton</strong> 编写的 <strong>GPU底层算子</strong>。它的作用是实现 <strong>RWKV4 模型的核心循环（Recurrent）计算</strong>。</p>
+<p>RWKV 是一种像 RNN 一样逐个处理 token 的模型，但可以像 Transformer 一样并行训练。这个文件实现的是它的 <strong>推理/循环模式（RNN mode）</strong>，即“读一个词，更新一下记忆，输出一个结果”。</p>
+<p>为了让你读懂，我把这个代码要做的事情拆解成一个 <strong>“处理流水线 Task List”</strong>，然后一步步对应代码给你讲。</p>
+<hr />
+<h3>核心任务清单 (Task List)</h3>
+<p>想象你是一个负责记忆的管理员，你的任务是处理一连串的信息（Token序列）。</p>
+<ol>
+<li><strong>准备阶段 (Setup):</strong> 确定你要同时处理多少个任务（Batch Size），每个任务有多少个特征通道（Channels）。分配好内存。</li>
+<li><strong>加载初始记忆 (Load State):</strong> 既然是循环神经网络（RNN），你在处理当前时刻之前，脑子里肯定已经有之前的“记忆”了。我们需要把这个记忆（State）读取进来。</li>
+<li><strong>时间循环 (Time Loop):</strong> 开始从第 1 秒走到第 T 秒（<code>for t in range(tsz)</code>）。<ul>
+<li><strong>3.1 读取当前输入:</strong> 拿到当前的 $K$ (Key, 强度) 和 $V$ (Value, 内容)。</li>
+<li><strong>3.2 计算当前输出 (WKV):</strong> 结合“过去的记忆”和“当前的输入”，计算出此时刻的输出结果。</li>
+<li><strong>3.3 更新记忆 (Update State):</strong> 把“当前的输入”融合进“记忆”里，同时让“旧的记忆”根据参数 $W$ 进行衰减（遗忘）。</li>
+</ul>
+</li>
+<li><strong>保存结果 (Store):</strong> 把算好的 WKV 和最新的 State 存回显存。</li>
+</ol>
+<hr />
+<h3>逐步讲解 (对应代码)</h3>
+<h4>1. 它是干嘛的？ (背景)</h4>
+<p>RWKV4 的核心公式可以简单理解为：
+$$ \text{输出} = \frac{\text{累积的(Value} \times \text{权重)}}{\text{累积的权重}} $$
+这涉及到指数运算，为了防止数字太大溢出，代码里用了大量的技巧（<code>eps</code>，<code>maximum</code>，<code>exp</code>），这叫 <strong>Log-Sum-Exp 技巧</strong>。</p>
+<h4>2. 核心函数：<code>fused_recurrent_rwkv4_forward_kernel</code></h4>
+<p>这是最主要的部分，我们按上面的 Task List 来看代码。</p>
+<p><strong>Step 1: 并行设置 (Parallelize)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># b_idx: 第几个样本 (Batch)</span>
+<span class="c1"># c_idx: 第几组通道 (Channel)</span>
+<span class="n">b_idx</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="n">c_idx</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<p>Triton 的魔法在于，它不按“时间”并行（因为RNN必须一步步走），而是按“数据样本”和“特征通道”并行。每个线程块负责处理一部分特征。</p>
+<p><strong>Step 2: 加载参数与初始状态 (Load Params &amp; State)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 加载 W (衰减率) 和 U (当前输入的额外加成)</span>
+<span class="n">w</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">w_ptr</span> <span class="o">+</span> <span class="n">cs</span> <span class="o">*</span> <span class="n">w_s_c</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">cmask</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="n">u</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">u_ptr</span> <span class="o">+</span> <span class="n">cs</span> <span class="o">*</span> <span class="n">u_s_c</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">cmask</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+
+<span class="c1"># 加载之前的记忆状态：Alpha, Beta, Eps</span>
+<span class="c1"># Alpha: 分子的累积值 (Numerator)</span>
+<span class="c1"># Beta:  分母的累积值 (Denominator)</span>
+<span class="c1"># Eps:   为了数值稳定性记录的最大指数偏移量</span>
+<span class="n">alpha</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">alpha_ptr</span> <span class="o">+</span> <span class="n">cs</span> <span class="o">*</span> <span class="n">state_s_c</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">cmask</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="n">beta</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">beta_ptr</span> <span class="o">+</span> <span class="n">cs</span> <span class="o">*</span> <span class="n">state_s_c</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">cmask</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="n">eps</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">eps_ptr</span> <span class="o">+</span> <span class="n">cs</span> <span class="o">*</span> <span class="n">state_s_c</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">cmask</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>Alpha/Beta/Eps 是什么？</strong> 它们三个合起来就是 RWKV 的“Hidden State”（隐藏状态/记忆）。</li>
+<li><strong>W 是什么？</strong> 遗忘因子。每过一步，旧记忆就要乘以 $e^W$ (代码里 W 通常是负数，所以是衰减)。</li>
+</ul>
+<p><strong>Step 3: 时间循环 (The Loop)</strong>
+这是最难懂的部分，对应代码里的 <code>for t in range(tsz):</code>。</p>
+<p><strong>3.1 读取输入</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">kt</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">k_ptr</span> <span class="o">+</span> <span class="n">t</span> <span class="o">*</span> <span class="n">k_s_t</span> <span class="o">+</span> <span class="n">cs</span> <span class="o">*</span> <span class="n">k_s_c</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="n">vt</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">v_ptr</span> <span class="o">+</span> <span class="n">t</span> <span class="o">*</span> <span class="n">v_s_t</span> <span class="o">+</span> <span class="n">cs</span> <span class="o">*</span> <span class="n">v_s_c</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+</code></pre></div>
+
+<p>读取当前时刻 $t$ 的 $K$ (Key) 和 $V$ (Value)。</p>
+<p><strong>3.2 计算输出 (Calculate Output)</strong>
+RWKV 的特点是：<strong>先计算输出，再更新状态</strong>（或者说计算输出时，包含当前输入的信息，但不改变传递给下一步的状态基底）。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># ukt = u + k_t (给当前输入加一个特殊的权重 u)</span>
+<span class="n">ukt</span> <span class="o">=</span> <span class="n">u</span> <span class="o">+</span> <span class="n">kt</span>
+
+<span class="c1"># 下面这几行是在做 数值稳定性的指数加法</span>
+<span class="c1"># 简单的说就是计算：Output = (Old_State + Current_Input) / Normalizer</span>
+<span class="n">tau</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">ukt</span><span class="p">,</span> <span class="n">eps</span><span class="p">)</span>  <span class="c1"># 找一个最大值作为基准，防止 exp 爆炸</span>
+<span class="n">e1a</span> <span class="o">=</span> <span class="n">exp</span><span class="p">(</span><span class="n">eps</span> <span class="o">-</span> <span class="n">tau</span><span class="p">)</span>        <span class="c1"># 旧记忆的权重</span>
+<span class="n">e2a</span> <span class="o">=</span> <span class="n">exp</span><span class="p">(</span><span class="n">ukt</span> <span class="o">-</span> <span class="n">tau</span><span class="p">)</span>        <span class="c1"># 当前输入的权重</span>
+
+<span class="c1"># wkv 就是这一步的输出结果</span>
+<span class="n">wkv</span> <span class="o">=</span> <span class="p">(</span><span class="n">e1a</span> <span class="o">*</span> <span class="n">alpha</span> <span class="o">+</span> <span class="n">e2a</span> <span class="o">*</span> <span class="n">vt</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">e1a</span> <span class="o">*</span> <span class="n">beta</span> <span class="o">+</span> <span class="n">e2a</span><span class="p">)</span>
+<span class="c1"># 保存输出</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">wkv_ptr</span> <span class="o">+</span> <span class="n">t</span> <span class="o">*</span> <span class="n">wkv_s_t</span> <span class="o">+</span> <span class="n">cs</span> <span class="o">*</span> <span class="n">wkv_s_c</span><span class="p">,</span> <span class="n">wkv</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">cmask</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>3.3 更新记忆 (Update State)</strong>
+计算完输出后，我们需要把当前的 $K$ 和 $V$ 融合进 <code>alpha</code>, <code>beta</code>, <code>eps</code> 中，供下一步使用。同时，旧的记忆要经过 $W$ 的衰减。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># w_eps = w + eps (旧记忆的指数 + 衰减系数 w)</span>
+<span class="n">w_eps</span> <span class="o">=</span> <span class="n">w</span> <span class="o">+</span> <span class="n">eps</span>
+
+<span class="c1"># 更新 eps (新的最大值基准)</span>
+<span class="n">eps</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">w_eps</span><span class="p">,</span> <span class="n">kt</span><span class="p">)</span>
+<span class="n">e1b</span> <span class="o">=</span> <span class="n">exp</span><span class="p">(</span><span class="n">w_eps</span> <span class="o">-</span> <span class="n">eps</span><span class="p">)</span> <span class="c1"># 衰减后的旧记忆权重</span>
+<span class="n">e2b</span> <span class="o">=</span> <span class="n">exp</span><span class="p">(</span><span class="n">kt</span> <span class="o">-</span> <span class="n">eps</span><span class="p">)</span>    <span class="c1"># 当前输入的权重</span>
+
+<span class="c1"># 更新 Alpha (分子) = 旧Alpha * 衰减 + 当前V * 当前权重</span>
+<span class="n">alpha</span> <span class="o">=</span> <span class="n">e1b</span> <span class="o">*</span> <span class="n">alpha</span> <span class="o">+</span> <span class="n">e2b</span> <span class="o">*</span> <span class="n">vt</span>
+<span class="c1"># 更新 Beta (分母) = 旧Beta * 衰减 + 当前权重</span>
+<span class="n">beta</span> <span class="o">=</span> <span class="n">e1b</span> <span class="o">*</span> <span class="n">beta</span> <span class="o">+</span> <span class="n">e2b</span>
+
+<span class="c1"># 注意：这里没有把 alpha/beta 存回显存，而是留在寄存器里直接进入下一次循环 t+1</span>
+<span class="c1"># 只有在需要输出 state 的时候才存 (代码里每一步都存了 state_out 用于训练反向传播)</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">alpha_out_ptr</span> <span class="o">+</span> <span class="o">...</span><span class="p">,</span> <span class="n">alpha</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">cmask</span><span class="p">)</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<h4>3. 那个 Backward Kernel 是啥？</h4>
+<p><code>fused_recurrent_rwkv4_backward_kernel</code> 是用来做 <strong>训练</strong> 的。
+*   Forward 是从 $t=0$ 算到 $t=T$。
+*   Backward 是从 $t=T$ 算回 $t=0$（代码里 <code>tc = tsz - t - 1</code>）。
+*   它的逻辑是 Forward 的逆运算，利用链式法则计算梯度（Gradient），用来更新神经网络的参数。如果你只是用模型（推理），不需要看这个函数。</p>
+<h4>4. Python 包装类 <code>FusedRecurrentRWKV4Function</code></h4>
+<p>这是连接 PyTorch 和 Triton 的桥梁。
+*   <code>forward</code>: 也就是 PyTorch 调用的入口。它把输入的 $W$ 做了一个处理 <code>w = -torch.exp(w.float())</code>，这保证了 $W$ 是负数，起到衰减作用。然后调用 Triton kernel。
+*   <code>backward</code>: 定义了反向传播时调用哪个 Triton kernel。</p>
+<h3>总结：这段代码在做什么？</h3>
+<p>简单来说，这段代码在 GPU 上高效地执行了一个 <strong>“有遗忘机制的累加器”</strong>：</p>
+<ol>
+<li><strong>输入：</strong> 也就是你的一句话（比如 "我 爱 吃 苹 果"）。</li>
+<li><strong>处理 "我"：</strong> 产生输出，更新记忆。</li>
+<li><strong>处理 "爱"：</strong> 结合 "我" 的残留记忆 + "爱" 的信息，产生输出，更新记忆。</li>
+<li><strong>处理 "吃"：</strong> 结合之前的残留记忆（"我"已经很淡了，"爱"还比较清楚）+ "吃"，产生输出...</li>
+<li><strong>输出：</strong> 每一个时刻的理解结果（WKV）和最后的记忆状态。</li>
+</ol>
+<p><strong>看不懂是因为：</strong>
+1.  <strong>数学公式被拆碎了</strong>：为了防止计算机算 <code>exp(100)</code> 溢出，它用了 <code>eps</code> 做减法平移，把公式搞得很乱。
+2.  <strong>Triton 语法</strong>：涉及指针操作 (<code>ptr + offset</code>) 和掩码 (<code>mask</code>)，这是 C/CUDA 风格的写法，不像 Python 那么直观。</p>
+<p>你只需要关注 <code>for t in range(tsz)</code> 循环内部：<strong>算出当前的 WKV，然后更新 Alpha/Beta 留给下一次循环</strong>，这就是它的全部逻辑。</p>

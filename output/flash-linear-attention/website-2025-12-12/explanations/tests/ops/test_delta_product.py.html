@@ -1,0 +1,111 @@
+<h1>tests/ops/test_delta_product.py</h1>
+<p>这份代码看起来确实比较晦涩，因为它不是在<strong>定义</strong>一个模型，而是在<strong>测试</strong>一个底层算子（Operator）。</p>
+<p>简单来说，这个文件的目的是：<strong>验证一个名为“Gated Delta Product”的高性能（通常是 CUDA/Triton 写成的）算子，其计算结果和梯度是否正确。</strong></p>
+<p>为了让你看懂，我把这个文件的逻辑拆解成一个 <strong>Task List（任务清单）</strong>，然后逐步讲解每个任务在做什么。</p>
+<hr />
+<h3>📝 任务清单 (Task List)</h3>
+<p>要把这段代码读懂，你需要完成以下几个思维步骤：</p>
+<ol>
+<li><strong>Task 1: 理解测试目标</strong> —— 我们在测什么？（对比“高性能版”和“标准版”）。</li>
+<li><strong>Task 2: 准备数据</strong> —— 搞清楚输入的张量（Tensors）长什么样（B, T, H, D）。</li>
+<li><strong>Task 3: 运行“高性能版”</strong> —— 运行我们要测试的那个函数，并计算它的梯度。</li>
+<li><strong>Task 4: 运行“标准参考版”</strong> —— 运行一个我们确信是正确的（但可能很慢）的函数，作为标准答案。</li>
+<li><strong>Task 5: 比对结果 (Assert)</strong> —— 拿 Task 3 和 Task 4 的结果进行对比，如果误差极小，测试通过。</li>
+<li><strong>Task 6: 变长序列测试 (VarLen)</strong> —— 处理不同长度句子的特殊情况。</li>
+</ol>
+<hr />
+<h3>🔍 逐步讲解</h3>
+<h4>Task 1: 理解测试目标</h4>
+<p>代码中有两个核心函数被调用：
+*   <strong><code>chunk_gated_delta_product</code></strong>: 这是<strong>被测试对象</strong>。通常是优化过的（比如用了 Triton 或 CUDA），速度快但代码复杂，容易写错。
+*   <strong><code>chunk_gated_delta_product_ref</code></strong>: 这是<strong>参考答案 (Reference)</strong>。通常是用纯 PyTorch 写的，逻辑简单直观，速度慢，但能保证数学上是绝对正确的。</p>
+<p><strong>核心逻辑：</strong> 如果 <code>高性能版</code> 的输出 == <code>标准参考版</code> 的输出，说明优化没问题。</p>
+<h4>Task 2: 准备数据 (Data Setup)</h4>
+<p>在 <code>test_chunk</code> 函数的开头：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># B=Batch大小, T=序列长度, H=头数, D=维度</span>
+<span class="c1"># num_householder: 这是一个算法特定的参数，跟 Householder 变换有关</span>
+<span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span> <span class="c1"># Query</span>
+<span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span> <span class="o">*</span> <span class="n">num_householder</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span> <span class="c1"># Key</span>
+<span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span> <span class="o">*</span> <span class="n">num_householder</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span> <span class="c1"># Value</span>
+<span class="n">beta</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">()</span> <span class="c1"># 门控机制的参数 (0到1之间)</span>
+<span class="n">h0</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 初始的记忆状态 (Initial State)</span>
+
+<span class="c1"># .requires_grad_(True) 意味着我们要测试反向传播（训练过程）是否正确</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">beta</span><span class="p">,</span> <span class="n">h0</span> <span class="o">=</span> <span class="nb">map</span><span class="p">(</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点：</strong> 这里模拟了线性 Attention 或 RNN 模型中的输入数据。<code>q, k, v</code> 是经典的注意力机制输入，<code>beta</code> 是遗忘门/输入门，<code>h0</code> 是历史记忆。</li>
+</ul>
+<h4>Task 3: 运行“高性能版” (Run Target)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 运行被测试的函数</span>
+<span class="n">tri</span><span class="p">,</span> <span class="n">tri_ht</span> <span class="o">=</span> <span class="n">chunk_gated_delta_product</span><span class="p">(</span>
+    <span class="n">q</span><span class="o">=...</span><span class="p">,</span> <span class="n">k</span><span class="o">=...</span><span class="p">,</span> <span class="n">v</span><span class="o">=...</span><span class="p">,</span> <span class="n">initial_state</span><span class="o">=</span><span class="n">h0</span><span class="o">...</span>
+<span class="p">)</span>
+
+<span class="c1"># 计算梯度 (反向传播)</span>
+<span class="c1"># do 和 dht 是模拟的“上游传下来的梯度”</span>
+<span class="p">((</span><span class="n">tri</span> <span class="o">*</span> <span class="n">do</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">+</span> <span class="p">(</span><span class="n">tri_ht</span> <span class="o">*</span> <span class="n">dht</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">retain_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+<span class="c1"># 保存算出来的梯度，稍后用来对比</span>
+<span class="n">tri_dq</span><span class="p">,</span> <span class="n">tri_dk</span><span class="p">,</span> <span class="n">tri_dv</span><span class="o">...</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span><span class="p">,</span> <span class="n">k</span><span class="o">.</span><span class="n">grad</span><span class="p">,</span> <span class="n">v</span><span class="o">.</span><span class="n">grad</span><span class="o">...</span>
+
+<span class="c1"># 清空梯度，为下一次计算做准备</span>
+<span class="n">q</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="o">...</span> <span class="o">=</span> <span class="kc">None</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释：</strong> <code>tri</code> 代表 Triton（一种 GPU 编程语言）版本的输出。我们不仅算出结果，还执行了 <code>.backward()</code>，看看这个算子算出来的梯度对不对。如果梯度算错，模型就训练不起来。</li>
+</ul>
+<h4>Task 4: 运行“标准参考版” (Run Reference)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 运行参考函数 (Ref)</span>
+<span class="n">ref</span><span class="p">,</span> <span class="n">ref_ht</span> <span class="o">=</span> <span class="n">chunk_gated_delta_product_ref</span><span class="p">(</span>
+    <span class="n">q</span><span class="o">=...</span><span class="p">,</span> <span class="n">k</span><span class="o">=...</span><span class="p">,</span> <span class="n">v</span><span class="o">=...</span><span class="p">,</span> <span class="n">initial_state</span><span class="o">=</span><span class="n">h0</span><span class="o">...</span>
+<span class="p">)</span>
+
+<span class="c1"># 同样计算梯度</span>
+<span class="p">((</span><span class="n">ref</span> <span class="o">*</span> <span class="n">do</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">+</span> <span class="p">(</span><span class="n">ref_ht</span> <span class="o">*</span> <span class="n">dht</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">retain_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+<span class="c1"># 保存参考版的梯度</span>
+<span class="n">ref_dq</span><span class="p">,</span> <span class="n">ref_dk</span><span class="p">,</span> <span class="n">ref_dv</span><span class="o">...</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span><span class="p">,</span> <span class="n">k</span><span class="o">.</span><span class="n">grad</span><span class="p">,</span> <span class="n">v</span><span class="o">.</span><span class="n">grad</span><span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释：</strong> 这里跑了一遍一模一样的流程，但是用的是“标准答案”函数。</li>
+</ul>
+<h4>Task 5: 比对结果 (Comparision)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># assert_close 检查两个张量数值是否非常接近</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39;o&#39;</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tri</span><span class="p">,</span> <span class="mf">0.005</span><span class="p">)</span>      <span class="c1"># 检查输出 output 是否一致</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39;ht&#39;</span><span class="p">,</span> <span class="n">ref_ht</span><span class="p">,</span> <span class="n">tri_ht</span><span class="p">,</span> <span class="mf">0.005</span><span class="p">)</span> <span class="c1"># 检查最终状态 hidden state 是否一致</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39;dq&#39;</span><span class="p">,</span> <span class="n">ref_dq</span><span class="p">,</span> <span class="n">tri_dq</span><span class="p">,</span> <span class="mf">0.008</span><span class="p">)</span> <span class="c1"># 检查 Q 的梯度是否一致</span>
+<span class="c1"># ... 检查 K, V, Beta 的梯度</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点：</strong> 这是单元测试的核心。如果这里报错，说明你的高性能算子写得有问题（比如数学公式推导错了，或者 CUDA 内存读写错了）。</li>
+</ul>
+<h4>Task 6: 变长序列测试 (VarLen)</h4>
+<p>代码的第二部分 <code>test_chunk_varlen</code> 处理更复杂的情况。</p>
+<ul>
+<li><strong>背景：</strong> 在处理自然语言时，一个 Batch 里的句子长度往往不一样（比如一句话 5 个字，另一句 100 个字）。为了效率，通常会把它们拼成一个长条（Packed Sequence），用 <code>cu_seqlens</code> (Cumulative Sequence Lengths) 来标记每句话的起止位置。</li>
+<li>
+<p><strong>代码逻辑：</strong>
+    <code>python
+    cu_seqlens = [0, 63, 100...] # 第一句是 0~63，第二句是 63~100...</code>
+    它测试的是：在这种拼起来的数据格式下，算子能不能正确地识别每一句话的边界，不让第一句话的信息“泄漏”到第二句话里。</p>
+<p>逻辑依然是：<strong>高性能版输出 vs 参考版输出</strong>，最后 <code>assert_close</code>。</p>
+</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这篇文章（代码文件）实际上是在说：</p>
+<blockquote>
+<p>“嘿，我写了一个新的、跑得很快的 <code>Gated Delta Product</code> 算子。为了证明它是对的，我造了一些随机数据，先用我的新算子跑一遍，再用最原始的 PyTorch 算法跑一遍。</p>
+<p>我对比了它们的<strong>输出结果</strong>和<strong>反向传播的梯度</strong>。</p>
+<ol>
+<li>在固定长度（Batch形式）下，结果一致。</li>
+<li>在变长序列（Packed形式）下，结果也一致。</li>
+</ol>
+<p>所以，这个新算子是可靠的。”</p>
+</blockquote>
+<p>你看不懂是因为它充满了测试框架的样板代码（Boilerplate），核心数学逻辑其实被封装在 <code>chunk_gated_delta_product</code> 这些函数内部了。</p>

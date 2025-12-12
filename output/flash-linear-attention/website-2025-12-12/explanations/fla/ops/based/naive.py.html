@@ -1,0 +1,106 @@
+<h1>fla/ops/based/naive.py</h1>
+<p>这份代码实现了一种名为 <strong>"Based"</strong> 的线性注意力机制（Linear Attention）。它的核心目的是为了解决标准 Transformer 在处理长序列时速度慢、显存占用高的问题。</p>
+<p>为了让你读懂它，我们需要把复杂的代码拆解成一个 <strong>“学习任务清单 (Todo List)”</strong>。我们先从核心数学原理开始，再看简单的实现，最后看复杂的实现。</p>
+<p>以下是你的学习路径：</p>
+<hr />
+<h3>✅ Task 1: 理解核心数学公式 (The "Based" Kernel)</h3>
+<p>在看代码之前，你只需要记住一个公式。
+标准 Attention 用的是 Softmax，也就是 $e^{QK^T}$。
+<strong>Based Attention</strong> 觉得 $e^x$ 太难算了，决定用 <strong>泰勒展开（Taylor Expansion）</strong> 的前三项来近似它：</p>
+<p>$$ \text{Based}(x) \approx 1 + x + \frac{1}{2}x^2 $$</p>
+<p>其中 $x = QK^T$。</p>
+<p><strong>为什么这么做？</strong>
+因为 $1 + QK^T + \frac{1}{2}(QK^T)^2$ 是多项式，可以利用结合律 $Q(K^TV)$ 把它变成线性复杂度，而不用像 Softmax 那样必须算出 $N \times N$ 的大矩阵。</p>
+<hr />
+<h3>✅ Task 2: 搞懂第一部分 <code>naive_parallel_based</code> (简单版)</h3>
+<p>这个函数是<strong>为了验证原理</strong>写的，它并没有加速（还是很慢），但逻辑最清晰。它的做法和普通 Transformer 几乎一样。</p>
+<p><strong>步骤分解：</strong></p>
+<ol>
+<li><strong>缩放 (Scale):</strong>
+    <code>q = q * scale</code> —— 标准操作，防止数值过大。</li>
+<li><strong>计算注意力分数 (Attention Score):</strong>
+    <code>attn = q @ k.transpose(-2, -1)</code> —— 算出 $QK^T$。</li>
+<li><strong>应用泰勒近似 (核心步骤):</strong>
+    <code>python
+    # 对应公式：1 + x + 0.5 * x^2
+    attn = 1 + attn + 1/2 * (attn ** 2)</code>
+    这就是 Based Attention 的灵魂。它没有用 <code>torch.softmax</code>，而是用了这个多项式。</li>
+<li><strong>加 Mask:</strong>
+    <code>attn.masked_fill_(...)</code> —— 保证是因果的（Causal），后面的词看不到前面的词。</li>
+<li><strong>计算输出:</strong>
+    <code>o = attn @ v</code> —— 算出 $A \times V$。</li>
+<li><strong>归一化 (Normalization):</strong>
+    因为没有 Softmax 自动归一化，所以需要手动算分母 $Z$ 并除以它。
+    <code>return o / (z[..., None] + 1e-6)</code></li>
+</ol>
+<hr />
+<h3>✅ Task 3: 挑战第二部分 <code>naive_chunk_based</code> (进阶版)</h3>
+<p>这一部分是为了<strong>加速</strong>。如果序列很长，我们不能算 $N \times N$ 的矩阵。
+解决办法是：<strong>分块（Chunking）</strong>。
+把长序列切成小块（比如 256 个词一块）。
+*   <strong>块内 (Intra-chunk):</strong> 用老办法（Task 2 的方法）算，因为块很小，算得快。
+*   <strong>块间 (Inter-chunk):</strong> 用线性注意力算（累加历史信息），传递给下一个块。</p>
+<p><strong>代码逻辑分解：</strong></p>
+<h4>3.1 准备工作</h4>
+<ul>
+<li>把 $Q, K, V$ 这里的维度重排，分成了 <code>(batch, head, num_chunks, chunk_size, dim)</code>。</li>
+</ul>
+<h4>3.2 计算分母 (Normalizer Z)</h4>
+<p>这部分代码在计算归一化因子。利用了 $1 + QK + \frac{1}{2}(QK)^2$ 的展开特性：
+*   <strong>Zero-th order:</strong> 对应公式里的 <code>1</code>。代码里是 <code>torch.arange...</code> 那一行。
+*   <strong>First order:</strong> 对应公式里的 <code>QK</code>。代码里是 <code>(q * k_cumsum).sum(-1)</code>。
+*   <strong>Second order:</strong> 对应公式里的 <code>0.5 * (QK)^2</code>。代码里涉及 <code>kk_cumsum</code> 的那部分。</p>
+<blockquote>
+<p><strong>目的：</strong> 算出每个 token 应该除以多大的数才能归一化。</p>
+</blockquote>
+<h4>3.3 计算分子 (Output O) - 这里的逻辑最绕</h4>
+<p>它把输出 $O$ 分成了三个部分累加：</p>
+<p><strong>第一部分：常数项 (The "1" term)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">_o</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span> <span class="c1"># 对应公式里的 1 * V</span>
+</code></pre></div>
+
+<p>因为 Attention 权重里有个 <code>1</code>，所以 $1 \times V$ 的前缀和就是这一项的贡献。</p>
+<p><strong>第二部分：块内注意力 (Intra-chunk)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">intra_chunk_attn</span> <span class="o">=</span> <span class="n">q</span> <span class="o">@</span> <span class="n">k</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="n">intra_chunk_attn</span> <span class="o">=</span> <span class="n">intra_chunk_attn</span> <span class="o">+</span> <span class="mi">1</span><span class="o">/</span><span class="mi">2</span> <span class="o">*</span> <span class="p">(</span><span class="n">intra_chunk_attn</span> <span class="o">**</span> <span class="mi">2</span><span class="p">)</span>
+<span class="c1"># ... mask ...</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">intra_chunk_attn</span> <span class="o">@</span> <span class="n">v</span>
+</code></pre></div>
+
+<p>这和 Task 2 完全一样！只计算<strong>当前块内部</strong>的注意力。</p>
+<p><strong>第三部分：块间历史记忆 (Inter-chunk History)</strong>
+这是线性注意力的精髓。我们需要把之前所有块的信息加到当前块来。
+由于公式是 $1 + QK + \frac{1}{2}Q^2K^2$ (简化写法)，我们需要维护 $K$ 和 $V$ 的累积量。</p>
+<ul>
+<li>
+<p><strong>二次项记忆 (Quadratic Term):</strong>
+    代码中计算 <code>kv</code> (einsum k, k, v) 并 <code>cumsum</code>。
+    <code>python
+    o += 0.5 * torch.einsum('...kv, ...q, ...q -&gt; ...', kv, q, q)</code>
+    这里其实是在算 $\frac{1}{2} Q^2 \sum (K^2 V)$。</p>
+</li>
+<li>
+<p><strong>一次项记忆 (Linear Term):</strong>
+    代码中计算 <code>kv</code> (einsum k, v) 并 <code>cumsum</code>。
+    <code>python
+    o += torch.einsum('...kv, ...q -&gt; ...', kv, q)</code>
+    这里其实是在算 $Q \sum (KV)$。</p>
+</li>
+</ul>
+<h4>3.4 收尾</h4>
+<p>最后把这三部分加起来，除以分母 $Z$，再把形状还原回去。</p>
+<hr />
+<h3>📝 总结清单 (Summary List)</h3>
+<p>如果你要看懂这个文件，请按这个顺序理解：</p>
+<ol>
+<li><strong>Based Attention 不用 Softmax</strong>，而是用 $1 + x + 0.5x^2$。</li>
+<li><strong><code>naive_parallel_based</code></strong> 是<strong>暴力算</strong>：直接生成大矩阵，套用公式，加 Mask，乘 V。</li>
+<li><strong><code>naive_chunk_based</code></strong> 是<strong>混合算</strong>：<ul>
+<li><strong>自己块内</strong>：依然暴力算（因为块小，不慢）。</li>
+<li><strong>之前块的影响</strong>：利用泰勒展开后的线性性质，把 $K$ 和 $V$ 累加起来 ($KV$ 和 $K^2V$)，直接乘给 $Q$。</li>
+<li><strong>常数项</strong>：别忘了公式里还有个 <code>1</code>，对应 $V$ 的直接累加。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话概括这个文件：</strong>
+它实现了一个用“泰勒展开”代替“Softmax”的注意力机制，并提供了一个慢速的参考实现（Parallel）和一个利用分块加速的实现（Chunk）。</p>

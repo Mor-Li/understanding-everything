@@ -1,0 +1,63 @@
+<h1>fla/layers/gated_deltanet.py</h1>
+<p>这份代码确实比较硬核，它实现的是一篇非常新的论文算法：<strong>Gated Delta Networks (Improving Mamba2)</strong>。</p>
+<p>简单来说，这是一个<strong>用来替代 Transformer 中“注意力机制（Attention）”的层</strong>。它的核心目的是：<strong>像 Transformer 一样聪明，但像 RNN（循环神经网络）一样快且省显存</strong>。</p>
+<p>为了让你听懂，我们把这个 <code>GatedDeltaNet</code> 想象成一个<strong>“超级记账员”</strong>。他的工作是阅读一长串文字（比如一本小说），并把重要信息记在脑子里的“小本本”（Hidden State / Memory）上。</p>
+<p>下面我为你列一个 <strong>Task Todo List</strong>，按照代码运行的顺序，一步步拆解他在做什么：</p>
+<hr />
+<h3>📋 GatedDeltaNet 的工作清单 (Todo List)</h3>
+<h4>✅ Task 1: 准备原材料 (Projections)</h4>
+<p><strong>代码对应：</strong> <code>self.q_proj</code>, <code>self.k_proj</code>, <code>self.v_proj</code>
+<strong>通俗解释：</strong>
+当这一层收到输入（比如一个词的向量 <code>hidden_states</code>）时，首先要把这个词拆解成三个不同的属性：
+1.  <strong>Q (Query/指令)：</strong> 我现在想查询什么信息？
+2.  <strong>K (Key/索引)：</strong> 这个词的特征是什么（用来和记忆匹配）？
+3.  <strong>V (Value/内容)：</strong> 这个词实际包含的具体内容是什么？</p>
+<blockquote>
+<p>💡 <strong>观点：</strong> 这和 Transformer 的 QKV 一样，是处理信息的第一步。</p>
+</blockquote>
+<h4>✅ Task 2: 快速扫视周围 (Short Convolution)</h4>
+<p><strong>代码对应：</strong> <code>self.q_conv1d</code>, <code>self.k_conv1d</code>, <code>self.v_conv1d</code>
+<strong>通俗解释：</strong>
+在把信息存入长期记忆之前，先“偷瞄”一下这个词前后的几个词。
+*   比如看到“苹果”，如果前面是“吃”，那它是水果；如果前面是“美国”，那它是科技公司。
+*   <strong>代码里的 <code>conv_size=4</code></strong> 就是说：先别只看当前这 1 个词，先把周围 4 个词混合一下，提取局部特征。</p>
+<blockquote>
+<p>💡 <strong>观点：</strong> 这一步叫“短卷积”，是 Mamba 类模型的标配。它能极大地增强模型对局部短语的理解能力。</p>
+</blockquote>
+<h4>✅ Task 3: 决定学习力度和遗忘速度 (Beta &amp; Gate)</h4>
+<p><strong>代码对应：</strong>
+*   <code>beta = self.b_proj(...).sigmoid()</code>
+*   <code>g = ...</code> (由 <code>A_log</code> 和 <code>dt_bias</code> 计算得出)
+<strong>通俗解释：</strong>
+记账员不能把所有废话都记下来，那样脑子会炸。他需要计算两个控制信号：
+1.  <strong>Beta (学习率/更新力度)：</strong> 这条新信息有多重要？如果是废话，Beta 就很小，我不更新记忆；如果是重点，Beta 很大，我要狠狠记住。
+2.  <strong>g (Decay/遗忘门)：</strong> 过去的记忆要保留多少？随着时间流逝，旧信息需要按比例衰减（遗忘）。</p>
+<h4>✅ Task 4: <strong>【核心】</strong> 更新记忆小本本 (The Delta Rule)</h4>
+<p><strong>代码对应：</strong> <code>chunk_gated_delta_rule(...)</code> 或 <code>fused_recurrent_gated_delta_rule(...)</code>
+<strong>通俗解释：</strong>
+这是全篇最难懂、也是最核心的地方。它不像 Transformer 那样把所有历史都存下来（显存杀手），而是用<strong>Delta Rule（增量规则）</strong>来更新一个固定大小的状态。</p>
+<p>逻辑是这样的：
+1.  <strong>预测：</strong> 用现在的记忆（State）去预测当前的 V。
+2.  <strong>找茬 (Delta)：</strong> 看看“预测值”和“真实当前的 V”差多少？
+3.  <strong>修正：</strong> 根据这个差值（Delta）乘以 Task 3 计算出的 <code>beta</code>，来修正记忆小本本。</p>
+<blockquote>
+<p><strong>公式直觉：</strong> <code>新记忆 = 旧记忆 + Beta * (新信息 - 旧记忆检索到的信息)</code>
+这就是为什么叫 <strong>Delta (差值)</strong> Net。它通过不断修正误差来学习。</p>
+</blockquote>
+<p><em>注：代码里分了 <code>chunk</code>（分块并行，训练快）和 <code>fused_recurrent</code>（循环，推理快）两种模式，数学上是等价的。</em></p>
+<h4>✅ Task 5: 整理输出 (Output Gating)</h4>
+<p><strong>代码对应：</strong> <code>self.o_norm</code>, <code>self.o_proj</code>
+<strong>通俗解释：</strong>
+记忆更新完了，现在要输出这一步的处理结果给下一层网络。
+1.  <strong>Output Gate (o_norm)：</strong> 再加一道门控（Gate），决定这一层计算出的结果，有多少能真正流向下一层。这就像一个过滤器，把杂音滤掉。
+2.  <strong>Output Projection (o_proj)：</strong> 调整一下数据的维度，让它变回原来的形状，方便下一层接手。</p>
+<hr />
+<h3>总结：这段代码到底牛在哪？</h3>
+<p>如果你看懂了上面的 List，你就明白了这段代码的精髓：</p>
+<ol>
+<li><strong>它不是 Transformer：</strong> 它不需要计算 $N^2$ 的注意力矩阵，所以处理长文本（比如 100k 长度）时，速度非常快，显存占用很低。</li>
+<li><strong>它比老式 RNN 强：</strong> 老式 RNN 只能顺序看，这个代码里的 <code>chunk</code> 模式允许它在训练时<strong>并行计算</strong>（把长文本切成块，同时算），利用显卡加速。</li>
+<li><strong>Delta Rule 的改进：</strong> 相比于 Mamba (SSM)，这个 <strong>Delta Rule</strong> 提供了更强的“联想记忆”能力（类似于注意力机制的效果），但在数学形式上依然保持了线性复杂度。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这是一个<strong>披着 RNN 外衣，装着 Delta 记忆更新算法，并且加了局部卷积和门控机制</strong>的高效神经网络层。</p>

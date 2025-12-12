@@ -1,0 +1,90 @@
+<h1>tests/ops/test_forgetting_attn.py</h1>
+<p>这份代码确实涉及很多深度学习底层的概念（如注意力机制、梯度检查、并行计算优化）。别担心，这其实是一份<strong>测试文件（Unit Test）</strong>。</p>
+<p>它的核心逻辑非常简单：<strong>为了验证一个写得很复杂但很快的算法（Parallel版）是对的，我们先写一个很简单但很慢的算法（Naive版），然后比较两者的结果是否一致。</strong></p>
+<p>我们可以把理解这份代码的任务拆解成以下 4 个 Todo List，我带你一步步完成：</p>
+<h3>✅ TODO 1: 搞清楚核心概念 —— 什么是 "Forgetting Attention"？</h3>
+<p>首先看函数名 <code>naive_forgetting_attn</code>。
+普通的 Attention 是 $Softmax(Q \cdot K^T) \cdot V$。
+而这里的 "Forgetting Attention"（遗忘注意力）多了一个输入 <strong><code>g</code></strong>。</p>
+<ul>
+<li><strong>直观理解</strong>：在这个机制里，随着时间推移，模型会有意“遗忘”之前的信息。<code>g</code> 控制了遗忘的程度。</li>
+<li><strong>数学逻辑</strong>：代码中有一句 <code>gc = g.float().cumsum(1)</code>。这说明它在计算累加的衰减量。在计算 Attention 分数时，不仅看 Q 和 K 的相似度，还要减去一个基于 <code>g</code> 的距离惩罚。</li>
+</ul>
+<h3>✅ TODO 2: 读懂“标准答案” —— <code>naive_forgetting_attn</code> 函数</h3>
+<p>这个函数是用来生成“正确答案”的参照物。因为它用的是 PyTorch 原生算子，虽然慢，但逻辑清晰，容易保证正确。</p>
+<p><strong>关键步骤解析：</strong>
+1.  <strong>准备阶段</strong>：
+    <code>python
+    # 计算 g 的累积和 (cumulative sum)，用于计算位置之间的衰减
+    gc = g.float().cumsum(1)
+    # 创建一个下三角掩码 (Causal Mask)，保证不能看到“未来”的信息
+    mask = torch.tril(torch.ones((T, T), ...))</code>
+2.  <strong>计算注意力分数 (Attention Scores)</strong>：
+    <code>python
+    # 计算 Q * K^T
+    ref = torch.einsum("bqhd,bkhd-&gt;bhqk", ...)
+    # 核心点：加上遗忘门控的影响。
+    # 这里的逻辑是：位置 i 和位置 j 之间的衰减，取决于它们之间 g 的累加值。
+    ref = ref + rearrange(gc, "b t h -&gt; b h t 1") - rearrange(gc, "b t h -&gt; b h 1 t")</code>
+3.  <strong>标准化与加权</strong>：
+    <code>python
+    # 屏蔽掉未来的位置 (Masking)
+    ref = ref.masked_fill(~mask..., -inf)
+    # Softmax 归一化后乘以 V
+    ref = torch.einsum("bhqk,bkhd-&gt;bqhd", F.softmax(ref, dim=-1), ...)</code></p>
+<p><strong>总结</strong>：这个函数就是告诉你，这个算子的数学定义是什么。</p>
+<h3>✅ TODO 3: 理解测试流程 —— <code>test_parallel</code> 函数</h3>
+<p>这个函数是测试的主体。它的目的是验证 <code>fla.ops.forgetting_attn.parallel</code> 里的 <code>parallel_forgetting_attn</code>（那个优化过的、看不见的快速版本）是否正确。</p>
+<p><strong>步骤解析：</strong>
+1.  <strong>造假数据</strong>：
+    <code>python
+    # 随机生成 Q, K, V
+    q = torch.randn(...)
+    # 随机生成 g (遗忘门)，范围在 -0.1 到 -0.01 之间
+    g = torch.randn(...).uniform_(-0.1, -0.01)
+    # 开启 requires_grad=True，因为我们要测反向传播（梯度）</code>
+2.  <strong>跑“慢”版本 (Ref)</strong>：
+    <code>python
+    ref = naive_forgetting_attn(q, k, v, g, scale)
+    ref.backward(do) # 算出标准答案的梯度
+    # 保存结果和梯度 (ref_dq, ref_dk...)</code>
+3.  <strong>跑“快”版本 (Tri/Parallel)</strong>：
+    <code>python
+    tri = parallel_forgetting_attn(q=q, k=k, v=v, g=g, scale=scale)
+    tri.backward(do) # 算出优化版本的梯度
+    # 保存结果和梯度 (tri_dq, tri_dk...)</code>
+4.  <strong>比对答案 (Assert)</strong>：
+    <code>python
+    # 比较输出结果 (o) 是否一致
+    assert_close(" o", ref, tri, 0.005)
+    # 比较 Q, K, V, G 的梯度 (dq, dk, dv, dg) 是否一致
+    assert_close("dq", ref_dq, tri_dq, 0.005)
+    # ...</code>
+    如果这里不报错，说明那个复杂的并行优化版本写对了。</p>
+<h3>✅ TODO 4: 理解变长序列测试 —— <code>test_parallel_varlen</code></h3>
+<p>在实际的大模型训练中，我们通常把很多个短句子拼成一个长的一维数组来训练（为了不浪费显存，不加 padding）。这叫 <strong>Variable Length (VarLen)</strong> 或 <strong>Packed Sequence</strong>。</p>
+<ul>
+<li><strong><code>cu_seqlens</code> 是什么？</strong>
+    Cumulative Sequence Lengths（累积序列长度）。
+    比如 <code>[0, 15, 100]</code>，意思是有两个句子：<ul>
+<li>第1句：索引 0 到 15</li>
+<li>第2句：索引 15 到 100</li>
+</ul>
+</li>
+</ul>
+<p><strong>测试逻辑的区别：</strong>
+*   <strong>慢版本 (Ref)</strong>：必须写一个 <code>for</code> 循环，一段一段地切出来算，算完再拼回去。
+    <code>python
+    for bos, eos in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+        # 手动切片 q[:, bos:eos]
+        ref[:, bos:eos] = naive_forgetting_attn(...)</code>
+*   <strong>快版本 (Tri)</strong>：直接把 <code>cu_seqlens</code> 传进去，算子内部自动处理边界，不需要外部循环，效率极高。
+    <code>python
+    tri = parallel_forgetting_attn(..., cu_seqlens=cu_seqlens)</code>
+*   最后依然是比对两者结果是否一致。</p>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<p>这个文件讲了三件事：
+1.  <strong>定义了一种特殊的 Attention</strong>：带有一个衰减门 <code>g</code>，让注意力随距离衰减 (Forgetting Attention)。
+2.  <strong>验证正确性</strong>：用简单的 Python 代码算出结果，去检查复杂的 CUDA/Triton 优化代码算出的结果。
+3.  <strong>验证全面性</strong>：不仅验证了前向传播（输出数值），还验证了反向传播（梯度更新），以及变长序列（VarLen）的处理能力。</p>

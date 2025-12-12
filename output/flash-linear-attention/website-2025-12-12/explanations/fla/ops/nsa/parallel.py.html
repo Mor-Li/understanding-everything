@@ -1,0 +1,83 @@
+<h1>fla/ops/nsa/parallel.py</h1>
+<p>这份代码确实非常硬核，它主要是在使用 <strong>Triton</strong>（一种用于编写高效 GPU 算子的语言）来实现 <strong>NSA (Native Sparse Attention)</strong> 机制。</p>
+<p>为了让你看懂，我们不要直接钻进每一行 Triton 代码里（那里面充满了指针运算和并行逻辑），而是从<strong>宏观的算法流程</strong>出发，列一个 <strong>Task List</strong>。</p>
+<p>你可以把这份文件看作是一个<strong>“如何高效地只关注重点信息”</strong>的工程实现。</p>
+<h3>核心任务清单 (Task List)</h3>
+<p>NSA 的核心思想是：全量 Attention 太慢了，我不想看所有的 Token。我只想看：
+1.  <strong>压缩后的全局摘要</strong> (Compression)
+2.  <strong>最重要的几个块</strong> (Selection / Top-K)
+3.  <strong>附近的邻居</strong> (Sliding Window)</p>
+<p>下面是代码实现这一思想的步骤：</p>
+<hr />
+<h4>Task 1: 准备“缩略图” (Compression)</h4>
+<p><strong>目标</strong>：把原始的 Key (K) 和 Value (V) 变小，方便快速浏览。
+*   <strong>对应代码位置</strong>：<code>parallel_nsa</code> 函数的开头部分。
+*   <strong>发生了什么</strong>：
+    *   代码调用了 <code>mean_pooling(k, block_size, ...)</code>。
+    *   <strong>比喻</strong>：原本是一部高清电影（原始 K/V），现在我们先把它压缩成一系列低分辨率的截图（Compressed K/V）。这样我们就能快速计算出大概哪里比较重要。</p>
+<h4>Task 2: 挑选“重点关注对象” (Top-K Selection)</h4>
+<p><strong>目标</strong>：用 Query (Q) 去看那些“缩略图”，算出哪些块（Block）的分数最高，把它们的索引（Index）记下来。
+*   <strong>对应代码位置</strong>：
+    *   Python 包装：<code>parallel_nsa_topk</code> 函数。
+    *   <strong>核心 Kernel</strong>：<code>parallel_nsa_kernel_topk</code>。
+*   <strong>步骤详解</strong>：
+    1.  <strong>粗略计算</strong>：GPU 线程读取 Q 和 <strong>压缩后的 K</strong>。
+    2.  <strong>打分</strong>：计算 Q 和压缩 K 的点积（Attention Score）。
+    3.  <strong>排序与筛选</strong>：代码中使用了 <code>_bitonic_merge</code>（双调排序），这是一种适合 GPU 并行的排序算法。
+    4.  <strong>记录</strong>：选出得分最高的 $S$ 个块的 ID，存入 <code>block_indices</code>。
+    *   <strong>结果</strong>：现在我们知道对于每个 Query，它应该去详细看哪几个原始数据块。</p>
+<h4>Task 3: 进行精细阅读 (Selected Attention Forward)</h4>
+<p><strong>目标</strong>：根据 Task 2 拿到的索引，去读取<strong>原始的、未压缩的</strong> K 和 V，计算精确的 Attention。
+*   <strong>对应代码位置</strong>：
+    *   Python 包装：<code>parallel_nsa_fwd</code>。
+    *   <strong>核心 Kernel</strong>：<code>parallel_nsa_fwd_kernel</code>。
+*   <strong>步骤详解</strong>：
+    1.  <strong>定位</strong>：Kernel 读取 <code>block_indices</code>，知道该去内存的哪个位置搬运数据。
+    2.  <strong>加载</strong>：只加载那些被选中的原始 K 和 V 块（跳过不重要的）。
+    3.  <strong>计算</strong>：标准的 $Q \times K^T \rightarrow \text{Softmax} \rightarrow \times V$ 流程。
+    4.  <strong>输出</strong>：得到 <code>o_slc</code> (Selected Output)。</p>
+<h4>Task 4: 兼顾“左邻右舍” (Sliding Window Attention)</h4>
+<p><strong>目标</strong>：除了看远处的重点，还要看眼前的上下文（比如最近的 512 个 token）。这部分通常由 FlashAttention 直接处理。
+*   <strong>对应代码位置</strong>：<code>parallel_nsa</code> 函数的末尾。
+*   <strong>发生了什么</strong>：
+    *   代码调用 <code>flash_attn_func</code> 或 <code>flash_attn_varlen_func</code>。
+    *   设置 <code>window_size</code> 参数，计算局部的 Attention 输出 <code>o_swa</code>。</p>
+<h4>Task 5: 融合所有结果 (Gating &amp; Combination)</h4>
+<p><strong>目标</strong>：把压缩摘要的结果、精选块的结果、滑动窗口的结果加权融合。
+*   <strong>对应代码位置</strong>：<code>parallel_nsa</code> 函数的最后几行。
+*   <strong>公式逻辑</strong>：
+    $$Output = o_{slc} \cdot g_{slc} + o_{cmp} \cdot g_{cmp} + o_{swa} \cdot g_{swa}$$
+    *   其中 $g$ 是门控分数（Gate scores），决定模型更听信哪一部分的信息。</p>
+<h4>Task 6: 反向传播 (Backward Pass - 训练专用)</h4>
+<p><strong>目标</strong>：为了训练模型，需要计算梯度。这是最复杂的部分，因为要处理稀疏的梯度回传。
+*   <strong>对应代码位置</strong>：
+    *   <code>parallel_nsa_bwd</code>
+    *   <code>parallel_nsa_bwd_kernel_dq</code> (算 Query 的梯度)
+    *   <code>parallel_nsa_bwd_kernel_dkv</code> (算 Key/Value 的梯度)
+*   <strong>难点</strong>：因为在前向传播中我们跳过了很多块，所以在反向传播时，我们只需要把梯度传回那些被选中的块里。</p>
+<hr />
+<h3>总结：这份代码的结构图</h3>
+<ol>
+<li><strong>入口</strong>：<code>parallel_nsa</code> (总指挥)<ul>
+<li>--&gt; 1. <strong>压缩</strong> K, V</li>
+<li>--&gt; 2. <strong>筛选</strong> (<code>parallel_nsa_topk</code> -&gt; <code>parallel_nsa_kernel_topk</code>)<ul>
+<li><em>产出：block_indices (索引表)</em></li>
+</ul>
+</li>
+<li>--&gt; 3. <strong>精算</strong> (<code>ParallelNSAFunction.apply</code> -&gt; <code>parallel_nsa_fwd</code> -&gt; <code>parallel_nsa_fwd_kernel</code>)<ul>
+<li><em>产出：o (基于选中的块算出的结果)</em></li>
+</ul>
+</li>
+<li>--&gt; 4. <strong>窗口</strong> (<code>flash_attn_func</code>)<ul>
+<li><em>产出：o_swa (基于局部算出的结果)</em></li>
+</ul>
+</li>
+<li>--&gt; 5. <strong>加权求和</strong> 返回最终结果。</li>
+</ul>
+</li>
+</ol>
+<h3>为什么你看不懂？</h3>
+<p>主要原因可能有两点：
+1.  <strong>Triton 语法</strong>：像 <code>tl.make_block_ptr</code>, <code>tl.program_id</code>, <code>tl.dot</code> 这种是 GPU 编程特有的，涉及内存分块管理，不熟悉 GPU 架构很难读懂。
+2.  <strong>算法逻辑隐含</strong>：代码是为了<strong>速度</strong>优化的，而不是为了可读性。比如 Top-K kernel 里并没有简单的 <code>sort</code> 函数，而是手写了一个并行的双调排序网络，这本身就很晦涩。</p>
+<p><strong>建议</strong>：你只需要关注 <code>parallel_nsa</code> 这个最下面的函数，弄懂它是如何串联 Compression -&gt; Selection -&gt; Attention -&gt; Gating 的流程即可。上面的 Kernel 代码是底层的黑盒实现。</p>

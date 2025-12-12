@@ -1,0 +1,69 @@
+<h1>fla/modules/layernorm.py</h1>
+<p>这份代码确实比较硬核，因为它不仅仅是实现了一个功能，而是用 <strong>Triton</strong>（一种专门写GPU高性能算子的语言）手写了底层的加速实现。</p>
+<p>简单来说，这个文件的核心目的是：<strong>在英伟达 GPU 上，以极快的速度完成 LayerNorm（层归一化）、RMSNorm 和 GroupNorm 的计算，并且支持“残差连接（Residual）”的融合操作。</strong></p>
+<p>如果你想读懂它，不要从第一行读到最后一行。我为你列了一个 <strong>“学习任务清单（TODO List）”</strong>，按照从易到难、从逻辑到实现的顺序，带你一步步拆解：</p>
+<hr />
+<h3>✅ 任务清单 (TODO List)</h3>
+<ol>
+<li><strong>【基础】看懂数学定义</strong>：阅读 <code>*_ref</code> 函数，理解它在算什么数学公式。</li>
+<li><strong>【概念】理解“融合（Fused）”</strong>：搞懂为什么要传 <code>residual</code> 参数。</li>
+<li><strong>【核心】理解 Triton Forward Kernel</strong>：看 <code>layer_norm_fwd_kernel</code>，理解数据是怎么在 GPU 上流动的。</li>
+<li><strong>【桥梁】理解 Autograd 封装</strong>：看 <code>LayerNormFunction</code>，理解 PyTorch 怎么调用 Triton。</li>
+<li><strong>【进阶】理解“线性层融合”</strong>：看 <code>LayerNormLinear</code>，这是进一步的性能压榨。</li>
+<li><strong>【应用】看对外接口</strong>：看 <code>class LayerNorm</code> 等，这是给用户用的“皮”。</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>1. 【基础】看懂数学定义 (Reference)</h4>
+<p><strong>目标代码</strong>：<code>layer_norm_ref</code>, <code>rms_norm_ref</code>, <code>group_norm_ref</code>
+<strong>解释</strong>：
+这些带 <code>_ref</code> 后缀的函数是 <strong>Reference（参考实现）</strong>。它们是用纯 PyTorch 写的，逻辑最清晰，用来做正确性验证（确保 Triton 写的复杂代码算出来的结果和这些简单代码一样）。
+*   <strong>LayerNorm</strong>: 减去均值，除以标准差，乘以权重 <code>weight</code>，加上偏置 <code>bias</code>。
+*   <strong>RMSNorm</strong>: 不减均值，直接除以均方根（RMS），比 LayerNorm 少算一步减法，速度更快（Llama 等大模型常用）。</p>
+<h4>2. 【概念】理解“融合（Fused）”</h4>
+<p><strong>关键点</strong>：注意代码里到处都有 <code>residual</code> 这个参数。
+<strong>解释</strong>：
+在 Transformer 结构（如 BERT, GPT, Llama）中，常见的操作顺序是：
+<code>x = x + residual</code> (残差相加) -&gt; <code>x = LayerNorm(x)</code> (归一化)。
+*   <strong>普通做法</strong>：PyTorch 会先读取 x 和 residual 做加法（读写一次显存），存回去；然后再读出来做 Norm（又读写一次）。
+*   <strong>这份代码的做法</strong>：把“加法”和“归一化”写在一个核函数里。数据读进显卡芯片后，做完加法直接做归一化，<strong>省去了一次昂贵的显存读写</strong>。这就是“Fused（融合）”。</p>
+<h4>3. 【核心】理解 Triton Forward Kernel (最难的部分)</h4>
+<p><strong>目标代码</strong>：<code>layer_norm_fwd_kernel</code> (被 <code>@triton.jit</code> 装饰的函数)
+<strong>解释</strong>：
+这是运行在 GPU 上的代码。
+*   <strong>并行逻辑</strong>：GPU 有成千上万个线程。这里 <code>i_t = tl.program_id(0)</code> 表示每个线程块处理数据的一行（或者一部分）。
+*   <strong>加载数据</strong>：<code>tl.load</code> 把数据从显存（HBM）搬运到芯片上极快的寄存器或 SRAM 中。
+*   <strong>计算统计量</strong>：
+    *   <code>b_mean = tl.sum(b_x, axis=1) / D</code>：在芯片内部快速算出均值。
+    *   <code>b_var</code>: 算出方差。
+    *   <code>b_rstd</code>: 算出标准差的倒数。
+*   <strong>归一化</strong>：<code>(b_x - b_mean) * b_rstd</code>。
+*   <strong>写回</strong>：<code>tl.store</code> 把结果写回显存。
+*   <strong>注意</strong>：代码里有两个 fwd kernel (<code>kernel</code> 和 <code>kernel1</code>)，这是为了针对不同的特征维度（<code>D</code>）做优化。如果 <code>D</code> 很大（&gt;512），用不同的策略。</p>
+<h4>4. 【桥梁】理解 Autograd 封装</h4>
+<p><strong>目标代码</strong>：<code>class LayerNormFunction(torch.autograd.Function)</code>
+<strong>解释</strong>：
+PyTorch 自身不知道怎么对你写的 Triton 代码求导（算梯度）。所以必须手动定义：
+*   <code>forward()</code>: 也就是前向传播，调用上面的 <code>layer_norm_fwd</code>。同时用 <code>ctx.save_for_backward</code> 保存均值、标准差等，供反向传播用。
+*   <code>backward()</code>: 也就是反向传播，接收梯度的输入 <code>dy</code>，调用 <code>layer_norm_bwd</code>（另一个 Triton kernel，负责算梯度的），算出输入 <code>x</code>、权重 <code>w</code>、偏置 <code>b</code> 的梯度。</p>
+<h4>5. 【进阶】理解“线性层融合”</h4>
+<p><strong>目标代码</strong>：<code>layer_norm_linear</code> 和 <code>LayerNormLinearFunction</code>
+<strong>解释</strong>：
+这是一种更极致的优化。
+通常模型里 LayerNorm 后面紧跟着一个 Linear 层（全连接层）。
+这份代码试图把 <code>Norm</code> 的输出直接传给 <code>Linear</code> 计算，甚至在反向传播时，重新计算 Norm 的输出以节省显存（Activation Checkpointing 的一种微操）。这部分是为了省显存和带宽。</p>
+<h4>6. 【应用】看对外接口</h4>
+<p><strong>目标代码</strong>：<code>class LayerNorm(nn.Module)</code>, <code>class RMSNorm(nn.Module)</code>
+<strong>解释</strong>：
+这是给最终用户（比如你）用的。
+它继承自 <code>nn.Module</code>，初始化时定义了 <code>self.weight</code> 和 <code>self.bias</code>。
+在 <code>forward</code> 函数里，它只是简单地调用了前面定义的 <code>layer_norm</code> 函数。
+这让你在使用时可以像使用 <code>torch.nn.LayerNorm</code> 一样简单：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">model</span> <span class="o">=</span> <span class="n">fla</span><span class="o">.</span><span class="n">modules</span><span class="o">.</span><span class="n">layernorm</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="mi">4096</span><span class="p">)</span>
+<span class="n">output</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="nb">input</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这份文件是一个<strong>高度优化的算子库</strong>。
+*   <strong>如果你的任务是使用它</strong>：你只需要看第 6 点，直接 import 它的 <code>LayerNorm</code> 或 <code>RMSNorm</code> 替换掉 PyTorch 原生的即可，不需要懂内部实现。
+*   <strong>如果你的任务是学习 Triton</strong>：重点看第 3 点，研究它是如何利用 <code>tl.block_ptr</code> 和 mask 来高效处理数据的。</p>

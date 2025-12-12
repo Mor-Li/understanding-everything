@@ -1,0 +1,125 @@
+<h1>fla/ops/delta_rule/naive.py</h1>
+<p>这份代码确实非常硬核，因为它涉及到<strong>线性注意力机制（Linear Attention）</strong>和<strong>递归神经网络（RNN）</strong>的底层数学优化。</p>
+<p>简单来说，这段代码实现了一种叫 <strong>"Delta Rule" (增量规则)</strong> 的算法，用来让模型像 RNN 一样随着时间步（Loop）更新记忆，但又试图用 GPU 并行加速。</p>
+<p>如果不理解背后的数学公式，直接看代码几乎是天书。为了让你能看懂，我为你列了一个 <strong>4步走的 Task List（任务清单）</strong>，我们一步步拆解。</p>
+<hr />
+<h3>📋 Task 0: 核心概念铺垫（不要看代码，先看这里）</h3>
+<p>在看代码之前，你必须建立一个心理模型：<strong>这就好比在一个黑板上写字。</strong></p>
+<ol>
+<li><strong>传统的 Attention (Transformer):</strong> 每次要回答问题，都必须回头把以前写过的所有日记（KV Cache）全部读一遍。随着日记越写越多，读得越来越慢。</li>
+<li><strong>RNN (递归):</strong> 脑子里只记一个“当前状态” $S$（黑板）。每来一个新字，就擦掉一点旧的，写上一点新的。</li>
+<li><strong>Delta Rule (本文的算法):</strong> 这是一种特殊的 RNN 更新方式。<ul>
+<li>普通的 RNN 是直接把新信息加到黑板上：$S_{new} = S_{old} + \text{新信息}$。</li>
+<li><strong>Delta Rule</strong> 比较聪明：它先看一眼黑板上已有的信息，计算一下“<strong>我想写的信息</strong>”和“<strong>黑板上已有的信息</strong>”之间的<strong>差值（Delta）</strong>，然后只把这个<strong>差值</strong>更新上去。</li>
+<li>公式直觉：$v_{更新} = v_{输入} - (S \times k)$。这其实是一种“修正”机制，避免记忆爆炸，且能更精准地更新。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 1: 搞懂基础逻辑 (<code>delta_rule_recurrence</code>)</h3>
+<p>这是最容易看懂的函数，它是算法的<strong>定义</strong>（虽然跑得慢，但逻辑最清晰）。</p>
+<p><strong>目标：</strong> 理解 $S$ 是怎么一步步更新的。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">delta_rule_recurrence</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">beta</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 省略形状变换 ...</span>
+
+    <span class="c1"># S 就是那个“黑板”（记忆矩阵），初始化为全0</span>
+    <span class="n">S</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">h</span><span class="p">,</span> <span class="n">d_k</span><span class="p">,</span> <span class="n">d_v</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> 
+
+    <span class="c1"># 核心循环：一步一步走（像 RNN 一样）</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">l</span><span class="p">):</span>
+        <span class="n">_k</span> <span class="o">=</span> <span class="n">k</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>      <span class="c1"># 当前时刻的 Key (写入地址)</span>
+        <span class="n">_q</span> <span class="o">=</span> <span class="n">q</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>      <span class="c1"># 当前时刻的 Query (查询请求)</span>
+        <span class="n">_v</span> <span class="o">=</span> <span class="n">v</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="c1"># 当前时刻的 Value (想写入的内容)</span>
+        <span class="n">beta_i</span> <span class="o">=</span> <span class="n">beta</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>  <span class="c1"># 学习率/遗忘率</span>
+
+        <span class="c1"># 【重点 1：计算 Delta】</span>
+        <span class="c1"># 我们想把 _v 写入 S。</span>
+        <span class="c1"># 但先检查 S 里在 _k 这个位置已经有了什么？ -&gt; (S * _k)</span>
+        <span class="c1"># 然后计算差值：新 _v 减去 已有的部分。</span>
+        <span class="n">_v</span> <span class="o">=</span> <span class="n">_v</span> <span class="o">-</span> <span class="p">(</span><span class="n">S</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="o">*</span> <span class="n">_k</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">])</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+
+        <span class="c1"># 【重点 2：应用 Beta】</span>
+        <span class="c1"># 这个差值要乘上一个系数 beta，决定更新力度</span>
+        <span class="n">_v</span> <span class="o">=</span> <span class="n">_v</span> <span class="o">*</span> <span class="n">beta_i</span>
+
+        <span class="c1"># 【重点 3：更新黑板 S】</span>
+        <span class="c1"># 把计算好的修正量 (_v) 写入到地址 (_k) 上</span>
+        <span class="n">S</span> <span class="o">=</span> <span class="n">S</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="o">+</span> <span class="n">_k</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">_v</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+
+        <span class="c1"># 【重点 4：计算输出】</span>
+        <span class="c1"># 用当前的 Query 去读黑板 S，得到输出 o</span>
+        <span class="n">o</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">&#39;bhd,bhdm-&gt;bhm&#39;</span><span class="p">,</span> <span class="n">_q</span><span class="p">,</span> <span class="n">S</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">o</span><span class="p">,</span> <span class="n">S</span>
+</code></pre></div>
+
+<p><strong>Task 1 总结：</strong>
+这只是一个带“回溯检查”机制的 RNN。它不是盲目添加记忆，而是先检查再修正。</p>
+<hr />
+<h3>✅ Task 2: 为什么要分块？ (<code>delta_rule_chunkwise</code>)</h3>
+<p>Python 的 <code>for</code> 循环在 GPU 上非常慢。为了加速，我们通常把数据切成小块（Chunk）。</p>
+<p><strong>目标：</strong> 理解“混合模式”。</p>
+<ul>
+<li><strong>Chunk 内部：</strong> 并行计算（用矩阵乘法，快）。</li>
+<li><strong>Chunk 之间：</strong> 串行递归（把上一个块的 $S$ 传给下一个块）。</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">delta_rule_chunkwise</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">beta</span><span class="p">,</span> <span class="n">chunk_size</span><span class="o">=</span><span class="mi">32</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 这里的代码看着很恐怖，主要是为了解决一个问题：</span>
+    <span class="c1"># 在一个 Chunk 内部，没有 for 循环，怎么模拟那个 &quot;S 依赖上一步&quot; 的过程？</span>
+
+    <span class="c1"># 这部分代码：</span>
+    <span class="c1"># attn = -(k_beta @ k.transpose(-1, -2)).masked_fill(mask, 0)</span>
+    <span class="c1"># for i in range(1, chunk_size): ...</span>
+
+    <span class="c1"># 翻译：</span>
+    <span class="c1"># 它在计算一个“块内修正矩阵”。</span>
+    <span class="c1"># 因为 Delta Rule 本质是 v = v - S*k，这是一个递归公式。</span>
+    <span class="c1"># 这里的数学操作是在求这个递归关系的“逆矩阵”或“展开形式”。</span>
+    <span class="c1"># 也就是一次性算出：在这个块里，第1个词怎么影响第2个，第2个怎么影响第3个...</span>
+
+    <span class="c1"># ...</span>
+
+    <span class="c1"># 这里的循环次数变少了 (l // chunk_size)</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">l</span> <span class="o">//</span> <span class="n">chunk_size</span><span class="p">):</span>
+        <span class="c1"># 1. 算出块内的输出 (并行)</span>
+        <span class="c1"># 2. 把上一个块遗留的 S 加进来</span>
+        <span class="c1"># 3. 更新 S 传给下一个块</span>
+</code></pre></div>
+
+<p><strong>Task 2 总结：</strong>
+这个函数是为了在<strong>速度</strong>（并行）和<strong>显存</strong>（递归）之间找平衡。它把长序列切短，块内用数学公式一次算完，块间传接力棒。</p>
+<hr />
+<h3>✅ Task 3: 终极形态 (<code>delta_rule_parallel</code>)</h3>
+<p>这是最难懂的部分，通常用于<strong>训练阶段</strong>。因为训练时我们已经知道了所有的输入，不需要像生成文本那样一个字一个字吐。</p>
+<p><strong>目标：</strong> 完全消灭 <code>for</code> 循环（或者只保留极少的块级循环），用纯矩阵运算解决所有问题。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">delta_rule_parallel</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">beta</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 核心难点在于：</span>
+    <span class="c1"># 这里的 mask 和 T 矩阵的计算：</span>
+    <span class="c1"># T = -(k_beta @ k.transpose(-1, -2)).masked_fill(mask, 0)</span>
+
+    <span class="c1"># 这里的数学原理叫 &quot;Wydrzynski 算法&quot; 或者 &quot;线性递归的并行扫描&quot;。</span>
+    <span class="c1"># 简单说：</span>
+    <span class="c1"># 本来 v_t 依赖于 v_{t-1}，是一个串行的链条。</span>
+    <span class="c1"># 这里构造了一个巨大的矩阵 T，通过矩阵乘法，</span>
+    <span class="c1"># 直接把 v_1 对 v_100 的影响一次性算出来了。</span>
+
+    <span class="c1"># 代码里的两层循环 (intra block, inter block) </span>
+    <span class="c1"># 是为了处理长序列时的显存优化（分块矩阵乘法），</span>
+    <span class="c1"># 并不是时间步的递归。</span>
+</code></pre></div>
+
+<p><strong>Task 3 总结：</strong>
+这个函数通过复杂的矩阵掩码（Masking）和累积求和技巧，把本来必须串行算的递归过程，转化成了一个巨大的矩阵乘法问题。这样就可以跑满 GPU 的算力。</p>
+<hr />
+<h3>🚀 总结清单 (Takeaway)</h3>
+<p>如果要把这个文件讲给别人听，你可以这样概括：</p>
+<ol>
+<li><strong>它是什么？</strong> 这是一个改进版的线性 Attention 算子，叫 Delta Rule。</li>
+<li><strong>核心逻辑 (<code>recurrence</code>)：</strong> 像 RNN 一样更新记忆 $S$，但每次更新前会先计算 <code>v - S*k</code> (残差)，只更新那个“差值”。这能让记忆更精准。</li>
+<li><strong>分块版 (<code>chunkwise</code>)：</strong> 为了跑得快，把序列切成小段。段内并行算，段间串行传记忆。</li>
+<li><strong>并行版 (<code>parallel</code>)：</strong> 训练时用的。用复杂的矩阵代数把递归过程展开成了矩阵乘法，最大化 GPU 利用率。</li>
+</ol>
+<p><strong>建议阅读顺序：</strong>
+先死磕 <code>delta_rule_recurrence</code>，把那个 $v = v - (S \cdot k)$ 的公式在纸上画一画，理解了这一点，后面两个函数只是为了算得更快的“数学魔法”而已。</p>

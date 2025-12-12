@@ -1,0 +1,125 @@
+<h1>fla/layers/hgrn2.py</h1>
+<p>这份代码确实比较硬核，它属于<strong>线性注意力机制（Linear Attention）</strong>或者<strong>现代RNN（Modern RNN）</strong>的范畴，具体来说是 <strong>HGRN2 (Hierarchically Gated Recurrent Neural Network)</strong> 的实现。</p>
+<p>简单来说，它的目的是：<strong>想拥有 Transformer 的性能，但推理时像 RNN 一样快（省显存、无限长文）。</strong></p>
+<p>为了让你听懂，我把阅读这份代码拆解成 <strong>6个 Task</strong>，我们像做任务一样一步步通关。</p>
+<hr />
+<h3>🗺️ 学习路线图 (To-Do List)</h3>
+<ul>
+<li><strong>Task 1: 搞懂角色定位</strong> —— 这到底是个什么层？</li>
+<li><strong>Task 2: 预处理 (Projections)</strong> —— 输入进来了，怎么变身？(Q, F, I 是什么)</li>
+<li><strong>Task 3: 局部增强 (Short Conv)</strong> —— 为什么要在 RNN 里面加卷积？</li>
+<li><strong>Task 4: 门控机制 (Gating)</strong> —— 最核心的数学魔法 (怎么算衰减率)。</li>
+<li><strong>Task 5: 核心算子 (The Core Kernel)</strong> —— <code>chunk_gla</code> 到底在干嘛？</li>
+<li><strong>Task 6: 整理输出 (Output)</strong> —— 归一化与还原。</li>
+</ul>
+<hr />
+<h3>Task 1: 搞懂角色定位</h3>
+<p><strong>目标</strong>：理解 <code>HGRN2Attention</code> 在模型里是干嘛的。</p>
+<ul>
+<li><strong>观点</strong>：你可以把它当成 Transformer 里的 <code>SelfAttention</code> 层的一个<strong>替代品</strong>。</li>
+<li><strong>代码对应</strong>：整个 <code>class HGRN2Attention(nn.Module)</code>。</li>
+<li><strong>解释</strong>：<ul>
+<li>传统的 Attention 复杂度是 $O(N^2)$，处理长文很慢。</li>
+<li>这个 HGRN2 试图把复杂度降到 $O(N)$（线性）。</li>
+<li>它保留了 <code>hidden_states</code> (输入) 和 <code>past_key_values</code> (KV Cache，这里其实是 RNN 的状态 State)，接口和 Transformer 很像。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 2: 预处理 (Projections)</h3>
+<p><strong>目标</strong>：理解输入向量被拆分成了哪三股势力。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    self.q_proj = nn.Linear(hidden_size, self.forget_dim, bias=False)
+    self.f_proj = nn.Linear(hidden_size, self.forget_dim, bias=False)
+    self.i_proj = nn.Linear(hidden_size, self.input_dim, bias=False)
+    # ... 在 forward 中 ...
+    q = self.q_proj(hidden_states)
+    f = self.f_proj(hidden_states)
+    i = self.i_proj(hidden_states)</code></li>
+<li><strong>解释</strong>：
+    在标准 Attention 里，我们有 Q, K, V。但在 HGRN2 里，逻辑变了：<ol>
+<li><strong><code>q</code> (Query)</strong>: 查询向量，决定我们需要提取什么信息。</li>
+<li><strong><code>i</code> (Input)</strong>: 相当于标准 Attention 里的 <strong>V (Value)</strong>，即实际的内容信息。</li>
+<li><strong><code>f</code> (Forget)</strong>: 这是一个<strong>门控信号</strong>。它决定了我们要“记住”多少历史信息，或者“遗忘”多少。这是 RNN 的核心特征。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 3: 局部增强 (Short Conv)</h3>
+<p><strong>目标</strong>：理解为什么要加一个 <code>Conv1d</code> (一维卷积)。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    if self.use_short_conv:
+        # ... 定义卷积 ...
+        q, conv_state_q = self.q_conv1d(...)
+        f, conv_state_f = self.f_conv1d(...)
+        i, conv_state_i = self.i_conv1d(...)</code></li>
+<li><strong>解释</strong>：<ul>
+<li><strong>痛点</strong>：纯 RNN 或线性 Attention 往往过于关注“全局”或“过去”，有时候会忽略<strong>当下</strong>相邻几个词的关系（比如“不”和“好”必须连在一起看）。</li>
+<li><strong>解决</strong>：在进入核心 RNN 循环之前，先用一个很短的卷积（比如窗口大小为 4），把相邻的几个词“混合”一下。</li>
+<li>这能让模型更好地理解局部短语，增强稳定性。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 门控机制 (Gating) —— 最难懂的部分</h3>
+<p><strong>目标</strong>：理解代码里 <code>logsigmoid</code> 和 <code>1 - g.exp()</code> 是在干什么。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    q = swish(q)  # 激活函数
+    g = F.logsigmoid(f) # 计算对数衰减率
+    # ... (lower_bound 省略) ...
+    k = 1 - g.exp() # 计算输入门</code></li>
+<li><strong>解释</strong>：
+    这是 HGRN2 论文的核心数学设计：<ol>
+<li><strong><code>f</code></strong>: 原始的遗忘分数。</li>
+<li><strong><code>g = logsigmoid(f)</code></strong>: <code>sigmoid</code> 把值压到 (0, 1)，取 <code>log</code> 后变成负数。这代表<strong>对数域的衰减率</strong>。</li>
+<li><strong><code>g.exp()</code></strong>: 还原回 (0, 1) 的衰减率 $\alpha$。比如 0.9，意味着上一时刻的记忆保留 90%。</li>
+<li><strong><code>k = 1 - g.exp()</code></strong>: 这相当于 <strong>$1 - \alpha$</strong>。如果保留 90% 的历史，那么当前时刻的新信息（Input）就只放 10% 进去。</li>
+<li><strong>总结</strong>：这一步是在动态计算：<strong>此刻我该忘掉多少旧事，记下多少新事？</strong></li>
+</ol>
+</li>
+</ul>
+<h3>Task 5: 核心算子 (The Core Kernel)</h3>
+<p><strong>目标</strong>：理解 <code>chunk_gla</code> / <code>fused_recurrent_gla</code>。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    if mode == 'fused_recurrent':
+        o, recurrent_state = fused_recurrent_gla(...)
+    elif mode == 'chunk':
+        o, recurrent_state = chunk_gla(...)</code></li>
+<li><strong>解释</strong>：
+    这是整个层计算“注意力”的地方，也是该库（fla）加速的核心。<ul>
+<li><strong>Recurrent (循环模式)</strong>: 像传统 RNN 一样，$S_t = S_{t-1} \times \text{衰减} + \text{输入}$。推理时极快，不需要存所有历史，只需要存一个状态 $S$。</li>
+<li><strong>Chunk (分块模式)</strong>: 训练时用。因为 RNN 串行训练太慢（没法并行），这里把长序列切成小块（Chunk）。块内用 Attention 并行算，块间用 RNN 传状态。</li>
+<li><strong>GLA (Gated Linear Attention)</strong>: 这个算子把上面计算好的 Q, K(门), V(内容), G(衰减) 融合在一起算出结果。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 6: 整理输出 (Output)</h3>
+<p><strong>目标</strong>：把计算结果变回原来的形状。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    o = rearrange(o, '... h d -&gt; ... (h d)') # 把多头拼接回去
+    o = rms_norm_linear(...) # 归一化 + 线性投影</code></li>
+<li><strong>解释</strong>：<ul>
+<li>算出来的 <code>o</code> 是多头（Multi-head）分离的，需要拼回去。</li>
+<li><strong>Group Norm / RMSNorm</strong>: 线性 Attention 的输出数值范围通常比较大或不稳定，所以 HGRN2 在输出前加了一个特殊的归一化处理。</li>
+<li>最后通过 <code>o_proj</code> 变回 <code>hidden_size</code>，交给下一层网络。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下 HGRN2 到底在讲啥？</h3>
+<p>如果你看懂了上面的 List，这段代码讲的就是：</p>
+<ol>
+<li>把输入拆成 <strong>查询(Q)</strong>、<strong>遗忘门(F)</strong>、<strong>内容(I)</strong>。</li>
+<li>用<strong>小卷积</strong>稍微混合一下局部信息。</li>
+<li>通过数学公式把 F 变成<strong>衰减率</strong>。</li>
+<li>用一个<strong>高度优化的算子 (GLA)</strong>，执行类似 RNN 的“遗忘旧的、写入新的”操作，同时结合了 Query 进行查询。</li>
+<li>最后整理形状输出。</li>
+</ol>
+<p>它就是一个<strong>自带“遗忘机制”和“局部混合”的高效 Attention</strong>。</p>

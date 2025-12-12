@@ -1,0 +1,86 @@
+<h1>legacy/training/flame/data.py</h1>
+<p>这份代码主要是在解决 <strong>“如何高效地为大型语言模型（LLM）训练准备数据”</strong> 的问题。</p>
+<p>在大模型训练中，数据量通常非常巨大（TB级别），无法一次性读入内存。因此，我们需要一个能够<strong>流式读取（Streaming）</strong>、<strong>实时分词（Tokenizing）</strong>、<strong>混合打乱（Shuffling）</strong> 并且支持 <strong>断点续训（Resuming）</strong> 的数据加载器。</p>
+<p>我把它拆解成一个 <strong>Task List（任务清单）</strong>，带你一步步看懂它是怎么工作的：</p>
+<hr />
+<h3>Task 1: 准备阶段 - 初始化与省内存</h3>
+<p><strong>目标：</strong> 建立数据集对象，并根据词表大小决定用什么数据类型存数据，以此节省显存/内存。</p>
+<ul>
+<li><strong>对应代码：</strong> <code>HuggingfaceDataset.__init__</code></li>
+<li><strong>原理解析：</strong><ul>
+<li><strong>分布式切分：</strong> 代码里的 <code>dataset.shard(world_size, rank)</code> 是为了多卡训练准备的。比如你有8张显卡，每张卡只读数据的 1/8，互不干扰。</li>
+<li><strong>内存优化：</strong>
+    <code>python
+    if tokenizer.vocab_size &lt; torch.iinfo(torch.int16).max:
+        self.dtype = torch.int16</code>
+    通常 PyTorch 默认用 <code>int64</code> 存数字。但如果你的词表很小（比如小于 32767），用 <code>int16</code> 存 token ID 就足够了。这能节省 4 倍的内存，这就意味着你的 Buffer 可以存更多数据，打乱得更彻底。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 2: 生产阶段 - 流式读取与分词</h3>
+<p><strong>目标：</strong> 从原始文本数据源源不断地读取文字，并转化成数字（Token IDs）。</p>
+<ul>
+<li><strong>对应代码：</strong> <code>tokenize</code> 方法</li>
+<li><strong>原理解析：</strong><ul>
+<li>它不是一条一条读，而是 <code>batch_size</code> 一批一批读（默认64条），然后批量调用 <code>tokenizer</code>。</li>
+<li><strong>关键点：</strong> 它是一个生成器（<code>yield</code>）。这意味着它不会把结果全存下来，而是下游要一点，它就处理一点。就像流水线上的工人，后面要货了，这里才开工。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 核心阶段 - 缓冲区打乱 (Streaming Shuffle)</h3>
+<p><strong>目标：</strong> 在无法加载全部数据的情况下，尽可能让数据随机打乱，防止模型“死记硬背”数据的顺序。</p>
+<ul>
+<li><strong>对应代码：</strong> <code>__iter__</code> 和 <code>sample</code> 方法</li>
+<li><strong>原理解析（最难懂的部分）：</strong><ol>
+<li><strong>蓄水池（Buffer）：</strong> 代码维护了一个 <code>self.buffer</code>。</li>
+<li><strong>填满：</strong> 刚开始，它会疯狂调用 <code>tokenize</code>，把分好词的数据填进 Buffer，直到填满 <code>buffer_size</code>（比如1024个chunk）。</li>
+<li><strong>随机抽取与替换：</strong><ul>
+<li>当 Buffer 满的时候，生成一个随机索引 <code>i</code>。</li>
+<li>把 Buffer 里第 <code>i</code> 个位置的数据拿出来，发给模型去训练。</li>
+<li><strong>马上</strong> 从新进来的数据流里截取一段新的数据，<strong>填补</strong> 到第 <code>i</code> 个位置。</li>
+</ul>
+</li>
+<li><strong>效果：</strong> 这样既不需要把所有数据读入内存，又能保证输出的数据是比较随机混合的。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 4: 兜底阶段 - 断点续训 (State Dict)</h3>
+<p><strong>目标：</strong> 如果训练了3天突然断电了，重启后必须能<strong>精确</strong>回到断电前的那个字继续练，不能重头开始，也不能漏掉数据。</p>
+<ul>
+<li><strong>对应代码：</strong> <code>state_dict</code> 和 <code>load_state_dict</code></li>
+<li><strong>原理解析：</strong><ul>
+<li>它保存了所有关键变量：<ul>
+<li><code>states</code>: 原始数据集读到哪了？</li>
+<li><code>buffer</code>: 当前缓冲区里存了哪些没被抽到的数据？</li>
+<li><code>tokens</code>: 还没进缓冲区的剩余 Token 列表。</li>
+<li><code>rng_state</code>: 随机数生成器的状态（确保随机抽取的顺序和上次一模一样）。</li>
+</ul>
+</li>
+<li>有了这些，重启训练时，数据流的状态就能 100% 还原。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 5: 包装阶段 - 组装成 Batch (Collator)</h3>
+<p><strong>目标：</strong> 把从 Dataset 拿出来的零散数据，打包成 PyTorch 能识别的 Tensor 格式，并处理 Padding（填充）或 Packing（拼接）。</p>
+<ul>
+<li><strong>对应代码：</strong> <code>DataCollatorForLanguageModeling</code> 类</li>
+<li><strong>原理解析：</strong><ul>
+<li><strong>普通模式 (<code>varlen=False</code>)：</strong> 如果大家的长度不一样，用 <code>pad_token</code> 把短的补齐，变成整齐的矩阵。同时生成 <code>labels</code>（通常就是 input_ids 自己，计算 Loss 用）。</li>
+<li><strong>变长模式 (<code>varlen=True</code>)：</strong> 这是高级优化（FlashAttention 等技术需要）。它不填充 0，而是把多条短数据首尾相连拼成一根超长的线，然后用 <code>offsets</code> 记录每一句话的分割点。这样能避免计算很多无用的 0（Padding），大幅提升训练速度。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：数据流动的全过程</h3>
+<ol>
+<li><strong>Raw Text</strong> (原始文本)
+    ↓ (<code>tokenize</code>)</li>
+<li><strong>Token IDs</strong> (数字列表)
+    ↓ (积累到一定数量)</li>
+<li><strong>Shuffle Buffer</strong> (缓冲区，比如存了1000个长句子)
+    ↓ (<code>sample</code> + <code>randint</code>)</li>
+<li><strong>Random Chunk</strong> (随机抽出的一个长句子，比如 2048 长度)
+    ↓ (<code>DataCollator</code>)</li>
+<li><strong>Batch Tensor</strong> (最终喂给 GPU 的张量，包含 input_ids 和 labels)</li>
+</ol>
+<p>这个文件就是一个<strong>高可靠、低内存占用、支持断点续训</strong>的工业级数据流水线。</p>

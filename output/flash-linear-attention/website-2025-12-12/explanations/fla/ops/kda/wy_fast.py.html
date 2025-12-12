@@ -1,0 +1,107 @@
+<h1>fla/ops/kda/wy_fast.py</h1>
+<p>这份代码确实非常硬核，它是用 <strong>OpenAI Triton</strong> 编写的高性能 GPU 内核，属于 <strong>线性注意力机制（Linear Attention）</strong> 或 <strong>RNN-like Transformer</strong>（比如 RetNet, GLA, RWKV 等变体）的底层实现。</p>
+<p>简单来说，这个文件的目的是：<strong>为了加速计算，把原本复杂的数学公式，拆解成几个中间变量（W 和 U），并用 GPU 并行计算出来。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“理解任务清单 (To-Do List)”</strong>，我们一步一步来打勾。</p>
+<hr />
+<h3>任务清单：一步步拆解 <code>wy_fast.py</code></h3>
+<h4>✅ Task 1: 搞清楚背景（我们在做什么？）</h4>
+<p><strong>核心观点：</strong> 这是一个“分块（Chunking）”算法。
+传统的 Transformer 是 $O(N^2)$ 复杂度，太慢。线性 Attention 想把它变成 $O(N)$。
+为了做到这一点，通常会把长序列切成很多小块（比如每块长度 <code>BT=64</code>）。
+*   <strong>块内</strong>：像传统 Attention 一样计算（或者用某种衰减矩阵）。
+*   <strong>块间</strong>：用 RNN 的方式传递状态。</p>
+<p><strong>这个文件的作用</strong>：它主要负责处理 <strong>“块内”</strong> 的数据预处理。它计算了两个关键的中间变量 $W$ 和 $U$，方便后续快速算出 Attention 的结果。</p>
+<hr />
+<h4>✅ Task 2: 认识主要角色（变量都是啥？）</h4>
+<p>在看代码前，先认全变量，否则全是字母会晕：</p>
+<ul>
+<li><strong><code>q, k, v</code></strong>: 老朋友，Query, Key, Value。</li>
+<li><strong><code>gk</code> (gate/decay)</strong>: 一个门控或衰减项（代码里用了 <code>exp2(gk)</code>），用来控制记忆保留多少。</li>
+<li><strong><code>beta</code></strong>: 一个缩放因子。</li>
+<li><strong><code>A</code></strong>: <strong>最关键的矩阵</strong>。这是一个 <code>[BT, BT]</code> 大小的矩阵，代表“块内”的相互作用（通常包含位置编码或因果衰减）。你可以把它理解为“当前的 token 和块内之前的 token 的关系权重”。</li>
+<li><strong><code>w</code> 和 <code>u</code></strong>: <strong>这是我们要算出的输出</strong>。<ul>
+<li>$u \approx A \times v$ （经过处理的 Value）</li>
+<li>$w \approx A \times k$ （经过处理的 Key）</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 3: 解析 Forward Kernel (<code>recompute_w_u_fwd</code>)</h4>
+<p><strong>目标</strong>：计算 $W$ 和 $U$。</p>
+<p><strong>代码逻辑分步走：</strong>
+1.  <strong>切块定位</strong>：
+    *   <code>tl.program_id</code> 拿到当前处理的是第几个 Batch (<code>i_b</code>)、第几个 Head (<code>i_h</code>)、第几个时间块 (<code>i_t</code>)。
+    *   加载当前块的 <code>beta</code> 和 <code>A</code> 矩阵。</p>
+<ol>
+<li>
+<p><strong>计算 U (Value 的变换)</strong>：</p>
+<ul>
+<li>代码：<code>b_vb = (b_v * b_b[:, None])</code> -&gt; <code>b_u = tl.dot(b_A, b_vb)</code></li>
+<li>解释：先把 $V$ 乘以 $\beta$（缩放），然后用矩阵 $A$ 去乘它。</li>
+<li><strong>物理含义</strong>：$U$ 是考虑了块内衰减/位置关系后的 Value 聚合体。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算 W (Key 的变换)</strong>：</p>
+<ul>
+<li>代码：<code>b_kb *= exp2(b_gk)</code> -&gt; <code>b_w = tl.dot(b_A, b_kb)</code></li>
+<li>解释：先把 $K$ 乘以 $\beta$，再乘以 $g_k$ 的指数形式（衰减项），最后用矩阵 $A$ 去乘它。</li>
+<li><strong>物理含义</strong>：$W$ 是考虑了块内衰减/位置关系后的 Key 聚合体。</li>
+</ul>
+</li>
+<li>
+<p><strong>顺手存点东西 (<code>STORE_QG</code>, <code>STORE_KG</code>)</strong>：</p>
+<ul>
+<li>如果需要，它会顺便把加上了衰减项的 $Q$ 和 $K$ 存下来（<code>qg</code>, <code>kg</code>），供后续步骤使用，避免重复计算。</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结 Task 3</strong>：就是做矩阵乘法：$U = A \cdot (V \cdot \beta)$ 和 $W = A \cdot (K \cdot \beta \cdot e^g)$。</p>
+<hr />
+<h4>✅ Task 4: 解析 Backward Kernel (<code>prepare_wy_repr_bwd</code>)</h4>
+<p><strong>目标</strong>：反向传播（训练模型时算梯度）。这是最难读的部分，因为全是链式法则。</p>
+<p><strong>代码逻辑分步走：</strong>
+1.  <strong>准备梯度</strong>：
+    *   输入是损失函数传回来的梯度 <code>dw</code> (W的梯度), <code>du</code> (U的梯度) 等。
+    *   我们需要算出 <code>dk</code>, <code>dv</code>, <code>dA</code>, <code>dbeta</code>, <code>dg</code>。</p>
+<ol>
+<li>
+<p><strong>计算 A 的梯度 (<code>dA</code>)</strong>：</p>
+<ul>
+<li>因为 Forward 里 $W = A \cdot K$，$U = A \cdot V$。</li>
+<li>所以 $A$ 的梯度来源有两部分：一部分来自 $W$，一部分来自 $U$。</li>
+<li>代码里通过 <code>tl.dot(b_dw, tl.trans(b_kbg))</code> (W部分) 和 <code>tl.dot(b_du, tl.trans(b_vb))</code> (U部分) 累加得到 <code>dA</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算 K, V, Beta 的梯度</strong>：</p>
+<ul>
+<li>这就是标准的矩阵乘法求导。</li>
+<li>比如 $dV$ (<code>b_dv</code>) 是通过 $A$ 转置后乘以 $dU$ 得到的（<code>b_dvb = tl.dot(b_A, b_du)</code>）。</li>
+</ul>
+</li>
+<li>
+<p><strong>特殊的 Mask 处理</strong>：</p>
+<ul>
+<li>代码末尾有一段 <code>m_A = ...</code> 和 <code>tl.where</code>。</li>
+<li>这是因为 $A$ 矩阵通常是<strong>因果的（Causal）</strong>，也就是下三角矩阵（未来的 token 不能影响过去）。</li>
+<li>在算梯度时，需要把不该有的部分（上三角部分）抹零，保证梯度回传符合时间顺序。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 5: 为什么要写这么复杂的 Triton 代码？</h4>
+<p>你可能会问：<em>“用 PyTorch 写 <code>u = torch.matmul(A, v * beta)</code> 不行吗？”</em></p>
+<p><strong>原因 list：</strong>
+1.  <strong>显存优化 (IO-Aware)</strong>：PyTorch 会把中间结果写回显存（HBM），再读出来。Triton 可以在 GPU 的片上内存（SRAM）里一次性算完 $W$ 和 $U$，不用反复读写显存。
+2.  <strong>融合 (Fusion)</strong>：它把 <code>exp2</code>（指数计算）、<code>multiply</code>（乘法）、<code>dot</code>（矩阵乘）全部融合在一个 Kernel 里了，速度极快。
+3.  <strong>分块并行</strong>：针对序列长度 $T$ 进行了并行的分块处理，特别适合长文本训练。</p>
+<hr />
+<h3>总结：这段代码讲了啥？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>高性能算子</strong>，用于在<strong>线性注意力机制</strong>的前向和后向传播中，快速计算<strong>块内（Intra-Chunk）</strong>的 Key 和 Value 的加权聚合（即 $W$ 和 $U$），利用 Triton 实现了显存读写最小化。</p>
+<p><strong>你的 Todo List 完成版：</strong>
+1.  [x] <strong>Input</strong>: 拿到了 $K, V, A$ 和一些衰减参数。
+2.  [x] <strong>Process</strong>: 把 $K$ 和 $V$ 加上衰减，然后通过矩阵 $A$ 进行混合。
+3.  [x] <strong>Output</strong>: 输出了 $W$ 和 $U$（为了后面算 Attention 更快）。
+4.  [x] <strong>Bonus</strong>: 写了对应的反向传播算子，支持模型训练。</p>

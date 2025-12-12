@@ -1,0 +1,90 @@
+<h1>tests/ops/test_deltaformer.py</h1>
+<p>这个文件其实是一个<strong>测试脚本（Unit Test）</strong>。</p>
+<p>简单来说，它的作用不是“实现”一个功能，而是<strong>“监考”</strong>。它要检查一个新的、跑得很快的算法（DeltaFormer），算出来的结果是不是和那个跑得慢但绝对正确的“标准答案”一模一样。</p>
+<p>为了让你更容易理解，我把你当作这个“监考老师”，列一个<strong>Task Todo List</strong>，一步步带你过一遍这个文件的逻辑。</p>
+<hr />
+<h3>📋 监考任务清单 (Task List)</h3>
+<p>作为一个监考老师（测试脚本），你需要完成以下 5 个步骤来验证算法是否合格：</p>
+<ol>
+<li><strong>准备考题（Setup）</strong>：设定好不同的输入规模（比如数据有多长、有多少个头），生成随机的输入数据。</li>
+<li><strong>计算标准答案（Reference Run）</strong>：用一个虽然慢、但逻辑简单且保证正确的“笨办法”（Naive实现）算一遍，记下答案。</li>
+<li><strong>计算学生答案（Target Run）</strong>：用那个需要被测试的、经过加速优化的算法（DeltaFormer实现）算一遍。</li>
+<li><strong>核对正向结果（Forward Check）</strong>：看“学生”算出的最终数值，和“标准答案”是否一致。</li>
+<li><strong>核对反向推导（Backward Check）</strong>：在训练神经网络时，还需要算梯度（Gradient）。你要检查“学生”算出的梯度，是否也和“标准答案”的梯度一致。</li>
+<li><strong>加试题（Variable Length Test）</strong>：测试更复杂的情况（比如一堆长短不一的句子拼在一起时），算法是否还能算对。</li>
+</ol>
+<hr />
+<h3>🪜 逐步讲解 (Step-by-Step)</h3>
+<p>下面我结合代码，把上面的 Task 拆解给你看：</p>
+<h4>Task 1: 准备考题 (Setup)</h4>
+<p>代码开头用了 <code>@pytest.mark.parametrize</code>。这就像是准备了多套试卷，涵盖不同的难度。
+*   <code>B</code>: Batch size (批次大小)
+*   <code>T</code>: Time steps (序列长度，比如 128, 1024)
+*   <code>H</code>: Heads (多头注意力的头数)
+*   <code>D</code>: Dimension (每个头的维度)</p>
+<p>在 <code>test_deltaformer_attn</code> 函数内部：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 生成随机的 Query, Key, Value</span>
+<span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="c1"># Beta 是 DeltaFormer 特有的一个参数（类似遗忘门），范围在 0-1 之间 (sigmoid)</span>
+<span class="n">beta</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这里 <code>requires_grad_(True)</code> 很重要，意思是：“我不光要算结果，还要准备算梯度”，这是为了后面的 Task 5 做准备。</p>
+<h4>Task 2: 计算标准答案 (Reference Run)</h4>
+<p>代码里调用了 <code>naive_deltaformer_attn</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 naive 意为“朴素的”，通常指未优化的 Python 原生实现，慢但易读且正确</span>
+<span class="n">ref</span> <span class="o">=</span> <span class="n">naive_deltaformer_attn</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">beta</span><span class="p">)</span>
+<span class="c1"># 模拟反向传播，算出标准答案的梯度</span>
+<span class="n">ref</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">do</span><span class="p">)</span>
+<span class="c1"># 把算好的梯度存起来（ref_dq, ref_dk...），并把原变量梯度清零，防止干扰下一步</span>
+<span class="n">ref_dq</span><span class="p">,</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="kc">None</span> 
+<span class="o">...</span>
+</code></pre></div>
+
+<p>这一步做完，你手里就有了一份满分的“标准答案”（<code>ref</code> 以及对应的梯度）。</p>
+<h4>Task 3: 计算学生答案 (Target Run)</h4>
+<p>现在轮到被测试的主角 <code>deltaformer_attn</code> 上场了：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这是经过 CUDA 优化或者 Triton 优化的快速版本</span>
+<span class="n">tri</span> <span class="o">=</span> <span class="n">deltaformer_attn</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">beta</span><span class="p">)</span>
+<span class="c1"># 让它也算一遍梯度</span>
+<span class="n">tri</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">do</span><span class="p">)</span>
+<span class="c1"># 把它的梯度存起来</span>
+<span class="n">tri_dq</span><span class="p">,</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="kc">None</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<h4>Task 4 &amp; 5: 核对正向与反向结果 (Comparison)</h4>
+<p>这是最关键的一步，打分环节：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 比较输出结果 &#39;o&#39;，允许 0.006 的误差</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39;o&#39;</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tri</span><span class="p">,</span> <span class="mf">0.006</span><span class="p">)</span>
+<span class="c1"># 比较 Q, K, V, Beta 的梯度，允许 0.008 的误差</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39;dq&#39;</span><span class="p">,</span> <span class="n">ref_dq</span><span class="p">,</span> <span class="n">tri_dq</span><span class="p">,</span> <span class="mf">0.008</span><span class="p">)</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39;dk&#39;</span><span class="p">,</span> <span class="n">ref_dk</span><span class="p">,</span> <span class="n">tri_dk</span><span class="p">,</span> <span class="mf">0.008</span><span class="p">)</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<p>如果这一步报错，说明优化后的算法算错了；如果通过，说明这个加速算法是可靠的。</p>
+<h4>Task 6: 加试题 (Variable Length Test)</h4>
+<p>看第二个函数 <code>test_deltaformer_attn_varlen</code>。
+在处理自然语言时，句子长度往往不一样。为了高效，我们常把几句话拼成一条长龙。
+*   <code>cu_seqlens</code>: 这是一个列表，标记了每句话的起止位置。例如 <code>[0, 5, 12]</code> 表示第一句话是索引 0-5，第二句是 5-12。</p>
+<p><strong>标准答案的做法（笨办法）：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 用一个循环 (for loop)，把每一句话单独切出来算一遍，最后拼回去</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">N</span><span class="p">):</span>
+    <span class="n">ref</span> <span class="o">=</span> <span class="n">naive_deltaformer_attn</span><span class="p">(</span><span class="n">切片</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">refs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ref</span><span class="p">)</span>
+<span class="n">ref</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">refs</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>学生答案的做法（优化版）：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 优化后的算法应该能直接处理这种拼起来的数据，不需要写 Python 循环</span>
+<span class="n">tri</span> <span class="o">=</span> <span class="n">deltaformer_attn</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="o">=</span><span class="n">cu_seqlens</span><span class="p">)</span>
+</code></pre></div>
+
+<p>最后同样进行 <code>assert_close</code> 比对。</p>
+<hr />
+<h3>总结</h3>
+<p>这篇文章（代码）的观点是：
+<strong>“我写了一个叫 DeltaFormer 的新算子（Operator），为了证明它是对的，我造了一堆随机数据，让它和普通的算法比对。只有当它的输出结果和梯度反向传播结果都和普通算法几乎一致时，这个代码才算通过。”</strong></p>

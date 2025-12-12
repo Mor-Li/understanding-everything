@@ -1,0 +1,84 @@
+<h1>fla/ops/log_linear_attn/naive.py</h1>
+<p>这份代码实现的是一种<strong>特殊的注意力机制（Attention Mechanism）</strong>，它是为了验证逻辑而写的“朴素（Naive）”版本（意思是它没有优化速度，主要为了数学上的正确性，方便理解原理）。</p>
+<p>这个算法的核心思想是：<strong>在这个注意力机制中，位置 $i$ 和位置 $j$ 之间的关系，不仅取决于 Query 和 Key 的相似度，还取决于它们之间的“距离衰减”和“层级结构”。</strong></p>
+<p>为了让你读懂，我制定了一个 <strong>5步走的学习清单（To-Do List）</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>✅ Task 1: 理解“对数空间”的累加 (函数 <code>segsum</code>)</h3>
+<p><strong>目标：</strong> 理解代码是如何计算两个时间步之间的“衰减总和”的。</p>
+<p>在很多现代 RNN 或线性 Attention 中，过去的信息传到现在会有一个衰减。比如 $h_t = h_{t-1} \cdot e^{g_t}$。如果我们想知道 $t-2$ 时刻的信息传到 $t$ 时刻剩多少，就是连乘：$e^{g_{t-1}} \cdot e^{g_t} = e^{(g_{t-1} + g_t)}$。</p>
+<ul>
+<li><strong>代码逻辑：</strong> <code>segsum</code> (Segment Sum) 就是在计算这个指数上的加法。</li>
+<li><strong>具体步骤：</strong><ol>
+<li><code>x_cumsum</code>: 先算出前缀和（比如 <code>[1, 3, 6]</code>）。</li>
+<li><code>x_segsum</code>: 用减法算出任意两点之间的和（比如 <code>6 - 1 = 5</code>，代表中间那段的和）。</li>
+<li><code>mask</code>: 加上一个下三角掩码（Mask），因为未来的信息不能传给过去（Causal）。</li>
+<li><strong>结论：</strong> 这个函数返回的是一个 $T \times T$ 的矩阵，第 $i$ 行 $j$ 列的值代表从时刻 $j$ 到 $i$ 之间所有衰减因子的<strong>对数和</strong>。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 2: 理解“分层结构” (函数 <code>construct_level_mask</code>)</h3>
+<p><strong>目标：</strong> 理解这个模型不是平铺直叙的，而是像一棵树一样分层的。</p>
+<p>这是这段代码最难懂的地方。普通的线性 Attention 衰减是平滑的，但这里引入了 <code>level</code>（层级）的概念。你可以把它想象成<strong>二进制树</strong>或者<strong>多尺度结构</strong>：
+*   <strong>Level 0:</strong> 只关注最近的细节。
+*   <strong>Level 1:</strong> 关注稍远一点的块与块之间的联系。
+*   <strong>Level higher:</strong> 关注更宏观的联系。</p>
+<ul>
+<li><strong>代码逻辑：</strong><ol>
+<li>如果 <code>level == 0</code>，只看对角线（自己对自己）。</li>
+<li>如果是其他 Level，代码用了一堆 <code>indices</code> 和取模运算 <code>% (1 &lt;&lt; level)</code>。</li>
+<li><strong>直白解释：</strong> 这段位运算逻辑是在画一个<strong>分块矩阵</strong>。它在 $T \times T$ 的矩阵上，根据层级不同，挖出了特定的“块”。</li>
+<li><strong>作用：</strong> 它决定了在第 <code>level</code> 层，哪些位置 $i$ 和 $j$ 是允许连接的，并给这些连接乘上一个该层特有的缩放系数 <code>L[..., level, :]</code>。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 3: 组装“位置偏置矩阵 H” (函数 <code>construct_H_matrix</code>)</h3>
+<p><strong>目标：</strong> 将“衰减”和“分层结构”结合起来，生成最终的权重矩阵。</p>
+<p>Attention 的公式通常是 $Softmax(Q K^T)$。但在这种线性 Attention 变体中，我们通常不依懒 Softmax，而是依赖一个位置偏置矩阵 $H$。</p>
+<ul>
+<li><strong>代码逻辑：</strong><ol>
+<li><code>A = torch.exp(segsum(a))</code>: 把 Task 1 算出来的对数和，通过 <code>exp</code> 变回乘法衰减系数。这就是基础的“距离越远，关系越弱”。</li>
+<li><code>for level in range(...)</code>: 开始循环每一层。</li>
+<li><code>H += A * mask</code>:<ul>
+<li><code>A</code> 是基础衰减。</li>
+<li><code>mask</code> 是 Task 2 算出来的分层结构系数。</li>
+<li>它们相乘并累加。</li>
+</ul>
+</li>
+<li><strong>结论：</strong> 矩阵 $H$ 是一个 $T \times T$ 的矩阵。$H_{i,j}$ 描述了：<strong>如果不考虑内容（Q和K），仅仅因为位置 $j$ 在位置 $i$ 之前，$j$ 的信息传到 $i$ 应该保留多少权重。</strong> 这个权重既包含了距离衰减，也包含了层级缩放。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 4: 计算最终的注意力 (函数 <code>naive_log_linear_attn</code>)</h3>
+<p><strong>目标：</strong> 加上 Q, K, V，完成 Attention 计算。</p>
+<p>现在有了位置权重矩阵 $H$，剩下的就是标准的 Attention 流程了。</p>
+<ul>
+<li><strong>代码逻辑：</strong><ol>
+<li><code>H = construct_H_matrix(...)</code>: 先造出上面说的那个 $H$ 矩阵。</li>
+<li><code>M = torch.einsum("bhlc,blhn,bchn-&gt;bhlc", H, q, k)</code>:<ul>
+<li>这是计算 Attention Score。</li>
+<li>普通 Attention 是 $Q \cdot K^T$。</li>
+<li>这里是 $H \cdot (Q \cdot K^T)$（元素级相乘）。</li>
+<li>意思是：内容相似度 ($QK$) 乘以 位置权重 ($H$)。</li>
+</ul>
+</li>
+<li><code>return torch.einsum("bhlc,bchp-&gt;blhp", M, v)</code>:<ul>
+<li>最后乘以 $V$ (Value)。</li>
+<li>公式：$Output = (H \odot (Q K^T)) V$。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这段代码到底在干嘛？</h3>
+<p><strong>一句话解释：</strong>
+这是一个<strong>分层对数线性注意力（Hierarchical Log-Linear Attention）</strong>的参考实现。</p>
+<p><strong>通俗解释：</strong>
+想象你在读一本书（序列数据）：
+1.  <strong>Task 1</strong> 告诉你：读到后面时，前面的记忆会模糊（指数衰减）。
+2.  <strong>Task 2</strong> 告诉你：你的记忆是有结构的，比如“这一章”、“这一节”、“这一段”（分层 Mask）。
+3.  <strong>Task 3</strong> 把这两个规则合并，算出每一个字对当前字的“基础重要性” $H$。
+4.  <strong>Task 4</strong> 结合这个字具体的含义（Q, K），算出最终你脑子里留下了什么信息（Output）。</p>
+<p><strong>为什么要叫 Naive？</strong>
+因为它显式地计算了 $T \times T$ 的矩阵 $H$ 和 $M$。如果序列长度 $T=4096$，这个矩阵会巨大无比，显存爆炸且计算慢。
+真正的“高效版”代码（Flash Linear Attention）会利用数学技巧（如结合律），不生成这个大矩阵，直接算出结果，也就是 $O(T)$ 复杂度，而这个 Naive 版本是 $O(T^2)$ 复杂度，仅用于<strong>跑通逻辑、测试正确性</strong>。</p>

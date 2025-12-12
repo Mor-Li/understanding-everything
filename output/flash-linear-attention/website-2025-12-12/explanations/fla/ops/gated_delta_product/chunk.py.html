@@ -1,0 +1,56 @@
+<h1>fla/ops/gated_delta_product/chunk.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到<strong>线性Attention（Linear Attention）</strong>的变种，具体来说是结合了<strong>Delta Rule（增量更新规则）</strong>和<strong>Gated（门控机制）</strong>的高性能算子实现。</p>
+<p>简单来说，这是一个<strong>让模型“像RNN一样有记忆，但像Transformer一样并行计算”</strong>的算法核心。</p>
+<p>我们可以把这段代码想象成一个<strong>“超级记忆管理员”</strong>的工作流程。它的任务是处理一连串的信息（K, V），根据遗忘门（g）和更新规则（Delta Rule），维护一个记忆库（State），并回答查询（Q）。</p>
+<p>下面我为你列一个 <strong>Task To-Do List</strong>，一步步拆解代码在干什么：</p>
+<h3>📝 超级记忆管理员的 Task List</h3>
+<h4>Task 1: 准备工作与数据预处理 (Preparation)</h4>
+<p><strong>目标</strong>：把输入的数据整理好，确保格式对齐，该归一化的归一化。
+*   <strong>代码位置</strong>：<code>ChunkGatedDeltaProductFunction.forward</code> 开头部分。
+*   <strong>动作</strong>：
+    1.  检查 <code>use_qk_l2norm_in_kernel</code>。如果开启，先把 Query (Q) 和 Key (K) 做一个 L2 标准化（<code>l2norm_fwd</code>）。这有助于数值稳定性。
+    2.  确认 <code>num_householder</code>（Householder 变换次数）。你可以理解为：在每一个时间步，我们不仅仅更新一次记忆，而是进行多次微调更新，以提高记忆的准确度。</p>
+<h4>Task 2: 处理“遗忘”机制 (Gate Preprocessing)</h4>
+<p><strong>目标</strong>：计算每个时间点应该“记住”多少，“遗忘”多少。
+*   <strong>代码位置</strong>：<code>chunk_gated_delta_product_fwd</code> 中的 <code>if g is not None:</code> 块。
+*   <strong>动作</strong>：
+    1.  如果提供了门控信号 <code>g</code>（log space 的遗忘门），需要对它做<strong>前缀和（Cumsum）</strong>。
+    2.  <strong>为什么？</strong> 在线性 Attention 或 RNN 中，状态衰减通常是连乘的（比如 $h_t = g_t * h_{t-1} + ...$）。在对数空间里，连乘就变成了累加。
+    3.  这里还处理了 <code>g_interleaved</code>，这是为了适配前面提到的 <code>num_householder</code>（多次微调），把门控信号扩展到微调的维度上。</p>
+<h4>Task 3: 计算“增量更新”规则 (The Delta Rule - WY Representation)</h4>
+<p><strong>目标</strong>：这是最核心的数学部分。计算为了记住当前的 Key-Value 对，我们的记忆矩阵需要做多大的<strong>修正（Delta）</strong>。
+*   <strong>代码位置</strong>：<code>chunk_scaled_dot_kkt_fwd</code> 和 <code>solve_tril</code> 以及 <code>recompute_w_u_fwd</code>。
+*   <strong>动作</strong>：
+    1.  <strong>计算 KKT 矩阵 (A)</strong>：这涉及到优化理论。简单理解就是计算 Key 之间的相互关系。
+    2.  <strong>求解 A</strong>：<code>solve_tril(A)</code>。解这个方程是为了找到最优的更新方向。
+    3.  <strong>生成 WY 形式 (w, u)</strong>：Delta Rule 的核心思想是 $V_{new} = V_{old} - \text{Correction}$。这里代码利用 <code>recompute_w_u_fwd</code> 将复杂的矩阵更新分解为两个向量 $w$ 和 $u$ 的外积（WY 分解/Householder 变换）。这样做是为了<strong>极大地减少计算量和显存占用</strong>。
+    *   <em>通俗理解</em>：这一步是在计算“为了把新知识 $K, V$ 完美塞进脑子，我的脑神经连接需要具体怎么改”。</p>
+<h4>Task 4: 更新“记忆状态” (Update Hidden State)</h4>
+<p><strong>目标</strong>：根据算好的更新规则，正式更新记忆状态 $H$。
+*   <strong>代码位置</strong>：<code>chunk_gated_delta_product_fwd_h</code>。
+*   <strong>动作</strong>：
+    1.  利用前面算好的 $w, u$ 和门控 $g$，在 Chunk（分块）级别上并行地更新隐状态（Hidden State）。
+    2.  这一步利用了 Chunk 并行技术，不用像传统 RNN 那样 <code>for</code> 循环一个一个字读，而是一块一块地“吞”数据，速度极快。</p>
+<h4>Task 5: 生成回答 (Generate Output)</h4>
+<p><strong>目标</strong>：根据当前的 Query (Q) 和最新的记忆状态，生成输出 (O)。
+*   <strong>代码位置</strong>：<code>chunk_gated_delta_product_fwd_o</code>。
+*   <strong>动作</strong>：
+    1.  用你的 Query 去查询当前的记忆状态 $H$。
+    2.  数学上大约是 $O = Q \cdot H$（配合上之前的 Scaling 和 Gating）。
+    3.  输出最终结果 <code>o</code>。</p>
+<h4>Task 6: 清理现场与反向传播准备 (Backward Prep)</h4>
+<p><strong>目标</strong>：把中间变量存好，为了等会儿训练（反向传播）用。
+*   <strong>代码位置</strong>：<code>ctx.save_for_backward</code>。
+*   <strong>动作</strong>：
+    1.  保存 $q, k, v, A$ 等张量。
+    2.  返回输出结果 <code>o</code> 和最终的状态 <code>final_state</code>。</p>
+<hr />
+<h3>总结：这段代码在解决什么痛点？</h3>
+<ol>
+<li><strong>Transformer 显存占用大</strong>：标准 Attention 是 $O(N^2)$ 复杂度，长序列直接爆显存。</li>
+<li><strong>RNN 训练慢</strong>：传统 RNN 不能并行，只能串行。</li>
+</ol>
+<p><strong>这个文件实现的算法（Gated DeltaNet + Chunking）做了两件事：</strong>
+1.  <strong>线性复杂度</strong>：通过维护一个固定大小的状态 $H$，把复杂度降到 $O(N)$。
+2.  <strong>并行训练</strong>：通过 <strong>Chunk（分块）</strong> 技术，把长序列切成小块，块内用类似 Attention 的方式并行，块间用 RNN 的方式传递，兼顾了速度和效果。</p>
+<p><strong>核心中的核心</strong>就是那个 <code>WY</code> 分解（Task 3），它用一种极其巧妙的数学方法（Householder变换）来低成本地实现“精准记忆更新”。</p>

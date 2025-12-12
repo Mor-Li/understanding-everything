@@ -1,0 +1,123 @@
+<h1>tests/modules/test_l2warp.py</h1>
+<p>这份代码其实是一个<strong>单元测试（Unit Test）</strong>文件。</p>
+<p>简单来说，它的核心目的是：<strong>验证一个新的、经过优化的算法（Fused版），算出来的结果是否和我们用普通方法（标准版）算出来的结果一模一样。</strong></p>
+<p>为了让你听懂，我们可以把这个过程想象成<strong>“做数学题”</strong>。
+*   <strong>普通方法（Reference）</strong>：就像你在草稿纸上一步一步按公式算，虽然慢，但逻辑清晰，肯定是对的。
+*   <strong>优化方法（Fused）</strong>：就像你用了一个新的“速算技巧”或者“高级计算器”，速度很快，但我们不确定它算得对不对。</p>
+<p>这个文件的任务就是：<strong>让两种方法做同一道题，如果最后答案一样，说明这个“速算技巧”是可靠的。</strong></p>
+<p>下面我为你列一个 <strong>Task Todo List</strong>，带你一步步拆解这段代码的逻辑：</p>
+<hr />
+<h3>Task 1：设定题目难度和参数 (Configuration)</h3>
+<p><strong>目标</strong>：定义这道数学题的规模（比如矩阵有多大）。</p>
+<p>代码对应部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;B&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">])</span>      <span class="c1"># Batch size: 一次考几个学生</span>
+<span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;T&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1024</span><span class="p">])</span>    <span class="c1"># Time/Sequence: 每个学生写多长的文章</span>
+<span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;H&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">256</span><span class="p">])</span>     <span class="c1"># Hidden size: 每个字的特征有多少维</span>
+<span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;V&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2000</span><span class="p">])</span>    <span class="c1"># Vocabulary: 字典里一共有多少个字</span>
+<span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;l2_penalty_factor&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mf">1e-4</span><span class="p">,</span> <span class="mi">1</span><span class="p">])</span> <span class="c1"># 惩罚系数</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这里定义了输入数据的维度。<code>B</code>是批次大小，<code>T</code>是序列长度，<code>H</code>是隐藏层维度，<code>V</code>是词表大小（分类的数量）。</li>
+</ul>
+<hr />
+<h3>Task 2：准备考试题目 (Data Preparation)</h3>
+<p><strong>目标</strong>：生成随机的输入数据（模拟神经网络的中间层输出）和标准答案（Labels）。</p>
+<p>代码对应部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 生成一个线性层（类似于最后分类用的全连接层）</span>
+<span class="n">lm_head</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">H</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+
+<span class="c1"># 生成输入数据 x (模拟 Transformer 输出的 hidden states)</span>
+<span class="c1"># requires_grad=True 表示我们要对它求导（后面要检查梯度）</span>
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+<span class="c1"># 生成正确答案 labels (随机生成的整数，代表正确的下一个词的ID)</span>
+<span class="n">labels</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+
+<span class="c1"># 关键步骤：错位处理 (Shift Labels)</span>
+<span class="c1"># 语言模型是预测“下一个词”，所以Label通常要向后移一位</span>
+<span class="n">shift_labels</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">((</span><span class="n">labels</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="mi">1</span><span class="p">:],</span> <span class="n">torch</span><span class="o">.</span><span class="n">full_like</span><span class="p">(</span><span class="n">labels</span><span class="p">[:,</span> <span class="p">:</span><span class="mi">1</span><span class="p">],</span> <span class="n">ignore_index</span><span class="p">)),</span> <span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：为了保证测试公平，输入数据必须是完全随机但固定的。<code>shift_labels</code> 是 LLM 训练的标准操作，用来对齐“当前输入”和“下一个词”。</li>
+</ul>
+<hr />
+<h3>Task 3：用“笨办法”做题 (Reference Implementation)</h3>
+<p><strong>目标</strong>：使用 PyTorch 自带的标准函数，一步步计算 Loss（损失）和 Gradient（梯度）。这是我们的<strong>标准答案</strong>。</p>
+<p>代码对应部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ref_criterion</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">CrossEntropyLoss</span><span class="p">()</span>
+
+<span class="c1"># 1. 算出 Logits (预测值) = 输入 * 权重 + 偏置</span>
+<span class="n">ref_logits</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">H</span><span class="p">),</span> <span class="n">lm_head</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="n">lm_head</span><span class="o">.</span><span class="n">bias</span><span class="p">)</span>
+
+<span class="c1"># 2. 算出基础的交叉熵损失 (Cross Entropy Loss)</span>
+<span class="n">ref_loss_ce</span> <span class="o">=</span> <span class="n">ref_criterion</span><span class="p">(</span><span class="n">ref_logits</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span> <span class="o">*</span> <span class="n">T</span><span class="p">,</span> <span class="n">V</span><span class="p">),</span> <span class="n">shift_labels</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+
+<span class="c1"># 3. 加上 L2 Warp (一种特殊的正则化手段，防止预测值过大)</span>
+<span class="c1"># 这里的 standalone_l2_warp 是一个逻辑简单的参考实现</span>
+<span class="n">ref_loss</span> <span class="o">=</span> <span class="n">standalone_l2_warp</span><span class="p">(</span><span class="n">ref_loss_ce</span><span class="p">,</span> <span class="n">ref_logits</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">V</span><span class="p">),</span> <span class="n">l2_penalty_factor</span><span class="p">)</span>
+
+<span class="c1"># 4. 反向传播，算出梯度 (Grad)</span>
+<span class="n">ref_loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="n">ref_x_grad</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>      <span class="c1"># 记下输入的梯度</span>
+<span class="n">ref_w_grad</span> <span class="o">=</span> <span class="n">lm_head</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="c1"># 记下权重的梯度</span>
+<span class="n">ref_b_grad</span> <span class="o">=</span> <span class="n">lm_head</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>   <span class="c1"># 记下偏置的梯度</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这一步虽然代码多、运行慢，但因为用的是 PyTorch 官方组件组合，所以结果绝对可信。我们把算出来的 Loss 和梯度存起来备用。</li>
+</ul>
+<hr />
+<h3>Task 4：用“新技巧”做题 (Fused Implementation)</h3>
+<p><strong>目标</strong>：使用我们要测试的主角 <code>FusedLinearCrossEntropyLoss</code>。这个模块号称把上面 Task 3 中的第1、2、3步合并（Fuse）成一步了，速度更快显存更省。</p>
+<p>代码对应部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 清空之前的梯度，准备重新计算</span>
+<span class="n">x</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="n">lm_head</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+
+<span class="c1"># 初始化这个“新技巧”模块</span>
+<span class="n">fused_criterion</span> <span class="o">=</span> <span class="n">FusedLinearCrossEntropyLoss</span><span class="p">(</span>
+    <span class="n">l2_penalty_factor</span><span class="o">=</span><span class="n">l2_penalty_factor</span><span class="p">,</span>
+    <span class="n">use_l2warp</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>  <span class="c1"># 开启 L2 Warp 功能</span>
+<span class="p">)</span>
+
+<span class="c1"># 直接一步到位算出 Loss！</span>
+<span class="c1"># 注意：这里直接传了 x 和 lm_head.weight，内部自动做矩阵乘法和Loss计算</span>
+<span class="n">fused_loss</span> <span class="o">=</span> <span class="n">fused_criterion</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">shift_labels</span><span class="p">,</span> <span class="n">lm_head</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="n">lm_head</span><span class="o">.</span><span class="n">bias</span><span class="p">)</span>
+
+<span class="c1"># 反向传播</span>
+<span class="n">fused_loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="n">fused_x_grad</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="n">fused_w_grad</span> <span class="o">=</span> <span class="n">lm_head</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="n">fused_b_grad</span> <span class="o">=</span> <span class="n">lm_head</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这是测试的核心。我们调用了这个“黑盒”函数，看它能不能吐出同样的结果。</li>
+</ul>
+<hr />
+<h3>Task 5：批改作业 (Verification)</h3>
+<p><strong>目标</strong>：对比 Task 3 和 Task 4 的结果。如果误差极小（在浮点数允许范围内），则测试通过。</p>
+<p>代码对应部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 设定允许的误差范围 (ratio)</span>
+<span class="n">ratio</span> <span class="o">=</span> <span class="mf">4e-3</span> <span class="k">if</span> <span class="n">dtype</span> <span class="o">==</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span> <span class="k">else</span> <span class="mf">1e-3</span>
+
+<span class="c1"># 1. 比对 Loss 大小</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;Loss&quot;</span><span class="p">,</span> <span class="n">ref_loss</span><span class="p">,</span> <span class="n">fused_loss</span><span class="p">,</span> <span class="n">ratio</span><span class="p">)</span>
+<span class="c1"># 2. 比对 输入的梯度 (dx)</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;dx&quot;</span><span class="p">,</span> <span class="n">ref_x_grad</span><span class="p">,</span> <span class="n">fused_x_grad</span><span class="p">,</span> <span class="n">ratio</span><span class="p">)</span>
+<span class="c1"># 3. 比对 权重的梯度 (dw)</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;dw&quot;</span><span class="p">,</span> <span class="n">ref_w_grad</span><span class="p">,</span> <span class="n">fused_w_grad</span><span class="p">,</span> <span class="n">ratio</span><span class="p">)</span>
+<span class="c1"># 4. 比对 偏置的梯度 (db)</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;db&quot;</span><span class="p">,</span> <span class="n">ref_b_grad</span><span class="p">,</span> <span class="n">fused_b_grad</span><span class="p">,</span> <span class="n">ratio</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：<code>assert_close</code> 就像老师批卷子。如果所有数值都对得上，说明 <code>FusedLinearCrossEntropyLoss</code> 这个新写的模块是正确的，可以放心地用在正式的模型训练中。</li>
+</ul>
+<h3>总结文中的核心观点</h3>
+<p>这个文件的作者实际上在说：</p>
+<blockquote>
+<p>“我写了一个新的 Loss 函数模块（<code>FusedLinearCrossEntropyLoss</code>），它把<strong>线性层映射</strong>、<strong>交叉熵计算</strong>和<strong>L2 Warp正则化</strong>这三件事融合在一起做了。为了证明我没写错，我用 PyTorch 原生的笨办法算了一遍，又用我的新模块算了一遍，对比发现两者的 Loss 和梯度完全一致。所以，大家可以放心用我的新模块，它既快又准。”</p>
+</blockquote>

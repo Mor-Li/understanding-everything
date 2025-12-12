@@ -1,0 +1,77 @@
+<h1>fla/ops/path_attn</h1>
+<p>这里是 <code>fla/ops/path_attn</code> 目录的高层解读。这个目录是 <strong>FLA (Fast Linear Attention)</strong> 库中实现 <strong>Path Attention</strong>（一种特殊的线性注意力机制）的核心引擎室。</p>
+<hr />
+<h3>1. 这个文件夹主要负责什么功能？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>“魔改版”的注意力计算引擎</strong>，它让模型在处理长文本时，既能像 RNN 一样快（线性复杂度），又能像 Transformer 一样并行加速。</p>
+<p><strong>核心逻辑（比喻）：</strong>
+想象你在阅读一本很厚的历史书：
+*   <strong>普通 Attention</strong>：每读一页，你都要把前面几千页重新翻一遍，非常慢。
+*   <strong>普通 RNN</strong>：你只记得上一页讲了啥，读到后面容易忘前面，而且必须一页页读，不能跳着读。
+*   <strong>Path Attention (本文件夹)</strong>：
+    1.  <strong>分块（Chunking）</strong>：把书撕成 100 个章节（Chunk），找 100 个人同时读（并行计算）。
+    2.  <strong>路径演变（Path）</strong>：当你回顾历史时，你的“视角”（Query）不是一成不变的，而是随着你回溯的距离和路径内容发生<strong>衰减或变形</strong>（由 Householder 变换控制）。这模拟了人脑“记忆随时间淡化或重构”的过程。</p>
+<p>这个文件夹里的代码，就是用最硬核的 GPU 编程语言（Triton），实现了上述过程的<strong>前向计算（推理）</strong>和<strong>反向传播（训练）</strong>。</p>
+<hr />
+<h3>2. 各个直接文件的作用（分工详解）</h3>
+<p>为了方便理解，我们可以把这些文件按<strong>角色</strong>分类：</p>
+<h4>A. <strong>指挥官与接口</strong></h4>
+<ul>
+<li><strong><code>__init__.py</code></strong>：<strong>接待员</strong>。只做一件事：把 <code>parallel_path_attn</code> 这个功能暴露给外面，把复杂的内部实现藏起来。</li>
+<li><strong><code>parallel.py</code></strong>：<strong>项目经理</strong>。它是用户直接调用的 Python 函数。它负责统筹全局，检查输入参数，然后根据是“训练”还是“推理”，去调度下面那些底层的 Triton 算子。</li>
+</ul>
+<h4>B. <strong>核心数学工具（特种兵）</strong></h4>
+<ul>
+<li><strong><code>cumprod_householder_fwd.py</code> / <code>_bwd.py</code></strong>：<strong>数学特种兵</strong>。<ul>
+<li><strong>作用</strong>：专门处理“Householder 变换”的累积乘积。</li>
+<li><strong>比喻</strong>：这是 Path Attention 的独门秘籍。它负责计算记忆在传递过程中是如何“旋转”和“变形”的。<code>fwd</code> 是算结果，<code>bwd</code> 是算梯度。</li>
+</ul>
+</li>
+<li><strong><code>transform_q.py</code></strong>：<strong>变形金刚</strong>。<ul>
+<li><strong>作用</strong>：负责对 Query (查询向量) 进行变换。</li>
+<li><strong>比喻</strong>：在你看向过去时，这个文件负责给你的“眼睛”戴上一层层滤镜，让你看到的过去是经过衰减或修正的。</li>
+</ul>
+</li>
+</ul>
+<h4>C. <strong>分块计算流水线（核心引擎）</strong></h4>
+<p>这部分文件采用了<strong>“分而治之”</strong>的策略，把长序列切成小块（Chunk）：</p>
+<ul>
+<li><strong><code>intra_chunk_preprocess_fwd.py</code> / <code>_bwd.py</code> / <code>_bwd_prepare.py</code></strong>：<strong>小组讨论负责人</strong>。<ul>
+<li><strong>作用</strong>：处理<strong>块内部（Intra-Chunk）</strong>的计算。</li>
+<li><strong>比喻</strong>：每个小组（Chunk）内部先自己开会，把组内的信息消化好。<code>prepare</code> 是为反向传播做准备工作。</li>
+</ul>
+</li>
+<li><strong><code>parallel_path_fwd.py</code></strong>：<strong>前向传播总装车间</strong>。<ul>
+<li><strong>作用</strong>：把所有处理好的块，结合历史记忆，并行地算出最终的 Attention 输出。</li>
+</ul>
+</li>
+<li><strong><code>parallel_path_bwd_intra.py</code></strong>：<strong>块内反向传播</strong>。<ul>
+<li><strong>作用</strong>：在训练时，计算块内部的参数梯度。</li>
+</ul>
+</li>
+<li><strong><code>parallel_path_bwd_inter_dkv.py</code> / <code>_dqh.py</code></strong>：<strong>块间信使（反向传播）</strong>。<ul>
+<li><strong>作用</strong>：处理<strong>块与块之间（Inter-Chunk）</strong>的梯度传递。</li>
+<li><strong>比喻</strong>：<ul>
+<li><code>_dkv</code>：负责告诉过去的 Key 和 Value，“未来的误差有一部分是你们造成的”。</li>
+<li><code>_dqh</code>：负责告诉 Query 和 隐藏状态（History），“你们需要为误差承担多少责任”。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>D. <strong>辅助工具</strong></h4>
+<ul>
+<li><strong><code>prepare_k_cache.py</code></strong>：<strong>档案管理员</strong>。负责在推理时准备 Key 的缓存（KV Cache），方便做生成任务。</li>
+</ul>
+<hr />
+<h3>3. 子文件夹的作用</h3>
+<p><em>(注：根据你提供的列表，该目录下没有子文件夹。如果存在未列出的 <code>impl</code> 或 <code>utils</code>，通常是存放具体的 CUDA 实现细节或通用工具函数。但基于现有信息，这是一个扁平的结构。)</em></p>
+<hr />
+<h3>4. 高层认知总结</h3>
+<p>要看懂这个文件夹，你只需要记住<strong>三个关键词</strong>：</p>
+<ol>
+<li><strong>并行（Parallel）</strong>：虽然逻辑上是像 RNN 一样随时间流动的，但代码通过数学技巧（前缀扫描/分块），强行把计算拆到了 GPU 的几千个核心上同时跑。</li>
+<li><strong>分块（Chunking）</strong>：把大任务切成小任务。<strong>块内</strong>用暴力矩阵乘法（快），<strong>块间</strong>用递归状态传递（省显存）。</li>
+<li><strong>路径（Path）</strong>：这是这个算法的灵魂。Query 和 Key 不是静态匹配的，而是通过 <code>Householder</code> 变换和 <code>transform_q</code> 在时间路径上动态演变的。</li>
+</ol>
+<p><strong>总结：</strong> 这是一个<strong>为了极致速度和长序列性能，把复杂的数学公式硬写成 GPU 汇编级代码（Triton）的工程奇迹</strong>。</p>

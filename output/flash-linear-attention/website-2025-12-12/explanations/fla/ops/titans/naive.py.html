@@ -1,0 +1,104 @@
+<h1>fla/ops/titans/naive.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了<strong>线性注意力（Linear Attention）</strong>、<strong>循环神经网络（RNN）</strong>以及<strong>测试时训练（Test-Time Training, TTT）</strong>的混合概念。</p>
+<p>简单来说，这段代码实现的是 DeepMind 提出的 <strong>Titans</strong> 架构中的核心机制（Memory Module）。它的核心思想是：<strong>模型在推理的时候，通过梯度的形式动态更新一个长短期记忆矩阵 $M$。</strong></p>
+<p>为了让你看懂，我为你列了一个 <strong>5步走的 Task List</strong>，我们一步步拆解：</p>
+<hr />
+<h3>Task List: 逐步攻克 Titans 代码</h3>
+<ol>
+<li><strong>Task 1: 理解核心概念（物理模型）</strong> —— 搞懂它想干什么。</li>
+<li><strong>Task 2: 读懂“慢速版”实现 (<code>titans_linear</code>)</strong> —— 也就是 RNN 模式，这是逻辑最直观的部分。</li>
+<li><strong>Task 3: 理解“梯度计算”的细节</strong> —— 它是如何“学习”记忆的。</li>
+<li><strong>Task 4: 读懂“辅助数学函数” (<code>combine_params</code> 等)</strong> —— 为并行化加速做准备。</li>
+<li><strong>Task 5: 读懂“快速版”实现 (<code>chunk_titans_linear</code>)</strong> —— 也就是 Chunk 模式，这是实际跑得快的部分。</li>
+</ol>
+<hr />
+<h3>详细讲解</h3>
+<h4>Task 1: 理解核心概念（物理模型）</h4>
+<p>想象这个模型有两个“大脑”状态：
+1.  <strong>$M_t$ (Memory)</strong>: 长期记忆矩阵。
+2.  <strong>$S_t$ (Surprise/Momentum)</strong>: 类似于优化器中的“动量”，或者短期内的“惊喜”。</p>
+<p><strong>核心公式（代码的灵魂）：</strong>
+*   <strong>$S_t = \eta_t S_{t-1} - \theta_t \nabla L$</strong>
+    *   新的动量 = 旧动量衰减 + 负梯度（根据当前输入 $x_t$ 计算出的误差梯度）。这实际上是在做<strong>梯度下降</strong>。
+*   <strong>$M_t = (1 - \alpha_t) M_{t-1} + S_t$</strong>
+    *   新的记忆 = 旧记忆衰减 + 当前的动量。</p>
+<p><strong>结论</strong>：这段代码本质上是在实现一个<strong>在线学习器</strong>，它一边读数据，一边用梯度下降更新自己的权重矩阵 $M$。</p>
+<hr />
+<h4>Task 2: 读懂“慢速版”实现 (<code>titans_linear</code>)</h4>
+<p>请定位到代码中的 <code>titans_linear</code> 函数。这是一个循环（Loop），最容易理解逻辑。</p>
+<ul>
+<li><strong>输入</strong>：<code>q, k, v</code>（注意力机制的三要素），以及参数 <code>theta</code> (学习率), <code>alpha</code> (记忆衰减), <code>eta</code> (动量衰减)。</li>
+<li><strong>循环体 (<code>for t in range(T):</code>)</strong>：<ol>
+<li><strong>回顾旧记忆</strong>：用当前的 Key ($k_t$) 去查询旧的记忆 $M_{prev}$，得到预测值 <code>km</code>。</li>
+<li><strong>计算误差</strong>：目标是 $v_t - k_t$ (代码中叫 <code>reconstruction_target</code>)。模型试图记住这个差值。</li>
+<li><strong>计算梯度 (<code>grad</code>)</strong>：看模型预测得准不准，算出一个梯度 <code>v_new</code>。</li>
+<li><strong>更新动量 $S_t$</strong>：
+    <code>python
+    # eta_t * 旧动量 - 学习率 * 梯度
+    S_t = eta_t * S_prev - 2 * theta_t * k_t.transpose(-2, -1) @ v_new</code></li>
+<li><strong>更新记忆 $M_t$</strong>：
+    <code>python
+    # (1 - alpha) * 旧记忆 + 新动量
+    M_t = (1 - alpha_t) * M_prev + S_t</code></li>
+<li><strong>输出</strong>：用 Query ($q_t$) 查询最新的记忆 $M_t$ 得到输出。</li>
+</ol>
+</li>
+</ul>
+<p><strong>总结</strong>：这一步让你明白了，它其实就是一个带遗忘机制的 RNN，每一步都在根据误差更新权重。</p>
+<hr />
+<h4>Task 3: 理解“梯度计算”的细节</h4>
+<p>在 <code>titans_linear</code> 中，有一段看起来很复杂的标准化代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">mean</span> <span class="o">=</span> <span class="n">km</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">var</span> <span class="o">=</span> <span class="n">km</span><span class="o">.</span><span class="n">var</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">rstd</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">var</span> <span class="o">+</span> <span class="n">eps</span><span class="p">)</span>
+<span class="n">km_hat</span> <span class="o">=</span> <span class="p">(</span><span class="n">km</span> <span class="o">-</span> <span class="n">mean</span><span class="p">)</span> <span class="o">/</span> <span class="n">rstd</span>
+<span class="n">grad</span> <span class="o">=</span> <span class="n">w</span> <span class="o">*</span> <span class="n">km_hat</span> <span class="o">+</span> <span class="n">b</span> <span class="o">-</span> <span class="n">reconstruction_target</span> <span class="c1"># 简单的线性误差</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+这里并没有直接用原始的 $k \times M$，而是先做了一个 <strong>LayerNorm</strong>（归一化），然后再算误差。
+代码中 <code>v_new = ...</code> 那一长串，其实是 <strong>LayerNorm 的反向传播（Backpropagation）的手写公式</strong>。因为我们要在线更新 $M$，所以必须手动算出关于 $M$ 的梯度。</p>
+<hr />
+<h4>Task 4: 读懂“辅助数学函数”</h4>
+<p>为了让这个 RNN 在 GPU 上跑得快，我们不能写 <code>for</code> 循环，必须把计算并行化（Chunking）。这就需要预先算出每一步的衰减系数。</p>
+<ul>
+<li><strong><code>cal_n</code>, <code>cal_f</code>, <code>cal_G</code>, <code>combine_params</code></strong>：
+    这些函数全是在做<strong>前缀和（Prefix Sum）</strong>或<strong>累积乘积（Cumulative Product）</strong>。<ul>
+<li><strong>$\beta$ (beta)</strong>: 累积的记忆衰减 $(1-\alpha)$。比如第10步的记忆还剩多少留到第20步。</li>
+<li><strong>$\eta$ (eta)</strong>: 累积的动量衰减。</li>
+<li><strong>$G$ 和 $n$</strong>: 复杂的相互作用项。</li>
+</ul>
+</li>
+</ul>
+<p><strong>你只需要知道</strong>：这些函数把 <code>for</code> 循环里每一步的 $\alpha$ 和 $\eta$ 变成了矩阵形式，这样就可以直接用矩阵乘法算出这一块（Chunk）结束时的最终状态，而不用一步步循环。</p>
+<hr />
+<h4>Task 5: 读懂“快速版”实现 (<code>chunk_titans_linear</code>)</h4>
+<p>这是实际生产中用的代码。它把长序列切成了很多小块（Chunk），比如每块128个token。</p>
+<ol>
+<li><strong>切块</strong>：<code>reshape</code> 和 <code>permute</code> 把 <code>[B, H, T, D]</code> 变成了 <code>[num_batch, ... chunk_size, ...]</code>.</li>
+<li><strong>块内并行（Intra-Chunk）</strong>：<ul>
+<li>调用 <code>combine_params</code> 算出这一块内的所有累积系数。</li>
+<li>使用 <strong>Attention 形式</strong>（<code>q @ k.T</code>）来一次性算出块内的所有输出。注意代码里的：
+    <code>python
+    Attn = torch.tril(q_i @ k_i.transpose(-2, -1)) * G</code>
+    这本质上就是线性 Attention，但是加了复杂的衰减系数 $G$。</li>
+</ul>
+</li>
+<li><strong>块间递归（Inter-Chunk）</strong>：<ul>
+<li>虽然块内是并行的，但块与块之间还是 RNN。</li>
+<li>代码最后更新了 <code>S_prev</code> 和 <code>M_prev</code>：
+    <code>python
+    M_t = beta_T * M_prev + ... # 把这一块结束时的状态传给下一块</code></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这段代码到底讲了啥？</h3>
+<p><strong>一句话：</strong>
+这是一个<strong>“会学习的线性 Attention”</strong>。</p>
+<p><strong>三句话：</strong>
+1.  它不像普通 Transformer 那样 $K, V$ 是静态的，而是把 $K, V$ 压缩进了一个记忆矩阵 $M$。
+2.  这个压缩过程是通过<strong>梯度下降</strong>完成的（根据预测误差不断修正 $M$）。
+3.  为了跑得快，代码利用数学推导（<code>combine_params</code>），把原本只能串行更新的梯度下降过程，转化成了分块并行的矩阵乘法（<code>chunk_titans_linear</code>）。</p>
+<p><strong>建议阅读顺序：</strong>
+先看 <code>titans_linear</code> 搞懂逻辑，再看 <code>chunk_titans_linear</code> 搞懂怎么加速。中间那堆 <code>cal_n</code> 之类的数学公式，只要知道它们是用来算“累积衰减系数”的即可，不用深究推导细节。</p>

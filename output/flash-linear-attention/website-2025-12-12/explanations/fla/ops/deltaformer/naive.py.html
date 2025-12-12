@@ -1,0 +1,116 @@
+<h1>fla/ops/deltaformer/naive.py</h1>
+<p>这份代码实现了一个名为 <strong>DeltaFormer</strong> 的注意力机制的“朴素版”（Naive implementation）。所谓的“朴素版”，通常意味着它没有为了速度做复杂的CUDA优化，而是用直观的 Python 循环写出来的，目的是为了<strong>验证逻辑正确性</strong>。</p>
+<p>DeltaFormer 是对标准 Transformer 注意力机制的一种修改。为了让你看懂，我制定了一个 <strong>5步走的 Task List</strong>，我们一步步拆解。</p>
+<hr />
+<h3>📝 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解基础工具 —— “严格的下三角 Softmax”</strong></li>
+<li><strong>Task 2: 复习基准 —— “标准因果注意力”</strong></li>
+<li><strong>Task 3: 核心逻辑 —— “计算新的特征 U” (最难的一步)</strong></li>
+<li><strong>Task 4: 组装 —— “最终的 DeltaFormer 注意力”</strong></li>
+<li><strong>Task 5: 外包装 —— “处理数据维度”</strong></li>
+</ol>
+<hr />
+<h3>🚀 Task 1: 理解基础工具 (<code>tril_softmax</code>)</h3>
+<p><strong>代码位置:</strong> <code>def tril_softmax(...)</code></p>
+<p><strong>讲的是啥:</strong>
+在处理序列数据（比如文字生成）时，我们不能“看见未来”。第 5 个词只能看第 1, 2, 3, 4 个词。这叫“因果（Causal）”掩码。</p>
+<p><strong>代码逻辑:</strong>
+1.  <strong>生成坐标:</strong> 创建 $i$ (当前位置) 和 $j$ (被关注的位置) 的网格。
+2.  <strong>制造掩码 (Mask):</strong>
+    *   如果 <code>strict=True</code>：只允许 $j &lt; i$（只能看过去，不能看自己）。
+    *   如果 <code>strict=False</code>：允许 $j \le i$（可以看过去，也可以看自己）。
+3.  <strong>填负无穷:</strong> 把不该看的位置填成 <code>-inf</code>，这样 Softmax 之后概率就是 0。
+4.  <strong>归一化:</strong> 做 Softmax，算出概率。</p>
+<p><strong>一句话总结:</strong></p>
+<blockquote>
+<p>这是一个专门给“过去的时间步”分配权重的函数。</p>
+</blockquote>
+<hr />
+<h3>🚀 Task 2: 复习基准 (<code>naive_causal_attention_bhtd</code>)</h3>
+<p><strong>代码位置:</strong> <code>def naive_causal_attention_bhtd(...)</code></p>
+<p><strong>讲的是啥:</strong>
+这是最标准的 Transformer 注意力计算过程，作为后续步骤的最后一步使用。
+<code>bhtd</code> 代表数据形状是 <code>(Batch, Head, Time, Dim)</code>。</p>
+<p><strong>代码逻辑:</strong>
+1.  <strong>打分:</strong> $Q \times K^T$ 算出注意力分数。
+2.  <strong>掩码:</strong> 遮住未来（标准的上三角掩码）。
+3.  <strong>概率:</strong> Softmax 算出权重。
+4.  <strong>加权:</strong> 权重 $\times V$ 得到输出 $O$。</p>
+<p><strong>一句话总结:</strong></p>
+<blockquote>
+<p>也就是公式 $O = \text{Softmax}(QK^T)V$。</p>
+</blockquote>
+<hr />
+<h3>🚀 Task 3: 核心逻辑 —— 计算 U (<code>naive_deltaformer_attn_head_first</code> 的中间部分)</h3>
+<p><strong>这是本文最核心、最独特的观点。</strong></p>
+<p><strong>讲的是啥:</strong>
+DeltaFormer 认为，直接用原始的 $V$ (Value) 去做注意力不够好。它想构造一个新的特征向量，叫 <strong>$U$</strong>。
+这个 $U$ 是怎么来的？它是 $V$ 减去“历史信息的加权和”。</p>
+<p><strong>代码拆解 (第 90-101 行):</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 先算出注意力概率，注意这里 strict=True，意味着只看过去，不看自己</span>
+<span class="n">probs</span> <span class="o">=</span> <span class="n">tril_softmax</span><span class="p">(</span><span class="n">scores</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> 
+
+<span class="n">u_list</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">T</span><span class="p">):</span> <span class="c1"># 随着时间一步步循环</span>
+    <span class="k">if</span> <span class="n">t</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="c1"># 第一步，没有过去，U 就是 V</span>
+        <span class="n">u_t</span> <span class="o">=</span> <span class="n">vf</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">t</span><span class="p">,</span> <span class="p">:]</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># 2. 拿出当前时刻 t 对过去所有时刻 (0 到 t-1) 的注意力权重 w</span>
+        <span class="n">w</span> <span class="o">=</span> <span class="n">probs</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">t</span><span class="p">,</span> <span class="p">:</span><span class="n">t</span><span class="p">]</span> 
+
+        <span class="c1"># 3. 拿出过去计算好的所有 U (u_prev)</span>
+        <span class="n">u_prev</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">u_list</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">2</span><span class="p">)</span>
+
+        <span class="c1"># 4. 算出历史 U 的加权和</span>
+        <span class="n">weighted_sum</span> <span class="o">=</span> <span class="p">(</span><span class="n">w</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">u_prev</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">2</span><span class="p">)</span>
+
+        <span class="c1"># 5. 核心公式：当前的 U = 当前的 V - (beta * 历史U的加权和)</span>
+        <span class="n">u_t</span> <span class="o">=</span> <span class="n">vf</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">t</span><span class="p">,</span> <span class="p">:]</span> <span class="o">-</span> <span class="n">betaf</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">t</span><span class="p">]</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">weighted_sum</span>
+
+    <span class="n">u_list</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">u_t</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>观点解读:</strong>
+*   这是一个<strong>递归 (Recurrent)</strong> 的过程。
+*   $V_t$ 代表当前时刻带来的新信息。
+*   $weighted_sum$ 代表根据注意力权重，预测出来的“本来应该有的信息”。
+*   $U_t$ 代表 <strong>“增量信息” (Delta)</strong> —— 即 $V_t$ 中减去历史预测部分后，剩下的那一丢丢新东西。
+*   $\beta$ 控制我们要减去多少历史信息。</p>
+<hr />
+<h3>🚀 Task 4: 组装 (<code>naive_deltaformer_attn_head_first</code> 的结尾)</h3>
+<p><strong>代码位置:</strong> 倒数几行</p>
+<p><strong>讲的是啥:</strong>
+既然我们费劲算出了这个代表“增量信息”的 $U$，接下来怎么用？</p>
+<p><strong>代码逻辑:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 把算出来的 U 列表拼成一个 Tensor</span>
+<span class="n">u</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">u_list</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+
+<span class="c1"># 把 U 当作 Value，丢进标准注意力机制里</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">naive_causal_attention_bhtd</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">u</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">orig_dtype</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>观点解读:</strong>
+DeltaFormer 的最终输出，是用 $Q$ 和 $K$ 计算注意力权重，然后对 <strong>$U$</strong> 进行加权求和，而不是对 $V$。</p>
+<hr />
+<h3>🚀 Task 5: 外包装 (<code>naive_deltaformer_attn</code>)</h3>
+<p><strong>代码位置:</strong> <code>def naive_deltaformer_attn(...)</code></p>
+<p><strong>讲的是啥:</strong>
+这只是一个接口函数，处理数据形状的转置，没什么数学原理。</p>
+<p><strong>代码逻辑:</strong>
+1.  用户输入的 Tensor 形状通常是 <code>[Batch, Time, Head, Dim]</code> (BTHD)。
+2.  但是为了计算方便（特别是矩阵乘法），内部函数喜欢用 <code>[Batch, Head, Time, Dim]</code> (BHTD)。
+3.  这个函数负责把 T 和 H 换位置，调完核心逻辑后，再换回来。</p>
+<hr />
+<h3>💡 总结：DeltaFormer 在做什么？</h3>
+<p>如果你把所有步骤串起来，这篇代码表达的观点是：</p>
+<p>标准的 Transformer 是：
+$$Output_t = \sum (\text{AttnWeight} \times V)$$</p>
+<p><strong>DeltaFormer 是：</strong>
+1.  先算一个“去冗余”的新向量 $U$：
+    $$U_t = V_t - \beta_t \cdot \sum_{i&lt;t} (\text{AttnWeight}_{t,i} \times U_i)$$
+    <em>(意思是：当前的新特征 = 原始特征 - 基于历史推测出的特征)</em>
+2.  再用这个 $U$ 算最终输出：
+    $$Output_t = \sum (\text{StandardAttnWeight} \times U)$$</p>
+<p>这篇 <code>naive.py</code> 就是用最慢的 <code>for</code> 循环把这个递归公式 $U_t$ 算了一遍，用来测试模型逻辑是否正确。</p>

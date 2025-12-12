@@ -1,0 +1,53 @@
+<h1>fla/ops/common/chunk_scaled_dot_kkt.py</h1>
+<p>这份代码确实比较晦涩，因为它不是普通的 Python 代码，而是 <strong>Triton</strong> 代码。Triton 是一种专门用来写 GPU 高性能算子（Kernel）的语言。</p>
+<p>简单来说，这段代码是为了在 GPU 上极其高效地计算一个数学公式。</p>
+<p>为了让你听懂，我们把这个复杂的 GPU 编程任务想象成一个<strong>“流水线工人的任务清单”</strong>。你是这个工人（GPU 线程），你的任务是处理长序列数据中的一小段。</p>
+<h3>核心目标</h3>
+<p><strong>一句话总结：</strong> 这段代码计算的是<strong>同一个数据块（Chunk）内部，Key（键）和 Key 之间的相互关系（点积），并加上了遗忘机制（Gate）和因果遮罩（Mask）。</strong></p>
+<p>公式大致是：$Output = \text{Mask}(\beta \cdot (K \times K^T) \cdot \text{Decay})$</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<p>我们将整个过程拆解为 6 个具体的步骤（Task），对应代码中的逻辑：</p>
+<h4>Task 1: 领任务卡（确定负责的数据区域）</h4>
+<p><strong>代码对应：</strong> <code>i_t, i_bh = tl.program_id(0), ...</code> 以及 <code>tl.load(chunk_indices...)</code>
+*   <strong>解释：</strong> GPU 是几千个工人同时干活。首先你要知道你是第几号工人，负责哪一个批次（Batch）、哪一个头（Head）、以及时间序列中的哪一段（Chunk）。
+*   <strong>动作：</strong> 比如你负责处理第 5 个 Chunk（假设每个 Chunk 包含 64 个时间步）。</p>
+<h4>Task 2: 准备原材料（加载 Key 和 Beta）</h4>
+<p><strong>代码对应：</strong> <code>p_b = tl.make_block_ptr(...)</code>, <code>p_k = tl.make_block_ptr(...)</code>
+*   <strong>解释：</strong>
+    *   <strong>K (Key):</strong> 这是一个特征矩阵。
+    *   <strong>Beta:</strong> 一个缩放系数。
+*   <strong>动作：</strong> 从显存（大仓库）里把你负责的那 64 个时间步的 <code>K</code> 和 <code>Beta</code> 搬到你的工作台（SRAM/寄存器）上。</p>
+<h4>Task 3: 计算 K 和 K 的“内战”（矩阵乘法）</h4>
+<p><strong>代码对应：</strong> <code>b_A += tl.dot(b_k, tl.trans(b_k))</code>
+*   <strong>解释：</strong> 这是最核心的一步。文件名叫 <code>kkt</code>，意思就是 $K \times K^T$。
+*   <strong>动作：</strong> 你拿着这 64 个时间步的 $K$ 向量，计算它们<strong>两两之间</strong>的点积相似度。
+    *   结果是一个 $64 \times 64$ 的方阵。
+    *   这个方阵代表了：<strong>在这个小块内部，第 $i$ 个时刻的 Key 和第 $j$ 个时刻的 Key 关系有多紧密。</strong></p>
+<h4>Task 4: 加上“遗忘”机制（Gating / Decay）</h4>
+<p><strong>代码对应：</strong> <code>b_A *= exp(b_g[:, None] - b_g[None, :])</code>
+*   <strong>解释：</strong> 这里的 <code>g</code> (gate) 代表一种累积的衰减量。
+    *   <code>b_g_diff</code> 计算的是两个时间点之间的距离带来的衰减。
+    *   <code>exp</code> 是指数函数。
+*   <strong>观点：</strong> 现在的模型通常认为，距离越远，关系越弱。如果 $g$ 变化很大，说明中间发生了很多事，之前的记忆要被“遗忘”。
+*   <strong>动作：</strong> 把刚才算出来的 $64 \times 64$ 矩阵，每个元素都乘以一个衰减系数。</p>
+<h4>Task 5: 加上“时间”规则（Causal Masking）</h4>
+<p><strong>代码对应：</strong> <code>m_A = (o_t[:, None] &gt; o_t[None, :]) ... b_A = tl.where(m_A, b_A, 0)</code>
+*   <strong>解释：</strong> 这是一个<strong>因果（Causal）</strong>模型。
+    *   <strong>规则：</strong> 只有<strong>过去</strong>能影响<strong>未来</strong>，未来不能影响过去。
+    *   在 $64 \times 64$ 的矩阵中，如果行号小于列号（代表过去的时间步在看未来的时间步），这是不允许的。
+*   <strong>动作：</strong> 把矩阵的“右上角”全部涂黑（变成 0）。只保留对角线和左下角。</p>
+<h4>Task 6: 乘以 Beta 并打包出货（Store）</h4>
+<p><strong>代码对应：</strong> <code>b_A *= b_b[:, None]</code>, <code>tl.store(p_A, ...)</code>
+*   <strong>解释：</strong> 最后再乘上一个缩放因子 <code>beta</code>，然后把结果写回显存。
+*   <strong>结果：</strong> 输出一个形状为 <code>[B, T, H, BT]</code> 的张量 <code>A</code>。</p>
+<hr />
+<h3>为什么要这么做？（背景补充）</h3>
+<p>你可能会问：<em>算这个 K 乘 K 的转置有什么用？</em></p>
+<p>在 <strong>线性注意力机制（Linear Attention）</strong> 或者 <strong>状态空间模型（如 Mamba, RWKV, GLA）</strong> 中，这通常是为了计算<strong>“块内状态更新”</strong>。</p>
+<ol>
+<li><strong>分块计算：</strong> 为了加速，模型把长序列切成小块（Chunk）。</li>
+<li><strong>KKT 的物理含义：</strong> $K \times K^T$ 结合 Decay ($g$)，通常代表了<strong>在这个小块内部，旧的状态（State）是如何随着时间推移、被新的 Key 也就是新的信息所更新和衰减的。</strong></li>
+</ol>
+<p><strong>总结一下代码在干啥：</strong>
+它在算一个<strong>局部的、带衰减的、因果的</strong>关联矩阵，用来描述这 64 个时间步内部，信息是如何相互作用并沉淀下来的。</p>

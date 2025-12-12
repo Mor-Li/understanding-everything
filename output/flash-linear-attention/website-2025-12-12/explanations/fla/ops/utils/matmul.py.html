@@ -1,0 +1,107 @@
+<h1>fla/ops/utils/matmul.py</h1>
+<p>这份代码是用 <strong>Triton</strong> 语言编写的一个<strong>高性能矩阵乘法（Matrix Multiplication）</strong> 实现。</p>
+<p>简单来说，它不是用普通的 Python 写的慢速乘法，而是直接写给 GPU 执行的底层代码，用来计算 $C = A \times B$。它的特点是速度极快，并且把“激活函数”（如 ReLU）和“残差连接”（Add）融合在了一起，减少了显存读写。</p>
+<p>为了让你看懂，我制定了一个 <strong>5步学习 Todo List</strong>。我们按照这个清单，一层一层剥开它的逻辑。</p>
+<hr />
+<h3>📋 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心目标</strong> —— 搞清楚这代码到底在算什么公式。</li>
+<li><strong>Task 2: 理解“分块计算” (Tiling)</strong> —— 为什么 GPU 不能一次把整个矩阵算完？</li>
+<li><strong>Task 3: 解析核心函数 <code>matmul_kernel</code></strong> —— 它是怎么在 GPU 上跑的？</li>
+<li><strong>Task 4: 理解“融合操作” (Fusion)</strong> —— 这里的 <code>addmm</code> 和 <code>activation</code> 是干嘛的？</li>
+<li><strong>Task 5: 解析 Python 接口</strong> —— 外部怎么调用它？</li>
+</ol>
+<hr />
+<h3>🟢 Task 1: 理解核心目标</h3>
+<p>这个文件主要实现了两个功能：
+1.  <strong><code>matmul</code></strong>: 标准矩阵乘法。
+    $$C = \text{Activation}(A \times B)$$
+2.  <strong><code>addmm</code></strong>: 矩阵乘法 + 加法（常用于神经网络的全连接层）。
+    $$C = \alpha \times (A \times B) + \beta \times \text{Input}$$</p>
+<p><strong>关键点</strong>：它不仅仅是乘法，它还顺便把激活函数（如 ReLU）和加法（Bias/Residual）一次性做完了。</p>
+<hr />
+<h3>🟢 Task 2: 理解“分块计算” (Tiling)</h3>
+<p>这是看懂 Triton 代码最关键的一步。</p>
+<p>假设矩阵 $A$ 和 $B$ 非常巨大（比如 $4096 \times 4096$），GPU 的显存能装下，但 GPU 的<strong>计算核心（SRAM/寄存器）</strong> 装不下。
+所以，必须把大矩阵切成无数个小方块（Block/Tile），一块一块地算。</p>
+<p>代码中的 <code>BM</code>, <code>BN</code>, <code>BK</code> 就是这些小方块的尺寸：
+*   <strong>BM</strong>: 每次算 $C$ 矩阵的多少行？（比如 128 行）
+*   <strong>BN</strong>: 每次算 $C$ 矩阵的多少列？（比如 256 列）
+*   <strong>BK</strong>: 在做点积的时候，每次累加多深？（比如 64）</p>
+<p><strong>代码中的 <code>@triton.autotune</code></strong>：
+这一大坨配置（<code>configs=[...]</code>），就是在让程序自动尝试：到底是切成 $128 \times 64$ 的块快，还是 $64 \times 32$ 的块快？它会自动选择最优解。</p>
+<hr />
+<h3>🟢 Task 3: 解析核心函数 <code>matmul_kernel</code></h3>
+<p>这是文件里带有 <code>@triton.jit</code> 的那个最长的函数。它是直接运行在 GPU 上的。</p>
+<p><strong>步骤拆解：</strong></p>
+<ol>
+<li>
+<p><strong>定位自己 (Program ID)</strong>：
+    <code>python
+    i_b, i_m, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)</code>
+    GPU 有成千上万个线程在同时跑。这行代码是让当前这个线程知道：“我是谁？我负责计算矩阵 $C$ 的哪一个小方块？”</p>
+</li>
+<li>
+<p><strong>找到数据指针 (Pointers)</strong>：
+    代码中 <code>p_a</code>, <code>p_b</code> 的计算逻辑。
+    根据“我是谁（$i_m, i_n$）”，算出我需要读取 $A$ 矩阵的哪一部分，和 $B$ 矩阵的哪一部分。</p>
+</li>
+<li>
+<p><strong>核心循环 (The Loop)</strong>：
+    <code>python
+    # 沿着 K 维度循环
+    for k in range(0, tl.cdiv(K, BK)):
+        # 1. 加载 A 的一小块 (BM x BK)
+        b_a = tl.load(...)
+        # 2. 加载 B 的一小块 (BK x BN)
+        b_b = tl.load(...)
+        # 3. 计算乘法并累加到 b_acc (Accumulator)
+        b_acc = tl.dot(b_a, b_b, acc=b_acc, ...)
+        # 4. 指针移动到下一个 K 块
+        p_a += BK * stride_ak
+        p_b += BK * stride_bk</code>
+    这就是矩阵乘法的本质：行乘列。但因为切块了，所以要像传送带一样，一段一段地加载数据，乘完累加起来。</p>
+</li>
+</ol>
+<hr />
+<h3>🟢 Task 4: 理解“融合操作” (Fusion)</h3>
+<p>当循环结束，<code>b_acc</code> 里已经存好了 $A \times B$ 的结果。在把结果写回内存之前，Triton 允许我们做一些“顺手”的操作，这比单独启动一个内核去算要快得多。</p>
+<p><strong>1. 激活函数融合：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">ACTIVATION</span> <span class="o">==</span> <span class="s2">&quot;leaky_relu&quot;</span><span class="p">:</span>
+    <span class="n">b_c</span> <span class="o">=</span> <span class="n">leaky_relu</span><span class="p">(</span><span class="n">b_c</span><span class="p">)</span>
+<span class="c1"># ... 其他激活函数</span>
+</code></pre></div>
+
+<p>数据还在寄存器里热乎着呢，直接算完激活函数再存。</p>
+<p><strong>2. AddMM 融合 (Alpha, Beta, Input)：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">HAS_INPUT</span><span class="p">:</span>
+    <span class="c1"># 加载 input 矩阵（比如 bias 或者残差连接的 x）</span>
+    <span class="n">b_i</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="c1"># C = alpha * (A*B) + beta * Input</span>
+    <span class="n">b_c</span> <span class="o">+=</span> <span class="n">b_i</span>
+</code></pre></div>
+
+<p>这就是 <code>addmm</code> 的逻辑。</p>
+<p><strong>3. 写回内存：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_c</span><span class="p">,</span> <span class="n">b_c</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">mask</span><span class="p">)</span>
+</code></pre></div>
+
+<p>最后把处理好的结果存到矩阵 $C$ 的显存位置。</p>
+<hr />
+<h3>🟢 Task 5: 解析 Python 接口</h3>
+<p>最后看文件底部的 <code>matmul</code> 和 <code>addmm</code> 函数。它们是 Python 写的“包装器”。</p>
+<p><strong>它们在做什么？</strong>
+1.  <strong>检查形状</strong>：确保 $A$ 的最后一维等于 $B$ 的第一维（矩阵乘法基本规则）。
+2.  <strong>处理维度</strong>：把 2D 矩阵统一当作 3D 处理（Batch 维度），方便内核统一逻辑。
+3.  <strong>定义 Grid</strong>：
+    <code>python
+    def grid(meta): return (B, triton.cdiv(M, meta['BM']), triton.cdiv(N, meta['BN']))</code>
+    这是告诉 GPU：“我要启动多少个线程块”。数量 = 总行数 / 块大小。
+4.  <strong>发射内核</strong>：
+    <code>matmul_kernel[grid](...)</code> 这一行就是按下发射按钮，让 GPU 开始干活。</p>
+<hr />
+<h3>总结</h3>
+<p><strong>这个文件讲了啥？</strong>
+它在教 GPU 如何高效地把大矩阵切成小块，进行乘法运算，并在写回结果前顺便把激活函数和加法给做了。</p>
+<p><strong>为什么它很重要？</strong>
+相比于 PyTorch 自带的 <code>torch.matmul</code>，这个实现允许开发者自定义融合逻辑（比如 FP8 支持、特殊的激活函数），并且通过 <code>autotune</code> 针对特定硬件尺寸进行极致优化。</p>

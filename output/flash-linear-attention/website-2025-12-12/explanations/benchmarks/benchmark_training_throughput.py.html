@@ -1,0 +1,109 @@
+<h1>benchmarks/benchmark_training_throughput.py</h1>
+<p>这份代码其实就是一个 <strong>“AI模型训练速度测速仪”</strong>。</p>
+<p>它的核心目的只有一件事：<strong>测试在给定的硬件（显卡）上，训练某个模型每秒钟能处理多少数据（Token）。</strong></p>
+<p>为了让你彻底看懂，我把阅读这份代码的过程拆解成一个 <strong>6步走的 Task List（任务清单）</strong>。我们一步步把这个“黑盒子”打开。</p>
+<hr />
+<h3>📋 Task 1: 搞清楚“测速”的基本逻辑</h3>
+<p><strong>目标：</strong> 理解我们在测什么。</p>
+<ul>
+<li><strong>概念：</strong> <code>Throughput</code> (吞吐量)。</li>
+<li><strong>公式：</strong> <code>吞吐量 = 处理的总字数 (Tokens) / 耗费的总时间 (Seconds)</code>。</li>
+<li><strong>代码对应：</strong>
+    这份代码的核心逻辑就是：<ol>
+<li>记录开始时间 <code>start</code>。</li>
+<li>疯狂训练模型（前向传播+反向传播）。</li>
+<li>记录结束时间，算出时长 <code>duration</code>。</li>
+<li>用 <code>总Token数 / 时长</code> 得到结果。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 2: 准备“假数据” (Mock Data)</h3>
+<p><strong>目标：</strong> 既然是测速，不需要真的去读《红楼梦》或《维基百科》，用随机生成的乱码数字就行，这样最快。</p>
+<ul>
+<li><strong>代码位置：</strong> 函数 <code>prepare_inputs(...)</code></li>
+<li><strong>解读：</strong><ul>
+<li><code>tokens = torch.randint(...)</code>: 这里生成了一堆随机整数，假装它们是文字。</li>
+<li><strong>关键点 <code>varlen</code> (Variable Length)：</strong><ul>
+<li>如果是 <code>False</code>（默认）：生成整整齐齐的矩阵，每句话长度一样（标准的 Batch）。</li>
+<li>如果是 <code>True</code>：这是现在的流行技术。它模拟“长短不一”的句子拼在一起的情况，用 <code>cu_seqlens</code> (Cumulative Sequence Lengths) 来标记每句话在哪里结束。这通常用于 Flash Attention 等高效算法。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 3: 搭建模型 (Setup Model)</h3>
+<p><strong>目标：</strong> 把我们要测试的那个“大脑”加载到显卡上。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>profile(...)</code> 函数的前半部分。</li>
+<li><strong>解读：</strong><ul>
+<li><code>config = ...</code>: 读取模型的配置（比如它是几层楼高，每层有多少个房间）。</li>
+<li><code>AutoModelForCausalLM.from_config(config)</code>: 根据配置在内存里把模型“盖”起来。注意，这里是用随机参数初始化的，因为我们只测<strong>速度</strong>，不在乎它<strong>聪明不聪明</strong>。</li>
+<li><code>model.cuda().to(dtype)</code>: 把模型搬运到 GPU 上，并转换精度（比如 bfloat16，为了省显存跑得快）。</li>
+<li><code>optimizer = AdamW(...)</code>: 准备好优化器。这是训练必须的，因为反向传播后需要更新参数，这也会消耗时间，必须算在测速里。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 4: 热身运动 (Warmup Phase)</h3>
+<p><strong>目标：</strong> 显卡和代码需要“预热”才能达到最佳状态。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>profile</code> 函数中的第一个 <code>for</code> 循环。
+    <code>python
+    bar = trange(warmup_steps)
+    for _ in bar:
+        # ... 跑一遍训练流程 ...</code></li>
+<li><strong>为什么要这么做？</strong><ul>
+<li>GPU 刚开始运行时需要分配显存。</li>
+<li>PyTorch 或 <code>torch.compile</code> (如果开启) 需要时间来优化计算图。</li>
+<li>如果一上来就计时，结果会偏慢，不准确。所以先空跑几圈（<code>warmup_steps</code>），<strong>不计入成绩</strong>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 5: 正式赛跑 (Benchmark Phase)</h3>
+<p><strong>目标：</strong> 开始掐表计时！</p>
+<ul>
+<li><strong>代码位置：</strong> <code>profile</code> 函数中的第二个 <code>for</code> 循环。</li>
+<li><strong>步骤解读：</strong><ol>
+<li><code>start = time.time()</code>: <strong>按下秒表</strong>。</li>
+<li><code>for _ in bar:</code> (循环 <code>steps</code> 次):<ul>
+<li><code>prepare_inputs</code>: 拿假数据。</li>
+<li><code>model(...)</code>: <strong>前向传播</strong> (算出预测结果)。</li>
+<li><code>accelerator.backward(outputs.loss)</code>: <strong>反向传播</strong> (算出梯度，这是训练中最费时间的一步)。</li>
+<li><code>optimizer.step()</code>: 更新参数。</li>
+<li><code>optimizer.zero_grad()</code>: 清空梯度，为下一次做准备。</li>
+</ul>
+</li>
+<li><code>torch.cuda.synchronize(device)</code>: <strong>关键一步！</strong> 因为 GPU 是异步运行的（CPU 发指令说“跑”，GPU 就在后台跑），CPU 必须等 GPU 完全跑完所有任务才能停止计时。</li>
+<li><code>duration = time.time() - start</code>: 算出花了多久。</li>
+<li><code>print(f"Throughput: {total_tokens / duration} tokens/s")</code>: <strong>交卷，打印成绩。</strong></li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 6: 怎么控制这个脚本 (Arguments)</h3>
+<p><strong>目标：</strong> 理解 <code>main</code> 函数里的参数，这决定了你怎么用它。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>if __name__ == "__main__":</code> 部分。</li>
+<li><strong>常用参数翻译：</strong><ul>
+<li><code>--name</code>: 测哪个模型？(比如 'retnet', 'llama' 等，默认是 'retnet')。</li>
+<li><code>--batch_size</code>: 一次塞多少条数据进去？(越大越快，但容易爆显存)。</li>
+<li><code>--seq_len</code>: 句子的长度是 2048 还是 4096？</li>
+<li><code>--compile</code>: 要不要用 <code>torch.compile</code> 加速？(PyTorch 2.0 的新特性)。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>你不需要看懂每一行 Python 语法，只需要理解这个脚本的<strong>叙事流程</strong>：</p>
+<ol>
+<li><strong>设置参数</strong> (我要测谁？多大规模？)</li>
+<li><strong>造假数据</strong> (准备好燃料)</li>
+<li><strong>建模型</strong> (把发动机装好)</li>
+<li><strong>热车</strong> (Warmup，让油温上来)</li>
+<li><strong>全速跑几圈并计时</strong> (Benchmark)</li>
+<li><strong>算出平均时速</strong> (Throughput)</li>
+</ol>
+<p>这个脚本就是为了证明：<strong>“我的模型/框架在训练时，每秒能吞掉多少数据，我比别人快！”</strong></p>

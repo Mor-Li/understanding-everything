@@ -1,0 +1,92 @@
+<h1>fla/models/nsa/modeling_nsa.py</h1>
+<p>这份代码确实比较硬核，因为它定义了一个完整的深度学习模型架构。</p>
+<p>为了让你更容易理解，我们可以把阅读这份代码想象成<strong>“组装一个乐高机器人”</strong>的过程。我们不需要一行行死磕，而是按照<strong>从零件到整体，再到功能</strong>的顺序来看。</p>
+<p>这里有一个为你准备的 <strong>学习 Task List</strong>，我们一步步来拆解：</p>
+<hr />
+<h3>📝 阅读 Task List</h3>
+<h4>✅ Task 1: 搞懂最基础的积木 —— <code>NSABlock</code> 类</h4>
+<p><strong>位置：</strong> 代码大约第 33 行开始。
+<strong>目标：</strong> 理解模型的一“层”是做什么的。</p>
+<p>这是整个模型最核心的重复单元。现在的 LLM（大语言模型）其实就是几十层这个 Block 堆叠起来的。
+在这个类里，你只需要关注 <code>__init__</code>（定义零件）和 <code>forward</code>（拼装逻辑）：</p>
+<ol>
+<li>
+<p><strong>零件清单 (<code>__init__</code>)：</strong></p>
+<ul>
+<li><code>self.attn_norm</code>: <strong>归一化层</strong>（RMSNorm）。你可以把它理解为“数据清洗”，让数据分布更稳定，防止模型训练飞掉。</li>
+<li><code>self.attn</code>: <strong>注意力机制</strong> (<code>NativeSparseAttention</code>)。这是这个模型最独特的地方（NSA）。它的作用是让模型在处理当前词时，去“看”之前的词。这里用的是一种稀疏（Sparse）的注意力机制，为了省显存和加速。</li>
+<li><code>self.mlp</code>: <strong>多层感知机</strong> (<code>NSAMLP</code>)。你可以把它理解为模型的“脑力”，负责处理和消化注意力机制收集来的信息。</li>
+</ul>
+</li>
+<li>
+<p><strong>拼装逻辑 (<code>forward</code>)：</strong></p>
+<ul>
+<li>代码逻辑非常经典：<ol>
+<li><code>input</code> -&gt; <code>Norm</code> -&gt; <code>Attention</code> -&gt; <code>+ input</code> (残差连接)</li>
+<li><code>result</code> -&gt; <code>Norm</code> -&gt; <code>MLP</code> -&gt; <code>+ result</code> (残差连接)</li>
+</ol>
+</li>
+<li><strong>总结：</strong> 这一层的作用就是：<strong>清洗数据 -&gt; 提取上下文信息 -&gt; 融合旧信息 -&gt; 清洗数据 -&gt; 深度思考 -&gt; 融合旧信息</strong>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 2: 搭建机器人的躯干 —— <code>NSABodel</code> 类</h4>
+<p><strong>位置：</strong> 代码大约第 152 行开始。
+<strong>目标：</strong> 理解这些积木是怎么堆成一个长条的。</p>
+<p>这个类是模型的“肉身”，它负责把输入的数据变成深层的特征。</p>
+<ol>
+<li><strong>输入端 (<code>self.embeddings</code>)：</strong><ul>
+<li>负责把文字的 ID（比如 "你" 是 1024）转换成向量（一串数字）。</li>
+</ul>
+</li>
+<li><strong>身体 (<code>self.layers</code>)：</strong><ul>
+<li><code>nn.ModuleList([...])</code>：这里是一个循环，把刚才 Task 1 里定义的 <code>NSABlock</code> 复制了 <code>config.num_hidden_layers</code> 次（比如 32 层）。</li>
+</ul>
+</li>
+<li><strong>运行逻辑 (<code>forward</code>)：</strong><ul>
+<li>数据进来后，先过 Embedding 变成向量。</li>
+<li>然后写了一个 <code>for layer in self.layers:</code> 循环，一层一层地往上传递。</li>
+<li>最后再过一个 <code>self.norm</code> 做最终清洗。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 3: 给机器人装上嘴巴 —— <code>NSAForCausalLM</code> 类</h4>
+<p><strong>位置：</strong> 代码大约第 244 行开始。
+<strong>目标：</strong> 理解模型是如何“说话”（预测下一个字）的。</p>
+<p>这是我们平时调用的最顶层接口。<code>CausalLM</code> 的意思是“因果语言模型”，也就是<strong>根据上文预测下文</strong>。</p>
+<ol>
+<li>
+<p><strong>核心组件：</strong></p>
+<ul>
+<li><code>self.model</code>: 就是 Task 2 里的那个躯干。</li>
+<li><code>self.lm_head</code>: <strong>语言模型头</strong> (<code>nn.Linear</code>)。这是一个线性层，它的作用是把躯干输出的高维向量，转换回词表大小（Vocab Size）的概率分布。比如词表有 5 万个词，它就输出 5 万个分数，分数最高的那个就是模型预测的下一个字。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算损失 (<code>forward</code> 中的 <code>loss</code> 部分)：</strong></p>
+<ul>
+<li>如果你提供了正确答案 (<code>labels</code>)，它会自动计算模型预测的和正确答案之间的差距（Loss）。</li>
+<li>代码里有一些高级优化（<code>FusedCrossEntropyLoss</code>），这是为了算得更快，但本质就是算“填空题做错没”。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 4: 了解这个模型的“独门绝技” (NSA)</h4>
+<p><strong>目标：</strong> 为什么这个模型叫 NSA？</p>
+<p>虽然这个文件主要是“脚手架”代码，但它引入了一个特殊的模块：
+<code>from fla.layers.nsa import NativeSparseAttention</code></p>
+<ul>
+<li><strong>普通模型</strong>（如 Llama 2）用的是全注意力，看前面所有的词。</li>
+<li><strong>NSA (Native Sparse Attention)</strong>：这是一种<strong>稀疏注意力</strong>。它不会看前面所有的词，而是有选择性地看（比如通过滑窗 <code>window_size</code> 或分块 <code>block_size</code>）。</li>
+<li><strong>好处</strong>：处理超长文本（Long Context）时速度更快，显存占用更小。</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底讲了啥？</h3>
+<p>如果用一句话概括：
+<strong>这段代码定义了一个使用“原生稀疏注意力机制（NSA）”的 Transformer 模型架构，它兼容 Hugging Face 的工具库，可以直接用来训练或生成文本。</strong></p>
+<p><strong>你的阅读路径建议：</strong>
+1.  先看 <code>NSABlock</code> 的 <code>forward</code> 函数，看懂数据是怎么流动的（Norm -&gt; Attn -&gt; Add -&gt; Norm -&gt; MLP -&gt; Add）。
+2.  再看 <code>NSAForCausalLM</code> 的 <code>forward</code> 函数，看懂 Loss 是怎么算的。
+3.  其他的 <code>__init__</code> 初始化参数、<code>NSAPreTrainedModel</code> 这种基类，都是为了配合框架运行的“八股文”，看不懂也没关系，不影响理解核心逻辑。</p>

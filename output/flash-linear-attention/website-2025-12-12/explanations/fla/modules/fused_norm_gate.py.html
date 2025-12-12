@@ -1,0 +1,141 @@
+<h1>fla/modules/fused_norm_gate.py</h1>
+<p>这份代码确实非常硬核，因为它不仅仅是写模型结构，而是直接用 <strong>Triton</strong> 语言写了底层的 <strong>GPU 加速算子（Kernel）</strong>。</p>
+<p>简单来说，这个文件的目的是：<strong>为了极致的速度和显存效率，把“残差连接 + LayerNorm/RMSNorm + 门控激活函数（Gate）”这三个步骤融合（Fuse）成一个操作。</strong></p>
+<p>别慌，我们按你的要求，列一个 <strong>“学习任务清单 (To-Do List)”</strong>，一步步拆解它的逻辑。</p>
+<hr />
+<h3>✅ Task 1：搞懂它在算什么数学公式（宏观层面）</h3>
+<p>在看代码细节前，先看它想实现什么功能。这个模块主要是在做 Transformer 结构中常见的操作。</p>
+<p><strong>流程如下：</strong>
+1.  <strong>输入</strong>：你有一个输入 <code>x</code> 和一个门控信号 <code>g</code>（gate）。
+2.  <strong>残差相加 (Optional)</strong>：如果提供了 <code>residual</code>，先算 <code>x = x + residual</code>。
+3.  <strong>归一化 (Norm)</strong>：对 <code>x</code> 进行 LayerNorm 或者 RMSNorm。
+    *   公式：<code>x_hat = (x - mean) / std</code> (如果是 RMSNorm 就不减 mean)。
+4.  <strong>仿射变换</strong>：乘以权重 <code>w</code> 加偏置 <code>b</code>（即 <code>y = x_hat * w + b</code>）。
+5.  <strong>门控机制 (Gated Activation)</strong>：这是它的特色。它不是直接输出，而是乘以一个经过激活函数的 <code>g</code>。
+    *   如果是 Swish/SiLU：<code>output = y * (g * sigmoid(g))</code>。
+    *   如果是 Sigmoid：<code>output = y * sigmoid(g)</code>。</p>
+<p><strong>一句话总结 Task 1</strong>：
+这个文件实现了一个 <strong>“带残差和门控机制的归一化层”</strong>。</p>
+<hr />
+<h3>✅ Task 2：理解为什么要“Fused”（融合）？</h3>
+<p>既然 PyTorch 自带 <code>torch.nn.LayerNorm</code>，为什么还要写这么多代码？</p>
+<ul>
+<li>
+<p><strong>普通 PyTorch 写法</strong>：</p>
+<ol>
+<li>从显存读数据 -&gt; 算加法 -&gt; 写回显存 (Residual)</li>
+<li>从显存读数据 -&gt; 算 Norm -&gt; 写回显存 (LayerNorm)</li>
+<li>从显存读数据 -&gt; 算激活 -&gt; 写回显存 (Activation)</li>
+<li><strong>缺点</strong>：显存读写（IO）次数太多，速度慢，带宽瓶颈。</li>
+</ol>
+</li>
+<li>
+<p><strong>这份代码的写法 (Fused)</strong>：</p>
+<ol>
+<li>从显存读数据 -&gt; <strong>在 GPU 芯片内部（寄存器/SRAM）一次性把 加法、Norm、激活 全部算完</strong> -&gt; 写回显存。</li>
+<li><strong>优点</strong>：极快，省显存。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3：拆解代码结构（地图导航）</h3>
+<p>把文件分成三个部分看，不要混在一起：</p>
+<ol>
+<li>
+<p><strong>底层计算核心 (<code>@triton.jit</code> 装饰的函数)</strong>：</p>
+<ul>
+<li><code>layer_norm_gated_fwd_kernel</code>：前向传播（算结果）。</li>
+<li><code>layer_norm_gated_bwd_kernel</code>：反向传播（算梯度，用于训练）。</li>
+<li><em>注意：代码里有 <code>kernel</code> 和 <code>kernel1</code>，这是针对不同数据形状（特征维度 D 的大小）做的特定优化。</em></li>
+</ul>
+</li>
+<li>
+<p><strong>中间桥梁 (<code>torch.autograd.Function</code>)</strong>：</p>
+<ul>
+<li><code>LayerNormGatedFunction</code>：把上面的 Triton kernel 包装成 PyTorch 能识别的函数，告诉 PyTorch 怎么做 Forward，怎么做 Backward。</li>
+</ul>
+</li>
+<li>
+<p><strong>用户接口 (<code>nn.Module</code>)</strong>：</p>
+<ul>
+<li><code>FusedLayerNormGated</code> / <code>FusedRMSNormGated</code>：这是给你在模型里 <code>self.layer = ...</code> 这样调用的类。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4：深入核心 - 前向传播 Kernel 做了啥？</h3>
+<p>以 <code>layer_norm_gated_fwd_kernel</code> 为例，虽然全是晦涩的 Triton 语法，但逻辑是线性的：</p>
+<ol>
+<li><strong><code>tl.load</code></strong>：把数据 <code>x</code> 和 <code>residual</code> 搬运到 GPU 的小缓存里。</li>
+<li><strong>残差计算</strong>：<code>b_x += tl.load(p_res)</code>。</li>
+<li><strong>计算统计量</strong>：<ul>
+<li>算均值 <code>mean</code> 和方差 <code>var</code>。</li>
+<li>算标准差的倒数 <code>rstd = 1 / sqrt(var + eps)</code>。</li>
+</ul>
+</li>
+<li><strong>归一化</strong>：<code>b_x_hat = (b_x - mean) * rstd</code>。</li>
+<li><strong>加载参数</strong>：读取权重 <code>w</code> 和偏置 <code>b</code>。</li>
+<li><strong>门控激活 (关键点)</strong>：<ul>
+<li>读取门控信号 <code>g</code>。</li>
+<li>计算 <code>swish</code> 或 <code>sigmoid</code>。</li>
+<li><code>b_y = b_y * b_g * tl.sigmoid(b_g)</code> (如果是 Swish)。</li>
+</ul>
+</li>
+<li><strong><code>tl.store</code></strong>：把最终结果 <code>y</code> 写回显存。</li>
+</ol>
+<p><strong>看不懂 <code>tl.make_block_ptr</code> 没关系</strong>，你只需要知道它是在<strong>分块（Tiling）</strong>处理数据，因为显存太大了，一次处理一小块。</p>
+<hr />
+<h3>✅ Task 5：反向传播 (Backward) 是干嘛的？</h3>
+<p>代码里那一长串 <code>layer_norm_gated_bwd_kernel</code> 是最复杂的。</p>
+<ul>
+<li><strong>目的</strong>：训练神经网络需要<strong>梯度</strong>。</li>
+<li><strong>输入</strong>：最终输出的梯度 <code>dy</code>。</li>
+<li><strong>计算</strong>：利用链式法则，反推：<ul>
+<li>输入 <code>x</code> 的梯度 <code>dx</code>。</li>
+<li>门控 <code>g</code> 的梯度 <code>dg</code>。</li>
+<li>权重 <code>w</code> 和偏置 <code>b</code> 的梯度 <code>dw</code>, <code>db</code>。</li>
+</ul>
+</li>
+<li><strong>难点</strong>：因为前向是融合算的，反向也必须融合算，数学推导非常麻烦，但对用户来说，只要知道它能正确传回梯度即可。</li>
+</ul>
+<hr />
+<h3>✅ Task 6：怎么使用它？（应用层面）</h3>
+<p>这是你最可能需要修改或调用的部分。看文件末尾的 <code>class</code> 定义。</p>
+<p>如果你想在你的 Transformer 模型里用这个高性能层：</p>
+<p><strong>1. 替换 LayerNorm + Swish：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 以前你可能这样写：</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">OldBlock</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">gate</span><span class="p">):</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">x</span> <span class="o">*</span> <span class="n">F</span><span class="o">.</span><span class="n">silu</span><span class="p">(</span><span class="n">gate</span><span class="p">)</span>
+
+<span class="c1"># 现在你可以这样写：</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">fla.modules.fused_norm_gate</span><span class="w"> </span><span class="kn">import</span> <span class="n">FusedLayerNormGated</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">NewBlock</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dim</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="c1"># 初始化</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">fused_norm</span> <span class="o">=</span> <span class="n">FusedLayerNormGated</span><span class="p">(</span><span class="n">dim</span><span class="p">,</span> <span class="n">activation</span><span class="o">=</span><span class="s1">&#39;swish&#39;</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">gate</span><span class="p">):</span>
+        <span class="c1"># 一行代码搞定 Norm + Gate，速度飞快</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">fused_norm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">g</span><span class="o">=</span><span class="n">gate</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>2. 替换 RMSNorm (LLaMA 等模型常用)：</strong>
+使用 <code>FusedRMSNormGated</code> 类，用法一样，只是内部数学公式变成了 RMSNorm（不减均值）。</p>
+<p><strong>3. 还有个 <code>Linear</code> 版本？</strong>
+代码里还有 <code>FusedLayerNormGatedLinear</code>。这是进一步的融合：把 Norm 之后的那个 Linear 层（全连接层）也通过逻辑串联起来处理（虽然 Linear 计算本身还是主要靠矩阵乘法，但梯度回传时可以优化）。</p>
+<hr />
+<h3>总结</h3>
+<p>这份代码是 <strong>"性能优化狂魔"</strong> 的产物。</p>
+<ul>
+<li><strong>讲的啥？</strong> 一个把“归一化”和“门控激活”合二为一的算子。</li>
+<li><strong>为什么难懂？</strong> 因为它为了快，跳过了 PyTorch 的自动求导，直接用 Triton 手写了 GPU 指令。</li>
+<li><strong>你需要做什么？</strong><ul>
+<li>如果你是<strong>使用者</strong>：直接 import <code>FusedLayerNormGated</code> 或 <code>FusedRMSNormGated</code> 当作普通的 Layer 用就行。</li>
+<li>如果你是<strong>开发者</strong>：只需要关注 <code>fwd</code> kernel 里的数学逻辑是否符合你的模型设计。</li>
+</ul>
+</li>
+</ul>

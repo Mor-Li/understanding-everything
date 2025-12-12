@@ -1,0 +1,102 @@
+<h1>benchmarks/modules/benchmark_layernorm.py</h1>
+<p>没问题，这段代码乍一看确实充满了技术术语，但其实它的核心逻辑非常简单：<strong>这就是一场“赛跑比赛”的裁判记录表</strong>。</p>
+<p>这段代码的目的是为了证明：<strong>作者写的“融合算子（Fused）”比 PyTorch 自带的“朴素算子（Naive）”跑得更快。</strong></p>
+<p>为了让你彻底看懂，我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>，我们一步一步来解锁这段代码的含义。</p>
+<hr />
+<h3>📝 任务清单：一步步读懂代码</h3>
+<h4>✅ Task 1: 搞懂核心目的——为什么要写这个文件？</h4>
+<p><strong>核心观点：</strong> 这是一个性能测试（Benchmark）脚本。
+*   <strong>解释：</strong> 在深度学习里，我们不仅关心模型准不准，还关心模型<strong>快不快</strong>。
+*   <strong>代码对应：</strong> 文件名 <code>benchmark_layernorm.py</code> 里的 <code>benchmark</code> 就是“基准测试”的意思。这整个脚本就是一个“秒表”，用来测量不同算法运行一次需要多少毫秒。</p>
+<h4>✅ Task 2: 认识参赛选手——谁在比赛？</h4>
+<p><strong>核心观点：</strong> 比赛分为两组，每组有两个选手（官方版 vs. 魔改版）。
+*   <strong>解释：</strong> 代码里对比了两种归一化层（Normalization）：
+    1.  <strong>LayerNorm (LN)</strong>
+    2.  <strong>GroupNorm (GN)</strong>
+*   <strong>关键术语：</strong>
+    *   <strong><code>naive</code> (朴素版):</strong> 指 <code>torch.nn.LayerNorm</code> 或 <code>torch.nn.GroupNorm</code>。这是 PyTorch 官方自带的，稳定但可能不是最快的。
+    *   <strong><code>fused</code> (融合版):</strong> 指 <code>fla.modules.LayerNorm</code> 或 <code>GroupNorm</code>。这是作者自己写的（通常用 Triton 语言写），把多个计算步骤“融合”在一起，为了跑得更快。
+*   <strong>代码对应：</strong>
+    <code>python
+    line_vals=['naive_ln', 'fused_ln', 'naive_gn', 'fused_gn', ...]</code>
+    这里列出了所有的参赛选手名字。</p>
+<h4>✅ Task 3: 搞懂比赛项目——比什么？</h4>
+<p><strong>核心观点：</strong> 既比“正向跑”，也比“倒着跑”。
+*   <strong>解释：</strong> 深度学习有两个过程：
+    1.  <strong>Forward (前向传播):</strong> 算出结果。
+    2.  <strong>Backward (反向传播):</strong> 算出梯度（用于更新模型）。
+    通常反向传播更费时间，所以都要测。
+*   <strong>代码对应：</strong>
+    *   <code>naive_ln</code>: 测 LayerNorm 的前向速度。
+    *   <code>naive_ln_bwd</code>: 测 LayerNorm 的反向速度（<code>bwd</code> = backward）。
+    *   代码里的 <code>norm(x)</code> 是前向，<code>norm(x).backward(x)</code> 是反向。</p>
+<h4>✅ Task 4: 了解比赛场地——赛道有多长？</h4>
+<p><strong>核心观点：</strong> 随着数据量变大，速度差距会拉大。
+*   <strong>解释：</strong> 测试不能只测一个数据量。代码让数据长度 <code>T</code> 从小变大，看看谁在大数据量下更稳。
+*   <strong>代码对应：</strong>
+    <code>python
+    x_names=['T'],
+    x_vals=[128 * 2 ** i for i in range(0, 8)], # 128, 256, 512 ... 直到很大</code>
+    这就是 X 轴，表示序列长度（Sequence Length）。</p>
+<h4>✅ Task 5: 拆解裁判逻辑——具体的测试函数</h4>
+<p><strong>核心观点：</strong> <code>benchmark</code> 函数就是发令枪。
+*   <strong>解释：</strong> 这个函数接收两个参数：<code>T</code> (数据长度) 和 <code>provider</code> (选手名字)。
+    1.  <strong>造数据：</strong> <code>x = torch.randn(...)</code> 创建一个随机的输入张量。
+    2.  <strong>选选手：</strong> 用一堆 <code>if provider.startswith(...)</code> 来判断当前轮到谁跑。
+    3.  <strong>计时：</strong> <code>triton.testing.do_bench(...)</code> 是 Triton 库自带的高精度计时器。它会让代码跑很多次，去掉最高分最低分，算平均时间。</p>
+<h4>✅ Task 6: 总结——这段代码想告诉你什么？</h4>
+<p><strong>结论：</strong>
+作者写这段代码是为了画一张图（<code>plot_name="Performance"</code>）。
+这张图的 X 轴是数据长度，Y 轴是耗时（毫秒）。
+<strong>作者预期的结果是：代表 <code>fused</code>（融合版）的线条，应该在代表 <code>naive</code>（官方版）的线条下方。</strong> （耗时更少 = 性能更好）。</p>
+<hr />
+<h3>🔍 代码逐段翻译（辅助理解）</h3>
+<p><strong>第一部分：设置比赛规则</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@triton</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">perf_report</span><span class="p">(</span>
+    <span class="n">triton</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">Benchmark</span><span class="p">(</span>
+        <span class="n">x_names</span><span class="o">=</span><span class="p">[</span><span class="s1">&#39;T&#39;</span><span class="p">],</span>  <span class="c1"># X轴是 T (长度)</span>
+        <span class="n">x_vals</span><span class="o">=</span><span class="p">[</span><span class="mi">128</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">**</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">8</span><span class="p">)],</span> <span class="c1"># X轴的刻度：128, 256, 512...</span>
+        <span class="n">line_arg</span><span class="o">=</span><span class="s1">&#39;provider&#39;</span><span class="p">,</span> <span class="c1"># 不同的线条代表不同的选手</span>
+        <span class="c1"># 下面是选手名单：官方LN，作者LN，官方GN，作者GN，以及对应的反向传播</span>
+        <span class="n">line_vals</span><span class="o">=</span><span class="p">[</span><span class="s1">&#39;naive_ln&#39;</span><span class="p">,</span>  <span class="s1">&#39;fused_ln&#39;</span><span class="p">,</span> <span class="s1">&#39;naive_gn&#39;</span><span class="p">,</span> <span class="s1">&#39;fused_gn&#39;</span><span class="p">,</span>
+                   <span class="s1">&#39;naive_ln_bwd&#39;</span><span class="p">,</span>  <span class="s1">&#39;fused_ln_bwd&#39;</span><span class="p">,</span> <span class="s1">&#39;naive_gn_bwd&#39;</span><span class="p">,</span> <span class="s1">&#39;fused_gn_bwd&#39;</span><span class="p">],</span>
+        <span class="n">ylabel</span><span class="o">=</span><span class="s2">&quot;Execution Time (ms)&quot;</span><span class="p">,</span>  <span class="c1"># Y轴是时间</span>
+        <span class="o">...</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>第二部分：裁判员执行测试</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">benchmark</span><span class="p">(</span><span class="n">T</span><span class="p">,</span> <span class="n">provider</span><span class="p">):</span>
+    <span class="c1"># 1. 准备数据</span>
+    <span class="n">B</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">1024</span> <span class="c1"># Batch size 和 维度</span>
+    <span class="c1"># 造一个随机矩阵 x，大小是 (16*T, 1024)</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span> <span class="o">*</span> <span class="n">T</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="n">requires_grad</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+
+    <span class="c1"># 2. 根据选手名字(provider)决定跑哪段代码</span>
+    <span class="k">if</span> <span class="n">provider</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s1">&#39;naive_ln&#39;</span><span class="p">):</span>
+        <span class="c1"># 选手：PyTorch 官方 LayerNorm</span>
+        <span class="n">norm</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+        <span class="c1"># 动作：测前向传播 norm(x)</span>
+        <span class="n">results</span> <span class="o">=</span> <span class="n">triton</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">do_bench</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">norm</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">provider</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s1">&#39;fused_ln&#39;</span><span class="p">):</span>
+        <span class="c1"># 选手：作者写的 fla.modules.LayerNorm</span>
+        <span class="n">norm</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+        <span class="c1"># 动作：测前向传播 norm(x)</span>
+        <span class="n">results</span> <span class="o">=</span> <span class="n">triton</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">do_bench</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">norm</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># ... (中间省略 GroupNorm 的测试) ...</span>
+
+    <span class="k">if</span> <span class="n">provider</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s1">&#39;naive_ln_bwd&#39;</span><span class="p">):</span>
+        <span class="c1"># 选手：PyTorch 官方 LayerNorm</span>
+        <span class="n">norm</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+        <span class="c1"># 动作：测反向传播 .backward(x)</span>
+        <span class="n">results</span> <span class="o">=</span> <span class="n">triton</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">do_bench</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">norm</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 3. 返回成绩</span>
+    <span class="k">return</span> <span class="n">results</span>
+</code></pre></div>
+
+<h3>💡 简单一句话总结</h3>
+<p>这个脚本就是为了<strong>炫耀</strong>作者写的 <code>LayerNorm</code> 和 <code>GroupNorm</code> 算子比 PyTorch 自带的跑得快，并且画个图表作为证据。</p>

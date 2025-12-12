@@ -1,0 +1,107 @@
+<h1>utils/convert_from_rwkv6.py</h1>
+<p>这段代码看起来很吓人，因为它充满了复杂的变量名（比如 <code>time_maa_x</code>, <code>receptance</code> 等），但它的核心逻辑其实非常简单。</p>
+<p>你可以把这段代码看作是一个 <strong>“搬家公司”</strong> 的工作清单。</p>
+<p>它的任务是：把一个 <strong>RWKV-6 原版模型</strong>（旧房子）里的家具（权重参数），搬运并重新摆放到 <strong>FLA 框架下的新模型</strong>（新房子）里。因为两个框架的代码实现不一样，所以变量的名字和形状（家具的摆放位置）也不同，需要一一对应。</p>
+<p>下面我为你列一个 <strong>Task To-Do List</strong>，一步一步拆解这段代码在干什么：</p>
+<hr />
+<h3>📦 Task 1: 准备工作（进场）</h3>
+<p><strong>目标</strong>：把原本的模型加载进来，再准备好一个空的“新壳子”等待填入数据。</p>
+<ol>
+<li><strong>加载原版模型 (Source)</strong>:<ul>
+<li>代码：<code>rwkv6 = AutoModelForCausalLM.from_pretrained(...)</code></li>
+<li>解释：从 HuggingFace 下载并加载 RWKV-6 的官方模型。这是我们要提取数据的地方。</li>
+</ul>
+</li>
+<li><strong>创建新模型架构 (Target)</strong>:<ul>
+<li>代码：<code>config = AutoConfig...</code> 和 <code>model = AutoModelForCausalLM.from_config(config)</code></li>
+<li>解释：根据 <code>fla</code> 库的配置文件，初始化一个<strong>随机参数</strong>的空模型。这个模型的结构是 <code>fla</code> 库特有的，但此时它里面全是乱码（随机数），不能用。</li>
+</ul>
+</li>
+<li><strong>打印信息</strong>:<ul>
+<li>解释：代码里有很多 <code>print</code>，是为了告诉你现在模型有多大，参数有多少，确认没加载错。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚚 Task 2: 搬运地基（Embedding 层）</h3>
+<p><strong>目标</strong>：把词汇表（字典）的权重搬过去。</p>
+<ul>
+<li><strong>动作</strong>:<ul>
+<li><code>model.model.embeddings.weight.data.copy_(rwkv6.rwkv.embeddings.weight)</code></li>
+</ul>
+</li>
+<li><strong>解释</strong>:<ul>
+<li>把旧模型里的 <code>embeddings</code> 复制到新模型的 <code>embeddings</code> 里。</li>
+<li><code>torch.testing.assert_close(...)</code>：这是一个<strong>质检员</strong>。每搬运一步，它都会检查一下：“新地方的数据和旧地方的数据完全一样吗？”如果不一样会报错。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🏗️ Task 3: 搬运楼层（核心循环）</h3>
+<p><strong>目标</strong>：这是最长的一段代码。大模型是由几十层完全相同的结构叠起来的（比如 32 层）。我们需要一层一层地搬。</p>
+<ul>
+<li><strong>循环开始</strong>: <code>for i in range(config.num_hidden_layers):</code> (对每一层进行操作)</li>
+</ul>
+<h4>Sub-Task 3.1: 搬运 Layer Norm (层归一化)</h4>
+<ul>
+<li><strong>动作</strong>: 也就是代码中出现 <code>pre_norm</code> 和 <code>attn_norm</code> 的部分。</li>
+<li><strong>解释</strong>: 搬运每一层原本的归一化参数（Weight 和 Bias）。</li>
+</ul>
+<h4>Sub-Task 3.2: 搬运 Attention (注意力机制) - <strong>这是最难懂的部分</strong></h4>
+<p>RWKV 的注意力机制有很多独特的参数，比如 <code>time_mix</code> (时间混合) 和 <code>decay</code> (衰减)。新旧模型的实现方式不同，所以需要<strong>变形</strong>再塞进去。</p>
+<ol>
+<li><strong>Time Mix 参数 (<code>time_maa</code>)</strong>:<ul>
+<li>代码里看到很多 <code>time_maa_x</code>, <code>time_maa_w1</code>, <code>time_maa_w2</code>。</li>
+<li><strong>操作</strong>: 原版模型把这些参数分散存，新模型 (<code>fla</code>) 可能把它们拼在一起存。所以你会看到代码里用了 <code>view</code>, <code>cat</code> (拼接), <code>stack</code> (堆叠) 这些命令。</li>
+<li><strong>人话</strong>: 旧房子的书是散落在桌子、床头、地上的；新房子买了个大书架，要把这些书按顺序整理好插进书架里。</li>
+</ul>
+</li>
+<li><strong>Projections (投影层)</strong>:<ul>
+<li>代码：<code>receptance</code>, <code>key</code>, <code>value</code>, <code>gate</code>, <code>output</code>。</li>
+<li><strong>操作</strong>: 这些是标准的线性层权重，直接 <code>copy_</code> 过去即可。</li>
+</ul>
+</li>
+<li><strong>Decay (时间衰减)</strong>:<ul>
+<li>代码：<code>time_decay</code>。</li>
+<li><strong>操作</strong>: 这是 RWKV 记忆能力的核心参数，也需要复制过去。</li>
+</ul>
+</li>
+</ol>
+<h4>Sub-Task 3.3: 搬运 Feed Forward (前馈网络)</h4>
+<ul>
+<li><strong>动作</strong>: 代码块后半部分的 <code>feed_forward</code>。</li>
+<li><strong>解释</strong>: 每一层除了注意力机制，还有一个 FFN（前馈网络）。这里同样涉及 <code>key</code>, <code>value</code>, <code>receptance</code> 的权重复制。</li>
+</ul>
+<hr />
+<h3>🧹 Task 4: 搬运屋顶（输出层）</h3>
+<p><strong>目标</strong>：处理最后一层的归一化和输出头。</p>
+<ol>
+<li><strong>Final Norm</strong>:<ul>
+<li>代码：<code>model.model.norm...</code></li>
+<li>解释：整个网络最后一次的数据整理层。</li>
+</ul>
+</li>
+<li><strong>LM Head (语言模型头)</strong>:<ul>
+<li>代码：<code>model.lm_head...</code></li>
+<li>解释：这是最后输出预测词汇的层。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💾 Task 5: 验收并保存</h3>
+<p><strong>目标</strong>：把填好数据的新模型存成文件。</p>
+<ul>
+<li><strong>动作</strong>:<ul>
+<li><code>model.save_pretrained(output)</code></li>
+<li><code>tokenizer.save_pretrained(output)</code></li>
+</ul>
+</li>
+<li><strong>解释</strong>: 现在 <code>model</code> 里的参数已经不是随机数了，而是从 RWKV-6 完美复刻过来的。把它保存到硬盘上，以后你就可以直接用 <code>fla</code> 库来加载这个模型进行推理或训练了。</li>
+</ul>
+<h3>总结</h3>
+<p>你之所以看不懂，是因为<strong>左边</strong>（RWKV原版）和<strong>右边</strong>（FLA新版）的变量命名规则完全不同。</p>
+<ul>
+<li><strong>原版喜欢叫</strong>: <code>time_maa_x</code>, <code>time_decay</code>, <code>ln1</code></li>
+<li><strong>新版喜欢叫</strong>: <code>x_proj</code>, <code>w_proj</code>, <code>attn_norm</code></li>
+</ul>
+<p><strong>这个脚本本质上就是一本“字典”</strong>，告诉程序：旧版里的 <code>A</code> 应该放在新版里的 <code>B</code> 位置，旧版里的 <code>C</code> 和 <code>D</code> 拼起来应该放在新版里的 <code>E</code> 位置。</p>

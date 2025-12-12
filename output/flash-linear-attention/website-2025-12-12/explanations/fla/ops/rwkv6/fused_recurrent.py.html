@@ -1,0 +1,129 @@
+<h1>fla/ops/rwkv6/fused_recurrent.py</h1>
+<p>这份代码确实看着很吓人，因为它不是普通的 PyTorch 代码，而是用 <strong>Triton</strong> 写的底层 GPU 加速代码。Triton 的特点是需要手动管理内存指针（pointers），所以满屏都是 <code>p_q + ...</code> 这种算地址的逻辑。</p>
+<p>为了让你看懂，我们把这个复杂的代码拆解成一个 <strong>“RWKV6 记忆处理任务”</strong> 的 Todo List。</p>
+<hr />
+<h3>核心任务说明</h3>
+<p><strong>目标</strong>：RWKV6 是一个类似 RNN 的模型。我们需要处理一个序列（比如一句话），按顺序阅读每个词，一边读一边更新大脑里的“记忆（Hidden State）”，并输出对下一个词的预测。</p>
+<p><strong>核心公式（简化版）</strong>：
+1.  <strong>输出</strong> = 当前的输入信息 + 之前的记忆 $\times$ 奖励系数(u)
+2.  <strong>更新记忆</strong> = 之前的记忆 $\times$ 遗忘系数(w) + 当前的新知识(k, v)</p>
+<hr />
+<h3>阶段一：准备工作 (Python 层面)</h3>
+<p>在进入那个看不懂的 <code>kernel</code> 之前，Python 函数 <code>fused_recurrent_rwkv6</code> (代码最下面) 做了这几件事：</p>
+<ol>
+<li>
+<p><strong>Todo 1: 检查食材（输入数据）</strong></p>
+<ul>
+<li><code>r</code> (reception/query): 相当于我想从记忆里提取什么。</li>
+<li><code>k</code> (key): 当前时刻的新知识的“索引”。</li>
+<li><code>v</code> (value): 当前时刻的新知识的“内容”。</li>
+<li><code>w</code> (decay): 遗忘门，决定每一步要忘掉多少旧记忆。</li>
+<li><code>u</code> (bonus): 奖励分数，给当前时刻的信息加权。</li>
+<li><code>h0</code>: 初始记忆（如果有的话）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 2: 分配工位（GPU 线程规划）</strong></p>
+<ul>
+<li>因为 GPU 有很多核心，我们不能让一个核心干所有活。</li>
+<li>代码把任务按 <strong>Batch（第几句话）</strong> 和 <strong>Head（第几个注意力头）</strong> 拆分。</li>
+<li>比如有 B=4 句话，H=8 个头，就会启动 $4 \times 8 = 32$ 组工人并行工作。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>阶段二：核心流水线 (Triton Kernel 层面)</h3>
+<p>这是代码里 <code>def fused_recurrent_rwkv6_fwd_kernel(...)</code> 的部分。想象这是<strong>一个工人</strong>（一个 GPU 线程块）正在处理<strong>一句话中的某一个头</strong>。</p>
+<h4>步骤 1：定位数据 (Pointer Arithmetic)</h4>
+<p>代码里那一堆 <code>p_q = ...</code>, <code>p_k = ...</code> 实际上是在做这件事：
+*   <strong>任务</strong>：找到我负责的那句话、那个头的数据在显存里的<strong>起始地址</strong>。
+*   <strong>类比</strong>：在一本巨大的书里，算出我要读的那一章在第几页第几行。</p>
+<h4>步骤 2：加载初始记忆</h4>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    b_h = tl.zeros(...) # 初始化一个空的记忆容器
+    if USE_INITIAL_STATE:
+        b_h += tl.load(p_h0, ...) # 如果有上一章的记忆，先加载进来</code></li>
+</ul>
+<h4>步骤 3：时间循环 (The Loop) - <strong>这是全篇最重要的地方</strong></h4>
+<p>代码里的 <code>for _ in range(0, T):</code> 是在按时间步（Time Step）一个词一个词地走。</p>
+<ul>
+<li>
+<p><strong>子任务 3.1: 读取当前时刻的数据</strong></p>
+<ul>
+<li>从内存里把当前的 $q_t, k_t, v_t, w_t$ 读出来。</li>
+<li>代码：<code>b_q = tl.load(...)</code>, <code>b_k = ...</code></li>
+</ul>
+</li>
+<li>
+<p><strong>子任务 3.2: 计算输出 (Output)</strong></p>
+<ul>
+<li>RWKV 的特点是：输出不仅看当前的记忆，还要给当前的新信息 $k \times v$ 一个额外的奖励 $u$。</li>
+<li>公式逻辑：输出 = (旧记忆 + 新信息 $\times$ u) $\times$ q</li>
+<li>代码对应：
+    <code>python
+    b_kv = b_k[:, None] * b_v[None, :]  # 算出当前的新知识矩阵
+    # b_h 是旧记忆，b_u 是奖励
+    b_o = tl.sum((b_h + b_kv * b_u[:, None]) * b_q[:, None], 0)</code></li>
+</ul>
+</li>
+<li>
+<p><strong>子任务 3.3: 更新记忆 (Update State)</strong></p>
+<ul>
+<li>这一步走完，记忆要变了。旧记忆要衰减（乘以 $e^w$），然后加上新知识。</li>
+<li>代码对应：
+    <code>python
+    # exp(b_w) 是衰减系数，旧记忆衰减 + 存入新知识 b_kv
+    b_h = b_h * exp(b_w)[:, None] + b_kv</code></li>
+</ul>
+</li>
+<li>
+<p><strong>子任务 3.4: 保存结果</strong></p>
+<ul>
+<li>把算出来的 <code>b_o</code> 写回显存。</li>
+<li>代码：<code>tl.store(p_o, ...)</code></li>
+</ul>
+</li>
+<li>
+<p><strong>子任务 3.5: 移动指针到下一个词</strong></p>
+<ul>
+<li>处理完这个词了，要把指针往后挪一位，准备读下一个词。</li>
+<li>代码：<code>p_q += H*K ...</code> (指针加一个步长)</li>
+</ul>
+</li>
+</ul>
+<h4>步骤 4：保存最终记忆</h4>
+<ul>
+<li>如果整句话读完了，需要把最后的记忆 <code>b_h</code> 存下来，留给下一段话用。</li>
+<li>代码：<code>tl.store(p_ht, b_h ...)</code></li>
+</ul>
+<hr />
+<h3>阶段三：反向传播 (Backward Kernel)</h3>
+<p>代码里带有 <code>_bwd</code> 后缀的函数（<code>dq</code>, <code>dkv</code>, <code>dw</code>）是用来训练模型的。</p>
+<ul>
+<li><strong>任务</strong>：如果你完全看不懂，可以先跳过。它的逻辑是<strong>把 Forward 的过程倒过来走一遍</strong>。</li>
+<li><strong>目的</strong>：计算梯度（Gradient）。比如，如果模型预测错了，我们需要知道是谁的锅？是 $q$ 没提取好？还是 $w$ 忘得太快了？</li>
+<li><strong>逻辑</strong>：<ul>
+<li>从最后一个词开始，倒着往回推（<code>for _ in range(T - 1, -1, -1):</code>）。</li>
+<li>利用链式法则（Chain Rule）算出每个参数的梯度。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：如何阅读这段代码</h3>
+<p>不要试图去推演每一行 <code>i_k * BK + tl.arange(0, BK)</code> 是什么意思，那是给编译器看的地址计算。你只需要关注核心逻辑流：</p>
+<ol>
+<li><strong>Input</strong>: 拿到 $Q, K, V, W, U$。</li>
+<li><strong>Init</strong>: 初始化隐藏状态 $H$。</li>
+<li><strong>Loop (0 to T)</strong>:<ul>
+<li>Load $q_t, k_t, v_t, w_t$.</li>
+<li><strong>Calculate Output</strong>: $o_t = (H_{t-1} + k_t v_t \cdot u) \cdot q_t$</li>
+<li><strong>Update State</strong>: $H_t = H_{t-1} \cdot e^{w_t} + k_t v_t$</li>
+<li>Store $o_t$.</li>
+<li>Move pointers.</li>
+</ul>
+</li>
+<li><strong>Return</strong>: 返回所有 $o$ 和最后的 $H_T$。</li>
+</ol>
+<p>这个文件之所以复杂，是因为它把上述简单的数学公式，为了极致的 GPU 速度，写成了“手动搬运内存”的形式。</p>

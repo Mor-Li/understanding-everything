@@ -1,0 +1,130 @@
+<h1>fla/ops/mesa_net/chunk_h_kv_intra_bwd.py</h1>
+<p>这份代码确实非常硬核，它是一个用 <strong>Triton</strong> 语言编写的 <strong>GPU Kernel</strong>，用于深度学习模型（具体是 Mesa Net）的<strong>反向传播（Backward Pass）</strong>计算。</p>
+<p>简单来说，这是在训练模型时，计算梯度（Gradients）的核心代码。</p>
+<p>为了让你看懂，我制定了一个 <strong>“理解任务清单 (Todo List)”</strong>，我们将分 4 步走，从宏观概念到微观代码，逐一击破。</p>
+<hr />
+<h3>📋 任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂背景 (Context)</strong> —— 这段代码在模型里处于什么位置？</li>
+<li><strong>Task 2: 理清输入输出 (I/O)</strong> —— 我们手里有什么数据？我们要算什么？</li>
+<li><strong>Task 3: 核心逻辑拆解 (The Kernel)</strong> —— 显卡里到底在算什么？(最难的部分，分步讲)<ul>
+<li>3.1 读数据 (Loading)</li>
+<li>3.2 算注意力梯度 (Attention Gradients)</li>
+<li>3.3 算历史状态梯度 (Recurrent Gradients)</li>
+<li>3.4 算门控梯度 (Gate Gradients)</li>
+</ul>
+</li>
+<li><strong>Task 4: 封装与调用 (The Wrapper)</strong> —— Python 是怎么指挥 GPU 的？</li>
+</ol>
+<hr />
+<h3>Task 1: 搞懂背景 (Context)</h3>
+<p><strong>关键词：Mesa Net, Linear Attention, Chunkwise, Intra-chunk, Backward</strong></p>
+<ul>
+<li><strong>Mesa Net / Linear Attention</strong>: 这是一种比传统 Transformer 更快的注意力机制。</li>
+<li><strong>Chunkwise (分块)</strong>: 为了加速，长序列（比如 4096 长度）被切成了很多小块（比如 64 长度，代码中 <code>BT=chunk_size</code>）。</li>
+<li><strong>Intra-chunk (块内)</strong>: 这个文件处理的是 <strong>“块内部”</strong> 的计算。即：在一个小块里，Token 之间是如何相互影响的。</li>
+<li><strong>Backward (反向)</strong>: 这是训练阶段用的。前向传播算出了结果，现在我们要根据误差，反推参数需要怎么调整（算梯度）。</li>
+</ul>
+<p><strong>一句话总结 Task 1：</strong>
+这个文件负责计算 <strong>“在一个小块内部，注意力机制产生的误差是如何反向传导给 Q, K, V 和门控 G 的”</strong>。</p>
+<hr />
+<h3>Task 2: 理清输入输出 (I/O)</h3>
+<p>看函数 <code>chunk_mesa_net_h_kv_bwd_intra_kernel</code> 的参数：</p>
+<p><strong>输入 (我们需要的数据):</strong>
+1.  <strong><code>q_star, k, v</code></strong>: 前向传播时的 Query, Key, Value。
+2.  <strong><code>g</code></strong>: 门控/衰减项 (Gate/Decay)，决定了在这个块里，前面的 Token 对后面的 Token 影响有多大（遗忘机制）。
+3.  <strong><code>h_kv</code></strong>: 这个块 <strong>开始时</strong> 的历史状态（前向传播算出来的）。
+4.  <strong><code>do</code></strong>: <strong>输出的梯度</strong> (Gradient of Output)。这是从后一层传回来的，是反向传播的起点。
+5.  <strong><code>dh_kv</code></strong>: <strong>历史状态的梯度</strong>。这是从下一个块（未来）传回来的梯度。</p>
+<p><strong>输出 (我们要算的结果):</strong>
+1.  <strong><code>dq, dk, dv</code></strong>: Q, K, V 的梯度。
+2.  <strong><code>dg</code></strong>: 门控 G 的梯度。</p>
+<hr />
+<h3>Task 3: 核心逻辑拆解 (The Kernel)</h3>
+<p>这是最难的部分，我们看 <code>chunk_mesa_net_h_kv_bwd_intra_kernel</code> 内部。</p>
+<h4>3.1 读数据 (Loading)</h4>
+<p>代码的前半部分（<code>tl.program_id</code>, <code>tl.make_block_ptr</code>, <code>tl.load</code>）都是在做准备。
+*   <strong>定位</strong>：确定当前 GPU 线程处理的是哪一个 Batch (<code>i_b</code>) 的哪一个 Head (<code>i_h</code>) 的哪一个块 (<code>i_t</code>)。
+*   <strong>加载</strong>：把显存（HBM）里的 $Q, K, V, G, dO$ 等数据加载到 GPU 的片上内存（SRAM）里，变成了 <code>b_q</code>, <code>b_k</code> 等变量。</p>
+<h4>3.2 核心计算流程 (Calculation)</h4>
+<p>这部分代码通过链式法则（Chain Rule）反向计算。</p>
+<p><strong>A. 恢复前向计算的中间量</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算当前块内的 mask (m_t) 和衰减 (b_m)</span>
+<span class="n">b_m</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">exp</span><span class="p">(</span><span class="n">b_g</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">-</span> <span class="n">b_g</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]),</span> <span class="mi">0</span><span class="p">)</span>
+<span class="c1"># K 乘上了一个 beta 系数</span>
+<span class="n">b_k</span> <span class="o">=</span> <span class="p">(</span><span class="n">b_k</span> <span class="o">*</span> <span class="n">b_beta</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">])</span>
+<span class="c1"># 重新计算前向传播时的 Attention Score (S = Q * K^T * Decay)</span>
+<span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span><span class="p">,</span> <span class="n">tl</span><span class="o">.</span><span class="n">trans</span><span class="p">(</span><span class="n">b_k</span><span class="p">))</span> <span class="o">*</span> <span class="n">b_m</span>
+</code></pre></div>
+
+<ul>
+<li>这里重现了前向传播里“块内注意力”的分数。</li>
+</ul>
+<p><strong>B. 计算 Attention Score 的梯度 (dS)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># dS = dO * V^T</span>
+<span class="n">b_ds</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_do</span><span class="p">,</span> <span class="n">tl</span><span class="o">.</span><span class="n">trans</span><span class="p">(</span><span class="n">b_v</span><span class="p">))</span>
+<span class="c1"># 加上衰减项的影响</span>
+<span class="n">b_ds</span> <span class="o">=</span> <span class="n">b_ds</span> <span class="o">*</span> <span class="n">b_m</span>
+</code></pre></div>
+
+<ul>
+<li><code>dO</code> 是输出的梯度，<code>V</code> 是 Value。根据矩阵乘法求导规则，我们可以算出 Attention 分数矩阵 <code>S</code> 的梯度。</li>
+</ul>
+<p><strong>C. 计算 Q, K, V 的梯度 (dQ, dK, dV)</strong>
+这是最复杂的数学部分，代码利用了线性注意力的性质：</p>
+<ol>
+<li><strong>算 <code>dQ</code></strong>:
+    <code>python
+    # dQ 由两部分组成：
+    # 1. 块内注意力的贡献: dS * K
+    b_dq += tl.dot(b_ds.to(b_k.dtype), b_k)
+    # 2. 历史状态对 Q 的影响 (Recurrent part): dO * h_kv * decay
+    b_dq += tl.dot(b_do, b_h.to(b_do.dtype)) * b_g_exp_q[:, None]</code></li>
+<li><strong>算 <code>dK</code></strong>:
+    <code>python
+    # dK 也是两部分：
+    # 1. 块内注意力的贡献: dS^T * Q
+    b_dk += tl.dot(tl.trans(b_ds.to(b_q.dtype)), b_q)
+    # 2. 未来传回来的梯度对 K 的影响: V * dh_kv * decay
+    b_dk += tl.dot(b_v, b_dh.to(b_v.dtype)) * b_g_exp_k[:, None]</code></li>
+<li><strong>算 <code>dV</code></strong>:
+    <code>python
+    # dV 同样两部分：
+    # 1. 块内: S^T * dO
+    b_dv += tl.dot(tl.trans(b_s.to(b_do.dtype)), b_do)
+    # 2. 跨块: K * dh_kv^T * decay
+    b_dv += tl.dot(b_k, tl.trans(b_dh).to(b_k.dtype)) * b_g_exp_k[:, None]</code></li>
+</ol>
+<p><strong>D. 计算门控梯度 (dG)</strong>
+<code>g</code> (Gate) 比较特殊，它参与了所有指数衰减的计算，所以它的梯度是所有相关项的累加。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这一大段就是在把所有用到 g 的地方的梯度加起来</span>
+<span class="n">b_dg</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_dm</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+<span class="n">b_dg</span> <span class="o">-=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_dm</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+<span class="n">b_dg_last</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_dk</span> <span class="o">*</span> <span class="n">b_k</span><span class="p">)</span>
+<span class="c1"># ... 以及更多累加</span>
+</code></pre></div>
+
+<ul>
+<li><code>b_dg</code> 的计算非常繁琐，因为它涉及到“当前时刻对历史的遗忘”以及“当前时刻对未来的影响”。</li>
+</ul>
+<h4>3.3 存数据 (Storing)</h4>
+<p>最后，把算好的 <code>b_dq</code>, <code>b_dk</code>, <code>b_dv</code>, <code>b_dg</code> 写回到显存里。</p>
+<hr />
+<h3>Task 4: 封装与调用 (The Wrapper)</h3>
+<p>看函数 <code>chunk_mesa_net_h_kv_bwd_intra_fn</code>。</p>
+<p>这是 Python 层面的入口。它的工作很简单：
+1.  <strong>检查硬件</strong>：<code>check_shared_mem('ampere')</code>。如果显卡太老或者共享内存不够大，这个 Kernel 跑不了，就去跑备用方案 (<code>_separate_fn</code>)。
+2.  <strong>设置网格 (Grid)</strong>：决定要启动多少个 GPU 线程块。
+    *   <code>NT</code> (时间方向的块数) * <code>B</code> (Batch) * <code>H</code> (Head)。
+3.  <strong>准备 Tensor</strong>：创建空的 <code>dq</code>, <code>dk</code>, <code>dv</code>, <code>dg</code> 用来接结果。
+4.  <strong>发射 Kernel</strong>：调用 Triton 编译好的 Kernel 开始计算。</p>
+<hr />
+<h3>总结：这段代码到底在讲啥？</h3>
+<p><strong>用人话总结：</strong></p>
+<p>这就好比你在整理一本<strong>很长的日记（序列）</strong>，你把日记分成了很多<strong>小册子（Chunk）</strong>。</p>
+<p>这个文件（<code>chunk_h_kv_intra_bwd.py</code>）负责处理<strong>修改建议（反向传播）</strong>。具体来说，当老师告诉你“你这篇日记写得不好（有 Loss）”时，这个代码负责计算：</p>
+<ol>
+<li><strong>小册子内部的逻辑</strong>：这一页的内容对同一本册子里的后几页有什么影响？（Intra-chunk Attention）</li>
+<li><strong>承上启下的逻辑</strong>：这一本册子的开头是怎么承接上一本的？（Initial State $h_{kv}$）以及这一本的内容是怎么影响下一本的？（Gradient from future $dh_{kv}$）</li>
+</ol>
+<p>它把这些复杂的影响关系用数学公式算出来，告诉每一个字（Q, K, V）和每一个转折词（G）：“你需要怎么改，才能让整篇日记变得更好”。</p>

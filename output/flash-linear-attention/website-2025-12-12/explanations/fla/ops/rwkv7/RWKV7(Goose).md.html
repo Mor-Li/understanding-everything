@@ -1,0 +1,116 @@
+<h1>fla/ops/rwkv7/RWKV7(Goose).md</h1>
+<p>这份文档确实写得非常硬核，因为它混合了<strong>数学推导</strong>、<strong>深度学习原理</strong>和<strong>底层代码实现</strong>。看不懂是很正常的。</p>
+<p>为了帮你理解，我把它拆解成一个<strong>5步的学习清单（To-Do List）</strong>。我们像剥洋葱一样，从最直观的概念开始，最后才看代码。</p>
+<hr />
+<h3>✅ Task 1: 建立直觉 —— RWKV-7 和 Transformer 有什么不同？</h3>
+<p><strong>目标</strong>：理解为什么要设计这个架构。</p>
+<ul>
+<li><strong>传统 Transformer (Attention)</strong>：<ul>
+<li><strong>像查字典</strong>。它把所有的历史记忆存成一堆 Key-Value 对（${k, v}$）。</li>
+<li>每次来一个新的 Query ($q$)，它都要回头去查所有的 $k$，找到对应的 $v$。</li>
+<li><strong>缺点</strong>：随着上下文变长，查字典越来越慢，内存占用越来越大。</li>
+</ul>
+</li>
+<li><strong>RWKV-7 (Goose)</strong>：<ul>
+<li><strong>像记笔记/大脑记忆</strong>。它不存原始数据，而是把数据“消化”进一个<strong>状态矩阵 $S$</strong>（State）里。</li>
+<li><strong>核心思想</strong>：与其存储所有历史，不如动态更新这个 $S$。</li>
+<li><strong>优点</strong>：不管读了多少书，大脑（状态 $S$）的大小是不变的。推理速度极快。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 核心机制 —— "模型里的模型" (In-Context Learning)</h3>
+<p><strong>目标</strong>：理解文中提到的 "Dynamic State Evolution"（动态状态演变）。</p>
+<p>文中有一句很关键的话：</p>
+<blockquote>
+<p>RWKV-7 automatically simulates dynamic gradient descent to continuously train its internal model.
+(RWKV-7 自动模拟动态梯度下降来持续训练其内部模型。)</p>
+</blockquote>
+<p>这是 RWKV-7 最天才的地方：
+1.  通常我们训练完模型，参数就固定了。
+2.  但在 RWKV-7 中，<strong>推理过程（Inference）本身也是一种训练过程</strong>。
+3.  想象这个 <strong>状态 $S$</strong> 就是一个小模型的权重。
+4.  每读到一个新词（也就是一对 $k_t, v_t$），RWKV 就用<strong>梯度下降（SGD）</strong>的方法，微调一下 $S$，让 $S$ 记住这个新词的关系。</p>
+<p><strong>简单说：RWKV-7 是一边读文章，一边在脑子里微调参数，试图记住 $k$ 到 $v$ 的映射关系。</strong></p>
+<hr />
+<h3>✅ Task 3: 数学推导 —— 从 SGD 到公式</h3>
+<p><strong>目标</strong>：看懂文中的数学公式是怎么来的。</p>
+<p>文中的推导逻辑如下：</p>
+<ol>
+<li><strong>目标函数</strong>：我们要让状态 $S$ 能够把 $k$ 变成 $v$。<ul>
+<li>公式：$v \approx k^{\top} S$</li>
+<li>Loss（误差）：$L = \frac{1}{2} || v - k^{\top} S ||^2$</li>
+</ul>
+</li>
+<li><strong>计算梯度</strong>：为了减小误差，我们需要知道怎么改 $S$。<ul>
+<li>对 $S$ 求导得到梯度：$\nabla S = S k k^{\top} - v k^{\top}$</li>
+</ul>
+</li>
+<li><strong>更新公式 (SGD)</strong>：新的 $S$ = 旧的 $S$ - 学习率 $\times$ 梯度。<ul>
+<li>$S_t = S_{t-1} - \eta \cdot (S_{t-1} k k^{\top} - v k^{\top})$</li>
+</ul>
+</li>
+<li><strong>整理一下</strong>：<ul>
+<li>$S_t = S_{t-1} (I - \eta k k^{\top}) + \eta v k^{\top}$</li>
+<li>这一步的意思是：<strong>旧状态 $S_{t-1}$ 减去一部分旧信息（遗忘），加上一部分新信息（$v k^{\top}$）</strong>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 进阶 —— 变成 "Goose" (RWKV-7 的具体形式)</h3>
+<p><strong>目标</strong>：理解文中提到的 $w, a, b$ 是什么。</p>
+<p>上面的 SGD 公式是很基础的，RWKV-7 为了更强（更复杂的表达能力），做了“泛化”（Generalization）：</p>
+<ol>
+<li><strong>加入时间衰减 ($w$)</strong>：<ul>
+<li>人脑会遗忘，所以给 $S_{t-1}$ 乘上一个衰减系数 $D_t$（代码里由 $w$ 计算得出）。</li>
+</ul>
+</li>
+<li><strong>泛化更新项 ($a, b$)</strong>：<ul>
+<li>在标准 SGD 里，减去的那一项是 $-\eta S k k^{\top}$。</li>
+<li>RWKV-7 说：我不一定要严格遵守 SGD，我可以让这一项更灵活。</li>
+<li>于是它把 $-\eta k k^{\top}$ 替换成了 $\alpha \beta^{\top}$（代码里叫 $a$ 和 $b$）。</li>
+<li><strong>$a$ (或 $\alpha$)</strong>：可以理解为动态的学习率/遗忘门控。</li>
+<li><strong>$b$ (或 $\beta$)</strong>：可以理解为辅助更新向量。</li>
+</ul>
+</li>
+</ol>
+<p><strong>最终公式（文中的核心公式）：</strong>
+$$S_t = S_{t-1} \cdot \text{Decay} + S_{t-1} a b^{\top} + v k^{\top}$$</p>
+<p>翻译成人话：
+<strong>现在的脑子 = (以前的脑子 $\times$ 遗忘一点) + (根据 $a,b$ 调整以前的记忆) + (写入新的 $v,k$ 知识)</strong></p>
+<hr />
+<h3>✅ Task 5: 代码对应 —— 怎么把公式写成 Python？</h3>
+<p><strong>目标</strong>：看懂 <code>naive_recurrent_rwkv7</code> 函数。</p>
+<p>现在对照代码看，就清晰了：</p>
+<ul>
+<li>
+<p><strong>输入变量</strong>：</p>
+<ul>
+<li><code>q</code> (Query): 就是文中的 $r$。用来从状态 $S$ 中读取输出。</li>
+<li><code>k</code>, <code>v</code>: 输入的键值对，用来更新状态 $S$。</li>
+<li><code>w</code>: 衰减因子（Log space decay）。</li>
+<li><code>a</code>, <code>b</code>: 上面提到的泛化更新项，由神经网络层生成。</li>
+</ul>
+</li>
+<li>
+<p><strong>核心循环 (For loop)</strong>：
+    ```python
+    # 1. 计算衰减率 (Decay)
+    w_t = torch.exp(-torch.exp(w[...])) </p>
+<h1>2. 计算 S * a (公式里的 S·α)</h1>
+<p>sa = (state[...] * a_t[...]).sum(dim=1)</p>
+<h1>3. 更新状态 State</h1>
+<h1>state = (旧状态 * 衰减) + (S·a * b -&gt; 泛化更新项) + (k * v -&gt; 写入新知识)</h1>
+<p>state[...] = w_t[...] * state[...] + sa[...] * b_t[...] + k_t[...] * v_t[...]</p>
+<h1>4. 计算输出 Output = S * q</h1>
+<p>o[...] = (state[...] * q_t[...]).sum(dim=1)
+```</p>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这篇文档讲的是 <strong>RWKV-7 如何利用“在线梯度下降”的数学原理，来设计一个比 Transformer 更高效、且具有强大记忆能力的 RNN 模型。</strong></p>
+<ul>
+<li><strong>看不懂数学？</strong> 记住它是在模拟“一边读一边学”的过程。</li>
+<li><strong>看不懂 $a, b$？</strong> 它们是用来控制“怎么改写记忆”的参数。</li>
+<li><strong>看不懂 Backward Pass？</strong> 那部分讲的是如何训练这个网络本身（反向传播求导），如果你只是想理解模型原理，可以先跳过，只要知道它能通过 PyTorch 自动求导训练即可。</li>
+</ul>

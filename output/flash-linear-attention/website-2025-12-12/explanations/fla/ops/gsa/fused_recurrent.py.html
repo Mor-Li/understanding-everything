@@ -1,0 +1,146 @@
+<h1>fla/ops/gsa/fused_recurrent.py</h1>
+<p>这份代码实现了一种名为 <strong>GSA (Gated Slot Attention)</strong> 的注意力机制。</p>
+<p>为了让你能够理解，我们不能一上来就看代码细节。我们需要先理解它的<strong>核心思想</strong>，然后看<strong>数据流向</strong>，最后再看<strong>代码实现</strong>。</p>
+<p>我为你准备了一个 <strong>5步学习清单 (Todo List)</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>📋 学习清单 (Todo List)</h3>
+<ol>
+<li><strong>概念对齐</strong>：搞清楚 GSA 是什么，为什么要用它？(输入是什么，输出是什么)</li>
+<li><strong>数学直觉</strong>：理解核心的“两步走”逻辑（这是看懂代码的关键）。</li>
+<li><strong>变量对应</strong>：把代码里的字母 ($q, k, v, s, g$) 对应到概念上。</li>
+<li><strong>流程拆解 (Forward)</strong>：看懂 <code>fused_recurrent_gsa_fwd</code> 函数是如何拼接两个核心步骤的。</li>
+<li><strong>内核解析 (Inference)</strong>：看懂 <code>fused_recurrent_gsa_inference_kernel</code> 是如何手动实现循环计算的。</li>
+</ol>
+<hr />
+<h3>✅ Task 1: 概念对齐 (这是什么？)</h3>
+<p><strong>背景</strong>：
+普通的 Transformer (Attention) 计算量很大，随着序列长度变长，计算量呈平方级增长 ($T^2$)。
+<strong>GSA (Gated Slot Attention)</strong> 是一种 <strong>线性 Attention</strong> 或者说 <strong>RNN (循环神经网络)</strong> 的变体。它的特点是计算量随着长度线性增长 ($T$)，非常快，而且省显存。</p>
+<p><strong>核心机制</strong>：
+它引入了一个中间变量叫做 <strong>Slot (插槽/s)</strong>。
+你可以把它想象成一个“中转站”。信息不是直接从 K 传给 V，而是：
+1.  信息先从 K 存入 Slot (形成记忆状态)。
+2.  然后再从 Slot 读出信息传给 V。
+同时，为了控制记忆的遗忘，引入了 <strong>Gate (门控/g)</strong>。</p>
+<hr />
+<h3>✅ Task 2: 数学直觉 (核心的“两步走”)</h3>
+<p>GSA 的运算其实是由 <strong>两个</strong> 类似的循环过程串联起来的。请记住这个结构，代码里完全复刻了这个结构：</p>
+<ul>
+<li>
+<p><strong>第 1 步 (计算注意力分数)</strong>：</p>
+<ul>
+<li>输入：Query ($q$), Key ($k$), Slot ($s$)。</li>
+<li>过程：用 $k$ 和 $s$ 更新一个“记忆状态” ($H_k$)，然后 $q$ 去读取这个状态。</li>
+<li>输出：得到初步的注意力分数 ($ok$)。</li>
+<li><em>直觉：Query 询问 Key，结合 Slot 的上下文，得到了关注度。</em></li>
+</ul>
+</li>
+<li>
+<p><strong>中间处理</strong>：</p>
+<ul>
+<li>对分数做 Softmax，得到概率 ($qv$)。</li>
+</ul>
+</li>
+<li>
+<p><strong>第 2 步 (计算最终输出)</strong>：</p>
+<ul>
+<li>输入：上一步的概率 ($qv$), Slot ($s$), Value ($v$)。</li>
+<li>过程：这次把 $s$ 当作 Key，把 $v$ 当作 Value，更新另一个“记忆状态” ($H_v$)，然后用概率 $qv$ 去读取。</li>
+<li>输出：最终结果 ($o$)。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 变量对应 (代码里的字母代表啥)</h3>
+<p>在文件 <code>fused_recurrent.py</code> 中，你需要重点关注这几个变量：</p>
+<ul>
+<li><code>q</code> (Query): 查询向量。</li>
+<li><code>k</code> (Key): 键向量。</li>
+<li><code>v</code> (Value): 值向量。</li>
+<li><strong><code>s</code> (Slot)</strong>: GSA 特有的插槽向量（维度通常是 $M$）。</li>
+<li><strong><code>g</code> (Gate)</strong>: 遗忘门，决定每一步要保留多少之前的记忆（类似 LSTM 里的 forget gate）。</li>
+<li><code>hk0</code>, <code>hv0</code>: 初始的隐藏状态 (Hidden State)，分别对应上面提到的第1步和第2步的记忆。</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 流程拆解 (Forward 函数)</h3>
+<p>现在我们来看 Python 函数 <code>fused_recurrent_gsa_fwd</code>。它是训练时调用的前向传播函数。你会发现它调用了两次 <code>fused_recurrent_fwd_kernel</code>（这是一个通用的循环算子）。</p>
+<p><strong>代码片段精读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># --- 第一阶段 ---</span>
+<span class="c1"># 目标：计算 ok (注意力分数)</span>
+<span class="c1"># 输入：q, k, s (注意这里把 s 当作 value 传进去了)</span>
+<span class="n">fused_recurrent_fwd_kernel</span><span class="p">[</span><span class="n">grid</span><span class="p">](</span>
+    <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span>
+    <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span>
+    <span class="n">v</span><span class="o">=</span><span class="n">s</span><span class="p">,</span>  <span class="c1"># &lt;--- 重点：这里 s 扮演了 value 的角色</span>
+    <span class="o">...</span>
+    <span class="n">o</span><span class="o">=</span><span class="n">ok</span><span class="p">,</span> <span class="c1"># 输出到 ok</span>
+    <span class="n">h0</span><span class="o">=</span><span class="n">hk0</span><span class="p">,</span>
+    <span class="n">ht</span><span class="o">=</span><span class="n">hkt</span><span class="p">,</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+
+<span class="c1"># 中间处理：Softmax</span>
+<span class="n">qv</span> <span class="o">=</span> <span class="n">ok</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span>
+
+<span class="c1"># --- 第二阶段 ---</span>
+<span class="c1"># 目标：计算 ov (最终输出)</span>
+<span class="c1"># 输入：qv (刚才算出来的概率), s (这里 s 变成了 key), v</span>
+<span class="n">fused_recurrent_fwd_kernel</span><span class="p">[</span><span class="n">grid</span><span class="p">](</span>
+    <span class="n">q</span><span class="o">=</span><span class="n">qv</span><span class="p">,</span> <span class="c1"># &lt;--- 重点：刚才算出的概率变成了 Query</span>
+    <span class="n">k</span><span class="o">=</span><span class="n">s</span><span class="p">,</span>  <span class="c1"># &lt;--- 重点：s 变成了 Key</span>
+    <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span>  <span class="c1"># &lt;--- 重点：v 才是真正的 Value</span>
+    <span class="o">...</span>
+    <span class="n">o</span><span class="o">=</span><span class="n">ov</span><span class="p">,</span> <span class="c1"># 输出到 ov</span>
+    <span class="n">h0</span><span class="o">=</span><span class="n">hv0</span><span class="p">,</span>
+    <span class="n">ht</span><span class="o">=</span><span class="n">hvt</span><span class="p">,</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>总结</strong>：Forward 函数不仅验证了“两步走”的逻辑，还展示了 GSA 如何复用通用的 RNN 算子来实现复杂逻辑。</p>
+<hr />
+<h3>✅ Task 5: 内核解析 (Inference Kernel)</h3>
+<p>文件开头那个一大坨的 <code>fused_recurrent_gsa_inference_kernel</code> 是专门为<strong>推理 (Inference)</strong> 写的 Triton kernel。推理通常是一步一步生成的，或者处理单个序列，所以写在一个 Kernel 里效率更高。</p>
+<p>这个 Kernel 把上面的“两步走”融合在了一个循环里。让我们用伪代码读懂它：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 伪代码逻辑，对应 Triton Kernel</span>
+<span class="k">for</span> <span class="n">每个时间步</span> <span class="n">t</span> <span class="p">(</span><span class="n">或者每个</span> <span class="n">Block</span><span class="p">):</span>
+
+    <span class="c1"># 1. 加载数据</span>
+    <span class="n">加载当前步的</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">g</span>
+
+    <span class="c1"># 2. 第一步循环 (对应 Task 2 的第1步)</span>
+    <span class="c1"># 更新 Key 的隐藏状态 (hk)</span>
+    <span class="c1"># 公式大致为: hk_new = hk_old * gate + k * s</span>
+    <span class="n">b_hk</span> <span class="o">=</span> <span class="n">b_hk</span> <span class="o">*</span> <span class="n">b_g</span> <span class="o">+</span> <span class="n">b_k</span> <span class="o">*</span> <span class="n">b_s</span> 
+    <span class="c1"># 计算分数</span>
+    <span class="n">b_ok</span> <span class="o">+=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">b_hk</span> <span class="o">*</span> <span class="n">b_q</span><span class="p">)</span>
+
+    <span class="c1"># 3. 中间 Softmax</span>
+    <span class="n">b_qv</span> <span class="o">=</span> <span class="n">softmax</span><span class="p">(</span><span class="n">b_ok</span><span class="p">)</span>
+
+    <span class="c1"># 4. 第二步循环 (对应 Task 2 的第2步)</span>
+    <span class="c1"># 更新 Value 的隐藏状态 (hv)</span>
+    <span class="c1"># 公式大致为: hv_new = hv_old * gate + s * v</span>
+    <span class="n">b_hv</span> <span class="o">=</span> <span class="n">b_hv</span> <span class="o">*</span> <span class="n">b_g</span> <span class="o">+</span> <span class="n">b_s</span> <span class="o">*</span> <span class="n">b_v</span>
+    <span class="c1"># 计算输出</span>
+    <span class="n">b_ov</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">b_hv</span> <span class="o">*</span> <span class="n">b_qv</span><span class="p">)</span>
+
+    <span class="c1"># 5. 保存结果</span>
+    <span class="n">store</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="n">b_ov</span><span class="p">)</span>
+    <span class="n">store</span><span class="p">(</span><span class="n">hk</span><span class="p">,</span> <span class="n">hv</span><span class="p">)</span> <span class="c1"># 保存状态给下一步用</span>
+</code></pre></div>
+
+<p><strong>Triton 代码细节点拨：</strong>
+*   <code>i_bh</code>: 表示 Batch 和 Head 的索引。
+*   <code>tl.load</code>: 从显存加载数据。
+*   <code>mask</code>: 处理边界情况（比如维度不是 2 的幂次时）。
+*   <code>scale</code>: 缩放因子（类似 Attention 里的除以根号 d）。
+*   <code>tl.store</code>: 把计算结果写回显存。</p>
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>GSA = (Q, K, S) 循环 -&gt; Softmax -&gt; (Prob, S, V) 循环</strong></p>
+<ul>
+<li><code>fused_recurrent_gsa_fwd</code>: 用两个通用的 RNN kernel 拼凑出这个逻辑，用于训练（因为需要保存中间变量做反向传播）。</li>
+<li><code>fused_recurrent_gsa_inference_kernel</code>: 手写一个融合的 kernel，把两步合并在一起，用于推理（速度最快，显存占用最小）。</li>
+</ul>
+<p>现在回头再看代码，是不是稍微清晰一点了？建议先看 <code>fused_recurrent_gsa_fwd</code> 的那两次调用，这是理解整个算法结构的最快入口。</p>

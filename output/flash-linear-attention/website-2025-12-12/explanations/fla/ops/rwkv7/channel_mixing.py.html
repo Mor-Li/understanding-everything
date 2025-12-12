@@ -1,0 +1,135 @@
+<h1>fla/ops/rwkv7/channel_mixing.py</h1>
+<p>这份代码确实比较硬核，因为它混合了 <strong>PyTorch</strong>（高层逻辑）和 <strong>Triton</strong>（底层 GPU 加速内核）。</p>
+<p>简单来说，这是 <strong>RWKV-v7 模型中 "Channel Mixing"（通道混合）层的具体实现</strong>。在 Transformer 架构中，这对应的是 FFN（前馈神经网络）层，但 RWKV 在这里加入了一个“时间混合”的小技巧（Token Shift）。</p>
+<p>为了让你看懂，我制定了如下的学习 List，我们一步步拆解：</p>
+<h3>📝 学习任务 List (Todo List)</h3>
+<ol>
+<li><strong>核心概念</strong>：搞懂这段代码到底想算个什么公式（数学逻辑）。</li>
+<li><strong>PyTorch 参考版</strong>：看懂代码中提供的 Python 原型函数（这是逻辑的真理）。</li>
+<li><strong>Triton 加速版 (Forward)</strong>：看懂前向传播是如何在 GPU 上并行计算的。</li>
+<li><strong>激活函数</strong>：看懂它用了什么特殊的激活函数。</li>
+<li><strong>反向传播 (Backward)</strong>：了解它是怎么算梯度的（略读即可，知道原理）。</li>
+<li><strong>整合 (Autograd)</strong>：看懂它是怎么把上面这些包成一个 PyTorch 算子的。</li>
+</ol>
+<hr />
+<h3>第一步：核心概念与数学逻辑</h3>
+<p>RWKV 的 Channel Mixing 虽然对应 FFN，但它不像 Transformer 那样只看当前词（Token）。它会<strong>偷看一眼上一个词的信息</strong>。</p>
+<p><strong>它的公式逻辑是这样的：</strong>
+1.  <strong>Token Shift (混合)</strong>：把“当前的输入 $x_t$”和“上一步的输入 $x_{t-1}$”按一定比例 $k$ 混合，得到一个新的向量。
+2.  <strong>投影 (Key)</strong>：把混合后的向量乘一个矩阵 $W_k$。
+3.  <strong>激活</strong>：通过一个激活函数（这里是 $ReLU(x)^2$）。
+4.  <strong>投影 (Value)</strong>：再乘一个矩阵 $W_v$，输出。</p>
+<hr />
+<h3>第二步：看懂 PyTorch 参考版 (<code>rwkv_mix_torch</code>)</h3>
+<p>文件里有一个函数 <code>rwkv_mix_torch</code>，这是最容易看懂的部分，它描述了“Token Shift”是怎么做的。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">rwkv_mix_torch</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">x_prev</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">x_k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+    <span class="c1"># x: 当前序列 [batch, seq_len, dim]</span>
+    <span class="c1"># x_prev: 上一段序列留下的最后一个状态 [batch, 1, dim]</span>
+
+    <span class="c1"># 1. 拼凑出“上一个时刻的 x”</span>
+    <span class="c1"># x[:, :-1, :] 是除了最后一个词的所有词</span>
+    <span class="c1"># 把 x_prev 拼在最前面，这就构成了整体向右移了一位的序列</span>
+    <span class="n">xx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">((</span><span class="n">x_prev</span><span class="p">,</span> <span class="n">x</span><span class="p">[:,</span> <span class="p">:</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="p">:]),</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span> <span class="o">-</span> <span class="n">x</span>
+
+    <span class="c1"># 2. 线性插值 (Lerp)</span>
+    <span class="c1"># 公式：result = x + (x_prev - x) * factor</span>
+    <span class="c1"># 这就是一种平滑的混合，x_k 控制了我们要保留多少当前信息，吸取多少上一步的信息</span>
+    <span class="n">k</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">addcmul</span><span class="p">(</span><span class="n">xx</span><span class="p">,</span> <span class="n">x_k</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">k</span>
+</code></pre></div>
+
+<p><strong>结论</strong>：这步做的事就是：<strong>“拿当前时刻向量，掺杂一点上一时刻的向量”</strong>。</p>
+<hr />
+<h3>第三步：解析 Triton 加速核心 (<code>rwkv_seq_mix_kernel</code>)</h3>
+<p>PyTorch 的 <code>cat</code> 操作在显存里搬运数据很慢，所以作者写了一个 <strong>Triton Kernel</strong> (<code>rwkv_seq_mix_kernel</code>) 来原地完成这个操作。</p>
+<p>这个 Kernel 的任务是：<strong>并行地计算上面的混合公式</strong>。</p>
+<p><strong>代码拆解：</strong>
+1.  <strong>定位线程</strong>：
+    <code>python
+    block_start = tl.program_id(0) * BLOCK_SIZE
+    # ... 计算 batch_idx, seq_idx (第几个词), feat_idx (第几个特征维度)</code>
+    GPU 上的成千上万个线程，每个线程负责算一个或几个具体的数值。</p>
+<ol>
+<li>
+<p><strong>加载数据</strong>：
+    <code>python
+    # 加载当前的 x
+    curr_x = tl.load(x_ptr + x_idx, mask=is_valid, other=0.0)...
+    # 加载混合系数 k
+    k_value = tl.load(mix_k_ptr + feat_idx)...</code></p>
+</li>
+<li>
+<p><strong>获取“上一个时刻”的数据 (难点)</strong>：
+    ```python
+    is_first = seq_idx &lt; 1  # 如果是序列的第0个词</p>
+<h1>情况A: 如果是第0个词，它的“前一个”是上一批次传进来的 x_prev</h1>
+<p>prev_state = tl.load(x_prev_ptr + prev_state_idx, mask=(is_first &amp; is_valid)...)</p>
+<h1>情况B: 如果不是第0个词，它的“前一个”就是当前 tensor 里索引减 1 (减去 hidden_dim) 的位置</h1>
+<p>prev_x_idx = x_idx - hidden_dim
+prev_x = tl.load(x_ptr + prev_x_idx, mask=(~is_first &amp; is_valid)...)</p>
+<h1>二选一</h1>
+<p>prev_value = tl.where(is_first, prev_state, prev_x)
+<code>``
+*解释*：这里避免了 PyTorch 中的</code>cat<code>操作。线程直接去内存里找它前一个位置的数据，如果越界了（是第一个），就去读</code>x_prev`。</p>
+</li>
+<li>
+<p><strong>计算混合</strong>：
+    <code>python
+    state_diff = prev_value - curr_x
+    mixed = state_diff * k_value
+    result = curr_x + mixed</code>
+    这和 Python 版的公式完全一致。</p>
+</li>
+</ol>
+<hr />
+<h3>第四步：解析激活函数 (<code>rwkv_channel_mixing_pow_and_relu</code>)</h3>
+<p>RWKV v7 用了一个比较特殊的激活操作：先 ReLU，再平方。</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@triton</span><span class="o">.</span><span class="n">jit</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">rwkv_channel_mixing_pow_and_relu</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">)</span> <span class="c1"># ReLU: 小于0的变0</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="n">x</span>              <span class="c1"># Square: 平方</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<p><strong>为什么写成 Kernel？</strong> 为了 <strong>“算子融合” (Fusion)</strong>。如果用 PyTorch 写 <code>relu(x) ** 2</code>，GPU 需要读取 x -&gt; 算 relu -&gt; 存 x -&gt; 读取 x -&gt; 算平方 -&gt; 存 x。写成一个 Kernel 后，读取一次就能算完两步，大大节省显存带宽。</p>
+<hr />
+<h3>第五步：反向传播 (Backward)</h3>
+<p>代码中 <code>rwkv_mix_bwd_kenel</code> 和 <code>relu_square_bwd_kernel</code> 是用来训练时算梯度的。</p>
+<ul>
+<li><strong>relu_square_bwd_kernel</strong>: $y = ReLU(x)^2$ 的导数是 $2x$ (当 $x&gt;0$)。</li>
+<li><strong>rwkv_mix_bwd_kenel</strong>: 这是一个极其复杂的 Kernel。因为在前向传播中，时刻 $t$ 用到了 $t-1$ 的数据。所以在反向传播时，计算 $t-1$ 的梯度时，不仅要看 $t-1$ 这一刻产生的误差，还要加上 $t$ 时刻因为“偷看” $t-1$ 而传回来的误差。</li>
+</ul>
+<p><strong>核心逻辑</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算当前位置的梯度贡献</span>
+<span class="n">dx_val</span> <span class="o">=</span> <span class="n">dk1</span> <span class="o">-</span> <span class="n">prod</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">mask_next</span><span class="p">,</span> <span class="n">prod_next</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这行代码处理了时间依赖性：<code>prod</code> 是当前时刻的梯度扣除，<code>prod_next</code> 是下一个时刻传回来的梯度。</p>
+<hr />
+<h3>第六步：整合流程 (<code>Rwkv7ChannelMixing</code>)</h3>
+<p>最后，<code>class Rwkv7ChannelMixing(torch.autograd.Function)</code> 把上面所有东西打包给 PyTorch 用。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">x_prev</span><span class="p">,</span> <span class="n">x_k</span><span class="p">,</span> <span class="n">key_weight</span><span class="p">,</span> <span class="n">value_weight</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 1. 混合 (Token Shift) - 调用 Triton Kernel</span>
+    <span class="n">k1</span> <span class="o">=</span> <span class="n">rwkv_mix_fwd</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">x_prev</span><span class="p">,</span> <span class="n">x_k</span><span class="p">)</span>
+
+    <span class="c1"># 2. 投影 (Linear) - 使用 PyTorch 的矩阵乘法</span>
+    <span class="n">k1_K</span> <span class="o">=</span> <span class="n">k1</span> <span class="o">@</span> <span class="n">key_weight</span>
+
+    <span class="c1"># 3. 激活 (ReLU^2) - 调用 Triton Kernel</span>
+    <span class="n">k</span> <span class="o">=</span> <span class="n">rwkv_relu_and_square_fwd</span><span class="p">(</span><span class="n">k1_K</span><span class="p">,</span> <span class="n">inplace</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+    <span class="c1"># 4. 保存变量给反向传播用</span>
+    <span class="n">ctx</span><span class="o">.</span><span class="n">save_for_backward</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 5. 输出投影 (Linear)</span>
+    <span class="k">return</span> <span class="n">k</span> <span class="o">@</span> <span class="n">value_weight</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这个文件的作用是：
+<strong>高效地执行 RWKV-v7 的 FFN 层。</strong></p>
+<p>它之所以难懂，是因为作者<strong>为了快</strong>（高性能），没有直接用 PyTorch 简单的几行代码（如 <code>rwkv_mix_torch</code>），而是手动编写了 CUDA (Triton) 代码来：
+1.  <strong>减少显存读写</strong>（把 Shift 和 Mix 融合，把 ReLU 和 Square 融合）。
+2.  <strong>避免内存复制</strong>（不用 <code>torch.cat</code> 创建新 Tensor）。</p>
+<p>你只需要理解：<strong>它就是在算 Input -&gt; Mix(Input, Prev) -&gt; MatMul -&gt; ReLU² -&gt; MatMul -&gt; Output</strong> 这一条流水线。</p>

@@ -1,0 +1,109 @@
+<h1>fla/layers/log_linear_mamba2.py</h1>
+<p>完全理解，这段代码确实非常硬核。它结合了 <strong>Mamba2</strong>（一种状态空间模型 SSM）和 <strong>Log-Linear Attention</strong>（一种线性注意力机制的变体）。</p>
+<p>为了让你看懂，我们把阅读这段代码想象成<strong>“组装一台精密机器（LogLinearMamba2 层）并让它运行一次”</strong>的过程。</p>
+<p>我为你列了一个 <strong>Task Todo List</strong>，我们一步步把这台机器拆解开：</p>
+<h3>📝 任务清单：理解 LogLinearMamba2</h3>
+<h4>✅ Task 1: 搞清楚这台机器是干嘛的 (宏观定位)</h4>
+<ul>
+<li><strong>文件名</strong>：<code>log_linear_mamba2.py</code>。</li>
+<li><strong>身份</strong>：这是一个神经网络的<strong>层（Layer）</strong>，就像 Transformer 里的 Attention 层一样。</li>
+<li><strong>核心逻辑</strong>：它试图结合 Mamba 的长序列处理能力和 Attention 的某些特性。</li>
+<li><strong>输入</strong>：一句话的特征向量（比如 <code>[Batch, Length, Hidden_Size]</code>）。</li>
+<li><strong>输出</strong>：处理后的特征向量（形状不变）。</li>
+</ul>
+<hr />
+<h4>✅ Task 2: 检查零件清单 (<code>__init__</code> 函数)</h4>
+<p>在机器启动前，我们需要看看它肚子里有哪些核心零件（参数）：</p>
+<ol>
+<li><strong>输入/输出投影 (<code>in_proj</code>, <code>out_proj</code>)</strong>：<ul>
+<li>把输入的向量“变宽”，方便内部处理；处理完再“变窄”回原来的大小。</li>
+</ul>
+</li>
+<li><strong>局部卷积 (<code>conv1d</code>)</strong>：<ul>
+<li>这是一个很短的卷积核（通常大小为4）。它的作用是<strong>“看一眼邻居”</strong>，捕捉非常局部的上下文信息（比如“不”后面常跟“是”）。</li>
+</ul>
+</li>
+<li><strong>SSM 参数 (Mamba 的灵魂)</strong>：<ul>
+<li><code>A_log</code>：状态衰减参数（决定遗忘多少历史信息）。</li>
+<li><code>D</code>：跳跃连接参数（Skip connection）。</li>
+<li><code>dt_bias</code>：时间步长的偏置。</li>
+</ul>
+</li>
+<li><strong>Log-Linear 特有参数 (新零件)</strong>：<ul>
+<li><code>L</code> (Lambda levels)：这是这个变体特有的。它定义了多层级的衰减率（Scales），用于控制注意力机制中的“层级”结构。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 3: 启动机器 - 数据预处理 (<code>forward</code> -&gt; <code>cuda_kernels_forward</code>)</h4>
+<p>当数据 <code>hidden_states</code> 进来时，第一步发生了什么？</p>
+<ol>
+<li><strong>扩维 (Projection)</strong>：<ul>
+<li>数据通过 <code>in_proj</code> 变得非常宽。</li>
+</ul>
+</li>
+<li><strong>切分 (Split)</strong>：<ul>
+<li>变宽后的数据被切成了好几块，分别叫 <code>gate</code>, <code>xBC</code>, <code>dt</code>, <code>dl</code>。</li>
+<li><code>gate</code>：门控信号，决定最后输出多少信息。</li>
+<li><code>xBC</code>：包含输入信息(x)和控制动态的参数(B, C)。</li>
+<li><code>dt</code>：时间步长（step size），控制信息流动的速度。</li>
+<li><code>dl</code>：<strong>这是新面孔</strong>，对应 Log-Linear 中的 lambda delta，控制层级衰减的动态变化。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 4: 局部处理 (Convolution)</h4>
+<ul>
+<li><strong>动作</strong>：拿着 <code>conv1d</code> 对 <code>xBC</code> 进行卷积。</li>
+<li><strong>目的</strong>：在进行复杂的长期记忆处理前，先让每个词与其前后的词“交流”一下，平滑局部特征。</li>
+<li><strong>结果</strong>：卷积后的数据被再次切分为 <code>x</code> (值), <code>B</code> (键/控制), <code>C</code> (查询/控制)。</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 核心魔法 - 混合扫描 (<code>hmamba_chunk_scan_combined</code>)</h4>
+<p>这是全文件最难懂的地方，也是这台机器的引擎。</p>
+<ul>
+<li><strong>传统 Mamba</strong>：使用 <code>selective_scan</code>，公式是 $h_t = A h_{t-1} + B x_t$。</li>
+<li><strong>Log-Linear Mamba (这里)</strong>：<ul>
+<li>它调用了 <code>chunk_log_linear_attn</code>。</li>
+<li><strong>映射关系</strong>：<ul>
+<li><code>C</code> 变成了 <strong>Query (Q)</strong>。</li>
+<li><code>B</code> 变成了 <strong>Key (K)</strong>。</li>
+<li><code>x</code> 变成了 <strong>Value (V)</strong>。</li>
+<li><code>A</code> 和 <code>dt</code> 生成了 <strong>Gate (g)</strong>（衰减系数）。</li>
+<li><code>L</code> 和 <code>dl</code> 生成了 <strong>Level Scales</strong>（层级缩放）。</li>
+</ul>
+</li>
+<li><strong>直白解释</strong>：它不再仅仅是简单的线性递归，而是把 Mamba 的参数映射成了 Attention 的 Q/K/V 形式，并加上了一个基于 <code>L</code> (层级) 的指数衰减机制。这允许模型在处理长序列时，既有 Mamba 的线性速度，又有类似 Attention 的查询能力。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 6: 组装输出 (Output)</h4>
+<p>核心引擎跑完后，得到了结果 <code>y</code>：</p>
+<ol>
+<li><strong>加残差</strong>：如果定义了 <code>D</code>，就把原始输入的一点点信息直接加到 <code>y</code> 上（<code>y = y + D * x</code>）。</li>
+<li><strong>门控与归一化 (Norm &amp; Gate)</strong>：<ul>
+<li>把 Task 3 里切出来的 <code>gate</code> 拿过来。</li>
+<li>对 <code>y</code> 做 RMSNorm 归一化。</li>
+<li>将归一化后的 <code>y</code> 乘以 <code>gate</code>（Sigmoid激活）。这步叫 SwiGLU 结构，用来筛选有效信息。</li>
+</ul>
+</li>
+<li><strong>最终投影</strong>：<ul>
+<li>通过 <code>out_proj</code> 把维度变回最初的大小。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这段代码到底在讲啥？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>魔改版的 Mamba2 层</strong>。它保留了 Mamba2 的整体架构（投影 -&gt; 卷积 -&gt; 状态空间 -&gt; 门控），但把中间最核心的“状态空间扫描（SSM Scan）”替换成了一种<strong>基于 Log-Linear 的分块注意力机制（Chunk Log-Linear Attention）</strong>。</p>
+<p><strong>为什么要这么做？</strong>
+*   <strong>Mamba</strong> 擅长推理速度快（线性复杂度）。
+*   <strong>Attention</strong> 擅长“回忆”以前的具体细节。
+*   <strong>Log-Linear Mamba</strong> 试图引入多层级（Levels/Lambdas）的衰减机制，让模型能更精细地控制“记住什么”和“忘掉什么”，同时保持计算效率。</p>
+<h3>你的阅读建议：</h3>
+<ol>
+<li><strong>不要纠结 <code>einops.rearrange</code></strong>：那些只是在调整张量的形状（比如把头数 <code>h</code> 放到前面还是后面），跳过不影响理解逻辑。</li>
+<li><strong>重点看 <code>hmamba_chunk_scan_combined</code></strong>：这是新旧 Mamba 的分水岭。</li>
+<li><strong>忽略 <code>cuda_kernels_forward</code> 中的 <code>cache</code> 部分</strong>：那是为了推理（生成文本）加速用的，训练时看 <code>else</code> 分支（Fused kernel 部分）即可。</li>
+</ol>

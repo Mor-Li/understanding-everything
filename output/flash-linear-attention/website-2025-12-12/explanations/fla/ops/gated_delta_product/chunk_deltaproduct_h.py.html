@@ -1,0 +1,118 @@
+<h1>fla/ops/gated_delta_product/chunk_deltaproduct_h.py</h1>
+<p>这份代码确实非常硬核，因为它不是普通的Python业务逻辑，而是用 <strong>OpenAI Triton</strong> 编写的高性能 <strong>GPU内核（Kernel）</strong> 代码。</p>
+<p>它的核心功能是实现一种名为 <strong>"Gated Delta Product"</strong> 的算法（通常用于线性Attention或RNN变体，比如DeltaNet）。简单来说，它在计算如何在序列处理过程中更新“记忆”（Hidden State）。</p>
+<p>为了让你看懂，我列了一个 <strong>“学习任务清单 (Todo List)”</strong>，我们将代码拆解成5个具体的任务，一步步攻克。</p>
+<hr />
+<h3>📝 任务清单：从概念到代码</h3>
+<h4>✅ Task 1: 搞懂核心数学逻辑（它在算什么？）</h4>
+<p>在看代码前，必须知道它想实现的公式。
+这并不是标准的 Transformer Attention，而是一种 <strong>RNN（递归神经网络）</strong> 的变体。</p>
+<p>想象你有一个巨大的“记忆矩阵” $H$（Hidden State）。
+对于序列中的每一个时间步 $t$，我们有输入 $k_t, v_t, w_t$。更新逻辑如下：</p>
+<ol>
+<li><strong>读取记忆</strong>：用 $w_t$ 去查询当前的记忆 $H_{t-1}$，得到一个预测值。<ul>
+<li><code>pred = w_t * H_{t-1}</code></li>
+</ul>
+</li>
+<li><strong>计算差值 (Delta)</strong>：比较输入 $v_t$ 和预测值的差距。<ul>
+<li><code>v_new = v_t - pred</code>  (这就是代码里的 <code>v_new</code>)</li>
+</ul>
+</li>
+<li><strong>更新记忆</strong>：把这个差值，通过 $k_t$ 写入回记忆矩阵 $H$ 中。<ul>
+<li><code>H_t = H_{t-1} + k_t * v_new</code></li>
+</ul>
+</li>
+<li><strong>门控 (Gating)</strong>：代码里还有一个 $g$ (gate)，用来控制记忆的衰减（遗忘）。</li>
+</ol>
+<p><strong>总结：</strong> 这段代码就是在 GPU 上极其高效地执行这个 <code>Read -&gt; Subtract -&gt; Write</code> 的循环。</p>
+<hr />
+<h4>✅ Task 2: 理解 "Chunk" (分块) 策略</h4>
+<p>文件名叫 <code>chunk_deltaproduct</code>。为什么要有 Chunk？</p>
+<ul>
+<li><strong>问题</strong>：RNN 是串行的（必须算完 $t=1$ 才能算 $t=2$），在 GPU 上跑很慢。</li>
+<li><strong>解决</strong>：把长序列切成很多小块（Chunk），比如每块长度 <code>BT=64</code>。<ul>
+<li>块<strong>内</strong>：依然是串行计算，但因为块很小，速度很快。</li>
+<li>块<strong>间</strong>：传递 Hidden State ($h$)。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码对应：</strong>
+*   <code>BT</code>: Block Time，时间维度的块大小。
+*   <code>BV</code>: Block Value，Value维度的块大小。
+*   <code>NT</code>: Number of Chunks，块的总数量。</p>
+<hr />
+<h4>✅ Task 3: 拆解 Forward Kernel (前向传播)</h4>
+<p>这是文件中第一个大函数 <code>chunk_gated_delta_product_fwd_kernel_h_blockdim64</code>。</p>
+<p><strong>核心流程解读：</strong></p>
+<ol>
+<li>
+<p><strong>准备工作 (Setup)</strong>：</p>
+<ul>
+<li><code>i_v, i_nh</code>: 确定当前 GPU 线程负责计算哪一部分数据（哪个 Head，哪一段 Value）。</li>
+<li><code>tl.load(...)</code>: 把 $k, v, w$ 等数据从显存加载到 GPU 的片上内存（SRAM）。</li>
+<li><strong>手动分块技巧</strong>：你会看到 <code>b_h1</code>, <code>b_h2</code>, <code>b_h3</code>, <code>b_h4</code>。这是因为 Triton 编译器有时候处理超大矩阵（比如 K &gt; 64）会溢出，所以作者手动把大矩阵切成了几个 <code>64xBV</code> 的小矩阵来存。</li>
+</ul>
+</li>
+<li>
+<p><strong>主循环 (Main Recurrence)</strong>：</p>
+<ul>
+<li><code>for i_t in range(NT):</code> 这是一个循环，遍历所有的 Chunk。</li>
+<li><strong>核心步骤 A (计算 $v_{new}$)</strong>:
+    <code>python
+    # 相当于公式：v_new = v - w * h
+    b_v_new += tl.dot(b_w, b_h1...) # 1. 计算 w * h
+    b_v_new = -b_v_new + tl.load(p_v...) # 2. 用 v 减去它</code></li>
+<li><strong>核心步骤 B (应用 Gate $g$)</strong>:
+    <code>python
+    # 如果有 gate，就让 v_new 和 h 衰减一下
+    if USE_G:
+        b_v_new = b_v_new * ... exp(b_g_last - b_g)
+        b_h1 = b_h1 * b_g_last ...</code></li>
+<li><strong>核心步骤 C (更新 $h$)</strong>:
+    <code>python
+    # 相当于公式：h = h + k * v_new
+    b_h1 += tl.dot(b_k, b_v_new)</code></li>
+<li><strong>保存状态</strong>:
+    每算完一个 Chunk，把当前的 $h$ 存下来 (<code>tl.store</code>)，供下一个 Chunk 或者反向传播使用。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 4: 拆解 Backward Kernel (反向传播)</h4>
+<p>这是第二个大函数 <code>chunk_gated_delta_product_bwd_kernel_dhu_blockdim64</code>。</p>
+<ul>
+<li><strong>目的</strong>：训练神经网络需要计算梯度（Gradients）。</li>
+<li><strong>逻辑</strong>：前向传播是从 $t=0$ 算到 $t=T$。反向传播通常是 <strong>时间倒流</strong>，从 $t=T$ 算回 $t=0$。</li>
+<li><strong>代码特征</strong>：<ul>
+<li><code>for i_t in range(NT - 1, -1, -1):</code> 看到这个了吗？倒着循环。</li>
+<li>它计算 <code>dh</code> (h的梯度), <code>dv</code> (v的梯度) 等。</li>
+<li>逻辑极其复杂，本质上是前向传播公式的链式法则逆运算。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 理解 Python 包装函数 (Wrapper)</h4>
+<p>文件底部的 <code>chunk_gated_delta_product_fwd_h</code> 和 <code>_bwd_dhu</code> 是给 PyTorch 调用的接口。</p>
+<ul>
+<li><strong>作用</strong>：<ol>
+<li>检查输入维度 (<code>B, T, H, K, V</code>)。</li>
+<li>计算 Grid 大小（决定启动多少个 GPU 线程块）。</li>
+<li>调用上面的 Triton Kernel。</li>
+<li>返回结果 Tensor。</li>
+</ol>
+</li>
+<li><strong>关键点</strong>：<ul>
+<li><code>IS_VARLEN</code> / <code>cu_seqlens</code>: 处理“变长序列”。比如一个 Batch 里有一句话长 10，另一句长 100，这个参数帮助 Kernel 知道每一句话的起止位置，把它们拼在一起算，避免 Padding 浪费计算资源。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结一下这篇文章的“中心思想”</h3>
+<p>这个文件实现了一个 <strong>带有门控机制的线性记忆更新算子</strong>。</p>
+<ol>
+<li><strong>输入</strong>：Key ($k$), Value ($v$), Query/Write ($w$), Gate ($g$)。</li>
+<li><strong>过程</strong>：在时间轴上，不断用 $w$ 读取记忆，算出误差，再用 $k$ 把误差写回记忆。</li>
+<li><strong>技术栈</strong>：使用 Triton 语言编写，利用分块（Chunking）并行，手动管理 GPU 寄存器（那些 <code>b_h1, b_h2...</code>），以达到极致的计算速度。</li>
+</ol>
+<p><strong>建议阅读顺序：</strong>
+先看 <code>chunk_gated_delta_product_fwd_kernel_h_blockdim64</code> 中的 <code>for</code> 循环部分，那是算法的灵魂。其他的代码大多是在处理数据加载、指针移动和内存边界检查。</p>

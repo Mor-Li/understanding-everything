@@ -1,0 +1,75 @@
+<h1>fla/models/modeling_layers.py</h1>
+<p>这段代码看起来确实充满了术语，但它的核心目的其实非常单一：<strong>为了省显存（GPU Memory）</strong>。</p>
+<p>它定义了一个名为 <code>GradientCheckpointingLayer</code> 的类，这个类是一个“基类”（Base Class），意味着其他的神经网络层（比如 Attention 层）会继承它，从而获得<strong>“梯度检查点”（Gradient Checkpointing）</strong>的功能。</p>
+<p>为了让你彻底理解，我把它拆解成一个 <strong>4步走的 Task List（任务清单）</strong>，我们一步步来完成这个思维导图。</p>
+<hr />
+<h3>Task 1: 理解背景 —— 什么是“梯度检查点”？</h3>
+<p><strong>目标</strong>：明白为什么我们需要这个类。</p>
+<ul>
+<li><strong>问题</strong>：训练大模型（LLM）时，显存经常不够用。因为模型在“前向传播”（Forward）时，会把每一层的中间结果（Activations）都存下来，留着“反向传播”（Backward）算梯度时用。层数越多，存的东西越多，显存就爆了。</li>
+<li><strong>解决方案</strong>：<strong>Gradient Checkpointing（梯度检查点）</strong>。<ul>
+<li><strong>策略</strong>：我不存中间结果了！等反向传播需要用到的时候，我再<strong>重新算一遍</strong>。</li>
+<li><strong>代价</strong>：用“时间”换“空间”。计算慢了一点点，但显存省下了很多，可以训练更大的模型。</li>
+</ul>
+</li>
+<li><strong>代码的作用</strong>：这个类就是一个开关管理器。如果开启了这个功能，它就负责指挥模型：“别存中间结果，一会儿重算”。</li>
+</ul>
+<hr />
+<h3>Task 2: 阅读核心逻辑 —— <code>__call__</code> 方法</h3>
+<p><strong>目标</strong>：看懂代码是怎么拦截模型运行的。</p>
+<p>代码里的 <code>__call__</code> 方法是每次模型被调用（计算）时都会执行的地方。</p>
+<p><strong>它的逻辑流如下（伪代码）：</strong></p>
+<ol>
+<li><strong>检查开关</strong>：<ul>
+<li><code>if self.gradient_checkpointing and self.training:</code></li>
+<li>意思就是：<strong>如果</strong>开启了省显存模式（checkpointing），<strong>并且</strong>模型正在训练中（training），那我们就进入“特殊处理模式”。</li>
+<li><strong>否则</strong>（如果是推理或者没开开关）：直接按普通方式运行 (<code>return super().__call__(*args, **kwargs)</code>)。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 3: 处理冲突 —— 为什么要关掉 Cache？</h3>
+<p><strong>目标</strong>：理解中间那一堆 <code>if "use_cache" in kwargs...</code> 是在干嘛。</p>
+<ul>
+<li><strong>冲突点</strong>：<ul>
+<li><strong>KV Cache (<code>use_cache</code>)</strong>：这是为了<strong>加速推理</strong>用的，它把算过的东西存下来，下次直接用。</li>
+<li><strong>Checkpointing</strong>：这是为了<strong>省显存训练</strong>用的，它故意不存东西，下次重算。</li>
+<li>这两个逻辑是<strong>互斥</strong>的。你不能一边说“我要重算以省内存”，一边又说“我要把所有历史都存下来以加速”。</li>
+</ul>
+</li>
+<li><strong>代码行为</strong>：<ul>
+<li>代码里那一长串的 <code>if</code> 语句（检查 <code>use_cache</code>, <code>past_key_value</code>, <code>layer_past</code> 等），就是在做<strong>清理工作</strong>。</li>
+<li>如果发现你开启了 checkpointing，却还传了 <code>use_cache=True</code>，它会强制把它改成 <code>False</code>（None），并且打印一条警告日志（<code>logger.warning_once</code>），告诉你：“嘿，省显存模式下不能用缓存，我帮你关了哦”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 核心操作 —— 这一行最难的代码</h3>
+<p><strong>目标</strong>：看懂最后那句 <code>return self._gradient_checkpointing_func(...)</code>。</p>
+<p>这是最关键的一步，代码如下：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_gradient_checkpointing_func</span><span class="p">(</span><span class="n">partial</span><span class="p">(</span><span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__call__</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">),</span> <span class="o">*</span><span class="n">args</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>拆解解释：</strong></p>
+<ol>
+<li><strong><code>super().__call__</code></strong>：这是该层原本的计算逻辑（比如原本的 Attention 计算）。</li>
+<li><strong><code>partial(..., **kwargs)</code></strong>：这是一个 Python 技巧。它把原本计算逻辑和一些参数（关键字参数，比如 <code>mask=...</code>）打包封存起来，变成一个“待执行的函数包”。</li>
+<li><strong><code>*args</code></strong>：这是位置参数（比如 <code>hidden_states</code>，即输入的数据）。<ul>
+<li><strong>为什么要分开传？</strong> 文档里的 <strong>Important</strong> 部分专门解释了这个。为了让 PyTorch 能够正确地追踪梯度的流动，<strong>输入数据（需要算梯度的张量）必须作为位置参数（<code>*args</code>）传入</strong>，而不能作为关键字参数。</li>
+</ul>
+</li>
+<li><strong><code>_gradient_checkpointing_func</code></strong>：这是 PyTorch 提供的一个魔法函数（通常是 <code>torch.utils.checkpoint.checkpoint</code>）。<ul>
+<li>它的作用是：<strong>运行</strong> 那个打包好的函数，但是<strong>不保存</strong>中间显存。等到反向传播时，它会自动重新运行一遍这个函数来恢复数据。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结（Takeaway）</h3>
+<p>如果把这个文件看作一个 <strong>“省电管家”</strong>：</p>
+<ol>
+<li><strong>Task 1</strong>：它的目的是为了在电量（显存）不够时，开启省电模式。</li>
+<li><strong>Task 2</strong>：每次你用电器（运行层）时，它先检查有没有开省电模式。</li>
+<li><strong>Task 3</strong>：如果开了省电模式，它会强制关掉高性能模式（Cache），并通知你。</li>
+<li><strong>Task 4</strong>：它用一种特殊的方式（Checkpointing Function）来运行电器，虽然稍微慢点，但能保证不跳闸（OOM）。</li>
+</ol>
+<p>现在再回头看代码，是不是清晰很多了？</p>

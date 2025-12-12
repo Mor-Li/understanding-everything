@@ -1,0 +1,112 @@
+<h1>fla/ops/gated_delta_product/naive.py</h1>
+<p>这段代码确实比较硬核，它属于<strong>线性注意力（Linear Attention）</strong>或者<strong>状态空间模型（SSM）</strong>的前沿变体。简单来说，它试图用类似 RNN（循环神经网络）的方式来实现 Transformer 的效果，但加入了一种特殊的“修正机制”（Delta Rule）。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>6步的学习清单 (Todo List)</strong>。我们把这个函数看作一个<strong>“正在记笔记的抄写员”</strong>。</p>
+<hr />
+<h3>📋 学习清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 01: 理解核心角色 (输入变量)</strong></li>
+<li><strong>Task 02: 理解“大脑” (Hidden State $h$)</strong></li>
+<li><strong>Task 03: 第一步操作 —— 遗忘 (Gating)</strong></li>
+<li><strong>Task 04: 核心操作 —— 修正记忆 (Delta Rule Update)</strong></li>
+<li><strong>Task 05: 什么是 <code>num_householder</code> (多次修正)</strong></li>
+<li><strong>Task 06: 输出结果 (Readout)</strong></li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>Task 01: 理解核心角色 (输入变量)</h4>
+<p>首先看函数的输入参数，想象这是一个抄写员在处理一连串的信息：</p>
+<ul>
+<li><strong><code>q</code> (Query)</strong>: 当前时刻的问题。抄写员要根据记忆回答这个问题。</li>
+<li><strong><code>k</code> (Key), <code>v</code> (Value)</strong>: 新进来的知识。$K$ 是知识的“索引/关键词”，$V$ 是具体的“内容”。</li>
+<li><strong><code>g</code> (Gate)</strong>: 遗忘门。决定抄写员要忘记多少之前的旧知识。</li>
+<li><strong><code>beta</code></strong>: 学习率。决定抄写员把新知识写入记忆时有多“用力”。</li>
+</ul>
+<p><strong>注意点</strong>：你会发现 $K$ 和 $V$ 的形状里有一个 <code>T * num_householder</code>。这意味着：<strong>每一个时间步（Time Step），我们可能有多次更新数据的机会</strong>。</p>
+<h4>Task 02: 理解“大脑” (Hidden State $h$)</h4>
+<p>看这行代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">h</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>在普通 Transformer 里，历史是把所有 KV 存成一个长长的列表。</li>
+<li>在这里（RNN模式），历史被压缩成了一个矩阵 <strong>$h$</strong>。</li>
+<li><strong>$h$ 的含义</strong>：可以把它看作一个<strong>“映射表”</strong>或者<strong>“模型参数”</strong>。它的作用是：给你一个 $K$，它能通过计算预测出对应的 $V$。</li>
+<li>形状 <code>[H, K, V]</code>：对于每个注意力头（Head），它是一个 $K \times V$ 的矩阵。</li>
+</ul>
+<h4>Task 03: 第一步操作 —— 遗忘 (Gating)</h4>
+<p>进入时间循环 <code>for i in range(T):</code> 后的第一件事：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">g</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">h</span> <span class="o">=</span> <span class="n">h</span> <span class="o">*</span> <span class="n">g</span><span class="p">[:,</span> <span class="n">i</span><span class="p">,</span> <span class="p">:]</span><span class="o">.</span><span class="n">exp</span><span class="p">()[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是<strong>遗忘机制</strong>。</li>
+<li>$g$ 是一个对数空间的衰减系数。<code>exp()</code> 之后变成了 $(0, 1)$ 之间的数值。</li>
+<li><strong>直觉</strong>：抄写员在学习新知识前，先把脑子里的旧记忆通过乘以一个系数（比如 0.9）淡化一点。这让模型更关注最近的信息。</li>
+</ul>
+<h4>Task 04: 核心操作 —— 修正记忆 (Delta Rule Update)</h4>
+<p>这是最难懂的部分，对应代码中的：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算预测误差 (Residual / Error)</span>
+<span class="n">prediction</span> <span class="o">=</span> <span class="p">(</span><span class="n">h</span> <span class="o">*</span> <span class="n">k_ij</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">])</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span> 
+<span class="n">error</span> <span class="o">=</span> <span class="n">v_ij</span> <span class="o">-</span> <span class="n">prediction</span>
+
+<span class="c1"># 更新记忆矩阵 h</span>
+<span class="n">h</span> <span class="o">=</span> <span class="n">h</span> <span class="o">+</span> <span class="n">error</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span> <span class="o">*</span> <span class="n">k_ij</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">beta_ij</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span>
+</code></pre></div>
+
+<p><em>(注：为了方便理解，我把代码逻辑简化重写了一下，原代码是一行写完的)</em></p>
+<ul>
+<li>
+<p><strong>发生了什么？</strong> 这其实是一个<strong>“即时训练”</strong>的过程（Delta Rule）。</p>
+<ol>
+<li><strong>预测</strong>：用当前的脑子 $h$ 和新来的关键词 $k$，试着回忆内容：$h \times k$。</li>
+<li><strong>找茬</strong>：看看回忆出来的内容和真实内容 $v$ 差多少？即 <code>v - (h * k)</code>。</li>
+<li><strong>修正</strong>：根据这个差值（Error），去修改脑子 $h$。</li>
+<li><strong>Beta</strong>：<code>beta</code> 控制修改的幅度。</li>
+</ol>
+</li>
+<li>
+<p><strong>结论</strong>：这不仅仅是简单的“把 $v$ 加进 $h$”，而是<strong>“根据 $h$ 当前的缺陷，针对性地填补 $h$ 缺失的知识”</strong>。</p>
+</li>
+</ul>
+<h4>Task 05: 什么是 <code>num_householder</code> (多次修正)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_householder</span><span class="p">):</span>
+    <span class="n">k_ij</span> <span class="o">=</span> <span class="n">k</span><span class="p">[:,</span> <span class="n">i</span><span class="o">*</span><span class="n">num_householder</span><span class="o">+</span><span class="n">j</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+    <span class="o">...</span>
+    <span class="n">h</span> <span class="o">=</span> <span class="n">h</span> <span class="o">+</span> <span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：在一个时间步 $i$ 内，代码并没有只做一次“修正”，而是做了一个小循环 <code>j</code>。</li>
+<li><strong>为什么？</strong> 就像你背单词，看一眼可能记不住。这个 <code>num_householder</code> 就是让你在这一刻，<strong>对着这个知识点反复背几次</strong>（或者用稍微不同的角度背几次），把记忆矩阵 $h$ 更新得更完美，更准确地记住当前的 $k$ 和 $v$。</li>
+<li>这也解释了为什么输入里的 $K$ 和 $V$ 长度是 <code>T * num_householder</code>。</li>
+</ul>
+<h4>Task 06: 输出结果 (Readout)</h4>
+<p>循环的最后一步：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">q_i</span> <span class="o">=</span> <span class="n">q</span><span class="p">[:,</span> <span class="n">i</span><span class="p">,</span> <span class="p">:,</span> <span class="p">:]</span>
+<span class="n">o_i</span> <span class="o">=</span> <span class="p">(</span><span class="n">h</span> <span class="o">*</span> <span class="n">q_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">])</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+<span class="n">o</span><span class="p">[:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">o_i</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：现在脑子 $h$ 已经更新完了（遗忘了旧的，记住了新的）。</li>
+<li><strong>操作</strong>：拿着当前的问题 $q$，去询问脑子 $h$。</li>
+<li><strong>计算</strong>：$o = h \times q$。</li>
+<li><strong>直觉</strong>：根据更新后的记忆，生成当前的注意力输出。</li>
+</ul>
+<hr />
+<h3>🚀 总结 (大白话版)</h3>
+<p>这个函数 <code>naive_recurrent_gated_delta_product</code> 做的事情是：</p>
+<ol>
+<li>创建一个空的记忆矩阵 <strong>$h$</strong>。</li>
+<li>对于每一个时刻：<ul>
+<li>先<strong>淡忘</strong>一点旧记忆（乘 $g$）。</li>
+<li>拿到新的知识 $(k, v)$。</li>
+<li>不要直接硬存，而是看一眼 $h$ 还没记住什么（计算 $v - hk$ 的误差）。</li>
+<li>根据误差去<strong>修正</strong> $h$。</li>
+<li>这件事可能连续做几次（<code>num_householder</code>），确保记得牢。</li>
+<li>最后，用更新好的 $h$ 回答当前的问题 $q$，得到输出。</li>
+</ul>
+</li>
+</ol>
+<p>这就是所谓的 <strong>Gated Delta Product</strong>：带遗忘门（Gated）的、基于误差修正（Delta）的矩阵乘积更新。</p>

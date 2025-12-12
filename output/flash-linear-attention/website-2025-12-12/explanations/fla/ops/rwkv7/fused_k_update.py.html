@@ -1,0 +1,110 @@
+<h1>fla/ops/rwkv7/fused_k_update.py</h1>
+<p>这份代码看起来确实很吓人，因为它是用 <strong>Triton</strong> 写的 GPU 底层加速代码。但如果我们剥离掉那些复杂的 GPU 线程管理逻辑，它做的事情其实非常简单。</p>
+<p>为了让你看懂，我把你（作为一个开发者）阅读这份代码的任务拆解成一个 <strong>To-Do List</strong>。我们一步一步把这个“大怪兽”拆解开。</p>
+<hr />
+<h3>✅ Task 1: 找到核心数学公式 (The "What")</h3>
+<p>不要看那些 <code>kernel</code> 函数，先看代码里最简单的部分。
+<strong>定位代码：</strong> <code>k_update_ref</code> 函数 (第 13 行)。</p>
+<ul>
+<li><strong>你的任务：</strong> 搞清楚这行代码算了个啥。
+    <code>python
+    return k.addcmul(k * (a - 1), ka)</code></li>
+<li><strong>解读：</strong><ul>
+<li>这是 PyTorch 的原生写法（Reference），也是这份文件的“标准答案”。</li>
+<li>数学公式是：$Output = k + (k \times (a - 1)) \times ka$</li>
+<li>或者整理一下：$Output = k \times (1 + (a - 1) \times ka)$</li>
+<li><strong>结论：</strong> 整个文件几百行代码，就是在算这个公式。输入是 <code>k</code>, <code>a</code>, <code>ka</code>，输出是一个新的 Tensor。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 理解为什么要写这么复杂 (The "Why")</h3>
+<p>既然 <code>k_update_ref</code> 一行代码就能搞定，为啥还要写后面那一大堆？</p>
+<ul>
+<li><strong>你的任务：</strong> 理解 "Fused" (融合) 和 "Triton" 的意义。</li>
+<li><strong>解读：</strong><ul>
+<li><strong>PyTorch 原生写法：</strong> 会产生多个中间变量（显存读写多次），速度慢，显存占用高。</li>
+<li><strong>Triton 写法 (Fused)：</strong> 把加法、乘法全部融合在一个“核函数”里。数据从显存读进芯片，算完直接写回，中间不存临时变量。</li>
+<li><strong>结论：</strong> 这份代码是为了<strong>极致的性能优化</strong>，专门为 RWKV7 模型定制的高速算子。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 解析前向传播 Kernel (The Forward Pass)</h3>
+<p>现在看 <code>k_update_fwd_kernel_short</code> 和 <code>k_update_fwd_kernel_long</code>。这是真正干活的工人。</p>
+<ul>
+<li><strong>你的任务：</strong> 看看它是怎么把上面的公式并行化计算的。</li>
+<li><strong>解读：</strong><ul>
+<li><strong>Short vs Long：</strong> 作者写了两个版本。<ul>
+<li><code>short</code>：专门处理短序列（比如长度 T &lt;= 512）。不用循环，直接一口气算完。</li>
+<li><code>long</code>：处理长序列。需要切块（Chunking），用 <code>for</code> 循环一部分一部分算。</li>
+</ul>
+</li>
+<li><strong>核心逻辑 (以 short 为例)：</strong><ol>
+<li><code>tl.load(...)</code>: 把 <code>k</code>, <code>a</code>, <code>ka</code> 的数据加载进来。</li>
+<li><code>out_val = b_k * (1 + (b_a - 1) * b_ka)</code>: <strong>看！这不就是 Task 1 里的公式吗？</strong></li>
+<li><code>tl.store(...)</code>: 把结果存回去。</li>
+</ol>
+</li>
+<li><strong>IS_VARLEN (变长序列)：</strong> 代码里有很多 <code>if IS_VARLEN:</code>。这是为了处理一个 Batch 里句子长度不一样的情况（不用 Padding，而是把所有句子拼成一条长龙，用 <code>cu_seqlens</code> 记录每句话的起止位置）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 解析反向传播 Kernel (The Backward Pass)</h3>
+<p>看 <code>k_update_bwd_kernel_short</code> 和 <code>k_update_bwd_kernel_long</code>。</p>
+<ul>
+<li><strong>你的任务：</strong> 理解模型训练时怎么算梯度。</li>
+<li><strong>解读：</strong><ul>
+<li>在深度学习里，要训练就需要“反向传播”。</li>
+<li>输入是 <code>grad_out</code> (输出的梯度)。</li>
+<li>目标是算出 <code>dk</code> (k的梯度), <code>da</code> (a的梯度), <code>dka</code> (ka的梯度)。</li>
+<li><strong>核心逻辑：</strong><ul>
+<li><code>dk_vec = b_go * (1 + (b_a - 1) * b_ka)</code> -&gt; 对 k 求导</li>
+<li><code>da_vec = b_go * b_k * b_ka</code> -&gt; 对 a 求导</li>
+<li><code>dka_vec = b_go * b_k * (b_a - 1)</code> -&gt; 对 ka 求导</li>
+</ul>
+</li>
+<li><strong>结论：</strong> 这些代码是手动实现了链式法则，为了让 PyTorch 能在这个自定义算子上进行 <code>loss.backward()</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 包装成 PyTorch 算子 (The Wrapper)</h3>
+<p>看 <code>class KUpdateFunction(torch.autograd.Function)</code>。</p>
+<ul>
+<li><strong>你的任务：</strong> 理解怎么把上面那些 Triton kernel 变成 PyTorch 能用的函数。</li>
+<li><strong>解读：</strong><ul>
+<li><code>forward</code> 静态方法：调用 Task 3 里的前向 Kernel，算出结果，并保存必要的变量（<code>ctx.save_for_backward</code>）。</li>
+<li><code>backward</code> 静态方法：拿出保存的变量，调用 Task 4 里的反向 Kernel，算出梯度返回。</li>
+<li><strong>结论：</strong> 这是一个标准的 PyTorch 自定义算子模板。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 6: 最终入口 (The Entry Point)</h3>
+<p>看文件最后的 <code>fused_k_rwkv7</code> 函数。</p>
+<ul>
+<li><strong>你的任务：</strong> 假如我是用户，我怎么调这个功能？</li>
+<li><strong>解读：</strong>
+    <code>python
+    def fused_k_rwkv7(k, a, ka, cu_seqlens=None):
+        if k.shape[1] == 1: # 如果序列长度是1（比如推理生成时）
+            return k_update_ref(k, a, ka) # 直接用简单的 PyTorch 算，不用启动 Triton 核
+        return KUpdateFunction.apply(k, a, ka, cu_seqlens) # 否则用高性能算子</code></li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>把这个文件看作一个<strong>黑盒子</strong>：</p>
+<ol>
+<li><strong>输入：</strong> 三个张量 <code>k</code>, <code>a</code>, <code>ka</code>。</li>
+<li><strong>黑盒内部：</strong><ul>
+<li>如果是简单的推理（长度1），用普通数学公式算。</li>
+<li>如果是训练或长序列，启动 <strong>Triton 引擎</strong>。</li>
+<li>Triton 引擎把数据切成小块，在 GPU 上并行计算 $k \times (1 + (a - 1) \times ka)$。</li>
+<li>同时，它还贴心地准备好了反向传播的梯度计算公式，方便你训练模型。</li>
+</ul>
+</li>
+<li><strong>输出：</strong> 计算后的结果。</li>
+</ol>
+<p><strong>一句话概括：</strong> 这是一个为了 RWKV7 模型跑得更快、更省显存，而手动用 Triton 手写的<strong>自定义数学算子（包含前向计算和梯度计算）</strong>。</p>

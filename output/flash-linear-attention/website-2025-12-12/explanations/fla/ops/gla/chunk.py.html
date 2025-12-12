@@ -1,0 +1,97 @@
+<h1>fla/ops/gla/chunk.py</h1>
+<p>这份代码确实非常硬核，它是一个用 <strong>Triton</strong> 编写的高性能 <strong>Gated Linear Attention (GLA)</strong> 的实现。</p>
+<p>看不懂很正常，因为这不仅仅是深度学习算法，更是<strong>GPU 并行计算编程</strong>。代码中大量的 <code>tl.program_id</code>, <code>tl.make_block_ptr</code>, <code>tl.load/store</code> 都是在手动管理 GPU 的显存和计算核心。</p>
+<p>为了让你理解这份代码在干什么，我们不要陷入具体的代码行，而是把它想象成一个<strong>流水线工厂的任务清单 (Todo List)</strong>。</p>
+<p>核心思想是 <strong>"分块 (Chunking)"</strong>：
+普通的 Linear Attention 要么是循环（慢），要么是全量矩阵乘法（显存爆炸）。<strong>Chunk GLA</strong> 的策略是：把长序列切成小块（Chunk），块内部用矩阵乘法（快），块之间用循环传递记忆（省显存）。</p>
+<p>下面是这份代码试图完成的 <strong>Task Todo List</strong>：</p>
+<hr />
+<h3>Task 1: 准备工作 (预处理)</h3>
+<p><strong>目标</strong>：处理“遗忘门” $g$。
+在 GLA 中，$g$ (gate) 决定了信息保留多少。我们需要计算累加值，以便快速知道从位置 A 到位置 B 衰减了多少。</p>
+<ul>
+<li><strong>代码对应</strong>: <code>chunk_local_cumsum</code> (在 <code>chunk_gla_fwd</code> 函数开头调用)。</li>
+<li><strong>动作</strong>: 对 $g$ 进行累加（Log space），方便后面算指数衰减。</li>
+</ul>
+<hr />
+<h3>Task 2: 这里的“记忆”是什么？(计算 Inter-Chunk State)</h3>
+<p><strong>目标</strong>：计算块与块之间传递的 hidden state ($h$)。
+这就像看书，你看完第一章（一个 Chunk），脑子里会生成一个摘要（Hidden State），带着这个摘要去看第二章。</p>
+<ul>
+<li><strong>代码对应</strong>: <code>chunk_fwd_h</code> (引用自 <code>common.chunk_h</code>)。</li>
+<li><strong>逻辑</strong>:<ol>
+<li>把 $K$ (Key) 和 $V$ (Value) 结合，根据衰减率 $g$，压缩成一个状态矩阵 $H$。</li>
+<li>这个 $H$ 会被传递给下一个 Chunk。</li>
+<li><strong>注意</strong>: 这部分代码主要在引用的 <code>chunk_h.py</code> 里，但在当前文件被调用。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 计算块内的“小圈子”关系 (计算 Intra-Chunk Matrix A)</h3>
+<p><strong>目标</strong>：计算同一个 Chunk 内部，Query 和 Key 的注意力分数。
+这就像虽然你有整本书的摘要，但当你读某一页时，这一页里的句子之间也有紧密的联系，需要仔细读。</p>
+<ul>
+<li><strong>代码对应</strong>: <code>chunk_gla_fwd_A_kernel_intra_sub_inter</code> 和 <code>chunk_gla_fwd_A_kernel_intra_sub_intra</code>。</li>
+<li><strong>Triton Kernel 解析</strong>:<ol>
+<li><strong>加载数据</strong>: 把当前 Chunk 的 $Q$ 和 $K$ 从显存加载到 SRAM。</li>
+<li><strong>计算分数</strong>: 计算 $Q \times K^T$。</li>
+<li><strong>应用衰减</strong>: 乘上 $g$ 带来的衰减（<code>exp(b_g - b_gn)</code>）。</li>
+<li><strong>生成矩阵 A</strong>: 这是一个 $BT \times BT$ (块大小 x 块大小) 的矩阵，表示块内元素两两之间的权重。</li>
+<li><strong>保存</strong>: 把这个矩阵 $A$ 存下来，后面算 Output 和 Backward 都要用。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 融合两部分信息生成输出 (计算 Output O)</h3>
+<p><strong>目标</strong>：计算最终输出 $O$。
+输出由两部分组成：<strong>历史记忆的贡献</strong> + <strong>当前块内的新贡献</strong>。</p>
+<ul>
+<li><strong>代码对应</strong>: <code>chunk_gla_fwd_kernel_o</code>。</li>
+<li><strong>Triton Kernel 解析</strong>:<ol>
+<li><strong>加载历史</strong>: 读取 Task 2 算出来的历史状态 $H$。</li>
+<li><strong>计算历史贡献</strong>: $Q \times H$。这意味着当前的问题 $Q$ 去查询历史记忆。</li>
+<li><strong>加载块内分数</strong>: 读取 Task 3 算出来的矩阵 $A$。</li>
+<li><strong>计算块内贡献</strong>: $A \times V$。这意味着利用块内的注意力权重聚合 $V$。</li>
+<li><strong>加和</strong>: $O = (Q \times H) + (A \times V)$。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>Task 5: 反向传播 (Backward Pass - 噩梦难度)</h3>
+<p><strong>目标</strong>：算梯度，用来更新模型参数。
+这是代码中最长、最复杂的部分（<code>chunk_gla_bwd_...</code> 开头的函数）。</p>
+<ul>
+<li><strong>逻辑</strong>: 前向传播怎么算的，反向传播就得倒着推回去。</li>
+<li><strong>子任务清单</strong>:<ol>
+<li><code>chunk_gla_bwd_kernel_dv</code>: 计算 Value ($V$) 的梯度。需要用到输出的梯度 $dO$ 和注意力矩阵 $A$。</li>
+<li><code>chunk_gla_bwd_kernel_dA</code>: 计算注意力矩阵 $A$ 的梯度。</li>
+<li><code>chunk_gla_bwd_kernel_intra</code>: 计算块内 $Q$ 和 $K$ 的梯度。</li>
+<li><code>chunk_gla_bwd_kernel_inter</code>: 计算块间（涉及历史状态 $H$）的梯度，以及最难算的门控 $g$ 的梯度。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：如何阅读这份文件？</h3>
+<p>不要试图一行行读 Triton kernel 里的指针运算（除非你要改写它）。你应该关注文件底部的 Python 包装函数，它们揭示了数据流向：</p>
+<ol>
+<li>
+<p><strong><code>chunk_gla_fwd</code> (主入口)</strong>:</p>
+<ul>
+<li>Step 1: 算 $g$ 的累加。</li>
+<li>Step 2: <code>chunk_fwd_h</code> -&gt; 算出块间状态 $h$。</li>
+<li>Step 3: <code>chunk_gla_fwd_intra_gk</code> -&gt; 算出块内注意力 $A$。</li>
+<li>Step 4: <code>chunk_gla_fwd_o_gk</code> -&gt; 结合 $h$ 和 $A$，算出输出 $o$。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>chunk_gla_bwd</code> (反向入口)</strong>:</p>
+<ul>
+<li>按相反顺序调用各种 <code>_bwd_</code> kernel 来计算 $dq, dk, dv, dg$。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话概括文中的观点（算法思想）：</strong>
+为了让 Linear Attention 既快又省显存，我们将序列切分为 <strong>Chunk</strong>。
+<strong>Chunk 之间</strong>使用 RNN 式的循环传递（$O(N)$ 复杂度，省显存）；
+<strong>Chunk 内部</strong>使用 Attention 式的矩阵运算（并行计算效率高）。
+这份代码就是这个思想在 GPU 硬件层面的极致优化实现。</p>

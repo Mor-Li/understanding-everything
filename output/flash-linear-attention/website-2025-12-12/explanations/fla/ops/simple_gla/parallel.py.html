@@ -1,0 +1,130 @@
+<h1>fla/ops/simple_gla/parallel.py</h1>
+<p>这份代码确实非常硬核，它属于 <strong>深度学习底层算子开发</strong>，具体是用 <strong>OpenAI Triton</strong> 语言编写的 <strong>Simple GLA (Gated Linear Attention)</strong> 的并行版本。</p>
+<p>看不懂很正常，因为它混合了：
+1.  <strong>数学算法</strong>（线性注意力机制 + 门控机制）。
+2.  <strong>并行计算逻辑</strong>（如何在 GPU 上切分任务）。
+3.  <strong>Triton 语法</strong>（一种专门写 GPU 内核的 Python 变体）。</p>
+<p>为了让你理解，我把这个学习任务拆解成一个 <strong>To-Do List</strong>，由浅入深，一步步带你看懂它的核心观点。</p>
+<hr />
+<h3>📋 学习任务 To-Do List</h3>
+<ol>
+<li><strong>Task 1: 搞懂 "它是干嘛的" (High Level Concept)</strong><ul>
+<li>理解标准注意力 (Attention) 和线性注意力 (Linear Attention) 的区别。</li>
+<li>理解什么是 "G" (Gate/Decay)。</li>
+</ul>
+</li>
+<li><strong>Task 2: 搞懂 "并行策略" (The Parallel Trick)</strong><ul>
+<li>理解为什么要 "Chunking" (分块)。</li>
+<li>理解 GPU 是怎么分工的。</li>
+</ul>
+</li>
+<li><strong>Task 3: 代码结构拆解 (Code Structure)</strong><ul>
+<li>识别 Forward (前向) 和 Backward (反向/训练) 模块。</li>
+<li>识别 Triton 的核心语法。</li>
+</ul>
+</li>
+<li><strong>Task 4: 核心逻辑映射 (Mapping Code to Logic)</strong><ul>
+<li>看懂 <code>fwd_kernel</code> 里的核心循环。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 它是干嘛的？(核心概念)</h4>
+<ul>
+<li><strong>背景：</strong> 标准的 Transformer（如 ChatGPT）计算注意力很慢，因为它是 $O(N^2)$ 的复杂度。句子越长，计算量爆炸增长。</li>
+<li><strong>Linear Attention (线性注意力)：</strong> 试图把复杂度降到 $O(N)$。它的核心思想是不算 $QK^T$ 这个大矩阵，而是先算 $K^TV$。</li>
+<li><strong>Simple GLA (Gated Linear Attention)：</strong> 纯线性的效果不够好，所以加了一个 <strong>Gate (门控 <code>g</code>)</strong>。<ul>
+<li>你可以把 <code>g</code> 想象成一个 <strong>"遗忘开关"</strong>。</li>
+<li>在处理序列时，前面的信息传到后面，会根据 <code>g</code> 的值逐渐衰减（遗忘）。</li>
+<li><strong>Viewpoint (观点)：</strong> 这份代码就是为了<strong>极快地</strong>算出这个带遗忘功能的线性注意力。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 并行策略 (最难懂的部分)</h4>
+<p>通常带有 "遗忘/衰减" 的模型（像 RNN）是<strong>串行</strong>的：必须算完第1步，才能算第2步，因为第2步依赖第1步的记忆。这在 GPU 上很慢。</p>
+<p>这份代码之所以叫 <code>parallel.py</code>，是因为它用了一种 <strong>并行 (Parallel)</strong> 的方法来算串行逻辑：</p>
+<ol>
+<li><strong>分块 (Chunking)：</strong> 把长句子切成很多小块（例如每块 128 个 token）。</li>
+<li><strong>块内并行：</strong> 在每一个小块内部，把它当成普通的 Attention 来算（因为块很小，$N^2$ 也不怕）。</li>
+<li><strong>块间累积：</strong> 把前一个块算出的 "记忆状态" 传给下一个块。</li>
+</ol>
+<p><strong>代码里的体现：</strong>
+你会看到 <code>BT</code> (Block Time, 块大小) 和 <code>chunk_size</code>。这就是切分的依据。</p>
+<h4>Task 3: 代码结构拆解</h4>
+<p>文件里主要由三部分组成：</p>
+<ol>
+<li><strong><code>parallel_simple_gla_fwd_kernel</code></strong>:<ul>
+<li><strong>功能</strong>：前向传播。计算 <code>O = Attention(Q, K, V, g)</code>。</li>
+<li><strong>核心</strong>：这是用来做推理或训练第一步的。</li>
+</ul>
+</li>
+<li><strong><code>parallel_simple_gla_bwd_kernel_...</code> (dq, dkv)</strong>:<ul>
+<li><strong>功能</strong>：反向传播。计算梯度（Gradient）。</li>
+<li><strong>核心</strong>：这是用来训练模型的。因为反向传播比前向复杂，所以拆成了算 <code>dq</code> (Query的梯度) 和算 <code>dk, dv</code> (Key/Value的梯度) 两个函数。</li>
+</ul>
+</li>
+<li><strong><code>parallel_simple_gla_fwd</code> / <code>bwd</code> (Python 函数)</strong>:<ul>
+<li><strong>功能</strong>：这是 "包装器" (Wrapper)。</li>
+<li><strong>核心</strong>：准备数据、设置 GPU 的 Grid（网格，即启动多少个线程块），然后调用上面的 Triton kernel。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 4: 核心逻辑映射 (深入代码细节)</h4>
+<p>让我们聚焦在最核心的 <code>parallel_simple_gla_fwd_kernel</code> (前向传播内核) 上，我来翻译它的“人话”版本：</p>
+<p><strong>代码段落 1：定位身份</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">i_kv</span><span class="p">,</span> <span class="n">i_t</span><span class="p">,</span> <span class="n">i_bh</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：GPU 有成千上万个小工人在工作。这行代码是让当前这个工人知道：我是谁？我负责哪个 Head？我负责句子的哪一段（Chunk）？</li>
+</ul>
+<p><strong>代码段落 2：加载数据与门控 (Gate)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">b_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_q</span><span class="p">,</span> <span class="n">boundary_check</span><span class="o">=</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span> <span class="c1"># 加载 Query</span>
+<span class="c1"># ...</span>
+<span class="k">if</span> <span class="n">USE_G</span><span class="p">:</span>
+    <span class="n">b_gq</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">g</span> <span class="o">+</span> <span class="n">o_q</span> <span class="o">*</span> <span class="n">H</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 加载遗忘门</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：把当前这块的数据搬到 GPU 的高速缓存 (SRAM) 里。<code>g</code> 在这里是用来计算衰减系数的。注意代码里用了 <code>exp(b_gq - b_gk)</code>，这是在对数空间做减法，等同于在原空间做除法/乘法，这是处理连乘衰减的数值稳定技巧。</li>
+</ul>
+<p><strong>代码段落 3：核心循环 (Attention 计算)</strong>
+代码里有两个 <code>for</code> 循环。</p>
+<ul>
+<li>
+<p><strong>循环 A (当前块内的因果关系)</strong>：
+    <code>python
+    for i_s in range(i_t * BT, min((i_t + 1) * BT, T), BS):
+        # ...
+        b_s = tl.dot(b_q, b_k) # Q 乘以 K
+        b_s *= exp(...)        # 乘以衰减系数
+        b_o += tl.dot(b_s, b_v) # 乘以 V</code></p>
+<ul>
+<li><strong>观点</strong>：这部分在算 <strong>当前块内部</strong> 的注意力。比如 "我爱吃苹果"，"吃" 和 "苹果" 在同一个块里，直接算它们的关系。</li>
+</ul>
+</li>
+<li>
+<p><strong>循环 B (历史块的影响)</strong>：
+    <code>python
+    for i_s in range(i_t * BT - BS, -BS, -BS):
+        # ...
+        # 逻辑类似，但是是在回溯之前的块</code></p>
+<ul>
+<li><strong>观点</strong>：这部分在算 <strong>之前的历史</strong> 对当前的影响。代码通过循环，一段一段地把前面的 KV 信息捞出来，乘上衰减 <code>g</code>，加到当前结果里。</li>
+</ul>
+</li>
+</ul>
+<h3>总结：文中的核心观点</h3>
+<p>这份文件其实在说：</p>
+<ol>
+<li><strong>Simple GLA 算法</strong>：我们在做一种带有“位置衰减”特性的注意力机制（即 <code>g</code> 门控）。距离越远，关系越弱。</li>
+<li><strong>Triton 优化</strong>：为了跑得快，我们不用 PyTorch 原生的 <code>cumsum</code> 或 <code>scan</code>，而是手写 GPU 内核。</li>
+<li><strong>分块并行 (Chunk-wise Parallelism)</strong>：<ul>
+<li>我们不按时间步 $t=1, 2, 3...$ 算（太慢）。</li>
+<li>我们按块 $Block_1, Block_2...$ 算。</li>
+<li><strong>核心魔法</strong>：利用 GPU 的 Tensor Core 快速计算矩阵乘法（<code>tl.dot</code>），把“串行衰减”转化为“分块矩阵乘法 + 修正”。</li>
+</ul>
+</li>
+</ol>
+<p><strong>简单一句话：</strong> 这是一个为了让大模型处理长文本更快、显存占用更少，而专门手写的、利用了分块并行技巧的 GPU 加速代码。</p>

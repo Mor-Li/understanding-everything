@@ -1,0 +1,90 @@
+<h1>.github/workflows/triton-builder.yml</h1>
+<p>这份代码是一个 <strong>GitHub Actions 工作流（Workflow）</strong> 文件。</p>
+<p>通俗地说，这是一份<strong>自动化流水线的“施工图纸”</strong>。它的主要目的是：<strong>把 Triton 这个软件的源代码，自动编译打包成用户可以直接安装的文件（也就是 Python 的 .whl 包）</strong>。</p>
+<p>为了让你更容易理解，我把它想象成一个<strong>工厂的生产过程</strong>，并为你列了一个 <strong>“任务清单 (Task List)”</strong>。</p>
+<p>程序运行时，就是照着这个清单一步步打勾执行的：</p>
+<hr />
+<h3>任务阶段一：接单（触发与输入）</h3>
+<p><strong>对应代码块：</strong> <code>on: workflow_dispatch</code></p>
+<p>这一步是流水线的起点。它不是自动发生的，而是需要人去按按钮。</p>
+<ul>
+<li><strong>Task 01: 等待管理员按下“开始构建”按钮</strong><ul>
+<li>这个工作流是手动的 (<code>workflow_dispatch</code>)。</li>
+</ul>
+</li>
+<li><strong>Task 02: 询问管理员两个问题（Input）</strong><ol>
+<li><strong>你要造什么架构的包？</strong> (<code>build_architecture</code>)<ul>
+<li>选项：<code>x86_64</code> (普通电脑), <code>aarch64</code> (ARM架构, 如Mac M1/M2或某些服务器), 或者 <code>all</code> (都要)。默认是 <code>all</code>。</li>
+</ul>
+</li>
+<li><strong>你要造哪个版本的代码？</strong> (<code>manual_ref</code>)<ul>
+<li>你可以填一个具体的标签（Tag）或版本号。如果不填，默认就是去抓最新的。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>任务阶段二：经理做计划（Job 1: prepare-release-build）</h3>
+<p><strong>对应代码块：</strong> <code>jobs: prepare-release-build</code></p>
+<p>这一步不干重活，主要是做决策和准备数据。就像工厂经理在分配任务。</p>
+<ul>
+<li>
+<p><strong>Task 03: 确定代码版本号</strong> (<code>id: discover-tag</code>)</p>
+<ul>
+<li><strong>检查：</strong> 管理员刚才填版本号了吗？</li>
+<li><strong>分支 A：</strong> 如果填了，就用管理员填的。</li>
+<li><strong>分支 B：</strong> 如果没填，就用 <code>curl</code> 访问 GitHub 的 API，去查一下 <code>triton-lang/triton</code> 这个仓库目前<strong>最新的 Tag</strong> 是什么。</li>
+<li><strong>输出：</strong> 把确定好的版本号记下来（存到 <code>outputs.tag</code>）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 04: 分配机器（生成矩阵）</strong> (<code>id: generate-matrix</code>)</p>
+<ul>
+<li><strong>检查：</strong> 管理员刚才选的架构是啥？(<code>x86_64</code>, <code>aarch64</code>, 还是 <code>all</code>)</li>
+<li><strong>逻辑：</strong><ul>
+<li>如果是 <code>x86_64</code> -&gt; 准备一张任务单，派给 <code>x64-docker</code> 机器。</li>
+<li>如果是 <code>aarch64</code> -&gt; 准备一张任务单，派给 <code>aarch64-docker</code> 机器（给的时间更长，1200秒，因为ARM编译通常慢）。</li>
+<li>如果是 <code>all</code> -&gt; 也就是上面两个都要。</li>
+</ul>
+</li>
+<li><strong>输出：</strong> 生成一个 JSON 格式的任务列表（<code>matrix</code>），告诉下一步该启动几台机器。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>任务阶段三：工人干活（Job 2: execute-release-build）</h3>
+<p><strong>对应代码块：</strong> <code>jobs: execute-release-build</code></p>
+<p>这一步是真正的苦力活。它依赖上一步经理的计划。</p>
+<ul>
+<li>
+<p><strong>Task 05: 检查经理的计划</strong> (<code>needs: prepare-release-build</code>)</p>
+<ul>
+<li>确认拿到了版本号和机器分配表，否则不干活。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 06: 平行启动机器</strong> (<code>strategy: matrix</code>)</p>
+<ul>
+<li>根据刚才生成的 JSON 列表，同时启动对应的机器。如果刚才选了 <code>all</code>，这里就会有两台机器（一台 x86，一台 ARM）同时开始跑。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 07: 外包施工</strong> (<code>uses: ./.github/workflows/reusable-build-triton.yml</code>)</p>
+<ul>
+<li>这里很有趣，它没有自己写编译步骤，而是<strong>调用了另一个文件</strong>（<code>reusable-build-triton.yml</code>）。这就好比工厂把核心组装工作外包给了一个专业的施工队。</li>
+<li><strong>传递参数</strong>（把之前的决定告诉施工队）：<ul>
+<li><code>runner</code>: 用哪种机器跑？</li>
+<li><code>arch</code>: 造什么架构？</li>
+<li><code>checkout-ref</code>: 用哪个代码版本（Task 03 确定的那个）？</li>
+<li><code>cibw-build</code>: <strong>重点！</strong> 这里指定了要构建 Python 3.10, 3.11, 3.12, 3.13 的版本 (<code>cp3{10,11,12,13}</code>).</li>
+<li><code>cibw-skip</code>: 跳过太老的 Python 版本 (3.5 - 3.9)。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件到底在干嘛？</h3>
+<p>简单一句话：
+<strong>这是一个“总控开关”，当你手动启动它时，它会自动去查最新的代码版本，然后根据你的选择，指挥 x86 和 ARM 机器同时开工，调用另一个通用的构建脚本，为 Python 3.10 到 3.13 生产出安装包。</strong></p>

@@ -1,0 +1,122 @@
+<h1>fla/layers/rodimus.py</h1>
+<p>这份代码确实比较硬核，它是一个名为 <strong>Rodimus</strong> 的大模型（LLM）架构的核心层实现。简单来说，它是为了解决 Transformer 计算太慢、显存占用太大的问题，提出的一种<strong>线性注意力（Linear Attention）</strong>变体。</p>
+<p>别被代码吓到，我们可以把它想象成一个<strong>处理信息的流水线</strong>。我为你列了一个 <strong>Task List (任务清单)</strong>，我们一步步来拆解这个文件到底在干嘛。</p>
+<hr />
+<h3>🟢 Task 0: 搞清楚背景 (Context)</h3>
+<p><strong>目标：</strong> 知道这代码属于哪个领域。
+*   <strong>这是什么？</strong> 这是一个神经网络的“层”（Layer），类似于 Transformer 里的 <code>SelfAttention</code> 层。
+*   <strong>为了解决什么？</strong> 标准 Transformer 的注意力机制是 $O(N^2)$ 复杂度的（句子越长，速度越慢）。这个 <code>Rodimus</code> 试图用 <strong>RNN 的方式（线性复杂度 $O(N)$）</strong> 来实现类似的效果，让模型能处理超长文本。
+*   <strong>核心库：</strong> 它依赖 <code>fla</code> (Fast Linear Attention) 库，这是专门做高效线性注意力的。</p>
+<hr />
+<h3>🟢 Task 1: 拆解核心模块 (The Big Picture)</h3>
+<p><strong>目标：</strong> 看看文件里有哪几个大积木。
+文件里主要定义了两个类（Class），它们是两种不同的注意力机制：
+1.  <strong><code>RodimusAttention</code></strong>: 这是主角。一种基于门控线性注意力（Gated Linear Attention, GLA）的模块。
+2.  <strong><code>SlidingWindowSharedKeyAttention</code></strong>: 这是一个辅助角色。标准的滑动窗口注意力（也就是传统的 Flash Attention），用来弥补线性注意力在“局部细节”上的不足。</p>
+<hr />
+<h3>🟢 Task 2: 深入 <code>RodimusAttention</code> (主角分析)</h3>
+<p><strong>目标：</strong> 它是怎么把输入变成输出的？（流水线分析）</p>
+<p>我们可以把 <code>forward</code> 函数看作一个待办事项：</p>
+<ul>
+<li>
+<p><strong>Todo 2.1: 扩容 (Expansion)</strong></p>
+<ul>
+<li>代码：<code>self.up_proj</code>, <code>self.gate_proj</code></li>
+<li><strong>解释：</strong> 就像 Mamba 或 MLP 一样，先把输入的特征维度放大（例如放大2倍），方便在更高维的空间里处理信息。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 2.2: 局部混合 (Short Convolution)</strong></p>
+<ul>
+<li>代码：<code>self.short_conv</code></li>
+<li><strong>解释：</strong> 在看长距离依赖之前，先看看“邻居”。用一个短的一维卷积（Conv1d）把相邻的几个词的信息混合一下。这能防止模型“灯下黑”，捕捉局部语法。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 2.3: 生成 Q, K, V 和 门控 (Gates)</strong></p>
+<ul>
+<li>代码：<code>q_proj</code>, <code>k_proj</code>, <code>i_gate_proj</code>, <code>g_gate_proj</code>, <code>tau_gate_proj</code></li>
+<li><strong>解释：</strong><ul>
+<li><strong>Q, K, V</strong>: 传统的注意力三要素。</li>
+<li><strong>Gates (门)</strong>: 这是 Rodimus 的特色。<ul>
+<li><code>g_gate</code> (Decay): 决定遗忘多少历史信息（类似 LSTM 的遗忘门）。</li>
+<li><code>i_gate</code>: 决定当前的输入有多少能进入记忆。</li>
+</ul>
+</li>
+<li><strong>数学魔法</strong>：代码中有一段 <code>rt_gate_log = -g_gate</code>，这是在计算“衰减率”的对数，为了后面数学计算数值稳定。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 2.4: 核心计算 (The Chunk/Recurrent GLA)</strong></p>
+<ul>
+<li>代码：<code>fused_recurrent_gla</code> 或 <code>chunk_gla</code></li>
+<li><strong>解释：</strong> 这是最难的一步。<ul>
+<li><strong>传统 Attention</strong>: 所有词两两看一遍（慢）。</li>
+<li><strong>这里</strong>: 它维护一个 <strong><code>recurrent_state</code> (记忆状态)</strong>。</li>
+<li>读一个词，更新一下状态，输出一个结果。</li>
+<li><code>chunk</code> 模式是为了并行加速，把长序列切成块，块内并行，块间递归。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 2.5: 压缩与输出</strong></p>
+<ul>
+<li>代码：<code>activation_norm</code>, <code>down_proj</code></li>
+<li><strong>解释：</strong> 把处理完的高维信息归一化，然后投影回原来的维度，加上残差连接（Residual Connection），输出给下一层。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 3: 深入 <code>SlidingWindowSharedKeyAttention</code> (配角分析)</h3>
+<p><strong>目标：</strong> 为什么还需要这个？</p>
+<ul>
+<li>
+<p><strong>Todo 3.1: 理解滑动窗口</strong></p>
+<ul>
+<li><strong>解释：</strong> <code>RodimusAttention</code> 擅长记长距离的大意，但在精确回忆最近几个词的细节上可能不如传统 Attention。所以这里加了一个“滑动窗口注意力”，只看最近（比如2048个）的词。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 3.2: 共享 Key (Shared Key)</strong></p>
+<ul>
+<li><strong>解释：</strong> 为了省显存，多个 Query 头（Head）共用一个 Key 头。代码里 <code>k = repeat(k, ...)</code> 就是在做这个广播操作。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 3.3: 调用 Flash Attention</strong></p>
+<ul>
+<li>代码：<code>flash_attn_varlen_func</code></li>
+<li><strong>解释：</strong> 直接调用 NVIDIA 优化的 Flash Attention 算子，计算速度极快。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 4: 工程细节 (Engineering)</h3>
+<p><strong>目标：</strong> 理解那些看起来很乱的辅助代码。</p>
+<ul>
+<li>
+<p><strong>Todo 4.1: 处理 KV Cache</strong></p>
+<ul>
+<li>代码里到处都在判断 <code>past_key_values</code>。</li>
+<li><strong>解释：</strong> 在生成文本（推理）时，我们是一个词一个词生成的。为了不重复计算前面的词，需要把“记忆状态”（recurrent state）和“卷积状态”（conv state）存下来。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 4.2: 填充处理 (Padding)</strong></p>
+<ul>
+<li>代码：<code>get_unpad_data</code>, <code>pad_input</code></li>
+<li><strong>解释：</strong> 一个 Batch 里句子长短不一，为了并行计算通常会补 0。这个代码很细致地把 0 去掉再计算，算完再填回去，保证计算结果不受废数据影响。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 总结 (Summary)</h3>
+<p><strong>一句话概括：</strong>
+这个文件定义了 <strong>Rodimus</strong> 模型的注意力层，它混合使用了<strong>线性注意力（类似 RNN，处理全局长记忆）</strong>和<strong>滑动窗口注意力（处理局部精确记忆）</strong>，旨在打造一个既快又准的大模型。</p>
+<p><strong>你现在的阅读建议：</strong>
+1.  <strong>忽略</strong> <code>import</code> 和工具函数（如 <code>align_multiple</code>）。
+2.  <strong>重点看</strong> <code>RodimusAttention.forward</code> 方法中的流程：<code>up_proj</code> -&gt; <code>short_conv</code> -&gt; <code>gla</code> (核心算法) -&gt; <code>down_proj</code>。
+3.  <strong>理解</strong> <code>mode='chunk'</code> vs <code>mode='fused_recurrent'</code>：前者是训练时用的（并行快），后者是推理生成时用的（省显存）。</p>

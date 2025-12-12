@@ -1,0 +1,68 @@
+<h1>tests/ops/test_rwkv6.py</h1>
+<p>这份代码其实是一个<strong>自动化测试脚本（Unit Test）</strong>。它的核心目的是：<strong>验证一个新的、运行更快的算法实现（Chunk模式），其计算结果是否和标准的、已知正确的算法实现（Recurrent模式）完全一致。</strong></p>
+<p>这就好比你要发布一个新的计算器App，你必须先拿它和传统的科学计算器做对比，算一万道题，确保两者的结果一模一样，你才敢发布。</p>
+<p>下面我列一个 <strong>Task List (任务清单)</strong>，带你一步步拆解这份代码在干什么：</p>
+<h3>📋 任务清单：RWKV6 算子正确性验证</h3>
+<h4>Task 1: 设定测试场景 (Setup)</h4>
+<p><strong>代码位置:</strong> <code>@pytest.mark.parametrize(...)</code>
+*   <strong>目的</strong>: 我们不能只测一种情况，要测各种不同的输入尺寸，确保算法在各种情况下都对。
+*   <strong>解释</strong>:
+    *   <code>B</code>: Batch size (一次处理多少条数据)
+    *   <code>T</code>: Time steps (序列长度，比如一句话有多少个字)
+    *   <code>H</code>: Heads (多头注意力的头数)
+    *   <code>D</code>: Dimension (每个头的维度)
+    *   代码里列出了好几组参数（比如 <code>(1, 15, 2, 60)</code>），测试程序会轮流用这些参数跑一遍。</p>
+<h4>Task 2: 准备造假数据 (Data Preparation)</h4>
+<p><strong>代码位置:</strong> <code>def test_chunk(...)</code> 内部开头部分
+*   <strong>目的</strong>: 生成随机的输入数据，用于喂给模型。
+*   <strong>解释</strong>:
+    *   <code>q, k, v</code>: 经典的注意力机制输入（Query, Key, Value）。
+    *   <code>w</code>: RWKV 特有的 Decay（衰减）参数，控制记忆能保留多久。
+    *   <code>u</code>: RWKV 特有的 Bonus 参数。
+    *   <code>h0</code>: 初始状态（Initial State），相当于模型刚开始时的“记忆”。
+    *   <code>.requires_grad_()</code>: 意思是告诉 PyTorch，“这些数据参与训练，一会儿我要算它们的梯度”。</p>
+<h4>Task 3: 运行“标准答案” (Run Reference)</h4>
+<p><strong>代码位置:</strong> <code>ref, ref_ht = fused_recurrent_rwkv6(...)</code>
+*   <strong>目的</strong>: 运行一个已知正确的、基于循环（Recurrent）的实现。这个通常比较慢，但逻辑最简单，不易出错，所以用来做<strong>标准答案（Reference）</strong>。
+*   <strong>动作</strong>:
+    *   把 <code>q, k, v, w</code> 等数据喂进去。
+    *   得到输出 <code>ref</code> (Reference Output) 和最终状态 <code>ref_ht</code>。</p>
+<h4>Task 4: 计算“标准答案”的梯度 (Backward Reference)</h4>
+<p><strong>代码位置:</strong> <code>((ref * do).sum()).backward()</code>
+*   <strong>目的</strong>: 深度学习不仅要算结果（前向传播），还要算梯度（反向传播，用于更新参数）。我们要确保新算法算出来的梯度也是对的。
+*   <strong>动作</strong>:
+    *   让 PyTorch 自动计算出 <code>q, k, v</code> 等参数的梯度。
+    *   把这些梯度存起来，命名为 <code>ref_dq</code> (Reference dQ), <code>ref_dk</code> 等等。
+    *   <em>注意：代码里把 <code>.grad</code> 清空（None）是为了给下一次计算腾位置。</em></p>
+<h4>Task 5: 运行“待测目标” (Run Target)</h4>
+<p><strong>代码位置:</strong> <code>tri, tri_ht = chunk_rwkv6(...)</code>
+*   <strong>目的</strong>: 运行我们要测试的、基于分块（Chunk）优化的 Triton 加速实现。这是主角。
+*   <strong>动作</strong>:
+    *   喂入<strong>完全相同</strong>的副本数据 (<code>.clone()</code>)。
+    *   得到输出 <code>tri</code> (Triton/Target Output) 和最终状态 <code>tri_ht</code>。</p>
+<h4>Task 6: 计算“待测目标”的梯度 (Backward Target)</h4>
+<p><strong>代码位置:</strong> <code>((tri * do).sum()).backward()</code>
+*   <strong>目的</strong>: 看看这个加速版算法，算出来的梯度对不对。
+*   <strong>动作</strong>:
+    *   同样进行反向传播。
+    *   保存梯度为 <code>tri_dq</code>, <code>tri_dk</code> 等等。</p>
+<h4>Task 7: 最终对账 (Check Results)</h4>
+<p><strong>代码位置:</strong> <code>assert_close(...)</code>
+*   <strong>目的</strong>: 也就是“判卷子”。比较 Task 3/4 的结果 和 Task 5/6 的结果。
+*   <strong>解释</strong>:
+    *   <code>assert_close('o', ref, tri, ...)</code>: 比较输出结果。如果不一致，报错。
+    *   <code>assert_close('dq', ref_dq, tri_dq, ...)</code>: 比较 Q 的梯度。
+    *   以此类推，比较所有的梯度。
+    *   <code>0.005</code>: 允许的误差范围（浮点数计算总会有微小误差，只要非常接近就算对）。</p>
+<hr />
+<h3>补充：关于 <code>test_chunk_varlen</code></h3>
+<p>文件下半部分还有一个 <code>test_chunk_varlen</code> 函数。
+*   <strong>逻辑</strong>: 和上面完全一样。
+*   <strong>区别</strong>: 上面测的是整齐的数据（每句话长度一样）。这个测的是<strong>长短不一的数据 (Variable Length)</strong>。
+    *   比如 Batch 里第一句话 15 个字，第二句话 100 个字。
+    *   <code>cu_seqlens</code>: 这是一个用来标记每句话结束位置的数组。</p>
+<h3>总结</h3>
+<p>这篇文章其实就是在说：</p>
+<blockquote>
+<p><strong>“嘿，我写了一个叫 <code>chunk_rwkv6</code> 的新加速算法。为了证明它是对的，我把它和老实可靠的 <code>fused_recurrent_rwkv6</code> 做了对比。我用各种尺寸的数据测了前向输出和反向梯度，发现它们的结果完全一致（误差极小）。”</strong></p>
+</blockquote>

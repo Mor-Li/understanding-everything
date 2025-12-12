@@ -1,0 +1,97 @@
+<h1>tests/ops/test_log_linear_attn.py</h1>
+<p>这份代码是一个<strong>单元测试（Unit Test）</strong>文件。</p>
+<p>简单来说，它的核心目的是：<strong>验证一个写得很快、很复杂的新算法（Chunk 模式），算出来的结果是不是和那个写得很慢、但绝对正确的旧算法（Naive 模式）一模一样。</strong></p>
+<p>为了让你听懂，我们把这个过程想象成你在<strong>验收一个新来的数学天才（优化的代码）</strong>。你手里有一个<strong>老教授（朴素的代码）</strong>，老教授算得慢但从来不错。你需要给天才出题，然后拿他的答案和老教授的比对。</p>
+<p>下面我列一个 <strong>“验收任务清单 (To-Do List)”</strong>，一步步带你读懂代码在干嘛。</p>
+<hr />
+<h3>验收任务清单 (Task List)</h3>
+<h4>✅ Task 1: 准备考试题目 (数据生成)</h4>
+<p><strong>代码位置：</strong> 每个测试函数的前半部分 (比如 <code>x = torch.randn...</code>)</p>
+<ul>
+<li><strong>目标</strong>：生成一堆随机的输入数据，模拟神经网络在训练时的真实情况。</li>
+<li><strong>详细步骤</strong>：<ol>
+<li><strong>设定规模</strong>：定义 Batch Size (B, 批次大小), Sequence Length (T, 序列长度), Heads (H, 多头注意力头数), Dimension (D, 维度)。</li>
+<li><strong>生成输入张量</strong>：<ul>
+<li><code>q</code>, <code>k</code>, <code>v</code>: Attention 机制的三大件（Query, Key, Value）。</li>
+<li><code>g</code> (gate/decay): 一个控制衰减的参数，经过了 <code>softplus</code> 和 <code>exp</code> 处理，确保数值符合数学定义。</li>
+<li><code>level_scales</code>: 这个特定的 Log Linear Attention 算法需要的层级缩放参数。</li>
+</ul>
+</li>
+<li><strong>计算 L</strong>：<code>L = int(np.log2(T) + 1)</code>，这是该算法特有的，根据序列长度计算层级数。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 2: 验证正向计算 (Forward Pass Test)</h4>
+<p><strong>代码位置：</strong> 函数 <code>test_chunk</code></p>
+<ul>
+<li><strong>目标</strong>：检查天才（Chunk版）算出的最终结果 <code>out</code> 对不对。</li>
+<li><strong>详细步骤</strong>：<ol>
+<li><strong>天才做题</strong>：调用 <code>out, _ = chunk_log_linear_attn(...)</code>。这是我们要测试的核心优化函数。</li>
+<li><strong>教授做题</strong>：调用 <code>ref = naive_log_linear_attn(...)</code>。这是用来当作标准答案的普通函数。</li>
+<li><strong>对答案</strong>：调用 <code>assert_close("o", ref, out, 0.004)</code>。<ul>
+<li>意思是：检查 <code>ref</code> 和 <code>out</code> 的数值是否非常接近（允许 0.004 的误差）。如果不一样，报错，测试失败。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 3: 验证反向传播 (Backward Pass Test)</h4>
+<p><strong>代码位置：</strong> 函数 <code>test_chunk_bwd</code></p>
+<ul>
+<li><strong>目标</strong>：不仅要结果对，还得能用来训练（Training）。训练需要计算“梯度”（Gradients），也就是求导。</li>
+<li><strong>详细步骤</strong>：<ol>
+<li><strong>开启记录</strong>：<code>requires_grad_()</code>。告诉 PyTorch，这些变量参与计算，我要追踪它们的变化。</li>
+<li><strong>天才求导</strong>：<ul>
+<li>运行 Chunk 函数。</li>
+<li>造一个随机的梯度 <code>do</code>。</li>
+<li>执行 <code>.backward()</code>。</li>
+<li>把算出来的梯度存下来：<code>tri_dq</code>, <code>tri_dk</code> 等。</li>
+</ul>
+</li>
+<li><strong>清空现场</strong>：把变量里的梯度清零，防止影响下一次计算。</li>
+<li><strong>教授求导</strong>：<ul>
+<li>运行 Naive 函数。</li>
+<li>执行同样的 <code>.backward()</code>。</li>
+<li>把标准答案梯度存下来：<code>ref_dq</code>, <code>ref_dk</code> 等。</li>
+</ul>
+</li>
+<li><strong>对答案</strong>：<ul>
+<li>不仅对比输出结果 <code>out</code>。</li>
+<li>还要对比每一个输入的梯度：<code>dq</code> (对q的导数), <code>dk</code>, <code>dv</code>, <code>dg</code> 等。</li>
+<li>只要有一个梯度算错，神经网络就没法训练，所以这一步至关重要。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 4: 验证变长序列 (Variable Length Test)</h4>
+<p><strong>代码位置：</strong> 函数 <code>test_chunk_varlen</code></p>
+<ul>
+<li><strong>目标</strong>：在实际应用中，一句话可能有 5 个字，另一句有 100 个字。为了效率，我们会把它们拼在一起处理。测试天才算法能不能处理这种“拼盘”数据。</li>
+<li><strong>详细步骤</strong>：<ol>
+<li><strong>设定分界线</strong>：<code>cu_seqlens</code> (Cumulative Sequence Lengths)。比如 <code>[0, 15, 100]</code>，意思是第一句话是 0-15，第二句话是 15-100。</li>
+<li><strong>天才做题（拼盘版）</strong>：调用 <code>chunk_log_linear_attn</code> 并传入 <code>cu_seqlens</code>。它应该能自动识别句子边界，不让第一句话的信息“泄露”给第二句话。</li>
+<li><strong>教授做题（拆开版）</strong>：<ul>
+<li>写一个 <code>for</code> 循环。</li>
+<li>手动把数据切片：<code>v_s = v[:, bos:eos]</code>。</li>
+<li>一句一句地算，最后把结果拼起来 (<code>torch.cat</code>)。</li>
+</ul>
+</li>
+<li><strong>对答案</strong>：对比“拼盘算出的结果”和“一句句算拼起来的结果”是否一致。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结文中的核心观点</h3>
+<p>这个文件其实没有在“讲观点”，而是在<strong>“做体检”</strong>。它隐含的观点是：</p>
+<ol>
+<li><strong>正确性至上</strong>：无论你的算法 <code>chunk_log_linear_attn</code> 跑得多快（通常这种优化版是用 Triton 写的高性能算子），它的数学结果必须和 Python 写的慢速版 <code>naive_log_linear_attn</code> 保持一致。</li>
+<li><strong>全面覆盖</strong>：<ul>
+<li>形状要对（Batch, Time, Head, Dim 各种组合）。</li>
+<li>能做推理（Forward）。</li>
+<li>能做训练（Backward/Gradient）。</li>
+<li>能处理长短不一的数据（VarLen）。</li>
+</ul>
+</li>
+</ol>
+<p>如果你是在学习这个算法的原理，<strong>不要看这个文件</strong>，你应该去看 <code>naive_log_linear_attn</code> 的实现代码，那里才是算法的数学逻辑。这个文件只是为了保证代码没写Bug。</p>

@@ -1,0 +1,125 @@
+<h1>fla/ops/generalized_delta_rule/dplr/naive.py</h1>
+<p>这份代码确实非常硬核，它实现了一种<strong>线性注意力（Linear Attention）</strong>或<strong>RNN</strong>的变体，具体来说是基于“广义Delta规则”（Generalized Delta Rule）的状态更新机制。</p>
+<p>简单来说，这是在试图<strong>用RNN的方式（递归）实现Transformer的效果，同时保持推理速度极快</strong>。</p>
+<p>为了让你看懂，我们将这个庞大的任务拆解成一个 <strong>“学习 To-Do List”</strong>，分为三个阶段，由浅入深。</p>
+<hr />
+<h3>📝 任务列表：一步步攻克 DPLR 代码</h3>
+<h4>✅ Task 1: 搞清楚角色分工 (输入是什么？)</h4>
+<h4>✅ Task 2: 看懂核心逻辑 (dplr_recurrence 函数)</h4>
+<h4>✅ Task 3: 理解为什么要写得这么复杂 (dplr_chunkwise 函数)</h4>
+<hr />
+<h3>🟢 Task 1: 搞清楚角色分工</h3>
+<p>在深入代码前，先明白这些变量代表什么。这其实是一个序列模型，处理时间序列数据（比如文本）。</p>
+<ul>
+<li><strong><code>q, k, v</code></strong>: 传统的 Attention 三剑客。<ul>
+<li>$q$ (Query): 当前时刻我在寻找什么信息。</li>
+<li>$k$ (Key): 信息的标签。</li>
+<li>$v$ (Value): 信息的具体内容。</li>
+</ul>
+</li>
+<li><strong><code>S</code> (State)</strong>: 这是核心！<ul>
+<li>这是一个<strong>记忆矩阵</strong>（Hidden State）。它存储了从过去到现在所有的上下文信息。</li>
+<li>代码的目标就是：每一步如何更新 <code>S</code>，以及如何用 <code>S</code> 算出输出。</li>
+</ul>
+</li>
+<li><strong><code>alpha, beta</code></strong>: 这是这个算法特有的。<ul>
+<li>它们用于控制“怎么更新记忆”。普通的 Linear Attention 直接把 $k \cdot v$ 加进记忆。而这里采用了更复杂的更新规则（Delta Rule），可以理解为一种“修正”机制。</li>
+</ul>
+</li>
+<li><strong><code>gk</code></strong>: Gate / Decay（衰减项）。<ul>
+<li>控制遗忘的程度。比如 <code>gk</code> 很大，说明要记住；<code>gk</code> 很小，说明旧的记忆要忘掉。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 2: 看懂核心逻辑 (<code>dplr_recurrence</code>)</h3>
+<p>这是代码中最容易看懂的部分。它用了一个 Python 的 <code>for</code> 循环，模拟了时间一步步流逝的过程。</p>
+<p><strong>代码段落分析：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">dplr_recurrence</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 初始化变量 ...</span>
+    <span class="n">S</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 1. 初始化记忆 S 为全 0</span>
+
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">l</span><span class="p">):</span> <span class="c1"># 2. 时间步循环：从第 0 步走到第 l 步</span>
+        <span class="c1"># 取出当前时刻的输入</span>
+        <span class="n">_k</span> <span class="o">=</span> <span class="n">k</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>
+        <span class="n">_q</span> <span class="o">=</span> <span class="n">q</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>
+        <span class="n">_v</span> <span class="o">=</span> <span class="n">v</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>
+        <span class="n">_alpha</span> <span class="o">=</span> <span class="n">alpha</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+        <span class="n">_beta</span> <span class="o">=</span> <span class="n">beta</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+
+        <span class="c1"># 3. 计算这一步要写入记忆的“增量” (_kv)</span>
+        <span class="c1"># 这一行是核心公式！</span>
+        <span class="c1"># 第一部分 _k * _v: 标准的 KV 写入</span>
+        <span class="c1"># 第二部分 (S * _alpha) * _beta: 这是 Delta Rule 的精髓。</span>
+        <span class="c1"># 它表示：根据当前的记忆 S，结合 alpha 和 beta 算出一个“修正值”。</span>
+        <span class="n">_kv</span> <span class="o">=</span> <span class="n">_k</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">_v</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">+</span> \
+              <span class="p">(</span><span class="n">S</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="o">*</span> <span class="n">_alpha</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">])</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="o">*</span> <span class="n">_beta</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span>
+
+        <span class="c1"># 4. 更新记忆 S</span>
+        <span class="c1"># 新的 S = (旧 S * 衰减系数) + 增量</span>
+        <span class="n">S</span> <span class="o">=</span> <span class="n">S</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="o">*</span> <span class="n">gk</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">exp</span><span class="p">()[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">+</span> <span class="n">_kv</span>
+
+        <span class="c1"># 5. 计算输出 o</span>
+        <span class="c1"># 输出 = 当前 Query 与 记忆 S 做乘法</span>
+        <span class="n">o</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">&#39;bhd,bhdm-&gt;bhm&#39;</span><span class="p">,</span> <span class="n">_q</span><span class="p">,</span> <span class="n">S</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Task 2 总结：</strong>
+这个函数告诉了我们模型的数学定义：
+<strong>记忆 $S$ 是不断累积更新的，每一步不仅加入新的 $K,V$，还会根据当前的记忆状态进行自我修正（通过 $\alpha, \beta$），并且旧记忆会随时间衰减（通过 $gk$）。</strong></p>
+<hr />
+<h3>🟢 Task 3: 理解为什么要写得这么复杂 (<code>dplr_chunkwise</code>)</h3>
+<p>既然 <code>dplr_recurrence</code> 已经实现了功能，为什么下面还有个又长又难懂的 <code>dplr_chunkwise</code>？</p>
+<p><strong>原因：</strong> Python 的 <code>for</code> 循环在 GPU 上<strong>太慢了</strong>！
+如果序列长度 $L=4096$，上面的函数就要循环 4096 次，GPU 只能串行等待。</p>
+<p><code>dplr_chunkwise</code> 的目的是<strong>并行加速</strong>。它利用了“分块计算”（Chunking）的思想。</p>
+<p><strong>逻辑拆解：</strong></p>
+<ol>
+<li>
+<p><strong>分块 (Chunking):</strong>
+    代码把长序列切成了很多小块（比如每块长度 32，<code>chunk_size=32</code>）。
+    <code>rearrange(x, 'b h (n c) d -&gt; b h n c d'...)</code> 就是在做切分。</p>
+</li>
+<li>
+<p><strong>块内计算 (Intra-chunk):</strong>
+    在每一个 32 长度的小块内部，它预先计算好了所有的交互。</p>
+<ul>
+<li><code>A_qk</code>, <code>A_qb</code> 等变量：这些是在计算块内的 Attention 分数。</li>
+<li>代码中的 <code>for i in range(chunk_size)</code> 虽然也是循环，但只循环 32 次（很短），而且是为了构建块内的转移矩阵。</li>
+</ul>
+</li>
+<li>
+<p><strong>块间递归 (Inter-chunk):</strong>
+    这是最难懂的部分：
+    <code>python
+    v2_i = u_i + w_i @ S  # 算出这一块结束时的状态
+    # ...
+    S = ... # 更新 S 传递给下一个块</code>
+    它不再是一步一步传 $S$，而是<strong>一块一块地传 $S$</strong>。</p>
+<ul>
+<li>它算出：如果其实状态是 $S_{start}$，经过这 32 步后，状态会变成什么？</li>
+<li>然后直接把这个结果传给下一个块。</li>
+</ul>
+</li>
+</ol>
+<p><strong>Task 3 总结：</strong>
+*   <code>dplr_chunkwise</code> 是为了<strong>速度</strong>。
+*   它把“一步一步走”变成了“一段一段跳”。
+*   虽然数学上等价于 <code>recurrence</code>，但它利用矩阵乘法一次性算出一个块内的所有变化，充分利用了 GPU 的并行能力。</p>
+<hr />
+<h3>💡 总结回顾</h3>
+<p>如果把这个代码比作<strong>记日记</strong>：</p>
+<ol>
+<li>
+<p><strong><code>dplr_recurrence</code> (Naive版)</strong>：
+    你每天晚上（每个时间步 <code>i</code>），回顾今天的经历（<code>k, v</code>），结合昨天的记忆（<code>S</code>）和一些反思（<code>alpha, beta</code>），写下新的日记，并稍微忘掉一点很久以前的事（<code>gk</code>）。
+    <em>优点：逻辑清晰。缺点：写完一辈子日记要花很久。</em></p>
+</li>
+<li>
+<p><strong><code>dplr_chunkwise</code> (加速版)</strong>：
+    你每个月（<code>chunk</code>）做一次总结。你先在草稿纸上把这个月30天内发生的事情理顺（块内计算），算出一个“月度增量”。然后只需要把每个月的变化串起来就行了。
+    <em>优点：速度极快。缺点：计算过程非常烧脑。</em></p>
+</li>
+</ol>
+<p><strong>建议：</strong>
+如果你只是想修改模型逻辑，看 <code>naive.py</code> 里的 <code>dplr_recurrence</code> 就够了。如果你要跑实验训练模型，必须调用 <code>dplr_chunkwise</code> 否则会慢死。</p>

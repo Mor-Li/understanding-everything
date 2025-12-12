@@ -1,0 +1,106 @@
+<h1>tests/ops/test_dplr_delta.py</h1>
+<p>这份代码其实不是在“训练”一个模型，而是在<strong>测试（Test）</strong> 一个底层的数学算子（Operator）写得对不对。</p>
+<p>简单来说，这个文件是用来<strong>给一个复杂的深度学习层（Layer）做质量检测的</strong>。这个层叫做 <strong>"DPLR Delta Rule"</strong>（一种改进的线性注意力机制或RNN层）。</p>
+<p>因为为了速度，真正的实现通常是用 CUDA/Triton 写的（非常难读且容易写错），所以这里用 Python 写了一个<strong>慢但是绝对正确</strong>的版本（Reference），然后对比两者的结果是否一致。</p>
+<p>我们可以把阅读这份代码的任务拆解成下面这个 <strong>Todo List</strong>，一步步来看：</p>
+<h3>任务清单 (Task List)</h3>
+<h4>✅ Task 1: 搞懂我们在测什么 (核心概念)</h4>
+<ul>
+<li><strong>目标</strong>：理解 <code>DPLR Delta Rule</code> 是个啥。</li>
+<li><strong>通俗解释</strong>：它像是一个 RNN（循环神经网络）。<ul>
+<li>输入：<code>q, k, v</code>（类似 Attention 的查询、键、值），还有 <code>a, b</code>（衰减项/更新项），<code>gk</code>（门控机制）。</li>
+<li>过程：它维护一个记忆状态 $S$。每一步，根据新的输入更新 $S$，并输出结果 $o$。</li>
+<li><strong>难点</strong>：这个过程既可以像 RNN 一样一步步算（Recurrent），也可以分块并行算（Chunk）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 建立“标准答案” (Reference 实现)</h4>
+<ul>
+<li><strong>代码对应</strong>：<ul>
+<li><code>recurrent_dplr_delta_rule_ref</code>: <strong>笨办法</strong>。用 <code>for</code> 循环一步一步算。虽然慢，但逻辑简单，不容易错，作为<strong>标准答案（Ground Truth）</strong>。</li>
+<li><code>chunk_dplr_delta_rule_ref</code>: <strong>分块办法</strong>。把长序列切成小块（Chunk），块内并行计算。这也是一个参考实现，用来验证逻辑。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 测试“前向传播” (Forward Pass)</h4>
+<ul>
+<li><strong>目标</strong>：确保算出来的结果是对的。</li>
+<li><strong>代码对应</strong>：<code>test_recurrent_fwd</code> 和 <code>test_fused_recurrent</code>。</li>
+<li><strong>步骤</strong>：<ol>
+<li>随机生成一堆数据 (<code>q, k, v...</code>)。</li>
+<li>用 Python 写的“慢版本”算一遍，得到结果 <code>ref</code>。</li>
+<li>用优化过的“快版本”（CUDA/Triton kernel）算一遍，得到结果 <code>tri</code>。</li>
+<li><strong>对比</strong>：用 <code>assert_close(ref, tri)</code> 检查这两个结果是不是几乎一样。如果不一样，说明快版本代码写错了。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 4: 测试“反向传播” (Backward Pass / Gradients)</h4>
+<ul>
+<li><strong>目标</strong>：确保模型训练时，梯度（Gradient）计算是对的。</li>
+<li><strong>代码对应</strong>：<code>test_chunk</code>。</li>
+<li><strong>背景</strong>：深度学习需要求导数来更新参数。手写的 CUDA 核心求导非常容易出错。</li>
+<li><strong>步骤</strong>：<ol>
+<li>输入数据，开启 <code>requires_grad=True</code>（允许求导）。</li>
+<li>算出 Loss，然后调用 <code>.backward()</code>。</li>
+<li><strong>对比</strong>：对比慢版本的梯度 (<code>ref_dq</code>) 和快版本的梯度 (<code>tri_dq</code>)。如果梯度对不上，模型就训练不起来。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 5: 测试“变长序列” (Variable Length)</h4>
+<ul>
+<li><strong>目标</strong>：确保处理长短不一的句子时不出错。</li>
+<li><strong>代码对应</strong>：<code>test_chunk_varlen</code>。</li>
+<li><strong>背景</strong>：实际应用中，一个 batch 里的句子有的长有的短（比如一句是5个词，一句是100个词）。</li>
+<li><strong>步骤</strong>：<ol>
+<li>传入 <code>cu_seqlens</code>（记录每个句子的长度）。</li>
+<li>把所有句子拼成一条长龙塞进去算。</li>
+<li><strong>对比</strong>：验证这种拼起来算的结果，和单独算每个句子的结果是否一致。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>逐段代码简析 (配合上面的 Task)</h3>
+<ol>
+<li>
+<p><strong>Helper Functions (<code>recurrent_dplr_delta_rule_ref</code>)</strong>:</p>
+<ul>
+<li>这是 <strong>Task 2</strong> 的核心。</li>
+<li>你看里面有个 <code>for i in range(T):</code>，这就是最原始的 RNN 循环，一步一步更新状态 <code>S</code>。它是用来生成标准答案的。</li>
+</ul>
+</li>
+<li>
+<p><strong>Test 1: <code>test_recurrent_fwd</code></strong>:</p>
+<ul>
+<li>这是 <strong>Task 3</strong> 的一部分。</li>
+<li>它对比了 <code>chunk_ref</code> (分块参考) 和 <code>recurrent_ref</code> (循环参考)。确保两种数学推导在 Python 层面就是一致的。</li>
+</ul>
+</li>
+<li>
+<p><strong>Test 2: <code>test_fused_recurrent</code></strong>:</p>
+<ul>
+<li>这是 <strong>Task 3</strong> 的核心。</li>
+<li>它引入了 <code>fused_recurrent_dplr_delta_rule</code> (这是真正要发布的高性能算子)。</li>
+<li>它在检查：<strong>高性能算子 vs Python参考算子</strong>，结果是否一致？</li>
+</ul>
+</li>
+<li>
+<p><strong>Test 3: <code>test_chunk</code></strong>:</p>
+<ul>
+<li>这是 <strong>Task 4</strong> 的核心。</li>
+<li>它生成了随机的梯度 <code>do</code>。</li>
+<li>它分别运行了 <code>.backward()</code>。</li>
+<li>最后一大串 <code>assert_close</code>：检查 <code>dq</code> (q的梯度), <code>dk</code> (k的梯度), <code>dv</code> (v的梯度) 等等是否全部吻合。这是最严格的测试。</li>
+</ul>
+</li>
+<li>
+<p><strong>Test 4: <code>test_chunk_varlen</code></strong>:</p>
+<ul>
+<li>这是 <strong>Task 5</strong> 的核心。</li>
+<li><code>cu_seqlens = [0, 15, 100...]</code> 表示第一句话长度15，第二句话长度85...</li>
+<li>它验证这种复杂的输入情况下，算子是否依然工作正常。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>你不需要看懂具体的数学公式（什么 <code>u = A_ab @ ...</code>），你只需要知道：
+<strong>这个文件是一个“质检员”。它用一套简单易懂但慢的代码（Reference），去“拷问”一套复杂难写但快的代码（Triton/CUDA Implementation），确保后者在算结果和算梯度时，都没有任何偏差。</strong></p>

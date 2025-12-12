@@ -1,0 +1,92 @@
+<h1>fla/models/rwkv7/modeling_rwkv7.py</h1>
+<p>这份代码文件 <code>modeling_rwkv7.py</code> 是 <strong>RWKV-v7</strong> 神经网络模型的“结构蓝图”。它定义了这个模型长什么样、由哪些零件组成、以及数据如何在里面流动。</p>
+<p>RWKV 是一种特殊的架构，它结合了 RNN（循环神经网络）的推理速度和 Transformer 的训练并行能力。</p>
+<p>为了让你听懂，我把这个文件的逻辑拆解成一个 <strong>“乐高积木搭建任务清单” (Task List)</strong>，然后逐步讲解每一个任务在做什么。</p>
+<hr />
+<h3>🧱 任务清单 (Task Todo List)</h3>
+<p>我们要造一个会说话的 AI，需要按顺序完成以下 4 个任务：</p>
+<ol>
+<li><strong>Task 1: 制造零件 —— <code>RWKV7FeedForward</code></strong><ul>
+<li><em>目标</em>：定义模型中负责“消化信息”的模块（通常叫 FFN 或 Channel Mix）。</li>
+</ul>
+</li>
+<li><strong>Task 2: 组装层级 —— <code>RWKV7Block</code></strong><ul>
+<li><em>目标</em>：把“注意力机制”（Attention）和“消化模块”（FFN）拼在一起，做成一层神经网络。</li>
+</ul>
+</li>
+<li><strong>Task 3: 搭建骨架 —— <code>RWKV7Model</code></strong><ul>
+<li><em>目标</em>：把几十层 <code>Block</code> 堆叠起来，加上把文字变成数字的入口（Embedding）。</li>
+</ul>
+</li>
+<li><strong>Task 4: 完成整机 —— <code>RWKV7ForCausalLM</code></strong><ul>
+<li><em>目标</em>：在骨架上装一个“嘴巴”（LM Head），让它能预测下一个字，并计算预测得准不准（Loss）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解 (Step-by-Step)</h3>
+<h4>Task 1: 制造零件 (<code>RWKV7FeedForward</code>)</h4>
+<p><strong>代码位置</strong>：<code>class RWKV7FeedForward(nn.Module):</code></p>
+<p>这是 RWKV 的“前馈神经网络”部分。在 RWKV 的术语里，这通常被称为 <strong>Channel Mixing（通道混合）</strong>。</p>
+<ul>
+<li><strong>它的作用</strong>：
+    注意力机制（Attention）负责看上下文的关系，而这个 FFN 负责具体分析当前看到的信息。</li>
+<li><strong>关键步骤</strong>：<ol>
+<li><strong><code>token_shift</code> (时间平移)</strong>：RWKV 的特色。它不仅看当前的输入，还把“上一个时刻”的输入拿一部分过来混合。这让模型有了极其短期的记忆。</li>
+<li><strong><code>key</code> 和 <code>value</code> (线性层)</strong>：把混合后的数据放大（升维），激活一下（<code>act_fn</code>），再缩小（降维）。这是神经网络提取特征的标准动作。</li>
+<li><strong><code>state</code> (状态)</strong>：你会看到代码里有很多 <code>state</code>。这是因为 RWKV 推理时像 RNN，需要把这一层的记忆传给下一个 token。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 2: 组装层级 (<code>RWKV7Block</code>)</h4>
+<p><strong>代码位置</strong>：<code>class RWKV7Block(GradientCheckpointingLayer):</code></p>
+<p>这是模型的一“层”（Layer）。现在的 LLM 都是几十层这样的 Block 堆起来的。</p>
+<ul>
+<li><strong>它的组成</strong>：<ol>
+<li><strong><code>attn</code> (注意力)</strong>：代码里调用了 <code>RWKV7Attention</code>。这是 RWKV7 的核心黑科技（Time Mixing），负责处理长距离的上下文依赖。</li>
+<li><strong><code>ffn</code> (前馈)</strong>：就是上面 Task 1 定义的模块。</li>
+<li><strong><code>LayerNorm</code> (归一化)</strong>：代码里的 <code>pre_norm</code>, <code>attn_norm</code>, <code>ffn_norm</code>。相当于数据的“安检口”，把数据整理得标准一点，防止训练时数值爆炸。</li>
+</ol>
+</li>
+<li><strong>数据流向</strong>：
+    输入 -&gt; 归一化 -&gt; <strong>注意力机制</strong> -&gt; 残差连接(加回原数据) -&gt; 归一化 -&gt; <strong>FFN</strong> -&gt; 残差连接 -&gt; 输出。</li>
+<li><strong>特殊点</strong>：代码里有个 <code>v_first</code>。这是 RWKV7 特有的设计，用于在层与层之间传递某种初始状态信息。</li>
+</ul>
+<h4>Task 3: 搭建骨架 (<code>RWKV7Model</code>)</h4>
+<p><strong>代码位置</strong>：<code>class RWKV7Model(RWKV7PreTrainedModel):</code></p>
+<p>这是整个模型的<strong>躯干</strong>。它不负责说话，只负责“理解”。</p>
+<ul>
+<li><strong>它的作用</strong>：<ol>
+<li><strong><code>Embedding</code> (嵌入层)</strong>：把人类的文字（Token ID）转换成计算机能懂的向量（数字矩阵）。</li>
+<li><strong><code>layers</code> (层堆叠)</strong>：一个 <code>nn.ModuleList</code>，里面装了 N 个 <code>RWKV7Block</code>。数据会一层一层往上钻，变得越来越抽象和高级。</li>
+<li><strong><code>load_state_dict</code> (加载存档)</strong>：代码里有一大段关于 <code>load_state_dict</code> 的逻辑。这是因为 RWKV7 的参数格式可能升级了（v1 到 v2），这段代码负责把旧的权重文件自动转换成新格式，防止报错。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 4: 完成整机 (<code>RWKV7ForCausalLM</code>)</h4>
+<p><strong>代码位置</strong>：<code>class RWKV7ForCausalLM(...)</code></p>
+<p>这是用户最终调用的类。<code>CausalLM</code> 的意思是“因果语言模型”，也就是通常说的“文本生成模型”。</p>
+<ul>
+<li><strong>它的作用</strong>：<ol>
+<li><strong><code>self.model</code></strong>：包含了上面 Task 3 里的躯干。</li>
+<li><strong><code>lm_head</code> (语言头)</strong>：一个巨大的线性层。它把躯干计算出的高维特征，转换成词表中每一个字出现的概率。</li>
+<li><strong><code>forward</code> 函数 (前向传播)</strong>：<ul>
+<li>它接收输入，跑一遍模型。</li>
+<li><strong>计算 Loss (损失)</strong>：如果提供了 <code>labels</code>（正确答案），它会计算模型预测的字和正确答案差了多少。</li>
+<li>代码里提到了 <code>FusedCrossEntropyLoss</code> 和 <code>l2_warp</code>，这些是用来加速计算和优化训练稳定性的高级技巧。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件其实就是告诉计算机：</p>
+<blockquote>
+<p>“嘿，我要造一个 RWKV7 机器人。
+先造一个<strong>混合器(FFN)</strong>，
+再把混合器和<strong>注意力(Attention)</strong>装进一个<strong>盒子(Block)</strong>里，
+然后把 32 个盒子<strong>堆起来(Model)</strong>，
+最后在顶上装个<strong>嘴巴(LM Head)</strong>，让它能把算出来的数字变成字吐出来。”</p>
+</blockquote>
+<p>你看不懂的部分（比如 <code>addcmul</code>, <code>token_shift</code>）大多是具体的数学运算实现，但只要理解了上面这个<strong>结构框架</strong>，你就掌握了这份代码的核心思想。</p>

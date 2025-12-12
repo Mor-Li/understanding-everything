@@ -1,0 +1,146 @@
+<h1>fla/layers/rwkv7.py</h1>
+<p>这段代码实现了 <strong>RWKV-7</strong> 模型的核心注意力层（Attention Layer）。RWKV 是一种“线性 Attention”架构，它既像 Transformer 一样可以并行训练，又像 RNN 一样推理时显存占用极低。</p>
+<p>RWKV-7 是该系列的最新版本，引入了更复杂的“状态演化”机制。为了让你看懂，我把这个模块的工作流程拆解成一个 <strong>“任务清单” (ToDo List)</strong>，就像是一个工厂流水线，每一步都在加工数据。</p>
+<hr />
+<h3>📋 任务清单：RWKV-7 Attention 的数据加工流程</h3>
+<h4>🟢 Phase 1: 准备阶段 (初始化与混合)</h4>
+<p><strong>目标</strong>：把当前的输入（当前看到的词）和上一个时刻的输入（上一个词）混合一下，作为加工原材料。</p>
+<ol>
+<li>
+<p><strong>Task 1.1: 提取上一刻的记忆 (Token Shift)</strong></p>
+<ul>
+<li><strong>代码对应</strong>: <code>token_shift(...)</code></li>
+<li><strong>解释</strong>: 这里的 <code>delta</code> 实际上是计算当前输入 <code>hidden_states</code> 和上一步输入的差值。RWKV 的特色是“混合时间”，它不仅仅看当前词，还通过这个差值把上一个词的信息“平滑”地混进来。</li>
+<li><strong>通俗理解</strong>: 你在读这句话时，眼睛看着当前字，余光其实还留着上一个字的残影。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 1.2: 调制六种不同的输入信号 (Fused Mixing)</strong></p>
+<ul>
+<li><strong>代码对应</strong>: <code>fused_addcmul_rwkv7(...)</code></li>
+<li><strong>解释</strong>: 利用上面算出的 <code>delta</code>，结合六组可学习的参数 (<code>x_r, x_w, x_k, x_v, x_a, x_g</code>)，生成六个不同的混合向量 (<code>xr, xw, xk, xv, xa, xg</code>)。</li>
+<li><strong>作用</strong>: 这六个向量将分别用于生成 Attention 机制所需的六个组件。</li>
+</ul>
+</li>
+</ol>
+<h4>🟡 Phase 2: 组件生产 (投影与变换)</h4>
+<p><strong>目标</strong>：利用混合好的原料，生产出控制记忆更新的关键组件（R, W, K, V, A, G）。</p>
+<ol>
+<li>
+<p><strong>Task 2.1: 生成 R (Receptance / 接收端)</strong></p>
+<ul>
+<li><strong>代码对应</strong>: <code>r = self.r_proj(xr)</code></li>
+<li><strong>解释</strong>: 类似于 Transformer 里的 <strong>Query (Q)</strong>。它决定了我们要从过去的记忆中“读取”多少信息。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.2: 生成 W (Decay / 遗忘率)</strong></p>
+<ul>
+<li><strong>代码对应</strong>: <code>w = -0.6065... * self.w_lora(xw).sigmoid()</code></li>
+<li><strong>解释</strong>: 这是 RWKV 的核心。W 决定了记忆衰减的速度。</li>
+<li><strong>细节</strong>: 使用了 <strong>LoRA</strong> (Low-Rank Adaptation) 来计算，为了节省参数量。<code>sigmoid</code> 保证值在 0-1 之间，前面的负数系数是为了让它表示“衰减”。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.3: 生成 K (Key) 和 V (Value)</strong></p>
+<ul>
+<li><strong>代码对应</strong>: <code>k = self.k_proj(xk)</code>, <code>v = self.v_proj(xv)</code></li>
+<li><strong>解释</strong>:<ul>
+<li><strong>K (Key)</strong>: 类似于索引标签，决定了当前信息“长什么样”。</li>
+<li><strong>V (Value)</strong>: 实际的内容信息。</li>
+</ul>
+</li>
+<li><strong>特殊处理</strong>: 代码中有一个 <code>v_first</code> 的逻辑，这是 RWKV-7 特有的，让层与层之间的 V 向量通过 LoRA 进行混合，增强信息流动。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.4: 生成 A (Anchor / In-context 修正)</strong></p>
+<ul>
+<li><strong>代码对应</strong>: <code>a = self.a_lora(xa).sigmoid()</code></li>
+<li><strong>解释</strong>: 这是 RWKV-7 新增的变量。它用来动态调整记忆的更新方式，防止记忆随着时间推移变得过于混乱。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.5: 生成 G (Gate / 门控)</strong></p>
+<ul>
+<li><strong>代码对应</strong>: <code>g = self.g_lora(xg)</code></li>
+<li><strong>解释</strong>: 一个门控机制，最后用来控制输出的音量大小。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.6: 对 K 进行微调 (Normalization &amp; Fusion)</strong></p>
+<ul>
+<li><strong>代码对应</strong>: <code>kk = ...</code>, <code>k = fused_k_rwkv7(...)</code></li>
+<li><strong>解释</strong>: 为了数值稳定性（防止数字变得太大或太小），对 K 进行了归一化，并融合了 A 向量的信息。</li>
+</ul>
+</li>
+</ol>
+<h4>🔴 Phase 3: 核心引擎 (状态更新 / Attention 计算)</h4>
+<p><strong>目标</strong>：这是最难的一步。根据刚才生成的组件，更新模型的“大脑”（State），并计算输出。</p>
+<ol>
+<li>
+<p><strong>Task 3.1: 维度重排 (Reshape)</strong></p>
+<ul>
+<li><strong>代码对应</strong>: <code>rearrange(...)</code></li>
+<li><strong>解释</strong>: 把数据整理成 <code>[batch, time, head, head_dim]</code> 的格式，方便多头注意力计算。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.2: 运行 RWKV 核心算子 (Chunk vs Recurrent)</strong></p>
+<ul>
+<li><strong>代码对应</strong>:<ul>
+<li><code>chunk_rwkv7(...)</code>: 训练时用。并行计算，速度快。</li>
+<li><code>fused_mul_recurrent_rwkv7(...)</code>: 推理时用（或序列很短时）。像 RNN 一样一步步算。</li>
+</ul>
+</li>
+<li><strong>核心逻辑</strong>:<ul>
+<li><strong>旧记忆 × 衰减 (W) + 新信息 (K, V, A) = 新记忆</strong></li>
+<li><strong>输出 = 接收 (R) × 新记忆</strong></li>
+</ul>
+</li>
+<li><strong>通俗理解</strong>: 这一步把当前的 K 和 V 存入大脑，同时根据 W 忘掉一些旧东西，然后根据 R 读取当前需要的信息作为 <code>o</code>。</li>
+</ul>
+</li>
+</ol>
+<h4>🔵 Phase 4: 包装出厂 (输出处理)</h4>
+<p><strong>目标</strong>：整理计算结果，输出给下一层。</p>
+<ol>
+<li>
+<p><strong>Task 4.1: 更新 Cache (仅在推理时)</strong></p>
+<ul>
+<li><strong>代码对应</strong>: <code>past_key_values.update(...)</code></li>
+<li><strong>解释</strong>: 把这一步算出来的“大脑状态”存下来，给生成下一个词的时候用。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 4.2: 归一化 (Group Normalization)</strong></p>
+<ul>
+<li><strong>代码对应</strong>: <code>o = self.g_norm(...)</code></li>
+<li><strong>解释</strong>: 对输出进行标准化，防止数值爆炸，保证训练稳定。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 4.3: 门控修正 (Gate Correction)</strong></p>
+<ul>
+<li><strong>代码对应</strong>: <code>o = gate_output_correction(o, ...)</code></li>
+<li><strong>解释</strong>: RWKV-7 特有的修正步骤。利用之前的 R, K, V, G 对输出进行最后的微调，增加模型的表达能力。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 4.4: 最终投影 (Output Projection)</strong></p>
+<ul>
+<li><strong>代码对应</strong>: <code>o = self.o_proj(o)</code></li>
+<li><strong>解释</strong>: 把数据的维度变回 <code>hidden_size</code>，使其可以顺利进入下一层网络。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这段代码在干什么？</h3>
+<p>简单来说，这是一个 <strong>“带遗忘功能的超级记事本”</strong> 模块：</p>
+<ol>
+<li><strong>看一眼</strong>：看当前词和上一个词（Token Shift）。</li>
+<li><strong>定参数</strong>：决定这一个词有多重要（K），内容是什么（V），以前的事要忘掉多少（W），我们要读出什么（R）。</li>
+<li><strong>写记忆</strong>：把新信息写进本子，把旧信息擦淡一点（State Update）。</li>
+<li><strong>读结果</strong>：根据现在的需求，从本子上读出结果，整理一下输出（Output）。</li>
+</ol>
+<p>这里的复杂代码（LoRA, Fused Kernel, Chunking）全都是为了让这个过程<strong>算得更快</strong>、<strong>显存更省</strong>、<strong>效果更好</strong>。</p>

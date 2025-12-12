@@ -1,0 +1,119 @@
+<h1>fla/ops/based/parallel.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到 <strong>Triton</strong>（一种用于编写高性能GPU内核的语言）和 <strong>Linear Attention</strong>（线性注意力机制）的底层实现。看不懂是很正常的。</p>
+<p>为了让你能够消化这段代码，我们把它拆解成一个 <strong>“学习任务清单 (Todo List)”</strong>。我们不一行行读代码，而是通过几个关键任务，逐渐揭开它的面纱。</p>
+<h3>核心背景：这是什么？</h3>
+<p>这是一个名为 <strong>"Based"</strong> 的模型的并行实现。
+简单来说，它是一种 <strong>线性注意力机制 (Linear Attention)</strong>。
+*   <strong>标准 Attention (Transformer):</strong> 用 <code>Softmax(Q @ K.T)</code> 计算权重。
+*   <strong>Based Attention (本文):</strong> 认为 Softmax 太慢且显存占用大，改用 <strong>泰勒展开 (Taylor Expansion)</strong> 来近似。
+    *   核心公式：$Attention(q, k) \approx 1 + qk^T + \frac{1}{2}(qk^T)^2$</p>
+<hr />
+<h3>任务清单 (Todo List)</h3>
+<p>请按照以下顺序阅读我的解释：</p>
+<ol>
+<li><strong>Task 1: 搞懂核心数学逻辑 (The Math)</strong> - 只要看懂一行代码。</li>
+<li><strong>Task 2: 搞懂数据切块 (Tiling)</strong> - 为什么要切成小块？</li>
+<li><strong>Task 3: 搞懂“因果”循环 (Causal Loop)</strong> - 怎么保证不看未来的数据？</li>
+<li><strong>Task 4: 搞懂 Python 接口</strong> - 输入输出是什么？</li>
+</ol>
+<hr />
+<h3>Step-by-Step 详细讲解</h3>
+<h4>Task 1: 搞懂核心数学逻辑</h4>
+<p>在 <code>parallel_based_fwd_kernel</code> 函数中，请找到这几行代码（大约在 56-57 行）：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span><span class="p">,</span> <span class="p">(</span><span class="n">b_k</span><span class="p">),</span> <span class="n">allow_tf32</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>  <span class="c1"># 1. 计算 Q * K^T</span>
+<span class="n">b_s</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">+</span> <span class="n">b_s</span> <span class="o">+</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">b_s</span> <span class="o">*</span> <span class="n">b_s</span>             <span class="c1"># 2. 泰勒展开的核心！</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<ul>
+<li>普通的 Attention 这里会接一个 <code>Softmax</code>。</li>
+<li><strong>Based</strong> 算法在这里做了一个特殊的映射：$f(x) = 1 + x + \frac{1}{2}x^2$。</li>
+<li>这就是这段代码的灵魂。它把 Q 和 K 的相似度转换成了权重。</li>
+<li>之后，它把这个权重乘到 V 上：<code>b_o = b_o + tl.dot(b_s, b_v)</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 搞懂数据切块 (Tiling)</h4>
+<p>Triton 的核心思想是“分块计算”。显存（HBM）很大但慢，SRAM（片上内存）很小但极快。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    # BTL, BTS, BK, BV 都是分块的大小 (Block Size)
+    # i_c 是 chunk index (当前处理序列的第几块)
+    p_q = tl.make_block_ptr(...) # 指向 Q 的一个小方块
+    p_k = tl.make_block_ptr(...) # 指向 K 的一个小方块</code></li>
+<li><strong>解释</strong>：<ul>
+<li>想象一个巨大的矩阵乘法 $Q \times K^T$。</li>
+<li>这个 Kernel 并不是一次性算完整个序列（比如长度 4096），而是把 Q 切成长度为 <code>BTL</code> (比如 128) 的小段。</li>
+<li>每个 GPU 线程块 (Program ID) 负责计算输出序列的一小段。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 搞懂“因果”循环 (Causal Loop)</h4>
+<p>这是最难理解的部分。因为是用于语言模型，<strong>当前的词不能看到未来的词</strong>（Causal Masking）。</p>
+<p>代码里把计算分成了<strong>两个循环</strong>：</p>
+<p><strong>循环 1：计算以前的块 (非对角线部分)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 range 结束点是 i_c * BTL</span>
+<span class="c1"># 也就是只看当前 Q 块 &quot;之前&quot; 的所有 K, V 块</span>
+<span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">i_c</span> <span class="o">*</span> <span class="n">BTL</span><span class="p">,</span> <span class="n">BTS</span><span class="p">):</span>
+    <span class="c1"># Load K, V block</span>
+    <span class="c1"># 计算 Q * K</span>
+    <span class="c1"># 这里的 Q 时间步肯定晚于 K，所以不需要 Mask，直接算！</span>
+    <span class="c1"># 这样效率极高，没有 if-else 判断。</span>
+</code></pre></div>
+
+<p><strong>循环 2：计算当前的块 (对角线部分)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里处理 Q 和 K 在同一个时间段的情况</span>
+<span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">i_c</span> <span class="o">*</span> <span class="n">BTL</span><span class="p">,</span> <span class="p">(</span><span class="n">i_c</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">BTL</span><span class="p">,</span> <span class="n">BTS</span><span class="p">):</span>
+    <span class="c1"># ... Load 数据 ...</span>
+
+    <span class="c1"># 关键点：Masking (掩码)</span>
+    <span class="n">m_s</span> <span class="o">=</span> <span class="n">o_q</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="n">o_k</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>  <span class="c1"># 创建一个下三角掩码</span>
+    <span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span><span class="p">,</span> <span class="n">b_k</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 如果位置非法 (Q的时间早于K)，就把权重设为 0</span>
+    <span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">m_s</span><span class="p">,</span> <span class="n">b_s</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> 
+
+    <span class="c1"># ... 累加结果 ...</span>
+</code></pre></div>
+
+<p><strong>总结 Task 3</strong>：
+为了并行计算的高效性，作者把“以前的历史”（完全可见，无脑算）和“当下的经历”（部分可见，需要遮盖）拆成了两段代码来写。</p>
+<h4>Task 4: 搞懂 Python 接口</h4>
+<p>最后看文件底部的 <code>parallel_based</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">parallel_based</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">scale</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">use_norm</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 1. 调整维度</span>
+    <span class="c1"># 2. 调用上面的 Triton Kernel</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">z</span> <span class="o">=</span> <span class="n">triton_parallel_based</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">scale</span><span class="p">)</span>
+
+    <span class="c1"># 3. 归一化 (Normalization)</span>
+    <span class="k">if</span> <span class="n">use_norm</span><span class="p">:</span>
+        <span class="n">o</span> <span class="o">=</span> <span class="n">o</span> <span class="o">/</span> <span class="p">(</span><span class="n">z</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">+</span> <span class="mf">1e-6</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">o</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<ul>
+<li>Based Attention 的输出不仅仅是 $O$，还有一个归一化因子 $Z$（分母）。</li>
+<li>在 Kernel 里，<code>b_z += tl.sum(b_s, axis=1)</code> 这一行就是在计算分母。</li>
+<li>最终输出是 <code>Numerator / Denominator</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这代码到底在干啥？</h3>
+<p>如果让你给同事讲这个文件，你可以这样总结：</p>
+<ol>
+<li><strong>算法</strong>：这是斯坦福 Zoology 里的 <strong>Based</strong> 模型的并行版本。</li>
+<li><strong>核心操作</strong>：它用 $1+x+0.5x^2$ 的泰勒展开代替了 Softmax Attention。</li>
+<li><strong>实现方式</strong>：<ul>
+<li>用 Triton 写的。</li>
+<li>采用了类似 FlashAttention 的分块逻辑。</li>
+<li><strong>Forward Kernel</strong>：先算历史块（无 Mask），再算当前块（有 Mask），同时计算了输出 <code>o</code> 和归一化项 <code>z</code>。</li>
+<li><strong>Backward Kernel</strong>：实现了反向传播的梯度计算（这部分最复杂，主要涉及链式法则的泰勒展开导数，但在概念理解上可以先跳过）。</li>
+</ul>
+</li>
+</ol>
+<p><strong>建议阅读路径</strong>：
+先看 Python 函数 <code>parallel_based</code> -&gt; 再看 Kernel <code>parallel_based_fwd_kernel</code> 里的两个 <code>for</code> 循环 -&gt; 最后盯着 <code>b_s = 1 + b_s + 0.5*b_s*b_s</code> 看懂这就是它的灵魂。</p>

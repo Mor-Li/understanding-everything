@@ -1,0 +1,101 @@
+<h1>fla/ops/generalized_delta_rule/dplr/wy_fast_fwd.py</h1>
+<p>这个文件 <code>wy_fast_fwd.py</code> 是 <strong>Flash Linear Attention (FLA)</strong> 库的一部分。</p>
+<p>简单来说，它的核心目的是：<strong>为了加速线性 Attention（或 RNN/SSM）的训练和推理，将长序列切分成小块（Chunk），并在每个小块内部预先计算好一些矩阵变换，以便后续可以并行计算。</strong></p>
+<p>这个过程涉及很多数学技巧（特别是矩阵求逆），所以代码看起来很晦涩。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>Task List (任务清单)</strong>，按执行顺序一步步讲。</p>
+<hr />
+<h3>核心任务清单 (Task Todo List)</h3>
+<p>想象你是一个负责处理序列数据的 GPU 核心，你的任务是把一个长序列（比如长度 2048）的数据“预处理”好。</p>
+<h4>✅ Task 0: 准备工作 (Chunking)</h4>
+<ul>
+<li><strong>目标</strong>: 无论序列多长，我们都把它切成固定大小的小块（Chunk），通常是 32 或 64 个 token 一组。</li>
+<li><strong>原因</strong>: RNN/线性 Attention 本质是串行的（t时刻依赖t-1时刻）。为了并行加速，我们把序列切块。块内虽然还是串行，但块与块之间可以并行处理，或者利用数学技巧加速块内计算。</li>
+<li><strong>代码对应</strong>: <code>prepare_wy_repr_fwd</code> 函数中的 <code>NT = triton.cdiv(T, BT)</code> (计算有多少个块)。</li>
+</ul>
+<h4>✅ Task 1: 计算块内依赖矩阵的逆 (Invert $A_{ab}$)</h4>
+<p>这是最难的一步，对应代码中的 <code>prepare_wy_repr_fwd_kernel_chunk32</code> 或 <code>chunk64</code>。</p>
+<ul>
+<li><strong>背景</strong>: 在每个 Chunk 内部，Token 之间存在因果依赖（比如 token 2 依赖 token 1）。这种依赖关系被存储在一个矩阵 $A_{ab}$ 中（这是一个下三角矩阵）。</li>
+<li><strong>目标</strong>: 我们需要求出这个矩阵的<strong>逆矩阵</strong> $A_{ab}^{-1}$。</li>
+<li><strong>为什么</strong>: 在线性代数中，求出了依赖矩阵的逆，就相当于把“串行递归”的问题转化成了“矩阵乘法”的问题，这样就可以利用 Tensor Core 并行加速了。</li>
+<li><strong>具体操作</strong>:<ul>
+<li><strong>Chunk=32时</strong>: 直接在 GPU 的 SRAM 里用循环迭代的方式，解出下三角矩阵的逆。代码里那个 <code>for i in range(1, BT)</code> 就是在做这件事（类似于高斯消元/前向代入的变体）。</li>
+<li><strong>Chunk=64时</strong>: 64太大，直接算太慢。代码利用了<strong>分块矩阵求逆公式</strong>。把 64x64 分成 4 个 32x32 的块，先算左上角的逆，再算右下角的逆，最后组合起来。</li>
+<li><strong>代码对应</strong>: <code>tl.store(p_Aab_inv, ...)</code> 把算好的逆矩阵存回去。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 变换输入数据 (Compute W and U)</h4>
+<p>有了上面算好的逆矩阵，我们就可以把原始输入数据转换成一种“好算”的形式。对应代码 <code>wu_fwd_kernel</code>。</p>
+<ul>
+<li><strong>输入</strong>:<ul>
+<li><code>ag</code> (Input gate / Gradient): 原始的输入门控信号。</li>
+<li><code>v</code> (Value): 原始的 Value 向量。</li>
+<li><code>A_ak</code>: 另一种块内的衰减/依赖矩阵。</li>
+<li><code>A_ab_inv</code>: 刚才 Task 1 算出来的逆矩阵。</li>
+</ul>
+</li>
+<li><strong>目标</strong>: 计算出两个新变量 <code>w</code> 和 <code>u</code>。<ul>
+<li><strong>公式 1</strong>: $w = A_{ab}^{-1} \times ag$</li>
+<li><strong>公式 2</strong>: $u = (A_{ab}^{-1} \times A_{ak}) \times v$</li>
+</ul>
+</li>
+<li><strong>直觉</strong>: 这一步叫 <strong>WY Representation</strong>（WY 表示法）。它把原本复杂的递归更新公式 $h_t = A h_{t-1} + K^T v_t$，转换成了可以通过矩阵乘法直接并行累加的形式。</li>
+<li><strong>代码对应</strong>:<ul>
+<li><code>b_w = tl.dot(b_Aab_inv, b_ag)</code></li>
+<li><code>b_u = tl.dot(b_Aak, b_v)</code> (注意代码里先算了一个中间量 <code>b_Aak = tl.dot(b_Aab_inv, b_Aak)</code>)</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 输出结果</h4>
+<ul>
+<li><strong>结果</strong>: 返回 <code>w</code>, <code>u</code>, 和 <code>A_ab_inv</code>。</li>
+<li><strong>后续</strong>: 这些计算好的张量会被送到下一个 Stage（通常是真正的 Attention 计算或者 Retention 计算），那时就可以直接用并行扫描（Parallel Scan）或者矩阵乘法极快地算出结果了。</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<p><strong>用一句话说：</strong>
+这段代码是线性 Attention 算法的<strong>预处理加速器</strong>，它通过在每个小块（Chunk）内<strong>求逆矩阵</strong>和<strong>变换基底</strong>，把原本只能串行算的 RNN 逻辑，变成了可以并行算的矩阵乘法逻辑。</p>
+<h3>详细代码片段解读（帮你对应 Task）</h3>
+<h4>1. <code>prepare_wy_repr_fwd_kernel_chunk32</code> (Task 1: 求逆)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这是一个下三角矩阵求逆的过程</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">BT</span><span class="p">):</span>
+    <span class="n">mask</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">BT</span><span class="p">)</span> <span class="o">==</span> <span class="n">i</span>
+    <span class="c1"># 这一步是在迭代地修正矩阵的每一行，消除依赖</span>
+    <span class="n">b_a</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">mask</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">],</span> <span class="n">b_A_ab</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="n">b_a</span> <span class="o">=</span> <span class="n">b_a</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_a</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">b_A_ab</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">BT</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">i</span><span class="p">)</span>
+    <span class="n">b_A_ab</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">mask</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">],</span> <span class="n">b_a</span><span class="p">,</span> <span class="n">b_A_ab</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这段看起来像天书，其实它是在 GPU 上高效实现 $L^{-1}$ (下三角矩阵求逆)。</p>
+<h4>2. <code>prepare_wy_repr_fwd_kernel_chunk64</code> (Task 1: 分块求逆)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的逻辑是：一个大的下三角矩阵的逆，可以通过它内部的小块的逆算出来</span>
+<span class="c1"># 公式：[A 0; C D]^-1 = [A^-1 0; -D^-1 C A^-1  D^-1]</span>
+<span class="c1"># b_A 是左上角(A)，b_A2 是左下角(C)，b_A3 是右下角(D)</span>
+
+<span class="c1"># ... 省略中间计算 ...</span>
+<span class="n">b_A3</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_A2</span><span class="p">,</span> <span class="n">b_A3</span><span class="p">),</span> <span class="n">b_A</span><span class="p">)</span> <span class="c1"># 这一步就是在算 -D^-1 C A^-1 这一项</span>
+</code></pre></div>
+
+<p>这是典型的“分治法”在矩阵计算中的应用。</p>
+<h4>3. <code>wu_fwd_kernel</code> (Task 2: 计算 W 和 U)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 加载刚才算好的逆矩阵</span>
+<span class="n">b_Aab_inv</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_A_ab_inv</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 2. 修正 A_ak 矩阵 (A_ak = A_ab_inv * A_ak)</span>
+<span class="n">b_Aak</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_Aab_inv</span><span class="p">,</span> <span class="n">b_Aak</span><span class="p">)</span>
+
+<span class="c1"># 3. 计算 w (w = A_ab_inv * ag)</span>
+<span class="n">b_w</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_Aab_inv</span><span class="p">,</span> <span class="n">b_ag</span><span class="p">)</span>
+
+<span class="c1"># 4. 计算 u (u = A_ak_new * v)</span>
+<span class="n">b_u</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_Aak</span><span class="p">,</span> <span class="n">b_v</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这一步就是纯粹的矩阵乘法，把预处理的结果应用到数据上。</p>
+<h3>建议阅读顺序</h3>
+<ol>
+<li>先看最后的 <code>prepare_wy_repr_fwd</code> 函数，看懂数据的流向（先算 chunk32/64，再算 wu）。</li>
+<li>再看 <code>wu_fwd_kernel</code>，逻辑比较简单，就是几个矩阵乘法。</li>
+<li>最后如果不需要自己写 CUDA，可以不用深究 <code>chunk32/64</code> 里的具体数学推导，只需要知道它是在<strong>算一个因果依赖矩阵的逆</strong>即可。</li>
+</ol>

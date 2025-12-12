@@ -1,0 +1,92 @@
+<h1>tests/ops/test_gla.py</h1>
+<p>这份代码其实是一个 <strong>“阅卷系统”</strong>（单元测试）。</p>
+<p>简单来说，开发者写了一个叫 <strong>GLA (Gated Linear Attention)</strong> 的深度学习算法，为了保证这个算法算得对，他写了这个测试文件。他手里有一个“标准答案生成器”（跑得慢但绝对正确的朴素代码），还有一个“考生”（跑得极快但逻辑复杂的优化代码）。</p>
+<p>这个文件的目的就是：<strong>让“考生”做题，然后跟“标准答案”比对，看结果和推导过程（梯度）是否一致。</strong></p>
+<p>下面我为你列一个 <strong>Task List (任务清单)</strong>，带你一步步看懂这个测试流程。</p>
+<hr />
+<h3>📋 Task List：测试一个算法算得对不对</h3>
+<p>如果我们是这个测试程序，我们需要按顺序执行以下步骤：</p>
+<ol>
+<li><strong>准备考题 (Setup Data):</strong> 生成随机的输入数据（Q, K, V, Gate等），模拟神经网络的输入。</li>
+<li><strong>生成标准答案 (Run Reference):</strong> 用最简单、最原始、肯定正确的慢速算法（Naive版）跑一遍，记下结果。</li>
+<li><strong>计算标准推导过程 (Ref Backward):</strong> 对标准答案进行“反向传播”（求导），记下各个参数的梯度。</li>
+<li><strong>让考生做题 (Run Target):</strong> 用我们需要测试的、高度优化的快速算法（Fused版 或 Chunk版）跑同一组数据。</li>
+<li><strong>计算考生推导过程 (Target Backward):</strong> 对考生的结果进行“反向传播”，记下梯度。</li>
+<li><strong>核对分数 (Compare):</strong><ul>
+<li>对比输出结果（Output）是否一致？</li>
+<li>对比梯度（Gradients）是否一致？</li>
+<li>如果误差在允许范围内（比如 0.005），则通过；否则报错。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码详解</h3>
+<p>现在我们结合上面的 List，把代码拆开看。</p>
+<h4>1. 核心测试函数：<code>test_fused_recurrent</code></h4>
+<p>这个函数是测试 <strong>“融合循环模式 (Fused Recurrent)”</strong> 是否正确。</p>
+<ul>
+<li>
+<p><strong>Task 1: 准备考题</strong>
+    <code>python
+    # 生成随机张量，B=Batch, T=Time, H=Head, D=Dimension
+    # requires_grad_() 表示我们要对这些变量求导
+    q = torch.rand(...).requires_grad_() 
+    k = torch.rand(...).requires_grad_()
+    v = torch.rand(...).requires_grad_()
+    g = ... # Gate (门控信号)
+    h0 = ... # 初始状态</code></p>
+</li>
+<li>
+<p><strong>Task 2 &amp; 3: 标准答案 (Naive)</strong>
+    ```python
+    # naive_recurrent_gla 是那个“慢但正确”的参考实现
+    ref, ref_ht = naive_recurrent_gla(q, k, v, gk=g, initial_state=h0, ...)</p>
+<h1>计算梯度 (反向传播)</h1>
+<h1>这里的 .backward() 就是在算导数</h1>
+<p>((ref * do).sum() + (ref_ht * dht).sum()).backward()</p>
+<h1>把算出来的正确梯度存起来 (ref_dq, ref_dk...)</h1>
+<p>ref_dq, q.grad = q.grad.clone(), None</p>
+<h1>... (保存其他梯度并清空)</h1>
+<p>```</p>
+</li>
+<li>
+<p><strong>Task 4 &amp; 5: 考生做题 (Fused)</strong>
+    ```python
+    # fused_recurrent_gla 是我们要测试的“快”代码
+    tri, tri_ht = fused_recurrent_gla(q, k, v, gk=g, initial_state=h0, ...)</p>
+<h1>同样计算梯度</h1>
+<p>((tri * do).sum() + (tri_ht * dht).sum()).backward()</p>
+<h1>把考生的梯度存起来 (tri_dq, tri_dk...)</h1>
+<p>tri_dq, q.grad = q.grad.clone(), None
+```</p>
+</li>
+<li>
+<p><strong>Task 6: 核对分数</strong>
+    <code>python
+    # assert_close 意思是：如果两个数差得太多，就报错
+    assert_close('o', ref, tri, 0.005)      # 比较输出结果
+    assert_close('dq', ref_dq, tri_dq, 0.005) # 比较 Q 的梯度
+    # ... 比较其他梯度</code></p>
+</li>
+</ul>
+<h4>2. 变长序列测试：<code>test_fused_recurrent_varlen</code></h4>
+<p>这个逻辑和上面一样，但多了一个 <strong><code>varlen</code> (Variable Length)</strong> 的概念。
+*   <strong>背景：</strong> 在处理文本时，一句话长，一句话短。为了效率，通常把它们拼成一条长龙。<code>cu_seqlens</code> (Cumulative Sequence Lengths) 就是用来记录每句话在哪里切断的。
+*   <strong>逻辑：</strong> 这里的“标准答案”是用循环把每句话单独切出来算一遍再拼回去；而“考生”（Fused算法）需要直接处理那条长龙。测试看两者结果是否一样。</p>
+<h4>3. 分块算法测试：<code>test_chunk</code></h4>
+<p>这里换了选手。
+*   <strong>之前的考生：</strong> <code>fused_recurrent_gla</code> (循环模式)。
+*   <strong>现在的考生：</strong> <code>chunk_gla</code> (分块并行模式)。
+*   <strong>现在的标准答案：</strong> <code>fused_recurrent_gla</code>。
+    *   <em>注意：</em> 因为上一轮测试证明了 <code>fused</code> 是对的，所以现在把它升级为“标准答案”，用来测试另一个更复杂的算法 <code>chunk_gla</code>。
+*   <strong>逻辑：</strong> 验证“分块并行计算”的结果，是否和“逐个循环计算”的结果一致。这是为了保证并行化加速没有破坏数学上的等价性。</p>
+<hr />
+<h3>💡 总结文中的观点</h3>
+<p>这个文件并不是在讲大道理，而是在做工程验证。它隐含的观点是：</p>
+<ol>
+<li><strong>正确性至上：</strong> 无论你的算法优化得多么快（用 Triton 写 CUDA kernel），首先必须保证数学结果和最朴素的 Python 循环实现是一模一样的。</li>
+<li><strong>梯度也要对：</strong> 仅仅前向传播（算出结果）对是不够的，反向传播（训练时的梯度更新）也必须完全一致，否则模型训练会发散。</li>
+<li><strong>多场景覆盖：</strong> 必须测试不同的形状（Batch size, Head, Dimension），不同的精度（float32, float16），以及变长序列（VarLen），确保代码在各种情况下都健壮。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这就好比数学老师（Naive版）先做了一遍题，然后让学霸（Fused版）和学神（Chunk版）分别用速算方法做同一道题，最后检查大家的答案和解题步骤是不是完全一样。</p>

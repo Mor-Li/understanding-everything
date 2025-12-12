@@ -1,0 +1,87 @@
+<h1>fla/modules/grpo.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到 <strong>大模型训练的核心算法（GRPO）</strong> 以及 <strong>底层GPU性能优化（Triton Kernel）</strong>。</p>
+<p>简单来说，这个文件的作用是：<strong>极快地、极省显存地计算 DeepSeek-R1 同款的强化学习损失函数（GRPO Loss）。</strong></p>
+<p>为了让你看懂，我把你（作为一个开发者）想要理解并实现它的过程拆解成一个 <strong>Task List (待办清单)</strong>。我们一步步来通关。</p>
+<hr />
+<h3>任务清单：从小白到理解 GRPO 源码</h3>
+<h4>✅ Task 1: 搞懂背景 —— 我们在做什么？</h4>
+<p><strong>目标</strong>：理解 GRPO 是干嘛的。
+*   <strong>场景</strong>：你在训练一个大模型（比如 DeepSeek-R1）。
+*   <strong>方法</strong>：你给模型同一个提示词（Prompt），让它生成一组（比如4个）不同的答案。
+*   <strong>打分</strong>：你给这4个答案打分。比平均分高的给予奖励（Advantage &gt; 0），比平均分低的给予惩罚。
+*   <strong>约束</strong>：模型不能为了拿高分就乱说话，它生成的概率分布不能偏离“参考模型（Reference Model）”太远，这叫 KL 散度约束。
+*   <strong>代码对应</strong>：文件开头的注释里 <code>compute_loss</code> 函数就是标准的 PyTorch 逻辑，但那个太慢太占显存，所以下面写了一堆 <code>triton</code> 代码来加速。</p>
+<h4>✅ Task 2: 梳理输入数据 —— 我们手里有什么？</h4>
+<p><strong>目标</strong>：看懂 <code>fused_grpo_loss</code> 函数的入参。
+你需要准备好以下食材才能下锅：
+1.  <strong><code>logits</code></strong>: 当前模型输出的原始数值（还没做 Softmax），形状通常巨大 <code>[Batch, Length, Vocab_Size]</code>。
+2.  <strong><code>ref_logp</code></strong>: 参考模型（旧模型）对同样输入的预测概率（Log对数形式）。用来做对比，防止模型练崩。
+3.  <strong><code>input_ids</code></strong>: 具体的 Token ID，即模型到底说了啥。
+4.  <strong><code>advantages</code></strong>: 这一组答案的好坏程度（归一化后的分数）。
+5.  <strong><code>beta</code></strong>: 一个系数，控制 KL 散度的重要性（通常是 0.0x）。</p>
+<h4>✅ Task 3: 核心挑战 —— 为什么要写这么复杂的 Triton 代码？</h4>
+<p><strong>目标</strong>：理解痛点。
+*   <strong>问题</strong>：大模型的词表（Vocab Size）很大（比如 128k）。如果用 PyTorch 标准写法做 <code>log_softmax</code>，需要显存存下 <code>[Batch, Length, 128000]</code> 的巨大张量。这很容易导致显存爆炸（OOM）。
+*   <strong>解决</strong>：<strong>Triton (显卡编程)</strong>。
+    *   我们不需要把整个概率表存下来。
+    *   我们只需要算出<strong>模型实际选择了哪个 Token</strong> 的概率，算出 Loss，其他的扔掉。
+    *   这叫 <strong>Fused Kernel（算子融合）</strong>，把几步操作合并在 GPU 显存里一次做完，不占中间空间。</p>
+<h4>✅ Task 4: 解析前向传播 (Forward) —— 算 Loss</h4>
+<p><strong>目标</strong>：看懂 <code>grpo_fwd_kernel</code>。
+这个 Kernel 就像一个精密的流水线工人：
+1.  <strong>读取数据</strong>：拿到当前位置的 logits。
+2.  <strong>在线计算 Softmax (LSE)</strong>：
+    *   代码里 <code>for start_n in tl.range(0, N, BLOCK_SIZE)</code> 这一段循环，是在分块读取巨大的词表，计算 <code>max(logits)</code> 和 <code>sum(exp(logits))</code>。
+    *   这是为了算出分母，从而得到 LogSoftmax，而<strong>不需要</strong>把整个表存下来。
+3.  <strong>提取目标概率</strong>：
+    *   <code>idx = tl.load(input_ids_ptr)</code>：看模型实际输出了哪个字。
+    *   <code>logp = x - lse</code>：算出这个字的对数概率。
+4.  <strong>计算 GRPO 公式</strong>：
+    *   <code>kl = exp(ref_logp - logp) - ...</code>：算出当前模型和参考模型的差距。
+    *   <code>loss = kl * beta - advantage</code>：<strong>核心公式</strong>。如果 Advantage 很大（奖励高），Loss 就会变小（负数更小），鼓励模型多这么做；同时加上 KL 惩罚。
+5.  <strong>写入结果</strong>：只把算好的一个标量 <code>loss</code> 存回显存。</p>
+<h4>✅ Task 5: 解析反向传播 (Backward) —— 算梯度</h4>
+<p><strong>目标</strong>：看懂 <code>grpo_bwd_kernel</code>。
+这是最难的部分。因为我们为了省显存，在前向传播时<strong>扔掉了</strong>中间结果（logits的概率分布）。
+所以在反向传播时，我们必须<strong>重新算一遍</strong>！
+1.  <strong>重算 LSE</strong>：利用前向传播存下的 <code>lse</code> 或者重新加载数据。
+2.  <strong>计算梯度公式</strong>：
+    *   <code>dlogp = ...</code>：根据 Loss 对概率的导数。
+    *   代码逻辑：<code>dlogits = tl.where(cols == idx, 1-probs, -probs) * dlogp</code>。
+    *   这是 Softmax 的求导公式。它通过重新计算 <code>probs = exp(logits - lse)</code> 来还原当时的概率分布，从而算出梯度。
+3.  <strong>写回梯度</strong>：把算出来的梯度 <code>dlogits</code> 存好，传给优化器去更新模型参数。</p>
+<hr />
+<h3>总结：这段代码的执行流程</h3>
+<p>想象你是一个监考老师（Loss Function）：</p>
+<ol>
+<li>
+<p><strong>准备 (Python层)</strong>：</p>
+<ul>
+<li>调用 <code>fused_grpo_loss</code>。</li>
+<li>它会调用 <code>GrpoLoss.apply</code>，这是连接 PyTorch 和 Triton 的桥梁。</li>
+</ul>
+</li>
+<li>
+<p><strong>阅卷 (Triton Forward Kernel)</strong>：</p>
+<ul>
+<li>你不需要把考生的整张卷子（所有词的概率）都复印一份。</li>
+<li>你只看考生<strong>填写的那个答案</strong>。</li>
+<li>你一边看，一边在脑子里（GPU寄存器）算出这个答案相对于其他选项的概率（Softmax）。</li>
+<li>对比标准答案（Ref Model）和加分项（Advantage），直接在草稿纸上写下一个分数（Loss）。</li>
+</ul>
+</li>
+<li>
+<p><strong>讲评 (Triton Backward Kernel)</strong>：</p>
+<ul>
+<li>要告诉学生怎么改（计算梯度）。</li>
+<li>因为之前没复印卷子，你现在必须<strong>重新看一遍题目</strong>，重新算出当时的概率分布。</li>
+<li>然后告诉学生：“你这个字填的概率太低了，要提高”，或者“你这里偏离参考答案太远了，要收敛”。</li>
+</ul>
+</li>
+</ol>
+<h3>为什么你之前看不懂？</h3>
+<p>因为这段代码混合了 <strong>数学逻辑</strong>（GRPO公式）和 <strong>工程实现</strong>（Triton内存管理）。
+*   <code>grpo_loss_torch</code> 函数：这是给人类看的，逻辑清晰但慢。
+*   <code>grpo_fwd_kernel</code> / <code>grpo_bwd_kernel</code>：这是给显卡看的，充满了内存指针操作、分块循环（Block）、掩码（Mask），这是为了极致的速度和省显存。</p>
+<p><strong>建议阅读顺序：</strong>
+先看文件最底部的 <code>grpo_loss_torch</code>（纯 PyTorch 逻辑），弄懂 GRPO 的数学公式。然后再看上面的 Triton Kernel 只是为了把这个公式算得更快而已。</p>

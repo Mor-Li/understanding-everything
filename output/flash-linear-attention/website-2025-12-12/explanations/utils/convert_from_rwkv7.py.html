@@ -1,0 +1,111 @@
+<h1>utils/convert_from_rwkv7.py</h1>
+<p>这个脚本 <code>utils/convert_from_rwkv7.py</code> 的核心作用只有一件事：<strong>搬运工</strong>。</p>
+<p>它把 <strong>RWKV7 原版格式的模型权重</strong>（通常是 <code>.pth</code> 文件），转换成 <strong><code>fla</code> 这个库能识别的 Hugging Face 格式</strong>。</p>
+<p>为了让你更容易理解，我们可以把这个过程想象成<strong>搬家</strong>：你要把家具从“旧房子（RWKV7原版）”搬到“新房子（fla 库结构）”。因为两个房子的户型图（架构定义）和房间名（参数名）不一样，所以不能直接扔进去，需要一边搬一边改标签。</p>
+<p>下面是一个 <strong>Task To-Do List</strong>，我们将代码逻辑拆解为 6 个步骤逐步讲解：</p>
+<hr />
+<h3>📝 Task 1: 准备原材料 (加载旧权重)</h3>
+<p><strong>代码位置：</strong> <code>convert</code> 函数开头</p>
+<div class="codehilite"><pre><span></span><code><span class="n">weights</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">rwkv7</span><span class="p">,</span> <span class="n">weights_only</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">map_location</span><span class="o">=</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：打开旧房子的门，把所有的家具（模型参数/权重）清单拿出来。</li>
+<li><strong>解释</strong>：<code>torch.load</code> 读取了 RWKV7 的原始权重文件。此时 <code>weights</code> 是一个巨大的字典，里面存着像 <code>blocks.0.att.w1</code> 这样的键和对应的矩阵数据。</li>
+</ul>
+<hr />
+<h3>📝 Task 2: 测量尺寸 (反推配置)</h3>
+<p><strong>代码位置：</strong> <code>config = RWKV7Config()</code> 及其后的一大段赋值</p>
+<div class="codehilite"><pre><span></span><code><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span> <span class="o">=</span> <span class="n">weights</span><span class="p">[</span><span class="s1">&#39;emb.weight&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>  <span class="c1"># 比如 50304</span>
+<span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="o">...</span>
+<span class="c1"># ...</span>
+<span class="k">while</span> <span class="sa">f</span><span class="s1">&#39;blocks.</span><span class="si">{</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="si">}</span><span class="s1">.ffn.key.weight&#39;</span> <span class="ow">in</span> <span class="n">weights</span><span class="p">:</span>
+    <span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="o">+=</span> <span class="mi">1</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：新房子还没盖好，我们需要根据旧家具的尺寸来画新房子的图纸。</li>
+<li><strong>解释</strong>：<ul>
+<li>脚本没有读取配置文件，而是直接<strong>量</strong>权重的形状。</li>
+<li>例如：看 <code>emb.weight</code>（词嵌入层）有多大，就知道词表大小 (<code>vocab_size</code>) 是多少。</li>
+<li>它通过 <code>while</code> 循环去数旧权重里有多少个 <code>blocks</code>，从而算出层数 (<code>num_hidden_layers</code>)。</li>
+<li>它还推断了各种内部维度（如 <code>hidden_size</code>, <code>head_size</code> 等）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 Task 3: 搭建骨架 (初始化新模型)</h3>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_config</span><span class="p">(</span><span class="n">config</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+<span class="n">model_names</span> <span class="o">=</span> <span class="p">[</span><span class="n">n</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">state_dict</span><span class="p">()]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：根据刚才画好的图纸，把新房子（fla 模型）的毛坯房盖好。里面全是空的，没有家具。</li>
+<li><strong>解释</strong>：<ul>
+<li><code>AutoModelForCausalLM.from_config(config)</code> 创建了一个结构正确但内容是随机初始化的新模型。</li>
+<li><code>model_names</code> 拿到了新模型里所有需要填入参数的位置名称（比如 <code>model.layers.0.attn...</code>）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 Task 4: 制定翻译规则 (核心逻辑)</h3>
+<p><strong>代码位置：</strong> 定义函数 <code>def translate_into_fla(name):</code>
+*   <strong>动作</strong>：制作一张“对照表”。旧家具上的标签叫“A”，搬到新家后得改名叫“B”。
+*   <strong>解释</strong>：这是脚本最复杂的部分。它定义了改名规则：
+    *   <strong>层级映射</strong>：旧名字 <code>blocks.0</code> 对应新名字 <code>model.layers.0</code>。
+    *   <strong>组件映射</strong>：旧名字 <code>att</code> (Attention) 对应新名字 <code>attn</code>；<code>ln0</code> 对应 <code>pre_norm</code>。
+    *   <strong>特殊参数映射</strong>：
+        *   RWKV7 里的 <code>r</code>, <code>k</code>, <code>v</code>, <code>o</code> 变成了 <code>r_proj</code>, <code>k_proj</code>, <code>v_proj</code>, <code>o_proj</code>。
+        *   最麻烦的是 LoRA 相关的参数（<code>w1</code>, <code>g1</code> 等），代码里有一段 <code>re.match("[wvag][012]", ...)</code>，专门处理这些特殊的低秩矩阵参数，把它们重命名为 <code>lora</code> 相关的名字。
+    *   <strong>形状调整标记</strong>：函数不仅返回新名字，还返回一个布尔值 <code>transposed</code>。这表示：“这个柜子搬过去的时候，是不是需要横过来放？”（即矩阵是否需要转置）。</p>
+<hr />
+<h3>📝 Task 5: 搬运与安装 (复制并转换权重)</h3>
+<p><strong>代码位置：</strong> <code>for name in weights:</code> 循环块</p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">weights</span><span class="p">:</span>
+    <span class="n">fla_name</span><span class="p">,</span> <span class="n">transposed</span> <span class="o">=</span> <span class="n">translate_into_fla</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+    <span class="c1"># ...</span>
+    <span class="n">weight</span> <span class="o">=</span> <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
+    <span class="k">if</span> <span class="n">transposed</span><span class="p">:</span> <span class="n">weight</span><span class="o">.</span><span class="n">t_</span><span class="p">()</span>  <span class="c1"># 如果需要，进行转置</span>
+    <span class="c1"># ...</span>
+    <span class="n">model_dict</span><span class="p">[</span><span class="n">fla_name</span><span class="p">]</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">weight</span><span class="p">)</span> <span class="c1"># 复制数据</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：开始干活！一件件拿起旧家具，撕掉旧标签，贴上新标签，如果需要旋转就旋转一下，然后塞进新房子的对应位置。</li>
+<li><strong>解释</strong>：<ul>
+<li>遍历旧权重。</li>
+<li>调用 Task 4 的翻译函数得到新名字。</li>
+<li><strong>形状检查</strong>：<code>if transposed: weight.t_()</code>。PyTorch 的 Linear 层通常希望权重是 <code>(out, in)</code>，而有些原始实现可能是 <code>(in, out)</code>，所以这里处理了形状不匹配的问题。</li>
+<li><strong>复制</strong>：<code>copy_(weight)</code> 把数值真正填进去。</li>
+<li><strong>移除清单</strong>：<code>model_names.remove(fla_name)</code>，表示这个位置已经填好了。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 Task 6: 验收与交付 (保存模型)</h3>
+<p><strong>代码位置：</strong> 循环结束后</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">print</span><span class="p">(</span><span class="s2">&quot;uninitialized parameters: &quot;</span><span class="p">,</span> <span class="n">model_names</span><span class="p">)</span>
+<span class="c1"># ...</span>
+<span class="n">model</span><span class="o">.</span><span class="n">save_pretrained</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">max_shard_size</span><span class="o">=</span><span class="s2">&quot;1000GB&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：检查新房子里还有没有空着的地方？如果没有大问题，就把新房子的钥匙交给你（保存文件）。</li>
+<li><strong>解释</strong>：<ul>
+<li>检查 <code>model_names</code> 里还有没有剩下来的名字。如果有（除了允许缺失的 bias 等），说明转换漏了东西，会报错。</li>
+<li>最后 <code>model.save_pretrained</code> 把转换好的模型保存成 Hugging Face 标准格式（包含 <code>config.json</code>, <code>model.safetensors</code> 等）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是把 <strong>RWKV7 的“方言”翻译成 fla 库的“普通话”</strong>。</p>
+<ol>
+<li><strong>读</strong>旧数据。</li>
+<li><strong>猜</strong>模型配置。</li>
+<li><strong>造</strong>新空壳。</li>
+<li><strong>对</strong>名字（查字典）。</li>
+<li><strong>填</strong>数据（注意矩阵转置）。</li>
+<li><strong>存</strong>新模型。</li>
+</ol>

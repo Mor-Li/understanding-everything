@@ -1,0 +1,97 @@
+<h1>fla/ops/common/chunk_h_parallel.py</h1>
+<p>这份代码是用 <strong>Triton</strong> 编写的高性能 <strong>GPU 算子</strong>，用于加速线性注意力（Linear Attention）或状态空间模型（SSM）中的 <strong>状态传递（State Passing）</strong>。</p>
+<p>简单来说，它在算这行公式的变体：
+$$ h_t = \text{decay} \cdot h_{t-1} + K_t^T V_t $$
+即：<strong>当前的记忆 = 衰减后的过去记忆 + 当前时刻的新信息</strong>。</p>
+<p>因为序列（Sequence）很长，如果一步一步算（RNN方式）太慢了。这个文件采用了一种 <strong>“分块并行（Chunk-wise Parallel）”</strong> 的策略。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>任务清单 (Todo List)</strong>，并在每个任务下解释代码在做什么。</p>
+<hr />
+<h3>核心任务清单 (Todo List)</h3>
+<p>整个文件的逻辑分为两大块：<strong>前向传播 (Forward)</strong> 和 <strong>反向传播 (Backward)</strong>。</p>
+<h4>✅ 任务一：前向传播 (Forward) - 算出记忆状态 $h$</h4>
+<p>我们要算出每一个小块（Chunk）结束时的记忆状态。
+*   <strong>Step 1 (并行计算):</strong> 不管前一个块发生什么，先算出当前块自己产生了多少“新记忆”。
+*   <strong>Step 2 (串行归约):</strong> 把所有块串起来，把前一个块的记忆传给后一个块（加上衰减）。</p>
+<h4>✅ 任务二：反向传播 (Backward) - 算出梯度 $dh$</h4>
+<p>训练模型需要反向传播误差。
+*   <strong>Step 3 (并行计算):</strong> 算出当前块对梯度的局部贡献。
+*   <strong>Step 4 (串行归约):</strong> 从最后一个块往前推，把梯度的误差累积传回前面的块。</p>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>1. 准备工作：变量解释</h4>
+<p>在看代码前，先认全几个“人”：
+*   <strong><code>k</code>, <code>v</code></strong>: 输入的 Key 和 Value 矩阵。
+*   <strong><code>h</code></strong>: Hidden State（隐藏状态/记忆矩阵），这是我们要算的。
+*   <strong><code>g</code>, <code>gk</code>, <code>gv</code></strong>: 衰减系数（Decay）。类似于 LSTM 的遗忘门，决定要忘掉多少过去的信息。
+*   <strong><code>BT</code> (Block Time)</strong>: 分块大小（比如每 64 个 token 分为一个 Chunk）。</p>
+<hr />
+<h4>任务一详解：前向传播 (<code>chunk_fwd_h</code>)</h4>
+<p>这个 Python 函数调用了两个 Triton kernel。</p>
+<p><strong>Step 1: 块内并行计算 (<code>chunk_fwd_kernel_h_parallel</code>)</strong>
+*   <strong>目标</strong>: 假设每个 Chunk 都是独立的，计算每个 Chunk 内部产生的 $K^T V$ 累加值。
+*   <strong>代码逻辑</strong>:
+    1.  每个 GPU 线程块负责处理一个 Chunk。
+    2.  加载当前 Chunk 的 <code>k</code> 和 <code>v</code>。
+    3.  加载衰减系数 <code>g</code> (scalar), <code>gk</code> (vector), <code>gv</code> (vector)。
+    4.  <strong>核心计算</strong>: <code>b_h = tl.dot(b_k, b_v)</code>。计算 $K \times V$。
+    5.  在此过程中应用 decay（代码中的 <code>exp(b_g_last - b_g)</code> 等部分）。
+    6.  把算出来的局部状态 <code>b_h</code> 存入显存 <code>h</code> 中。
+*   <strong>通俗理解</strong>: 就像有 10 个人分别读一本书的 10 个章节，每个人只总结自己那章的内容，不看前面的。</p>
+<p><strong>Step 2: 块间归约 (<code>chunk_fwd_kernel_h_reduction</code>)</strong>
+*   <strong>目标</strong>: 把 Step 1 算出来的独立状态串联起来，形成真正的历史记忆。
+*   <strong>代码逻辑</strong>:
+    1.  这是一个循环 <code>for i_t in range(NT)</code>。
+    2.  读取当前 Chunk 在 Step 1 算出来的 <code>h</code>。
+    3.  读取前一个 Chunk 传递过来的累积状态，乘上衰减系数（<code>exp</code> 部分）。
+    4.  <strong>核心计算</strong>: <code>当前最终h = 当前局部h + 衰减后的前一个h</code>。
+    5.  把更新后的 <code>h</code> 写回显存。
+*   <strong>通俗理解</strong>: 第 2 个人把第 1 个人的总结拿过来，加上自己的；第 3 个人把第 2 个人的（包含第 1 个人的）拿过来，加上自己的... 形成连贯的故事线。</p>
+<hr />
+<h4>任务二详解：反向传播 (<code>chunk_bwd_dh</code>)</h4>
+<p>这是为了训练模型，计算梯度。逻辑和前向传播是对称的。</p>
+<p><strong>Step 3: 计算局部梯度 (<code>chunk_bwd_kernel_dh_parallel</code>)</strong>
+*   <strong>目标</strong>: 计算每个 Chunk 内部的梯度贡献。
+*   <strong>输入</strong>: <code>q</code> (Query), <code>do</code> (Output Gradient)。
+*   <strong>代码逻辑</strong>:
+    1.  加载 <code>q</code> 和 <code>do</code>。
+    2.  应用衰减系数。
+    3.  <strong>核心计算</strong>: <code>b_dh = tl.dot(b_q, b_do)</code>。
+    4.  这算出了当前时刻的 Query 和输出梯度对状态 <code>h</code> 的梯度的贡献。
+    5.  存入 <code>dh</code>。</p>
+<p><strong>Step 4: 梯度归约 (<code>chunk_bwd_kernel_dh_reduction</code>)</strong>
+*   <strong>目标</strong>: 误差反向传播。后面的误差要传给前面。
+*   <strong>代码逻辑</strong>:
+    1.  这是一个倒序循环 <code>range(NT - 1, -1, -1)</code>。
+    2.  从最后一个 Chunk 开始，读取 Step 3 算的局部 <code>dh</code>。
+    3.  加上后一个 Chunk 传回来的梯度（同样要乘衰减系数）。
+    4.  更新 <code>dh</code>。
+*   <strong>通俗理解</strong>: 就像改卷子，最后一道题做错了扣分，这个扣分的影响要反向推导，看看是不是因为第一章的基础概念没学好导致的。</p>
+<hr />
+<h3>代码中的关键技术点（如果你想装懂）</h3>
+<ol>
+<li>
+<p><strong>Triton Heuristics &amp; Autotune</strong>:</p>
+<ul>
+<li><code>@triton.heuristics</code>: 告诉编译器根据参数（如是否有初始状态 <code>h0</code>）自动选择代码路径。</li>
+<li><code>@triton.autotune</code>: 自动尝试不同的块大小配置（<code>BK</code>, <code>BV</code>, <code>num_warps</code>），选跑得最快的那个。</li>
+</ul>
+</li>
+<li>
+<p><strong>Decay 的处理</strong>:</p>
+<ul>
+<li>代码里有 <code>USE_G</code> (标量衰减), <code>USE_GK</code> (键衰减), <code>USE_GV</code> (值衰减)。这是为了适配不同的模型架构（如 GLA, Mamba 等）。</li>
+<li>它使用了 <code>exp(b_g_last - b_g)</code> 这种形式，是在对数域计算衰减，数值更稳定。</li>
+</ul>
+</li>
+<li>
+<p><strong>Variable Length (VarLen)</strong>:</p>
+<ul>
+<li>代码里有很多 <code>IS_VARLEN</code> 判断。这是为了处理一个 Batch 里句子长短不一的情况。如果不处理，短句子后面补的 0 会浪费计算资源。这个代码支持把所有句子拼成一条长龙（Packed Sequence）来算，非常高效。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件就是个<strong>流水线工人</strong>：
+1.  <strong>并行工人</strong>：先把每个小块的 $K \times V$ 算好。
+2.  <strong>串行工人</strong>：把这些小块的结果像这就积木一样搭起来，中间抹上胶水（Decay）。</p>
+<p>你看懂这个逻辑，就看懂了这个文件的核心。</p>

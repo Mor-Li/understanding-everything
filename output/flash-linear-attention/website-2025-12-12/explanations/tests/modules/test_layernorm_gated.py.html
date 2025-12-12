@@ -1,0 +1,101 @@
+<h1>tests/modules/test_layernorm_gated.py</h1>
+<p>这份代码其实不是核心算法代码，而是一个<strong>测试脚本（Test Script）</strong>。</p>
+<p>它的核心目的是：<strong>验证一个新的、为了加速而写的“融合算子”（Fused Module）算得对不对。</strong></p>
+<p>这就好比你发明了一个新的“快速计算器”，在发布之前，你得拿它和一个“标准计算器”做对比，算一万次加减乘除，看看结果是不是一模一样。</p>
+<p>为了让你彻底看懂，我列了一个<strong>学习任务清单 (To-Do List)</strong>，我们一步步来拆解：</p>
+<hr />
+<h3>✅ Task 1: 理解核心概念 —— 什么是 "Gated Norm"？</h3>
+<p>在看代码前，先搞懂它在测什么数学公式。
+*   <strong>LayerNorm/RMSNorm</strong>: 神经网络中常用的归一化层，把数据拉回到标准分布。
+*   <strong>Gated (门控)</strong>: 意思是数据在输出前，要乘以一个“门信号”。
+*   <strong>公式</strong>: $$输出 = Norm(x) \times Activation(g)$$
+    *   $x$ 是输入数据。
+    *   $g$ 是门控信号（另一个输入张量）。
+    *   $Activation$ 是激活函数（代码里用了 <code>silu</code> 或 <code>sigmoid</code>）。</p>
+<p><strong>代码里的对应：</strong>
+这个文件里有两个主要测试函数：
+1.  <code>test_layernorm_gated</code>: 测 LayerNorm 版的门控。
+2.  <code>test_rmsnorm_gated</code>: 测 RMSNorm 版的门控。</p>
+<hr />
+<h3>✅ Task 2: 搞懂测试的“两方阵营”</h3>
+<p>测试的核心逻辑是“找茬”。代码里设了两个对照组：</p>
+<ol>
+<li><strong>Ref (Reference/参考组)</strong>: 用 PyTorch 自带的标准积木搭建的。<ul>
+<li>代码：<code>ref = nn.LayerNorm(...)</code></li>
+<li>特点：<strong>绝对正确</strong>，但速度可能慢，因为它是分两步算的（先算 Norm，再算乘法）。</li>
+</ul>
+</li>
+<li><strong>Tri (Triton/测试组)</strong>: 也就是 <code>fla.modules</code> 里导入的 <code>FusedLayerNormGated</code>。<ul>
+<li>代码：<code>tri = FusedLayerNormGated(...)</code></li>
+<li>特点：这是开发者新写的、融合了步骤的<strong>加速版</strong>。</li>
+<li>目的：我们要证明 <code>Tri</code> 算出来的结果和 <code>Ref</code> 一模一样。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 拆解代码流程 —— 它是怎么跑的？</h3>
+<p>让我们拿 <code>test_layernorm_gated</code> 这个函数为例，按顺序看它干了啥：</p>
+<p><strong>Step 3.1: 准备考题 (Setup)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这部分是 pytest 的语法，意思是：<strong>换不同的参数多测几次</strong>。
+比如：
+*   <code>B, H, T, D</code>: 数据的维度（Batch, Head, Time, Dimension）。
+*   <code>activation</code>: 换着测 <code>silu</code> 和 <code>sigmoid</code>。
+*   <strong>目的</strong>：防止你的新算子只在某种特定形状下是对的，换个形状就挂了。</p>
+<p><strong>Step 3.2: 制造假数据 (Data Generation)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span> <span class="c1"># 输入 x</span>
+<span class="n">g</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span> <span class="c1"># 门控信号 g</span>
+</code></pre></div>
+
+<ul>
+<li>随机生成两个张量 <code>x</code> 和 <code>g</code>。</li>
+<li><code>requires_grad_(True)</code> 意思是：一会儿还要测反向传播（算梯度），看看梯度对不对。</li>
+</ul>
+<p><strong>Step 3.3: 同步权重 (Copy Weights)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">tri</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">ref</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">data</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>这一步<strong>非常关键</strong>。为了对比，两个模型的初始权重（Weight）和偏置（Bias）必须完全一样。不然就像两把尺子刻度不一样，没法比。</li>
+</ul>
+<p><strong>Step 3.4: 正向传播对比 (Forward Pass)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 标准组：手动把 LayerNorm 和 激活函数乘法 拼起来</span>
+<span class="n">ref_y</span> <span class="o">=</span> <span class="n">ref</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="o">*</span> <span class="n">act_fn</span><span class="p">(</span><span class="n">g</span><span class="p">)</span> 
+
+<span class="c1"># 测试组：直接调用融合算子</span>
+<span class="n">tri_y</span> <span class="o">=</span> <span class="n">tri</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">g</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>这里就是让两个计算器分别算一次结果。</li>
+</ul>
+<p><strong>Step 3.5: 反向传播对比 (Backward Pass)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 标准组算梯度</span>
+<span class="n">ref_dx</span><span class="p">,</span> <span class="n">ref_dg</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">grad</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># 测试组算梯度</span>
+<span class="n">tri_dx</span><span class="p">,</span> <span class="n">tri_dg</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">grad</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>不仅结果要一样，训练时的<strong>梯度（导数）</strong>也必须一样，否则模型训练会收敛不了。</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 最后的审判 —— <code>assert_close</code></h3>
+<div class="codehilite"><pre><span></span><code><span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39; y&#39;</span><span class="p">,</span> <span class="n">ref_y</span><span class="p">,</span> <span class="n">tri_y</span><span class="p">,</span> <span class="mf">1e-3</span><span class="p">)</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39;dx&#39;</span><span class="p">,</span> <span class="n">ref_dx</span><span class="p">,</span> <span class="n">tri_dx</span><span class="p">,</span> <span class="mf">1e-3</span><span class="p">)</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<p>这是测试的最后一步。
+*   它在比较 <code>ref_y</code> (标准答案) 和 <code>tri_y</code> (你的答案)。
+*   <code>1e-3</code> 是容忍的误差范围（因为浮点数计算总会有微小的精度误差）。
+*   <strong>如果报错</strong>：说明新写的 <code>FusedLayerNormGated</code> 有 Bug，算错了。
+*   <strong>如果不报错</strong>：说明测试通过，这个新算子是可靠的。</p>
+<hr />
+<h3>总结</h3>
+<p>这篇代码实际上就在说一句话：</p>
+<blockquote>
+<p><strong>“喂，PyTest，帮我生成一堆随机数据，分别用 PyTorch 原生写法 和 我新写的 Fused 写法 算一遍。如果两者的 输出结果 和 梯度 哪怕有一点点不一样（超过 0.001），就给我报错！”</strong></p>
+</blockquote>

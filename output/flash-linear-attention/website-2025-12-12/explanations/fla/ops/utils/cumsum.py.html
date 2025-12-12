@@ -1,0 +1,129 @@
+<h1>fla/ops/utils/cumsum.py</h1>
+<p>这份代码确实比较硬核，因为它是用 <strong>Triton</strong> 写的底层 GPU 算子，主要用于加速深度学习（特别是线性 Attention 或 SSM 模型）中的 <strong>前缀和（Cumulative Sum / Cumsum）</strong> 操作。</p>
+<p>看不懂很正常，因为它是为了极致性能而写的，牺牲了可读性。</p>
+<p>为了让你理解它在干什么，我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>。我们不看代码细节，而是按逻辑步骤，一步步拆解这个文件的核心观点和功能。</p>
+<hr />
+<h3>📋 任务清单：一步步理解 <code>fla/ops/utils/cumsum.py</code></h3>
+<h4>✅ Task 1: 理解基础目标 —— 什么是 Cumsum？</h4>
+<p>首先，我们要知道这个文件想算什么。
+*   <strong>数学定义</strong>：给定一个序列 $x = [x_1, x_2, x_3, x_4]$，Cumsum（累加和）的结果 $y$ 是：
+    *   $y_1 = x_1$
+    *   $y_2 = x_1 + x_2$
+    *   $y_3 = x_1 + x_2 + x_3$
+    *   ...
+*   <strong>在深度学习中的作用</strong>：这在 RNN、Mamba、RWKV 或者线性 Attention 中非常常见，用于计算状态的累积。</p>
+<h4>✅ Task 2: 理解核心策略 —— 为什么要“分块 (Chunk)”？</h4>
+<p>文件里到处都是 <code>chunk</code> 这个词。这是核心观点。
+*   <strong>问题</strong>：如果序列长度 $T$ 很长（比如 4096 或 32k），直接算 Cumsum 很难并行化，因为 $y_t$ 依赖于 $y_{t-1}$，必须串行算。
+*   <strong>解决方案</strong>：把长序列切成很多小块（Chunk），比如每块长度 <code>BT=128</code>。
+    *   GPU 可以同时处理很多个小块。
+    *   这就是为什么代码里有 <code>chunk_size</code> 和 <code>BT</code> 参数。</p>
+<h4>✅ Task 3: 区分两种模式 —— Local vs. Global (最容易晕的地方)</h4>
+<p>代码里把函数分为 <code>Local</code> 和 <code>Global</code> 两类，这是完全不同的逻辑：</p>
+<ol>
+<li>
+<p><strong>Chunk Local (块内独立)</strong>：</p>
+<ul>
+<li><strong>逻辑</strong>：把序列切断，每个块<strong>内部</strong>自己算 Cumsum，不看前面的块。</li>
+<li><strong>例子</strong>：输入 <code>[1, 1, 1, 1, 1, 1]</code>，切成两块 <code>[1, 1, 1]</code> 和 <code>[1, 1, 1]</code>。</li>
+<li><strong>结果</strong>：<code>[1, 2, 3, 1, 2, 3]</code> (注意第二个块从 1 重新开始)。</li>
+<li><strong>对应代码</strong>：<code>chunk_local_cumsum_...</code></li>
+<li><strong>用途</strong>：通常用于线性 Attention 的中间步骤，计算块内的局部状态。</li>
+</ul>
+</li>
+<li>
+<p><strong>Chunk Global (全局连续)</strong>：</p>
+<ul>
+<li><strong>逻辑</strong>：这是真正的全局 Cumsum，但是利用分块并行加速算的。它会把前一个块的总和加到当前块上。</li>
+<li><strong>例子</strong>：输入同上。</li>
+<li><strong>结果</strong>：<code>[1, 2, 3, 4, 5, 6]</code>。</li>
+<li><strong>对应代码</strong>：<code>chunk_global_cumsum_...</code></li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 4: 区分数据维度 —— Scalar vs. Vector</h4>
+<p>代码里又把函数分为 <code>Scalar</code> 和 <code>Vector</code>，这取决于数据的形状：</p>
+<ol>
+<li>
+<p><strong>Scalar (标量)</strong>：</p>
+<ul>
+<li><strong>形状</strong>：<code>[Batch, Heads, Time]</code>。也就是说，每个时间步 $t$ 上只有一个数值。</li>
+<li><strong>对应代码</strong>：<code>..._scalar_kernel</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Vector (向量)</strong>：</p>
+<ul>
+<li><strong>形状</strong>：<code>[Batch, Heads, Time, Head_Dim]</code>。每个时间步 $t$ 上是一个向量（比如维度是 64 或 128）。</li>
+<li><strong>对应代码</strong>：<code>..._vector_kernel</code>。</li>
+<li><strong>区别</strong>：Vector 版本需要多处理一个维度 <code>S</code> (代码里的 Head Dim)，计算量更大，内存布局更复杂。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 5: 理解高级特性 —— Reverse, VarLen, Head_First</h4>
+<p>代码里有很多 <code>if</code> 判断，是为了支持不同的输入情况：
+*   <strong>REVERSE (反向)</strong>：不仅能算 $x_1 + ... + x_t$，还能算 $x_t + ... + x_T$（从后往前加）。这在反向传播（训练）时非常重要。
+*   <strong>IS_VARLEN (变长序列)</strong>：为了处理 FlashAttention 风格的输入（把所有 batch 的句子拼成一长串，用 <code>cu_seqlens</code> 记录分界线），避免 Padding 浪费计算。
+*   <strong>HEAD_FIRST</strong>：处理内存布局。数据是 <code>[B, H, T]</code> 还是 <code>[B, T, H]</code>？Triton 读写内存时需要知道准确的步长（stride）。</p>
+<hr />
+<h3>🚀 总结：代码结构映射</h3>
+<p>现在你再回头看文件，就会发现它其实很规整，就是排列组合：</p>
+<p>这个文件一共实现了 <strong>4 个核心 Kernel (GPU函数)</strong> + <strong>4 个 Python 包装函数</strong>：</p>
+<ol>
+<li>
+<p><strong><code>chunk_local_cumsum_scalar_kernel</code></strong></p>
+<ul>
+<li><strong>任务</strong>：块内独立 Cumsum，数据是标量。</li>
+<li><strong>实现细节</strong>：每个 GPU 线程块读取一个 Chunk，调用 <code>tl.cumsum</code>，然后写回。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>chunk_local_cumsum_vector_kernel</code></strong></p>
+<ul>
+<li><strong>任务</strong>：块内独立 Cumsum，数据是向量。</li>
+<li><strong>实现细节</strong>：同上，但要处理额外的 <code>S</code> 维度。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>chunk_global_cumsum_scalar_kernel</code></strong></p>
+<ul>
+<li><strong>任务</strong>：全局 Cumsum，数据是标量。</li>
+<li><strong>实现细节</strong>：这是一个循环 (<code>for i_c in range(NT)</code>)。它维护一个累加器 <code>b_z</code> (之前的总和)。<ul>
+<li>读当前块 -&gt; 加上之前的总和 <code>b_z</code> -&gt; 算出当前块的 Cumsum -&gt; 更新 <code>b_z</code> -&gt; 写回。</li>
+<li>这其实是一个串行扫描（Scan）过程，但在块内部是并行的。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong><code>chunk_global_cumsum_vector_kernel</code></strong></p>
+<ul>
+<li><strong>任务</strong>：全局 Cumsum，数据是向量。</li>
+<li><strong>实现细节</strong>：同上，处理向量维度。</li>
+</ul>
+</li>
+</ol>
+<h3>💡 举个栗子（以 Global Scalar 为例）</h3>
+<p>假设你要算 <code>[1, 2, 3, 4]</code> 的 Cumsum，Chunk size = 2。</p>
+<p><strong>代码逻辑 (<code>chunk_global_cumsum_scalar_kernel</code>) 是这样跑的：</strong></p>
+<ol>
+<li><strong>初始化</strong>：累加器 <code>b_z = 0</code>。</li>
+<li><strong>处理第 1 个 Chunk <code>[1, 2]</code></strong>：<ul>
+<li>加载 <code>[1, 2]</code>。</li>
+<li>算块内 Cumsum -&gt; <code>[1, 3]</code>。</li>
+<li>加上 <code>b_z</code> (0) -&gt; 结果 <code>[1, 3]</code>。</li>
+<li><strong>存下</strong> <code>[1, 3]</code>。</li>
+<li>更新 <code>b_z</code>：<code>b_z</code> += 这一块的总和 (1+2=3)。现在 <code>b_z = 3</code>。</li>
+</ul>
+</li>
+<li><strong>处理第 2 个 Chunk <code>[3, 4]</code></strong>：<ul>
+<li>加载 <code>[3, 4]</code>。</li>
+<li>算块内 Cumsum -&gt; <code>[3, 7]</code>。</li>
+<li>加上 <code>b_z</code> (3) -&gt; <code>[3+3, 7+3]</code> -&gt; 结果 <code>[6, 10]</code>。</li>
+<li><strong>存下</strong> <code>[6, 10]</code>。</li>
+</ul>
+</li>
+<li><strong>最终输出</strong>：<code>[1, 3, 6, 10]</code>。完全正确！</li>
+</ol>
+<h3>结论</h3>
+<p>这个文件就是一个<strong>高性能的、支持分块、支持变长序列、支持反向计算的 GPU 累加器工具库</strong>。它主要是为了服务于 <code>fla</code> (Fast Linear Attention) 库中的线性注意力机制计算。</p>

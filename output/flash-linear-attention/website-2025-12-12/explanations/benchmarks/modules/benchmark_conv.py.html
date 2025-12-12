@@ -1,0 +1,74 @@
+<h1>benchmarks/modules/benchmark_conv.py</h1>
+<p>这个文件 <code>benchmark_conv.py</code> 的核心目的只有一个：<strong>“赛跑”</strong>。</p>
+<p>它是一个<strong>性能测试脚本</strong>（Benchmark），用来对比不同的代码实现（算法）在显卡（GPU）上运行得有多快。</p>
+<p>为了让你更容易理解，我把你当作这个测试的“裁判”，列了一个 <strong>Task To-Do List（任务清单）</strong>。我们按顺序一步步完成这个清单，你就懂了。</p>
+<hr />
+<h3>📋 裁判的任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>确定比赛项目</strong>：我们要测什么？</li>
+<li><strong>确定参赛选手</strong>：谁和谁比？</li>
+<li><strong>布置赛道</strong>：输入数据长什么样？</li>
+<li><strong>制定规则</strong>：怎么算赢？（测量标准）</li>
+<li><strong>发令枪响</strong>：具体代码是怎么跑起来的？</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>Task 1: 确定比赛项目</h4>
+<p><strong>代码对应：</strong> 文件名 <code>benchmark_conv</code> 和 导入的 <code>causal_conv1d</code>。
+<strong>解释：</strong>
+比赛项目叫 <strong>“因果一维卷积” (Causal Conv1d)</strong>。
+这是一种在现代大模型（如 Mamba, RWKV 等）中常用的操作。你不必深究它的数学原理，只需要知道它是一个<strong>数学运算</strong>，我们想知道谁算得最快。</p>
+<h4>Task 2: 确定参赛选手</h4>
+<p><strong>代码对应：</strong> <code>line_vals</code> 和 <code>if provider.startswith(...)</code> 部分。
+<strong>解释：</strong>
+这次比赛主要有两拨选手，每拨选手又要跑两个模式（只跑单程/前向传播，和跑往返/前向+反向传播）：</p>
+<ol>
+<li><strong>选手 A (FLA/Triton 版):</strong> 代码里的 <code>causal_conv1d</code>。这是 <code>fla</code> 库自己用 Triton 语言写的实现。</li>
+<li><strong>选手 B (CUDA 版):</strong> 代码里的 <code>causal_conv1d_fn</code>。这是外部导入的、通常用 C++/CUDA 写的底层实现（通常作为速度标杆）。</li>
+</ol>
+<p><strong>比赛模式：</strong>
+*   <code>_fwd</code> (Forward): 只测算结果的时间（推理阶段）。
+*   <code>_fwdbwd</code> (Forward + Backward): 测算结果 + 算梯度的总时间（训练阶段）。</p>
+<h4>Task 3: 布置赛道 (设置变量)</h4>
+<p><strong>代码对应：</strong> <code>@triton.testing.perf_report</code> 装饰器中的 <code>x_names</code> 和 <code>x_vals</code>。
+<strong>解释：</strong>
+赛道不能只有一条，我们要看选手在不同情况下的表现。
+*   <strong>X轴 (变量)</strong>：
+    *   <code>T</code>: 序列长度 (Sequence Length)。比如一句话有 128 个字，还是 4096 个字。
+    *   <code>D</code>: 隐藏层维度 (Hidden Dimension)。比如每个字用 256 个数字表示，还是 2048 个数字。
+*   代码生成了一堆 <code>(T, D)</code> 的组合，比如 <code>(256, 256)</code>, <code>(512, 512)</code> 等等。这就像是设置了“100米跑”、“1000米跑”、“负重跑”等不同关卡。</p>
+<h4>Task 4: 制定规则 (准备数据)</h4>
+<p><strong>代码对应：</strong> <code>benchmark</code> 函数的前半部分。
+<strong>解释：</strong>
+在比赛开始前，必须造好假数据给选手跑：
+*   <code>x</code>: 输入的张量（你可以理解为一堆待处理的数字）。
+*   <code>weight</code>, <code>bias</code>: 卷积需要的权重和偏置。
+*   <code>cu_seqlens</code>: <strong>这很关键</strong>。这叫“累积序列长度”。因为有时候为了快，我们会把好几句话拼成一条长龙塞给 GPU。这个变量就是告诉 GPU：“第0到10个字是第一句话，第11到50个字是第二句话...”。</p>
+<h4>Task 5: 发令枪响 (开始跑分)</h4>
+<p><strong>代码对应：</strong> <code>triton.testing.do_bench(...)</code> 以及里面的 <code>if/elif</code> 逻辑。
+<strong>解释：</strong>
+这是最核心的逻辑：</p>
+<ol>
+<li>
+<p><strong>如果是选手 A (Triton版)</strong>:</p>
+<ul>
+<li>直接调用 <code>causal_conv1d(x, ...)</code>。</li>
+<li>用 <code>do_bench</code> 计时，看它跑几毫秒。</li>
+</ul>
+</li>
+<li>
+<p><strong>如果是选手 B (CUDA版)</strong>:</p>
+<ul>
+<li>这里有个<strong>坑</strong>：<code>rearrange(x, 'b t d -&gt; b d t')</code>。</li>
+<li><strong>解释</strong>：选手 B 比较矫情，它要求的数据格式（形状）和选手 A 不一样。选手 A 喜欢 <code>[批次, 长度, 维度]</code>，选手 B 喜欢 <code>[批次, 维度, 长度]</code>。</li>
+<li>所以代码里先给数据“变个形”，扔给选手 B 跑，跑完再“变回来”。</li>
+<li>最后同样用 <code>do_bench</code> 计时。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这段代码在干这事：</p>
+<blockquote>
+<p><strong>“嘿，我写了一个新的 Triton 版卷积算子（选手 A），我想看看它到底厉不厉害。所以我找来了业界标准的 CUDA 版算子（选手 B），让它们在不同的序列长度（T）和维度（D）下，分别跑前向传播和反向传播。最后画一张图告诉我，谁用的时间更短（毫秒）。”</strong></p>
+</blockquote>
+<p>当你运行这个脚本后，它会在终端打印出数据，或者生成一张图表，横轴是数据量大小，纵轴是耗时，几条线分别代表 Triton 版和 CUDA 版的性能对比。</p>

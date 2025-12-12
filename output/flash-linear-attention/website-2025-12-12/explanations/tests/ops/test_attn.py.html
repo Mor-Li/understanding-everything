@@ -1,0 +1,111 @@
+<h1>tests/ops/test_attn.py</h1>
+<p>这段代码其实不是在“写”一个算法，而是在<strong>“考”</strong>一个算法。</p>
+<p>这是一个<strong>测试文件</strong>（Test Script）。它的核心目的是：<strong>验证一个新的注意力机制实现（<code>parallel_attn</code>）是否正确。</strong></p>
+<p>为了验证它对不对，作者找了一个“标准答案”——也就是业界公认最快、最准的 <strong>Flash Attention</strong>。</p>
+<p>如果把 <code>parallel_attn</code> 比作一个学生，把 <code>flash_attn</code> 比作老师，这个文件的逻辑就是：<strong>让学生和老师做同一道题，如果答案一样，说明学生学会了。</strong></p>
+<p>下面我为你列一个 <strong>Task List (任务清单)</strong>，带你一步步看懂这个“考试”的过程：</p>
+<hr />
+<h3>Task List: “考试”流程全解析</h3>
+<h4>📋 Task 0: 考前准备 (环境检查)</h4>
+<p>在正式考试前，代码先做了一些检查工作：
+1.  <strong>检查工具包</strong>：看你电脑上装没装 <code>flash_attn</code>（标准答案生成器）。没装的话，这试就没法考了（<code>HAS_FLASH</code> 标志位）。
+2.  <strong>引入考生</strong>：从 <code>fla.ops.attn.parallel</code> 引入我们要测试的主角 <code>parallel_attn</code>。</p>
+<hr />
+<h4>📋 Task 1: 第一场考试 —— 标准模式 (<code>test_parallel</code>)</h4>
+<p>这个函数测试的是最常见的数据格式（Batch模式）。</p>
+<ul>
+<li>
+<p><strong>Step 1.1: 出题 (设定参数)</strong></p>
+<ul>
+<li>代码里的 <code>@pytest.mark.parametrize</code> 是在列出几套不同的“考卷”。</li>
+<li>比如 <code>(1, 63, 1, 1, 64, 1.0)</code> 代表：<ul>
+<li><code>B=1</code>: 1个样本</li>
+<li><code>T=63</code>: 序列长度63</li>
+<li><code>H=1</code>: 1个Head</li>
+<li><code>D=64</code>: 向量维度64</li>
+</ul>
+</li>
+<li>它会循环测好几组不同大小的数据，确保大题小题都能做对。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 1.2: 发卷子 (生成随机数据)</strong></p>
+<ul>
+<li>生成 <code>q</code> (Query), <code>k</code> (Key), <code>v</code> (Value)。</li>
+<li><code>torch.randn(...)</code>: 用随机数填充这些张量。</li>
+<li><code>.requires_grad_(True)</code>: <strong>关键点</strong>。这表示我们要测的不仅是“算出的结果”，还要测“反向传播的梯度”。也就是说，不仅要会做题，还要知道怎么改错（训练神经网络需要梯度）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 1.3: 老师做一遍 (获取标准答案)</strong></p>
+<ul>
+<li><code>ref = flash_attn_func(...)</code>: 调用官方的 Flash Attention。</li>
+<li><code>ref.backward(do)</code>: 老师演示了一遍反向传播，算出了标准梯度（<code>q.grad</code>, <code>k.grad</code>, <code>v.grad</code>）。</li>
+<li>代码把老师算出的梯度存起来，分别叫 <code>ref_dq</code>, <code>ref_dk</code>, <code>ref_dv</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 1.4: 学生做一遍 (获取测试结果)</strong></p>
+<ul>
+<li><code>tri = parallel_attn(...)</code>: 调用我们要测的函数。</li>
+<li><code>tri.backward(do)</code>: 学生也做一遍反向传播。</li>
+<li>代码把学生算出的梯度存起来，叫 <code>tri_dq</code>, <code>tri_dk</code>, <code>tri_dv</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 1.5: 批改作业 (对比结果)</strong></p>
+<ul>
+<li><code>assert_close(" o", ref, tri, ...)</code>: 对比输出结果。如果误差超过 0.005，就报错，考试不及格。</li>
+<li><code>assert_close("dq", ref_dq, tri_dq, ...)</code>: 对比梯度的结果。</li>
+<li><strong>结论</strong>：如果这一步通过，说明在标准模式下，你的代码和 Flash Attention 效果一模一样。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>📋 Task 2: 第二场考试 —— 变长模式 (<code>test_parallel_varlen</code>)</h4>
+<p>这个函数测试的是更高级的“变长序列”（Variable Length）模式。</p>
+<ul>
+<li>
+<p><strong>Step 2.1: 理解题目背景</strong></p>
+<ul>
+<li>在处理对话时，每句话长度不一样。为了不浪费显存，我们通常把几句话拼成一条长长的线，然后用 <code>cu_seqlens</code> (Cumulative Sequence Lengths) 告诉程序哪里是切分点。</li>
+<li>例如 <code>cu_seqlens = [0, 15, 100]</code> 意思是：第一句话是 0~15，第二句话是 15~100。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.2: 再次出题与发卷</strong></p>
+<ul>
+<li>同样生成随机的 <code>q</code>, <code>k</code>, <code>v</code>。</li>
+<li>这次的数据是“压扁”的（Batch size通常设为1，所有句子拼在一起）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.3: 老师做一遍 (Flash Attention Varlen)</strong></p>
+<ul>
+<li>调用 <code>flash_attn_varlen_func</code>。注意参数里多了 <code>cu_seqlens</code>，这是告诉老师怎么切分句子。</li>
+<li>同样计算结果和梯度。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.4: 学生做一遍 (Parallel Attention)</strong></p>
+<ul>
+<li>调用 <code>parallel_attn</code>，同样传入 <code>cu_seqlens</code>。</li>
+<li>计算结果和梯度。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.5: 再次批改</strong></p>
+<ul>
+<li>再次使用 <code>assert_close</code> 对比输出和梯度。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件想告诉你什么？</h3>
+<ol>
+<li><strong>功能对齐</strong>：<code>fla</code> 库里的 <code>parallel_attn</code> 函数，旨在完全复刻 <code>flash_attn</code> 的数学逻辑。</li>
+<li><strong>精度达标</strong>：通过对比，作者证明了这个新写的算子在正向计算（Output）和反向传播（Gradient）上，误差都极小（小于 0.005），可以放心用来训练模型。</li>
+<li><strong>覆盖全面</strong>：既支持普通的 Batch 模式，也支持省显存的 Variable Length 模式。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这只是一个<strong>质检报告</strong>，证明 <code>parallel_attn</code> 这个零件是合格的，和原厂件（Flash Attention）一样好用。</p>

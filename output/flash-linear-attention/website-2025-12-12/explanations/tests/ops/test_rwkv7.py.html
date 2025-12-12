@@ -1,0 +1,85 @@
+<h1>tests/ops/test_rwkv7.py</h1>
+<p>这份代码确实看起来充满了技术术语，如果你不熟悉深度学习框架（PyTorch）或者模型架构（RWKV），看不懂是非常正常的。</p>
+<p>简单来说，<strong>这是一个“质检清单”（Unit Tests）</strong>。它的目的是验证 RWKV-7 这个 AI 模型的各种底层算子（Operators）写得对不对。</p>
+<p>为了让你能够循序渐进地理解，我为你列了一个 <strong>学习/阅读 Task List</strong>，我们一步步来拆解它：</p>
+<hr />
+<h3>Task 1: 理解核心背景 —— "我们在测什么？"</h3>
+<p>首先，你需要知道这个文件的存在意义。</p>
+<ul>
+<li><strong>背景知识</strong>：RWKV-7 是一种新型的语言模型架构。为了让它跑得快，开发者通常会写两套代码：<ol>
+<li><strong>慢代码（Reference/Torch版）</strong>：用标准的 PyTorch 写，逻辑清晰，容易读懂，保证数学上是绝对正确的，但运行慢。</li>
+<li><strong>快代码（Fused/CUDA/Triton版）</strong>：为了在显卡（GPU）上极速运行，把很多步骤合并（Fused）在一起写的底层代码，很难读，容易写错。</li>
+</ol>
+</li>
+<li><strong>本文件的目的</strong>：就是把“快代码”跑出来的结果，和“慢代码”跑出来的结果做对比。如果两者结果无限接近（<code>assert_close</code>），说明快代码没写错。</li>
+</ul>
+<h3>Task 2: 理解测试的通用套路 —— "怎么测？"</h3>
+<p>你会发现文件里每个函数长得都很像，因为它们都遵循同一个逻辑模版：</p>
+<ol>
+<li><strong>造数据</strong>：用 <code>torch.randn</code> 随机生成一些假数据（输入）。</li>
+<li><strong>跑慢代码</strong>：把数据喂给标准版函数，得到结果 A。</li>
+<li><strong>跑快代码</strong>：把数据喂给加速版函数，得到结果 B。</li>
+<li><strong>比对结果</strong>：<ul>
+<li><strong>比对输出</strong>：看结果 A 和 B 是否几乎一样。</li>
+<li><strong>比对反向传播（Gradients）</strong>：这是 AI 训练的关键。不仅结果要对，计算出来的“梯度”（告诉模型如何修改参数的方向）也必须一致。代码里的 <code>.backward()</code> 就是在算梯度。</li>
+</ul>
+</li>
+</ol>
+<h3>Task 3: 拆解具体关卡 —— "每个函数在测模型的哪个零件？"</h3>
+<p>现在我们按照文件中的函数顺序，一步步看它在测什么零件：</p>
+<h4>1. <code>test_channel_mixing_gradients</code> (测试通道混合的梯度)</h4>
+<ul>
+<li><strong>任务</strong>：RWKV 模型里有一部分叫 Channel Mixing（类似于 Transformer 里的 FFN/前馈网络）。</li>
+<li><strong>动作</strong>：<ul>
+<li>它对比了 <code>channel_mixing_rwkv7_torch</code>（慢）和 <code>channel_mixing_rwkv7</code>（快）。</li>
+<li>重点检查了 <code>backward()</code> 后的梯度（<code>.grad</code>），确保加速版代码在训练时能正确更新参数。</li>
+</ul>
+</li>
+</ul>
+<h4>2. <code>test_fused_mul_recurrent_fwd</code> (测试融合循环前向传播)</h4>
+<ul>
+<li><strong>任务</strong>：这是 RWKV 的核心灵魂。RWKV 是一个 RNN（循环神经网络），它需要把上一时刻的状态传给下一时刻。</li>
+<li><strong>动作</strong>：<ul>
+<li><code>recurrent</code> 意味着“循环”。</li>
+<li>它对比了通用的 <code>fused_recurrent_dplr_delta_rule</code> 和专门为 RWKV7 优化的 <code>fused_mul_recurrent_rwkv7</code>。</li>
+<li>验证模型在处理序列数据（比如一句话）时，记忆的传递是对的。</li>
+</ul>
+</li>
+</ul>
+<h4>3. <code>test_fused_rwkv7_addcmul</code> (测试加法与乘法的融合算子)</h4>
+<ul>
+<li><strong>任务</strong>：模型内部有很多数学运算是：<code>x = x + a * b</code>。</li>
+<li><strong>动作</strong>：<ul>
+<li>如果在 GPU 上分三步做（先乘、再加、再赋值）很慢。</li>
+<li>这个测试验证了一个把这些步骤“融合（Fused）”成一步的算子 <code>fused_addcmul_rwkv7</code> 是否计算正确。</li>
+<li>它特别测试了输入数据形状不同（<code>B, T, H, D</code>）时的兼容性。</li>
+</ul>
+</li>
+</ul>
+<h4>4. <code>test_fused_k_update</code> (测试 K 向量的更新)</h4>
+<ul>
+<li><strong>任务</strong>：RWKV-7 引入了一种新的状态更新机制，涉及到 Key (k) 向量的演变。</li>
+<li><strong>动作</strong>：<ul>
+<li>对比 <code>k_update_ref</code>（参考实现）和 <code>fused_k_rwkv7</code>（加速实现）。</li>
+<li>同样进行了反向传播测试（<code>.sum().backward()</code>），确保训练时 K 向量的学习方向是正确的。</li>
+</ul>
+</li>
+</ul>
+<h4>5. <code>test_gate_output_correction</code> (测试门控输出修正)</h4>
+<ul>
+<li><strong>任务</strong>：模型输出层通常有一个“门（Gate）”来控制多少信息流出，RWKV-7 还有一个额外的修正步骤。</li>
+<li><strong>动作</strong>：<ul>
+<li>对比 <code>gate_output_correction_ref</code> 和 <code>gate_output_correction</code>。</li>
+<li>验证这个最后的把关步骤数值是否精确。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 总结核心观点</h3>
+<p>如果你要向别人复述这个文件在讲什么，你可以这样总结：</p>
+<ol>
+<li><strong>这是一个单元测试套件</strong>：用于保障 <code>fla</code> 库中 RWKV-7 模型实现的正确性。</li>
+<li><strong>核心方法是“对码”</strong>：通过对比<strong>纯 PyTorch 参考实现</strong>和<strong>高性能 CUDA/Triton 实现</strong>的数值，来确保加速算子没有引入 Bug。</li>
+<li><strong>覆盖了关键组件</strong>：测试覆盖了 Channel Mixing（通道混合）、Recurrent State（循环状态更新）、K-update（键更新）以及 Output Gating（输出门控）等 RWKV-7 的核心数学机制。</li>
+<li><strong>关注训练稳定性</strong>：不仅测试了前向计算（输出结果），还重点测试了反向传播（梯度计算），这是保证模型能正常训练的前提。</li>
+</ol>
+<p>希望这个 List 能帮你把这些枯燥的代码对应到具体的逻辑概念上！</p>

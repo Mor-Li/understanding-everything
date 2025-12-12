@@ -1,0 +1,110 @@
+<h1>tests/ops/test_simple_gla.py</h1>
+<p>这份代码确实看起来很硬核，因为它是一个<strong>深度学习底层算子库（FLA）的单元测试文件</strong>。</p>
+<p>简单来说，这个文件的目的不是“跑模型”，而是<strong>“找茬”</strong>。它要证明为了加速而写的复杂代码（CUDA/Triton内核），和写得很慢但逻辑绝对正确的简单代码（Naive Python实现），算出来的结果是一模一样的。</p>
+<p>为了让你听懂，我把阅读这份代码的任务拆解成一个 <strong>5步的 To-Do List</strong>，我们一步步来通关：</p>
+<hr />
+<h3>✅ Task 1: 搞懂核心角色（Q, K, V, G 是什么？）</h3>
+<p>在看代码逻辑前，先看懂这些变量。这是“线性注意力机制（Linear Attention）”或类似 Mamba 的结构。</p>
+<ul>
+<li><strong>Q, K, V</strong>: 和 Transformer 里的 Query, Key, Value 一样。</li>
+<li><strong>G (Gate/Decay)</strong>: 这是一个特殊的门控信号，用来控制“遗忘”多少历史信息。</li>
+<li><strong>B, T, H, D</strong>: 数据的形状。<ul>
+<li><code>B</code>: Batch size (一次处理几句话)</li>
+<li><code>T</code>: Time/Sequence length (句子的长度)</li>
+<li><code>H</code>: Number of Heads (多头注意力的头数)</li>
+<li><code>D</code>: Dimension (每个头的维度)</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码中的体现：</strong>
+你会看到所有测试函数开头都在造假数据：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 随机生成 Q</span>
+<span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 随机生成 K</span>
+<span class="c1"># ...</span>
+</code></pre></div>
+
+<hr />
+<h3>✅ Task 2: 理解“对答案”的逻辑（核心测试模式）</h3>
+<p>这是整个文件 90% 的内容。它的逻辑就像老师改卷子：<strong>标准答案 vs 学生答案</strong>。</p>
+<ul>
+<li><strong>Ref (Reference)</strong>: 标准答案。通常由 <code>naive_...</code> 开头的函数生成。这种函数写得简单、跑得慢，但数学逻辑一眼就能看对。</li>
+<li><strong>Tri (Triton/Trial)</strong>: 待测答案。通常由 <code>fused_...</code>, <code>chunk_...</code>, <code>parallel_...</code> 开头的函数生成。这些是高度优化、跑得飞快但容易写错的代码。</li>
+</ul>
+<p><strong>代码流程解析（以 <code>test_fused_recurrent</code> 为例）：</strong></p>
+<ol>
+<li><strong>正向传播 (Forward)</strong>:<ul>
+<li>算出 <code>ref</code> (标准输出)。</li>
+<li>算出 <code>tri</code> (加速版输出)。</li>
+</ul>
+</li>
+<li><strong>反向传播 (Backward)</strong>:<ul>
+<li>因为深度学习要训练，所以必须测试<strong>梯度（Gradient）</strong>对不对。</li>
+<li>代码里有 <code>.backward()</code>，然后提取 <code>q.grad</code>, <code>k.grad</code> 等。</li>
+</ul>
+</li>
+<li><strong>对比 (Assert)</strong>:<ul>
+<li>最后用 <code>assert_close</code> 对比两者。如果误差超过 <code>0.005</code>，测试就挂了。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 区分三种计算模式（Recurrent, Chunk, Parallel）</h3>
+<p>Simple GLA 这种算法有三种算发，数学上等价，但计算方式不同。这个文件在测试它们之间是否互通。</p>
+<ul>
+<li>
+<p><strong>TODO 3.1: 循环模式 (Recurrent)</strong></p>
+<ul>
+<li><strong>对应函数</strong>: <code>test_fused_recurrent</code></li>
+<li><strong>原理</strong>: 像 RNN 一样，读一个词，更新一下记忆，输出一个结果。一步一步走。</li>
+<li><strong>测试点</strong>: 验证加速版的 RNN 写法 (<code>fused_recurrent</code>) 和 朴素版 RNN 写法 (<code>naive_recurrent</code>) 结果一致。</li>
+</ul>
+</li>
+<li>
+<p><strong>TODO 3.2: 并行模式 (Parallel)</strong></p>
+<ul>
+<li><strong>对应函数</strong>: <code>test_parallel</code></li>
+<li><strong>原理</strong>: 像 Transformer 一样，一次性算出所有词之间的关系（矩阵乘法）。速度快，但显存占用大。</li>
+<li><strong>测试点</strong>: 验证并行版 (<code>parallel_simple_gla</code>) 和 循环版 (<code>fused_recurrent_simple_gla</code>) 结果是否一致。<strong>注意：这里把循环版当作了标准答案。</strong></li>
+</ul>
+</li>
+<li>
+<p><strong>TODO 3.3: 分块模式 (Chunk)</strong></p>
+<ul>
+<li><strong>对应函数</strong>: <code>test_chunk</code> 和 <code>test_fused_chunk</code></li>
+<li><strong>原理</strong>: 折中方案。把长句子切成小块（Chunk）。块内用并行算，块之间用循环算。这是目前最高效的做法。</li>
+<li><strong>测试点</strong>: 验证分块版 (<code>chunk_simple_gla</code>) 和 循环版 结果一致。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 理解“变长序列” (VarLen / Packed)</h3>
+<p>你会看到很多带 <code>_varlen</code> 后缀的测试函数，比如 <code>test_fused_recurrent_varlen</code>。</p>
+<ul>
+<li><strong>背景</strong>: 在处理一批数据时，有的句子长（100个词），有的短（5个词）。通常做法是补零（Padding）。</li>
+<li><strong>VarLen 技术</strong>: 为了不浪费计算力算 0，把所有句子拼成一条超级长的贪吃蛇，用 <code>cu_seqlens</code> (Cumulative Sequence Lengths) 记录每句话的切分点。</li>
+<li><strong>代码逻辑</strong>:<ul>
+<li>它用 <code>for</code> 循环把拼起来的数据切开，用老办法算一遍作为 <code>ref</code>。</li>
+<li>然后把整条贪吃蛇丢给加速算子算一遍作为 <code>tri</code>。</li>
+<li>对比结果。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 最后的彩蛋 (Mamba2 兼容性测试)</h3>
+<p>文件最后有一个 <code>test_simple_gla_to_mamba2</code>。</p>
+<ul>
+<li><strong>观点</strong>: 这段代码在说：“嘿，我们的 Simple GLA 算法其实在数学上和最新的 <strong>Mamba2</strong> 模型里的 SSD 算法是一回事！”</li>
+<li><strong>做法</strong>:<ul>
+<li>引用 <code>mamba_ssm</code> 库（Mamba2 的官方代码）。</li>
+<li>用 Mamba2 的算子算一遍 (<code>y_ssd</code>)。</li>
+<li>把输入数据转换一下格式，丢给 FLA 的 <code>chunk_simple_gla</code> 算一遍。</li>
+<li><strong>结论</strong>: 两个库算出来的结果是一样的。这意味着你可以用 FLA 的算子来跑 Mamba2 模型。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这文件到底讲了啥？</h3>
+<p>如果你要用一句话概括这个文件的观点：</p>
+<blockquote>
+<p><strong>“我们实现了 Simple GLA 算法的多种加速版本（循环、分块、并行），并且通过了严格的单元测试，证明它们在正向计算和反向传播梯度上都是正确的，甚至能完美复现 Mamba2 的计算结果。”</strong></p>
+</blockquote>

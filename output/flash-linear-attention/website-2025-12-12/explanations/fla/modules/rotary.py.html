@@ -1,0 +1,108 @@
+<h1>fla/modules/rotary.py</h1>
+<p>这份代码确实看起来比较“硬核”，因为它不仅仅是实现了算法，还使用了 <strong>Triton</strong> 进行底层 GPU 加速优化。</p>
+<p>简单来说，这个文件的核心功能是：<strong>高效地实现旋转位置编码（Rotary Positional Embedding, RoPE）</strong>。它是现代大模型（如 LLaMA, Mistral, Qwen）中最常用的位置编码方式。</p>
+<p>为了让你读懂，我制定了一个 <strong>“从概念到实现”的学习 Task List</strong>，分 5 步带你拆解这个文件：</p>
+<hr />
+<h3>📝 学习 Task List</h3>
+<ol>
+<li><strong>Task 1: 理解核心目标 (What)</strong> —— 什么是 RoPE？这文件想干嘛？</li>
+<li><strong>Task 2: 理解数学逻辑 (Logic)</strong> —— <code>rotate_half</code> 和 <code>ref</code> 函数在算什么？</li>
+<li><strong>Task 3: 理解数据排布 (Layout)</strong> —— <code>Interleaved</code> 是什么鬼？</li>
+<li><strong>Task 4: 理解核心优化 (Kernel)</strong> —— 那个最长的 <code>triton</code> 函数在做什么？</li>
+<li><strong>Task 5: 理解工程封装 (Module)</strong> —— 如何在模型里实际调用它？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 理解核心目标 (What)</h4>
+<ul>
+<li><strong>背景</strong>：Transformer 模型需要知道词的顺序（位置）。RoPE 是一种通过旋转向量来注入位置信息的方法。</li>
+<li><strong>痛点</strong>：PyTorch 原生的实现虽然简单，但在处理超长序列（Long Sequence）或者需要极高速度时，显存读写（IO）是瓶颈。</li>
+<li><strong>本文件作用</strong>：使用 <strong>Triton</strong>（一种写 GPU CUDA 内核的 Python 语言）手写了一个算子，把计算合并，<strong>跑得比 PyTorch 原生代码更快，且支持变长序列（VarLen）</strong>。</li>
+</ul>
+<h4>Task 2: 理解数学逻辑 (Logic)</h4>
+<p>先看文件开头的两个 Python 函数，这是 RoPE 的数学定义：</p>
+<ol>
+<li>
+<p><strong><code>rotate_half(x)</code></strong>:</p>
+<ul>
+<li>RoPE 的核心操作是把向量分成两半，然后旋转。</li>
+<li>数学上大约是：$(x_1, x_2) \to (-x_2, x_1)$。</li>
+<li>代码里 <code>torch.cat((-x2, x1), dim=-1)</code> 就是在做这个“交换并取负”的操作。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>rotary_embedding_ref(...)</code></strong>:</p>
+<ul>
+<li>这是<strong>参考实现（Reference）</strong>，也就是“慢但在数学上绝对正确”的版本。</li>
+<li>核心公式是：
+    $$ \text{Output} = x \cdot \cos + \text{rotate}(x) \cdot \sin $$</li>
+<li>如果你看不懂后面的 Triton 代码，只要看懂这个函数，就知道它在算什么了。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 3: 理解数据排布 (Layout) - <code>Interleaved</code></h4>
+<p>代码里反复出现 <code>interleaved</code> 这个词。这是 RoPE 的两种流派：</p>
+<ul>
+<li><strong>GPT-NeoX 风格 (<code>interleaved=False</code>)</strong>:<ul>
+<li>把向量切成两半：<code>[x0, x1, ..., xn | y0, y1, ..., yn]</code>。</li>
+<li>前半部分和后半部分配对计算。</li>
+</ul>
+</li>
+<li><strong>GPT-J 风格 (<code>interleaved=True</code>)</strong>:<ul>
+<li>相邻元素配对：<code>[x0, y0, x1, y1, ..., xn, yn]</code>。</li>
+<li>偶数位和奇数位配对计算。</li>
+</ul>
+</li>
+</ul>
+<p>这个文件同时支持这两种模式，通过参数控制。</p>
+<h4>Task 4: 理解核心优化 (Kernel) —— 最难的部分</h4>
+<p>那个被 <code>@triton.jit</code> 装饰的 <code>rotary_embedding_kernel</code> 是文件的灵魂。</p>
+<ul>
+<li>
+<p><strong>为什么要写这个？</strong>
+    PyTorch 算 RoPE 需要：读数据 -&gt; 乘 Cos -&gt; 读数据 -&gt; 乘 Sin -&gt; 加法 -&gt; 写回。中间产生很多临时变量，浪费显存带宽。
+    Triton Kernel 做的是 <strong>算子融合（Fusion）</strong>：读一次数据，在 GPU 芯片上算完所有公式，直接写回结果。</p>
+</li>
+<li>
+<p><strong>Kernel 里的关键步骤</strong>：</p>
+<ol>
+<li><strong>定位 (<code>program_id</code>)</strong>: 确定当前 GPU 线程处理的是哪个 Batch (B)、哪个头 (H)、哪段序列 (T)。</li>
+<li><strong>处理变长序列 (<code>IS_VARLEN</code>)</strong>: 这是 <code>fla</code> 库的特色。通常 Transformer 需要把句子 Padding 到相同长度，但这里支持把所有句子拼成一条长龙（FlashAttention 的做法），通过 <code>cu_seqlens</code>（累积长度）来找句子的开头和结尾。</li>
+<li><strong>加载 Cos/Sin</strong>: 根据当前的位置索引，从预计算好的表中读取对应的 Cos 和 Sin 值。</li>
+<li><strong>计算</strong>:<ul>
+<li>如果是 <code>Interleaved=False</code>：加载前半段和后半段，执行 $x \cdot \cos - y \cdot \sin$。</li>
+<li>如果是 <code>Interleaved=True</code>：加载相邻元素，执行旋转。</li>
+</ul>
+</li>
+<li><strong>存储 (<code>tl.store</code>)</strong>: 把算好的结果写回显存 <code>y</code>。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 5: 理解工程封装 (Module)</h4>
+<p>最后看 <code>class RotaryEmbedding(nn.Module)</code>，这是给用户用的类。</p>
+<ol>
+<li><strong>缓存 (<code>inv_freq</code>, <code>cos_cached</code>, <code>sin_cached</code>)</strong>:<ul>
+<li>Cos 和 Sin 的值只跟位置有关，跟输入数据无关。</li>
+<li>所以这个类会在初始化时，预先算好一个巨大的 Cos/Sin 表存起来（Cache），避免每次 forward 都重算频率。</li>
+</ul>
+</li>
+<li><strong><code>forward</code> 函数</strong>:<ul>
+<li>当数据进来时，它会检查序列长度有没有超过缓存。如果超过了，就更新缓存。</li>
+<li>然后调用 <code>RotaryEmbeddingFunction.apply</code>，最终进入那个极速的 Triton Kernel 进行计算。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 总结：这篇代码讲了啥？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>高性能的、支持变长序列的 RoPE 算子实现</strong>。</p>
+<p><strong>它的工作流</strong>：
+1.  <strong>初始化</strong>：<code>RotaryEmbedding</code> 类预计算好 Cos/Sin 表。
+2.  <strong>前向传播</strong>：输入 Query 和 Key 张量。
+3.  <strong>加速计算</strong>：调用 <code>rotary_embedding_kernel</code> (Triton)，在 GPU 上并行地读取数据、应用旋转公式、写回结果。
+4.  <strong>输出</strong>：带有位置信息的 Query 和 Key。</p>
+<p><strong>你应该怎么用？</strong>
+你不需要看懂 Triton 内核的每一行指针运算。你只需要知道：
+*   它比 PyTorch 原生快。
+*   它支持 <code>flash-attention</code> 常用的变长序列格式（传入 <code>cu_seqlens</code>）。
+*   在你的模型 Attention 层之前，把 Q 和 K 丢给它处理一下即可。</p>

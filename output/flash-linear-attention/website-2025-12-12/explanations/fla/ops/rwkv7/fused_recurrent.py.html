@@ -1,0 +1,100 @@
+<h1>fla/ops/rwkv7/fused_recurrent.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到 <strong>RWKV-v7</strong> 模型的核心算子实现，而且是用 <strong>Triton</strong>（一种专门写GPU高性能内核的语言）写的。</p>
+<p>简单来说，这个文件的作用是：<strong>极其快速地计算 RWKV-v7 模型的“循环（Recurrent）”过程。</strong></p>
+<p>为了让你看懂，我们把阅读代码想象成在执行一个 <strong>“处理记忆流水线”</strong> 的任务。我把这个过程拆解成一个 Todo List，带你一步步看完。</p>
+<hr />
+<h3>任务清单：理解 RWKV7 核心算子</h3>
+<h4>✅ Task 1: 搞清楚我们在做什么 (Context)</h4>
+<p>RWKV 是一个像 RNN 一样运行的大模型。RNN 的核心特点是：
+1.  它有一个 <strong>“隐藏状态” (Hidden State)</strong>，你可以把它想象成一个 <strong>“笔记本”</strong>。
+2.  每读入一个词（Token），它就更新一下笔记本的内容。
+3.  同时，根据笔记本的内容和当前的词，输出一个结果。</p>
+<p>这个脚本就是用来<strong>在显卡上并行加速</strong>这个“读词 -&gt; 改笔记本 -&gt; 输出”的过程。</p>
+<h4>✅ Task 2: 认识原材料 (Inputs)</h4>
+<p>在 <code>fused_recurrent_rwkv7_fwd_kernel</code> 函数的参数里，有一堆字母，它们是原材料：
+*   <strong><code>r</code> (Receptance/Query)</strong>: 相当于“我想从笔记本里读什么”。
+*   <strong><code>w</code> (Decay)</strong>: 遗忘率。笔记本里的旧信息会随着时间变淡，<code>w</code> 决定淡化多少。
+*   <strong><code>k</code> (Key)</strong>: 相当于“我要往笔记本里写什么内容的索引”。
+*   <strong><code>v</code> (Value)</strong>: 相当于“我要往笔记本里写的具体内容”。
+*   <strong><code>a</code>, <code>kk</code></strong>: 这是 RWKV7 特有的参数，用于对记忆更新进行更复杂的修正（这是 v7 和 v6 的主要区别）。
+*   <strong><code>h0</code></strong>: 笔记本的初始状态（比如上一段话留下的记忆）。</p>
+<h4>✅ Task 3: 启动流水线 (Kernel Setup)</h4>
+<p>代码开头的一大段 <code>i_v, i_nh = ...</code> 和 <code>if IS_VARLEN:</code> 是在分配任务：
+*   GPU 有成千上万个小核心。
+*   这段代码把不同的句子（Batch）和不同的注意力头（Head）分配给不同的 GPU 核心去处理。
+*   <strong>类比</strong>：这就好比你雇了100个会计，每个人负责算一本账，大家互不干扰。</p>
+<h4>✅ Task 4: 初始化笔记本 (Load State)</h4>
+<p>看代码块：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">USE_INITIAL_STATE</span><span class="p">:</span>
+    <span class="n">p_h0</span> <span class="o">=</span> <span class="o">...</span>
+    <span class="n">b_h</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：如果之前有留下的记忆（<code>h0</code>），先把旧笔记本拿出来，放在桌子上（<code>b_h</code> 就是当前时刻的笔记本状态）。</li>
+</ul>
+<h4>✅ Task 5: 核心循环 (The Loop) - 最重要的一步！</h4>
+<p>这是整个代码的灵魂。看 <code>for _ in range(0, T):</code> 这一块。这意味着我们开始一个词一个词地读文章了。</p>
+<p>在这个循环里，每一步发生了四件事：</p>
+<p><strong>Step 5.1: 准备数据</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">b_r</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 读入当前的 r</span>
+<span class="n">b_w</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 读入当前的 w</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<p>把当前这个时刻 $t$ 的所有参数（r, w, k, v, a, kk）都加载到高速缓存里。</p>
+<p><strong>Step 5.2: 复杂的记忆更新 (RWKV7 特色)</strong>
+这几行是数学核心：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">b_act_a</span> <span class="o">=</span> <span class="o">-</span><span class="n">b_kk</span>
+<span class="n">b_b</span> <span class="o">=</span> <span class="n">b_kk</span> <span class="o">*</span> <span class="n">b_a</span>
+
+<span class="c1"># 下面这行是 v7 的核心公式：</span>
+<span class="c1"># 1. exp(b_w) * b_h: 旧记忆衰减（忘了点东西）</span>
+<span class="c1"># 2. b_b * sum(...) : 这是一个修正项，根据当前状态对记忆做微调</span>
+<span class="n">b_h</span> <span class="o">=</span> <span class="n">exp</span><span class="p">(</span><span class="n">b_w</span><span class="p">)[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">b_h</span> <span class="o">+</span> <span class="n">b_b</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_act_a</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">b_h</span><span class="p">,</span> <span class="mi">0</span><span class="p">)[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：RWKV7 不仅仅是简单的“旧记忆衰减 + 新记忆写入”。它在衰减之后，还用 <code>a</code> 和 <code>kk</code> 对当前的记忆状态做了一个<strong>线性变换</strong>（你可以理解为对笔记本里的内容进行了一次整理和压缩）。</li>
+</ul>
+<p><strong>Step 5.3: 写入新记忆</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">b_h</span> <span class="o">+=</span> <span class="n">b_k</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">b_v</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：把当前时刻的信息（Key 和 Value 的乘积）加到笔记本里。现在 <code>b_h</code> 是更新后的笔记本了。</li>
+</ul>
+<p><strong>Step 5.4: 产出结果</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">b_o</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_h</span> <span class="o">*</span> <span class="n">b_r</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">],</span> <span class="mi">0</span><span class="p">)</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_o</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：根据刚才更新好的笔记本（<code>b_h</code>），结合当前的意图（<code>r</code>），计算出这一时刻的输出（<code>b_o</code>），并写回显存。</li>
+</ul>
+<p><strong>Step 5.5: 移动指针</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">p_r</span> <span class="o">+=</span> <span class="o">...</span> 
+<span class="n">p_w</span> <span class="o">+=</span> <span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：准备读下一个词。</li>
+</ul>
+<h4>✅ Task 6: 保存最终状态 (Save Final State)</h4>
+<p>循环结束后：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">STORE_FINAL_STATE</span><span class="p">:</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_ht</span><span class="p">,</span> <span class="n">b_h</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：文章读完了，把最后的笔记本状态（<code>b_h</code>）存入 <code>ht</code>。这很重要，因为生成长文本时，下一段话需要接着这个笔记本继续算。</li>
+</ul>
+<hr />
+<h3>总结一下文中的观点（代码逻辑）</h3>
+<p>这段代码实现了一个<strong>带门控和低秩修正的线性注意力循环</strong>。</p>
+<ol>
+<li><strong>它是一个 RNN</strong>：因为它维护一个状态 <code>b_h</code>，随时间步迭代。</li>
+<li><strong>它是线性的</strong>：计算复杂度跟序列长度是线性的，不像 Transformer 是平方级，所以这一步非常快。</li>
+<li><strong>RWKV7 的改进</strong>：相比于普通 RNN 简单的 $h_t = w \cdot h_{t-1} + k \cdot v$，RWKV7 引入了 <code>a</code> 和 <code>kk</code>。在代码中体现为 <code>b_h</code> 的更新包含了一个额外的项 <code>b_b * sum(b_act_a * b_h)</code>。这让模型能更灵活地控制记忆的流动，甚至能一定程度上“旋转”或“修正”之前的记忆状态，从而获得比 RWKV5/6 更强的表达能力。</li>
+</ol>
+<p><strong>简单说：这就是一个极速版的、带了高级记忆整理功能的“烂笔头”系统。</strong></p>

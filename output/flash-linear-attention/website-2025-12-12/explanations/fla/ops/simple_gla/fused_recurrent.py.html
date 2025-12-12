@@ -1,0 +1,62 @@
+<h1>fla/ops/simple_gla/fused_recurrent.py</h1>
+<p>这份代码确实非常底层，属于大模型架构中<strong>线性注意力机制（Linear Attention）</strong>的具体实现部分。如果你没有相关的背景知识，看不懂是很正常的。</p>
+<p>别担心，为了让你理解这份代码在干什么，我为你制定了一个 <strong>“学习任务清单” (Task List)</strong>。我们将这个复杂的代码拆解成 6 个小任务，一步步通关。</p>
+<hr />
+<h3>📋 任务清单：从小白到看懂 <code>Simple GLA</code></h3>
+<h4>✅ Task 1: 理解核心背景 —— 它是“记性好的速记员”</h4>
+<p>首先，你要明白这个函数是用来算什么的。
+*   <strong>传统 Attention (Transformer):</strong> 像是在看书，看完一整页，然后回头找每一句话之间的关系。这很慢，且占内存（$O(N^2)$）。
+*   <strong>RNN (Recurrent Neural Network):</strong> 像是速记员，听一句话，记一点笔记，脑子里的“状态”更新一下，然后听下一句。
+*   <strong>GLA (Gated Linear Attention):</strong> 结合了两者。它既有 Attention 的能力，又像 RNN 一样通过“状态”一步步处理。</p>
+<p><strong>结论：</strong> 这个函数 <code>fused_recurrent_simple_gla</code> 就是在执行这个<strong>“听一句、记笔记、更新脑子、输出结果”</strong>的过程。</p>
+<h4>✅ Task 2: 认识主角 —— 输入参数 Q, K, V, G</h4>
+<p>代码里有一堆参数，我们把它们想象成速记员处理的信息：
+*   <strong><code>q</code> (Query):</strong> 当前的问题（比如：“这句话的重点是什么？”）。
+*   <strong><code>k</code> (Key) &amp; <code>v</code> (Value):</strong> 输入的内容信息（比如：“这句话说苹果是红色的”）。
+*   <strong><code>g</code> (Gate, 遗忘门):</strong> <strong>这是关键！</strong> 它决定了速记员要<strong>忘掉多少</strong>之前的信息。
+    *   比如 <code>g</code> 很大，说明之前的信息很重要，要记住；<code>g</code> 很小，说明之前的信息可以忘了。
+*   <strong><code>initial_state</code>:</strong> 速记员刚开始工作时，脑子里已经有的记忆（即上一段话遗留的记忆）。</p>
+<h4>✅ Task 3: 理解 "Simple" —— 简化的遗忘机制</h4>
+<p>代码名字叫 <code>simple_gla</code>，哪里 Simple（简单）了？
+*   <strong>普通的 GLA:</strong> 每一个具体的数字（元素级）都有一个独立的遗忘门，计算量极大。
+*   <strong>Simple GLA (本代码):</strong> 注意看注释 <code>g</code> 的形状是 <code>[B, T, H]</code>。
+    *   这意味着：它不是控制每个数字，而是控制<strong>每个注意力头 (Head)</strong>。
+    *   <strong>比喻：</strong> 普通 GLA 是给书里的每个字都标记“是否重要”；Simple GLA 是给每一页纸标记“是否重要”。这样计算起来更快。</p>
+<h4>✅ Task 4: 理解 "Fused" —— 极速模式</h4>
+<p>函数名里有 <code>fused</code>（融合）。这是什么意思？
+*   <strong>非 Fused:</strong> 读取数据 -&gt; 算第一步 -&gt; 存回内存 -&gt; 读取数据 -&gt; 算第二步...（很慢，显存带宽瓶颈）。
+*   <strong>Fused (本代码):</strong> 把所有步骤打包，扔进 GPU 的核心里（Kernel），一次性算完再吐出来，中间不写回内存。
+*   <strong>目的:</strong> 极致的速度优化。</p>
+<h4>✅ Task 5: 攻克难点 —— 变长序列 (<code>cu_seqlens</code>)</h4>
+<p>代码里有一大段关于 <code>cu_seqlens</code> 的检查逻辑，这是干嘛的？
+*   <strong>场景:</strong> 假设你要训练两句话，一句 5 个字，一句 1000 个字。
+*   <strong>Batch 处理:</strong> 为了并行，通常需要把短的补零（Padding）成 1000 字。但这浪费计算资源。
+*   <strong>VarLen (Variable Length):</strong> 我们把两句话拼成一根长条（1005个字），然后用 <code>cu_seqlens</code> 告诉 GPU：“第 0-5 字是第一句，第 5-1005 字是第二句”。
+*   <strong>代码逻辑:</strong>
+    <code>python
+    if cu_seqlens is not None:
+        if q.shape[0] != 1:
+             # 如果用了变长模式，Batch Size 维度必须被压扁成 1
+             raise ValueError(...)</code>
+    这段代码就是在做安全检查，防止你用错了格式。</p>
+<h4>✅ Task 6: 总结代码逻辑 —— 它只是个“包工头”</h4>
+<p>最后，我们回看整个函数。你会发现它其实没干什么具体的数学计算，它只是个<strong>Wrapper（包装器）</strong>。</p>
+<ol>
+<li><strong>检查参数:</strong> 看看你有没有乱传参（比如 <code>cu_seqlens</code> 对不对）。</li>
+<li><strong>设置默认值:</strong> 如果你没给 <code>scale</code>，它帮你算一个默认的缩放比例。</li>
+<li><strong>调用后端:</strong>
+    <code>python
+    o, final_state = fused_recurrent(...) # 这一行是去调用写好的 CUDA 加速内核</code></li>
+<li><strong>返回结果:</strong> 把算好的输出 <code>o</code> 和最后的记忆状态 <code>final_state</code> 给用户。</li>
+</ol>
+<hr />
+<h3>🧠 总结一下文中的核心观点 (Takeaway)</h3>
+<p>如果你要向别人介绍这个文件，你可以这样说：</p>
+<ol>
+<li><strong>功能:</strong> 这是一个实现了 <strong>Simple GLA</strong> 算法的前向传播函数，采用 <strong>RNN 模式</strong>（Recurrent）。</li>
+<li><strong>优化:</strong> 它使用了 <strong>Fused Kernel</strong>（算子融合）技术，为了在 GPU 上跑得飞快。</li>
+<li><strong>特点:</strong> 相比于标准 GLA，它的 gating（门控）机制更简单，是 <strong>Head-wise</strong>（按头控制）而不是 Element-wise（按元素控制）的。</li>
+<li><strong>接口:</strong> 它支持 <strong>FlashAttention 风格</strong> 的接口（即 <code>cu_seqlens</code>），可以高效处理长短不一的文本序列。</li>
+<li><strong>本质:</strong> 这个 Python 文件本身只是一个<strong>接口层</strong>，负责参数检查和预处理，真正的计算在引用的 <code>fla.ops.common.fused_recurrent</code> 里。</li>
+</ol>
+<p>现在的感觉是不是清晰一点了？它就是一个为了让大模型“记忆力更好、计算更快”而写的高性能算子接口。</p>

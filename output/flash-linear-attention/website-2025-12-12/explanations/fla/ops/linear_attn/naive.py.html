@@ -1,0 +1,115 @@
+<h1>fla/ops/linear_attn/naive.py</h1>
+<p>这份代码确实涉及比较底层的深度学习操作，特别是关于 <strong>线性注意力机制 (Linear Attention)</strong> 的实现。如果不知道背景，看这些 <code>einsum</code> 和 <code>rearrange</code> 确实像天书。</p>
+<p>别担心，我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>。我们把这个复杂的代码拆解成 5 个小任务，一步一步来攻克它。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 01: 理解核心背景</strong> —— 为什么要搞这个“线性注意力”？它想解决什么问题？</li>
+<li><strong>Task 02: 搞懂数据形状</strong> —— 代码里的 <code>q, k, v</code> 到底长什么样？</li>
+<li><strong>Task 03: 攻克第一关 <code>naive_recurrent_linear_attn</code></strong> —— 把它当成一个 RNN (循环神经网络) 看。</li>
+<li><strong>Task 04: 攻克第二关 <code>naive_chunk_linear_attn</code></strong> —— 把它当成“分块并行”处理看。</li>
+<li><strong>Task 05: 总结归纳</strong> —— 这两个函数其实是在算同一个东西，只是算法不同。</li>
+</ol>
+<hr />
+<h3>🚀 开始执行任务</h3>
+<h4>✅ Task 01: 理解核心背景 —— 为什么要“线性”？</h4>
+<ul>
+<li><strong>传统 Attention 的痛点</strong>：标准的 Transformer (像 ChatGPT 用的) 计算注意力时，需要计算所有词和所有词之间的关系，是一个 $N \times N$ 的大矩阵。如果文章特别长，这个矩阵会大到内存爆炸，计算也很慢 (复杂度是 $O(T^2)$)。</li>
+<li><strong>Linear Attention (线性注意力) 的解法</strong>：<ul>
+<li>数学上利用了一个技巧：<strong>先乘 K 和 V，再乘 Q</strong>。</li>
+<li>原本是：$(Q \times K^T) \times V$。</li>
+<li>现在改成了：$Q \times (K^T \times V)$。</li>
+<li><strong>好处</strong>：这样就不需要那个巨大的 $N \times N$ 矩阵了，计算量随着长度线性增长 $O(T)$，所以叫“线性注意力”。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 02: 搞懂数据形状 —— 输入是什么？</h4>
+<p>在阅读代码前，先约定符号：
+*   <strong>B</strong>: Batch size (一批有多少句话)
+*   <strong>T</strong>: Time / Sequence length (句子的长度)
+*   <strong>H</strong>: Heads (注意力头的数量)
+*   <strong>K, V</strong>: 向量的维度 (特征的大小)</p>
+<p>代码里的 <code>q, k, v</code> 都是张量，形状通常是 <code>[B, T, H, K]</code> 或 <code>[B, T, H, V]</code>。</p>
+<h4>✅ Task 03: 攻克第一关 <code>naive_recurrent_linear_attn</code> (循环模式)</h4>
+<p>这个函数是用 <strong>RNN (循环)</strong> 的方式来算线性注意力。想象你在逐字逐句读一本书。</p>
+<ul>
+<li>
+<p><strong>核心逻辑</strong>：</p>
+<ol>
+<li>维护一个“记忆状态” <strong>S</strong> (State)。</li>
+<li>每读一个词 (时刻 $t$)，用当前的 $k$ 和 $v$ 更新这个记忆 <strong>S</strong>。</li>
+<li>用当前的 $q$ 去查询这个记忆 <strong>S</strong>，得到输出。</li>
+</ol>
+</li>
+<li>
+<p><strong>代码逐行解读</strong>：
+    ```python
+    # S 就是那个“记忆”，初始化为0
+    S = torch.zeros((B, H, K, V), ...)</p>
+<h1>循环遍历每一个时间步 T (像读每一个词)</h1>
+<p>for t in range(T):
+    # 1. 更新记忆 (Write to memory)
+    # S = S + (k_t * v_t)
+    # einsum 里的 'b h k, b h v -&gt; b h k v' 就是在做 k 和 v 的外积
+    S = S + torch.einsum('b h k, b h v -&gt; b h k v', k[:, t], v[:, t])</p>
+<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 2. 读取记忆 (Read from memory)
+<span class="gh">#</span> o_t = S * q_t
+<span class="gh">#</span> 用当前的 query 去乘积累下来的状态 S
+o[:, t] = torch.einsum(&#39;b h k v, b h k -&gt; b h v&#39;, S, q[:, t] * scale)
+</code></pre></div>
+
+<p>```</p>
+</li>
+<li>
+<p><strong>总结</strong>：这是一种串行算法，必须等上一步算完才能算下一步。它的优点是<strong>推理时极快</strong>且省内存（只需要保存 S），缺点是<strong>训练时很慢</strong>（因为不能并行）。</p>
+</li>
+</ul>
+<h4>✅ Task 04: 攻克第二关 <code>naive_chunk_linear_attn</code> (分块模式)</h4>
+<p>既然循环模式训练太慢，这个函数就是为了<strong>加速</strong>。它把长句子切成一小块一小块 (Chunk)，结合了并行计算。</p>
+<ul>
+<li>
+<p><strong>核心逻辑</strong>：</p>
+<ol>
+<li>把长句子切成 <code>chunk_size</code> (比如 64) 大小的块。</li>
+<li><strong>块内 (Intra)</strong>：在这一小块内部，用标准的 Attention 算（因为块很小，算 $N \times N$ 也没事）。</li>
+<li><strong>块间 (Inter)</strong>：这一块需要利用之前所有块的信息。我们把之前所有块的 KV 乘积累加起来，传给当前块。</li>
+</ol>
+</li>
+<li>
+<p><strong>代码逐行解读</strong>：
+    ```python
+    chunk_size = 64
+    # 1. 变形：把 T 拆成 (n c)，n是块的数量，c是块大小
+    q = rearrange(q, 'b (n c) h d -&gt; b h n c d', c=chunk_size) ...</p>
+<h1>2. 准备历史记忆 (Inter-chunk)</h1>
+<h1>算出每一块的 KV 乘积</h1>
+<p>kv = k.transpose(-1, -2) @ v</p>
+<h1>cumsum 是“累加和”。意思是我把第1块、第1+2块、第1+2+3块的记忆都算出来</h1>
+<p>kv = kv.cumsum(2)</p>
+<h1>错位操作：当前块只能看“之前”的块，不能看自己及未来的，所以要做 padding 和 shift</h1>
+<p>kv = torch.cat([torch.zeros_like(kv[:, :, :1]), kv[:, :, :-1]], dim=2)</p>
+<h1>计算历史信息对当前的影响</h1>
+<p>inter = q @ kv</p>
+<h1>3. 计算块内部注意力 (Intra-chunk)</h1>
+<h1>这是标准的 Attention 公式：Masked(Q * K^T) * V</h1>
+<h1>这里的 mask 是为了保证不能看到未来的词</h1>
+<p>intra = ((
+    q @ k.transpose(-1, -2)).masked_fill_(
+    torch.triu(..., diagonal=1), 0,
+)) @ v</p>
+<h1>4. 合并：总结果 = 历史记忆的结果 + 当前块内的结果</h1>
+<p>o = inter + intra
+```</p>
+</li>
+<li>
+<p><strong>总结</strong>：这是一种<strong>混合算法</strong>。它利用了 GPU 的并行能力（块内并行），同时保留了线性注意力的特性（块间线性）。这种写法在训练时比纯循环快得多。</p>
+</li>
+</ul>
+<h4>✅ Task 05: 总结归纳</h4>
+<p>读完这两个函数，你应该明白：</p>
+<ol>
+<li><strong>它们在算一样的东西</strong>：数学结果理论上是相等的（误差范围内）。</li>
+<li><strong><code>naive_recurrent_linear_attn</code></strong>：是 <strong>RNN 视角</strong>。适合理解原理，或者做推理（Inference）生成文本时用。</li>
+<li><strong><code>naive_chunk_linear_attn</code></strong>：是 <strong>并行视角</strong>。适合训练（Training）时用，为了在 GPU 上跑得更快。</li>
+</ol>
+<p><strong>简单一句话概括</strong>：这个文件实现了一个<strong>不使用 Softmax 的线性注意力机制</strong>，并提供了“逐个词算（循环）”和“分块并行算（分块）”两种实现方式。</p>

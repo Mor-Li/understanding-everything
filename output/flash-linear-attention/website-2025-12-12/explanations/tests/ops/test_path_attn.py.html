@@ -1,0 +1,58 @@
+<h1>tests/ops/test_path_attn.py</h1>
+<p>这个文件 <code>tests/ops/test_path_attn.py</code> 是一个<strong>单元测试文件</strong>。</p>
+<p>它的核心目的是：<strong>验证一种名为“Path Attention（路径注意力）”的新算法的计算是否正确。</strong></p>
+<p>为了让你听懂，我把阅读和理解这个代码的过程拆解成一个 <strong>“任务清单 (Todo List)”</strong>。想象你是一个质检员，你要一步步检查这个算法是否合格。</p>
+<hr />
+<h3>任务一：搞清楚我们在测什么 (核心概念)</h3>
+<p>在看代码细节前，先理解这个算法的输入是什么。
+<strong>Todo:</strong>
+1.  <strong>准备基础原料 (Q, K, V):</strong> 和标准的 Transformer 注意力一样，我们需要 Query, Key, Value。
+2.  <strong>准备特殊原料 (w, beta, g):</strong> 这是 Path Attention 特有的：
+    *   <code>w</code> 和 <code>beta</code>: 可以理解为控制“路径”权重的参数。在序列中，token A 到 token B 的注意力不仅仅取决于它们俩的相似度，还取决于它们中间经过的路径（decay 或 变换）。
+    *   <code>g</code> (Forget Gate): 遗忘门。类似于 LSTM，用来控制保留多少历史信息。</p>
+<hr />
+<h3>任务二：理解“标准答案”是怎么算的 (<code>naive_path_attn</code>)</h3>
+<p>代码中定义了一个函数 <code>naive_path_attn</code>。这个函数是用最普通的 PyTorch 写出来的，虽然运行慢，但逻辑清晰，作为<strong>参考答案 (Ground Truth)</strong>。</p>
+<p><strong>Todo:</strong>
+1.  <strong>数据预处理:</strong> 把 Q, K, V, w, beta 都转成 <code>float32</code> 保证精度，并调整形状。
+2.  <strong>计算遗忘门 (g):</strong> 代码 <code>g_cumsum = g.cumsum(-1)</code>。
+    *   <em>解释：</em> 通过累加计算，决定每个位置要“遗忘”多少之前的累积信息。
+3.  <strong>计算路径矩阵 (Matrix T):</strong> 这是最难的一段（代码中 <code>T = ...</code> 那一大块）。
+    *   <em>解释：</em> 它模拟了一个递归过程。它计算的是：如果不只是直接看过去，而是通过 $w$ 和 $\beta$ 一步步传导过来，两个位置之间的“连接强度”是多少。它在一个小块 (Block, <code>BT=64</code>) 内部通过循环计算这种复杂的依赖关系。
+4.  <strong>计算注意力分数 (Attention Score):</strong>
+    *   <em>解释：</em> 结合了标准的点积注意力 ($Q \times K^T$) 和上面算出来的路径影响 ($T$ 矩阵相关的项)。
+5.  <strong>输出结果:</strong>
+    *   <em>解释：</em> 应用 Softmax，乘以 V，最后得到输出。</p>
+<p><strong>总结：</strong> <code>naive_path_attn</code> 就是用笨办法（循环、大矩阵乘法）把数学公式老老实实算一遍，确保结果绝对正确。</p>
+<hr />
+<h3>任务三：执行对比测试 (<code>test_parallel</code>)</h3>
+<p>这是测试的主体部分。作者写了一个高性能的并行版本 <code>parallel_path_attention</code>（通常是用 Triton 写的 CUDA 核，跑得很快），现在要验证它对不对。</p>
+<p><strong>Todo:</strong>
+1.  <strong>生成随机数据:</strong>
+    *   创建随机的 B (Batch), T (Time/Length), H (Heads), D (Dimension) 数据。
+    *   开启 <code>requires_grad=True</code>，因为我们不仅要测结果，还要测<strong>反向传播（梯度）</strong>。
+2.  <strong>跑“慢”版本 (Ref):</strong>
+    *   调用 <code>naive_path_attn</code>。
+    *   运行 <code>.backward()</code> 算出标准梯度的答案 (<code>ref_dq</code>, <code>ref_dk</code> 等)。
+3.  <strong>跑“快”版本 (Tri):</strong>
+    *   调用 <code>parallel_path_attention</code> (这是本仓库真正要发布的算子)。
+    *   运行 <code>.backward()</code> 算出它的梯度 (<code>tri_dq</code>, <code>tri_dk</code> 等)。
+4.  <strong>核心任务：找茬 (Assert Close):</strong>
+    *   对比 <strong>输出结果 (<code>o</code>)</strong>: 慢版本和快版本的输出是否几乎一样？(误差允许在 0.005 以内)。
+    *   对比 <strong>梯度 (<code>dq</code>, <code>dk</code>, <code>dv</code>, ...)</strong>: 两个版本算出来的梯度是否一样？如果梯度不一样，模型这就没法训练。</p>
+<hr />
+<h3>任务四：测试变长序列 (<code>test_parallel_varlen</code>)</h3>
+<p>在实际的大模型训练中，我们经常把不同长度的句子拼在一起训练（Variable Length），所以还需要专门测一下这种情况。</p>
+<p><strong>Todo:</strong>
+1.  <strong>设定句子长度 (<code>cu_seqlens</code>):</strong>
+    *   比如 <code>[0, 15, 333, 2048]</code> 表示有三个句子，长度分别是 15, 318, 1715。
+2.  <strong>拼接数据:</strong> 把这三个句子拼成一个长条 (Batch Size = 1)。
+3.  <strong>分段跑“慢”版本:</strong>
+    *   用 <code>for</code> 循环，一段一段地切出来跑 <code>naive_path_attn</code>，然后拼回去作为标准答案。
+4.  <strong>一次性跑“快”版本:</strong>
+    *   <code>parallel_path_attention</code> 支持传入 <code>cu_seqlens</code>，它应该能自动处理这种拼接数据，不需要手动写循环。
+5.  <strong>再次找茬:</strong> 对比拼起来的结果和梯度是否一致。</p>
+<hr />
+<h3>总结：这段代码在讲什么？</h3>
+<p><strong>一句话概括：</strong>
+这段代码是一个<strong>质检车间</strong>。它先用 Python 手工算一遍复杂的“路径注意力”数学题（<code>naive</code>），然后用这个答案去检查那个写得飞快但容易出错的 GPU 加速版本（<code>parallel</code>），确保加速版本算得又快又对，而且能正确地进行模型训练（反向传播）。</p>

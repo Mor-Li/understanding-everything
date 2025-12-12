@@ -1,0 +1,100 @@
+<h1>benchmarks/ops/benchmark_hgrn.py</h1>
+<p>这段代码乍一看确实很抽象，因为它不是在“写模型”，而是在<strong>给模型算子（Operator）做性能测试（跑分）</strong>。</p>
+<p>你可以把这个文件想象成一个<strong>赛车场的计时器</strong>。</p>
+<p>为了让你彻底看懂，我为你制定了一个<strong>6步走的 Task List</strong>，我们一步步来拆解：</p>
+<hr />
+<h3>✅ Task 1: 搞清楚这文件是干嘛的？（宏观定位）</h3>
+<p><strong>核心观点：这是一个“测速仪”。</strong></p>
+<ul>
+<li><strong>背景</strong>：你正在看的是 <code>FLA</code> (Fast Linear Attention) 库中的代码。这里面实现了一种叫 <strong>HGRN</strong> (Hierarchical Gated Recurrent Network) 的算法。</li>
+<li><strong>目的</strong>：开发者写了两种实现 HGRN 的方法（一种叫 <code>chunk</code>，一种叫 <code>recurrent</code>）。这个文件的唯一目的，就是<strong>对比这两种方法谁跑得快，以及在不同序列长度下消耗多少时间</strong>。</li>
+<li><strong>工具</strong>：它使用了 OpenAI 的 <code>triton</code> 库来进行测试和绘图。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 认识“参赛选手” （关键导入）</h3>
+<p><strong>核心观点：我们要在两种算法之间通过“正向”和“反向”传播进行比赛。</strong></p>
+<p>看代码顶部的导入：</p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">fla.ops.hgrn</span><span class="w"> </span><span class="kn">import</span> <span class="n">chunk_hgrn</span><span class="p">,</span> <span class="n">fused_recurrent_hgrn</span>
+</code></pre></div>
+
+<p>这里有两个主角：
+1.  <strong><code>chunk_hgrn</code></strong>：分块版算法（通常并行度更高）。
+2.  <strong><code>fused_recurrent_hgrn</code></strong>：融合循环版算法（类似 RNN 的串行逻辑）。</p>
+<hr />
+<h3>✅ Task 3: 读懂“比赛规则” （装饰器部分）</h3>
+<p><strong>核心观点：定义图表的 X 轴、Y 轴和线条。</strong></p>
+<p>代码中 <code>@triton.testing.perf_report</code> 这一大段装饰器，实际上是在<strong>配置一张统计图表</strong>：</p>
+<ul>
+<li><strong>X 轴 (<code>x_names=['T']</code>)</strong>：<ul>
+<li><strong>含义</strong>：序列长度 (Sequence Length)。</li>
+<li><strong>取值 (<code>x_vals</code>)</strong>：从 $128$ 开始，每次乘 2，一直到 $128 \times 2^7$。意思是测试当句子长度分别是 128, 256, ..., 16384 时的情况。</li>
+</ul>
+</li>
+<li><strong>线条 (<code>line_arg='provider'</code>)</strong>：<ul>
+<li>图里会有 4 条线，分别代表：<ol>
+<li><code>chunk</code> (分块版-前向传播)</li>
+<li><code>recurrent</code> (循环版-前向传播)</li>
+<li><code>chunk_bwd</code> (分块版-反向传播/算梯度)</li>
+<li><code>recurrent_bwd</code> (循环版-反向传播/算梯度)</li>
+</ol>
+</li>
+</ul>
+</li>
+<li><strong>Y 轴 (<code>ylabel</code>)</strong>：执行时间 (毫秒 ms)。越低越好。</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 准备“比赛器材” （数据生成）</h3>
+<p><strong>核心观点：造假数据，模拟真实的训练场景。</strong></p>
+<p>进入 <code>def benchmark(T, provider):</code> 函数内部：</p>
+<ol>
+<li><strong>设置规格</strong>：<ul>
+<li><code>B, D = 16, 512</code>：Batch Size 是 16，特征维度是 512。</li>
+<li><code>T</code>：由上面配置的 X 轴传入（比如 128, 256...）。</li>
+</ul>
+</li>
+<li><strong>造数据</strong>：<ul>
+<li><code>x</code>：输入数据 (Random)。</li>
+<li><code>g</code>：门控信号 (Gate)，经过了 <code>sigmoid</code> 激活。</li>
+<li><code>x = (1 - g) * x</code>：这是 HGRN 算法特有的公式预处理。</li>
+</ul>
+</li>
+<li><strong>开启记录</strong>：<ul>
+<li><code>.requires_grad_()</code>：告诉 PyTorch 我们要测训练过程（需要算梯度），不仅仅是推理。</li>
+<li><code>do</code>：这是 "Gradient of Output"（输出的梯度），用于测试反向传播。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 正式“开跑” （核心逻辑）</h3>
+<p><strong>核心观点：根据当前轮到的选手，运行代码并计时。</strong></p>
+<p>函数最后的 <code>if</code> 判断是真正的测试环节：</p>
+<ul>
+<li><code>triton.testing.do_bench(...)</code>：这是 Triton 提供的秒表。它会把里面的函数运行很多次，取平均时间。</li>
+</ul>
+<p><strong>逻辑拆解：</strong>
+1.  <strong>如果是 <code>chunk</code></strong>：
+    *   测 <code>chunk_hgrn(x, g)</code> 跑一次要多久（前向传播/推理速度）。
+2.  <strong>如果是 <code>recurrent</code></strong>：
+    *   测 <code>fused_recurrent_hgrn(x, g)</code> 跑一次要多久。
+3.  <strong>如果是 <code>chunk_bwd</code> (Backward)</strong>：
+    *   测 <code>chunk_hgrn(x, g)[0].backward(do)</code>。
+    *   <strong>解释</strong>：<code>.backward(do)</code> 是在算梯度。这对应神经网络的<strong>训练</strong>阶段。通常反向传播比前向传播慢，所以要分开测。
+4.  <strong>如果是 <code>recurrent_bwd</code></strong>：
+    *   同上，测循环版的反向传播速度。</p>
+<hr />
+<h3>✅ Task 6: 总结与输出 （Main 函数）</h3>
+<p><strong>核心观点：生成报告。</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+    <span class="n">benchmark</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">print_data</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>这行代码一运行，Triton 就会自动按照 Task 3 定义的规则，把 Task 5 里的测试全跑一遍。</li>
+<li>最后会在终端打印出一个表格，显示不同长度下（T），不同方法（Provider）的耗时（ms）。如果有图形界面支持，它还会保存一张折线图。</li>
+</ul>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<p><strong>这个文件在说：</strong></p>
+<blockquote>
+<p>"嘿，我有两种算 HGRN 的方法（Chunk 和 Recurrent）。我要模拟一批 Batch=16, Dim=512 的数据，让序列长度从 128 涨到 16k，看看这两种方法在<strong>推理（前向）</strong>和<strong>训练（反向）</strong>时，谁跑得更快！"</p>
+</blockquote>

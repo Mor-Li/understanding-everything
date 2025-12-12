@@ -1,0 +1,87 @@
+<h1>fla/ops/gated_delta_rule/fused_recurrent.py</h1>
+<p>这份代码确实比较晦涩，因为它使用了 <strong>OpenAI Triton</strong> 编写，这是一种专门用于编写高性能 GPU 内核的语言，而且它实现的是一种比较前沿的 <strong>线性注意力（Linear Attention）</strong> 变体，叫做 <strong>"Gated Delta Rule"</strong>。</p>
+<p>为了让你看懂，我把它拆解成一个<strong>“开发者的任务清单 (Task Todo List)”</strong>。想象一下，如果我们要从头实现这个算法，我们需要做哪些步骤。</p>
+<p>我们将这个过程分为三个阶段：<strong>概念理解</strong> -&gt; <strong>数据准备</strong> -&gt; <strong>核心循环（最难的部分）</strong>。</p>
+<hr />
+<h3>阶段一：理解我们要造什么 (Concept)</h3>
+<p><strong>Task 0: 搞懂核心公式</strong>
+这段代码的核心逻辑不是普通的 Transformer，而是一个 RNN（循环神经网络）的变体。
+它的核心思想是：<strong>“我有一个记忆状态 $h$，每次来一个新的输入，我算出预测误差（Delta），然后用这个误差去更新记忆。”</strong></p>
+<p>逻辑如下（简化版）：
+1.  <strong>记忆衰减</strong>：时间过去了，旧的记忆 $h_{t-1}$ 会淡忘一点（乘以 decay）。
+2.  <strong>计算误差 (Delta)</strong>：用当前的 Key ($k$) 去查询记忆，看看预测出的 Value 是多少，然后跟真实的 Value ($v$) 对比，算出差距。
+    *   $Error = v - (h_{t-1} \cdot k)$
+3.  <strong>更新记忆</strong>：把这个差距（乘以学习率 $\beta$）存入记忆 $h$ 中。
+    *   $h_t = h_{t-1} + k \cdot Error \cdot \beta$
+4.  <strong>输出</strong>：用 Query ($q$) 从更新后的记忆中读取结果。
+    *   $o = h_t \cdot q$</p>
+<hr />
+<h3>阶段二：GPU 搬砖前的准备 (Setup)</h3>
+<p>现在我们进入代码 <code>fused_recurrent_gated_delta_rule_fwd_kernel</code> 函数内部。</p>
+<p><strong>Task 1: 确定“我是谁” (Grid &amp; Indexing)</strong>
+GPU 是成千上万个小工人在干活。代码开头是在分配任务。
+*   <code>i_v, i_nh</code>: 确定当前线程块负责处理哪个 Head (注意力头) 以及 Value 的哪一部分维度。
+*   <strong>代码对应</strong>: <code>tl.program_id(0)</code>, <code>tl.program_id(1)</code> 等。</p>
+<p><strong>Task 2: 找到数据的“起点” (Pointers)</strong>
+我们需要在显存的大海里找到属于当前任务的数据指针。
+*   我们需要 Q, K, V, G (Gate/衰减), Beta (学习率) 的指针。
+*   <strong>代码对应</strong>: <code>p_q = ...</code>, <code>p_k = ...</code> 等一系列指针计算。</p>
+<p><strong>Task 3: 初始化记忆状态 (Init State)</strong>
+*   如果在序列开始前已经有记忆了（比如这是长文本的第二段），需要把之前的 $h_0$ 加载进来。如果没有，就初始化为 0。
+*   <strong>代码对应</strong>: <code>b_h = tl.zeros(...)</code> 以及 <code>if USE_INITIAL_STATE: ...</code></p>
+<hr />
+<h3>阶段三：核心循环 (The Loop) - 也就是“一步一步讲”</h3>
+<p>这是代码中最核心的 <code>for _ in range(0, T):</code> 循环。每一个循环代表时间步 $t$ 前进了一步。</p>
+<p><strong>Task 4: 加载当前时刻的数据</strong>
+*   把当前时刻 $t$ 的 $q, k, v$ 以及各种门控参数 $g, \beta$ 从显存读到寄存器。
+*   <strong>代码对应</strong>: <code>tl.load(p_q, ...)</code> 等。</p>
+<p><strong>Task 5: 应用遗忘/衰减 (Apply Decay)</strong>
+*   在更新记忆之前，先让旧记忆 $b_h$ 衰减。
+*   这里有三种衰减方式：全局衰减 <code>g</code>，针对 Key 的衰减 <code>gk</code>，针对 Value 的衰减 <code>gv</code>。
+*   公式：$h = h \cdot \exp(g)$
+*   <strong>代码对应</strong>:
+    <code>python
+    if USE_G: b_h *= exp(b_g)
+    if USE_GK: b_h *= exp(b_gk[:, None])
+    # ...</code></p>
+<p><strong>Task 6: 计算 Delta (核心中的核心)</strong>
+*   这就是“Delta Rule”名字的由来。
+*   <strong>第一步</strong>：用旧记忆 $h$ 和当前的 $k$ 做点积，预测一个 $v'$。
+    *   代码: <code>tl.sum(b_h * b_k[:, None], 0)</code>
+*   <strong>第二步</strong>：计算真实 $v$ 和预测 $v'$ 的差值，并乘以 $\beta$ (写入强度)。
+    *   公式：$v_{new} = \beta \cdot (v - (h \cdot k))$
+    *   <strong>代码对应</strong>:
+        <code>python
+        b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))</code>
+    *   <em>注：代码里复用了 <code>b_v</code> 变量来存储这个 Delta 差值。</em></p>
+<p><strong>Task 7: 更新记忆 (Update State)</strong>
+*   把算出来的 Delta ($b_v$) 通过 Key ($b_k$) 写入到记忆矩阵 $b_h$ 中。
+*   公式：$h_{new} = h_{old} + k \cdot v_{delta}$
+*   <strong>代码对应</strong>:
+    <code>python
+    b_h += b_k[:, None] * b_v</code></p>
+<p><strong>Task 8: 计算输出 (Compute Output)</strong>
+*   现在记忆 $h$ 已经是最新的了，用 Query ($q$) 去“读”记忆，得到输出 $o$。
+*   公式：$o = h \cdot q$
+*   <strong>代码对应</strong>:
+    <code>python
+    b_o = tl.sum(b_h * b_q[:, None], 0)
+    tl.store(p_o, ...) # 把结果写回显存</code></p>
+<p><strong>Task 9: 移动指针 (Advance Pointers)</strong>
+*   准备处理下一个时间步 $t+1$，把所有指针往后移一位。
+*   <strong>代码对应</strong>: <code>p_q += H*K</code> 等。</p>
+<hr />
+<h3>阶段四：收尾 (Finalize)</h3>
+<p><strong>Task 10: 保存最终状态</strong>
+*   如果循环结束了，而且用户需要保留最后的记忆（以便处理下一段文本），就把当前的 $b_h$ 存回显存。
+*   <strong>代码对应</strong>: <code>if STORE_FINAL_STATE: tl.store(p_ht, ...)</code></p>
+<hr />
+<h3>总结一下本文观点的“人话版”</h3>
+<p>这个文件实现了一个<strong>带门控的增量更新循环单元</strong>：</p>
+<ol>
+<li><strong>Fused (融合)</strong>: 它把计算 Output 和更新 State 的过程写在一个 GPU Kernel 里，不用反复读写显存，速度极快。</li>
+<li><strong>Recurrent (循环)</strong>: 它是按时间步 $t=1, 2, 3...$ 顺序执行的，维护一个隐状态 $h$。</li>
+<li><strong>Gated (门控)</strong>: 它引入了 <code>g</code>, <code>gk</code>, <code>gv</code> 这种机制来控制记忆的遗忘，就像 LSTM 里的遗忘门。</li>
+<li><strong>Delta Rule (增量规则)</strong>: 它的更新方式很特别，不是把新信息直接加进去，而是<strong>只把“预测错误”的部分加进去</strong>。这在理论上能让模型学得更精准，减少冗余信息。</li>
+</ol>
+<p>你看懂了吗？其实就是三个步骤的循环：<strong>“先忘掉一点旧的” -&gt; “看看新来的数据和预期的差多少” -&gt; “把差值补进记忆里并输出”</strong>。</p>

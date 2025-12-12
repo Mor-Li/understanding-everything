@@ -1,0 +1,83 @@
+<h1>fla/layers/lightnet.py</h1>
+<p>这份代码确实比较硬核，它实现的是 <strong>LightNet</strong> 的核心注意力机制（LightNetAttention）。LightNet 是一种 <strong>线性注意力（Linear Attention）</strong> 的变体，旨在比传统 Transformer 更快、更省显存，同时保持高性能。</p>
+<p>为了让你看懂，我把阅读这份代码的过程拆解成一个 <strong>“处理流水线”的 Todo List</strong>。我们可以把这个类想象成一个加工厂，数据（Hidden States）进来，经过一道道工序，最后变成成品（Output）。</p>
+<p>以下是你的 <strong>LightNet 代码阅读任务清单</strong>：</p>
+<hr />
+<h3>✅ Task 1: 准备原材料 (维度设定与投影)</h3>
+<p><strong>目标</strong>：理解输入的数据是如何被拆分成 Q (Query), K (Key), V (Value) 的。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>__init__</code> 方法前半部分 和 <code>forward</code> 方法开头。</li>
+<li><strong>白话解释</strong>：<ol>
+<li>输入是一个向量序列 <code>hidden_states</code>。</li>
+<li>代码通过 <code>nn.Linear</code> (即 <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>) 把输入变成了三份数据：<strong>Q</strong> (用来查询), <strong>K</strong> (用来索引), <strong>V</strong> (实际的内容)。</li>
+<li><strong>注意点</strong>：这里有一个 <code>expand_ratio</code>。LightNet 的特点是 K 的维度通常比 V 大（或者成比例），这与标准 Transformer 不同。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 2: 看看周围 (局部卷积 Short Convolution)</h3>
+<p><strong>目标</strong>：理解代码是如何在进行全局混合前，先处理“局部”信息的。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>__init__</code> 中的 <code>use_short_conv</code> 部分 和 <code>forward</code> 中的 <code>if self.use_short_conv:</code>。</li>
+<li><strong>白话解释</strong>：<ol>
+<li>线性注意力有时候容易忽略“邻居”的信息。</li>
+<li>这里加了一个 <strong>1D 卷积 (<code>ShortConvolution</code>)</strong>。</li>
+<li><strong>动作</strong>：在 Q, K, V 真正进入核心计算前，先用一个小窗口（比如大小为4）在序列上滑一遍。</li>
+<li><strong>作用</strong>：让每个 token 先知道它前后几个词是什么，增强局部特征捕捉能力。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 3: 核心魔法 —— 制造衰减门 (The Decay Gate)</h3>
+<p><strong>目标</strong>：这是 LightNet 最特别的地方，看懂它是如何通过 K 计算出衰减率的。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>forward</code> 方法中间：
+    <code>python
+    z = k.float().logcumsumexp(1)
+    k, g = torch.exp(k - z).to(k.dtype), (torch.cat((z[:, :1], z[:, :-1]), 1) - z).to(k.dtype)</code></li>
+<li><strong>白话解释</strong>：<ol>
+<li><strong><code>logcumsumexp</code></strong>：这是一个数学技巧。它在对 K 进行某种累积求和的对数运算。</li>
+<li><strong>目的</strong>：LightNet 不像其他模型那样单独学习一个“遗忘门”，而是<strong>直接利用 K 来计算归一化因子和衰减门</strong>。</li>
+<li><strong>结果</strong>：<ul>
+<li>新的 <code>k</code>：被归一化处理过了。</li>
+<li><code>g</code> (Gate)：这是一个“衰减率”。它决定了在处理长序列时，旧的信息要被遗忘多少，新的信息要保留多少。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 4: 混合搅拌 (GLA - Gated Linear Attention)</h3>
+<p><strong>目标</strong>：理解信息是如何在整个序列长度上进行交互的。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>forward</code> 中的 <code>chunk_gla</code> 或 <code>fused_recurrent_gla</code>。</li>
+<li><strong>白话解释</strong>：<ol>
+<li>这是整个模块的“心脏”。</li>
+<li><strong>Chunk 模式</strong>：训练时用。把长序列切成小块（Chunk）并行计算，速度快。</li>
+<li><strong>Recurrent 模式</strong>：推理（生成文本）时用。像 RNN 一样，读一个词，更新一下状态，输出一个词。显存占用极低。</li>
+<li><strong>动作</strong>：利用 Task 3 算出来的 Q, K, V 和 g（衰减门），进行线性注意力计算。简单说就是：<strong>根据 Q 去找 K，按 g 的比例融合 V 的信息</strong>。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 5: 最后的精修与把关 (Output Gating &amp; Norm)</h3>
+<p><strong>目标</strong>：理解输出结果是如何被处理和整形的。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>forward</code> 的最后几行：
+    <code>python
+    o = rms_norm_swish_gate_linear(...)</code></li>
+<li><strong>白话解释</strong>：<ol>
+<li>注意力算出来的结果 <code>o</code> 并不是直接输出。</li>
+<li>代码并行地算了一个 <strong>Gate 分支</strong> (<code>self.g_proj(hidden_states)</code>)。</li>
+<li><strong>融合</strong>：使用了 <code>rms_norm_swish_gate_linear</code>。这其实是一个 <strong>SwiGLU</strong> 结构（一种在 LLaMA 等大模型中很常见的激活函数结构）加上了 RMSNorm。</li>
+<li><strong>作用</strong>：它可以看作是把标准 Transformer 中的 FFN（前馈神经网络）融合进了 Attention 层里，既做归一化，又做非线性变换，进一步提升表达能力。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p>如果不看细节，这个文件的逻辑流是：</p>
+<ol>
+<li><strong>输入</strong> $\rightarrow$ 投影成 Q, K, V。</li>
+<li><strong>(可选)</strong> 用卷积扫一遍，提取局部特征。</li>
+<li><strong>关键创新</strong>：用 K 自己算出一个“遗忘曲线”（Gate）。</li>
+<li><strong>核心计算</strong>：用线性注意力算法（GLA），结合遗忘曲线，把整个序列的信息压缩并提取出来。</li>
+<li><strong>输出</strong>：过一个带门控的归一化层（类似 FFN），输出最终结果。</li>
+</ol>
+<p><strong>一句话概括</strong>：这是一个<strong>自带局部卷积、利用 Key 自适应计算衰减率、并融合了 FFN 结构的线性注意力层</strong>，旨在实现“扫描一次（You Only Scan Once）”的高效序列建模。</p>

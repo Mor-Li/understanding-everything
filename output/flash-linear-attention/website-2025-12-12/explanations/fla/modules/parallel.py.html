@@ -1,0 +1,88 @@
+<h1>fla/modules/parallel.py</h1>
+<p>这段代码确实比较晦涩，因为它涉及到了 PyTorch 中比较前沿的<strong>分布式训练（Distributed Training）</strong>和<strong>张量并行（Tensor Parallelism）</strong>的原生 API。</p>
+<p>简单来说，这段代码是为了<strong>把一个普通的 PyTorch 模型参数，转换成可以在多张显卡上协同工作的“分布式张量”</strong>。</p>
+<p>为了让你看懂，我列了一个 <strong>6步的学习 Task List</strong>，我们一步一步拆解：</p>
+<hr />
+<h3>📋 Task 1: 理解背景 —— 为什么要“并行”？</h3>
+<ul>
+<li><strong>现状</strong>：现在的模型（比如 LLM）太大了，一张显卡放不下，或者算得太慢。</li>
+<li><strong>目标</strong>：我们需要把模型的参数（Weights）切分或者复制到多张显卡（GPU）上。</li>
+<li><strong>难点</strong>：普通的 <code>torch.Tensor</code> 只存在于一张卡上。我们需要一种特殊的 Tensor，它逻辑上是一个整体，但物理上分布在多张卡上。</li>
+<li><strong>代码对应</strong>：这就是代码中 <code>DTensor</code> (Distributed Tensor) 的作用。</li>
+</ul>
+<h3>📋 Task 2: 理解“座位表” —— DeviceMesh</h3>
+<ul>
+<li><strong>概念</strong>：假设你有 8 张显卡，你需要告诉 PyTorch 这些卡是怎么排列的。是 8 张卡排成一排？还是 4x2 的矩阵？这个排列方式就叫 <code>DeviceMesh</code>（设备网格）。</li>
+<li><strong>代码对应</strong>：代码里多次出现的 <code>device_mesh</code> 参数，就是指这个显卡排列的“座位表”。</li>
+</ul>
+<h3>📋 Task 3: 核心主角 —— DTensor (Distributed Tensor)</h3>
+<ul>
+<li><strong>概念</strong>：这是 PyTorch 2.x 引入的新概念。<ul>
+<li>普通 Tensor：我知道我的数据是多少。</li>
+<li>DTensor：我知道我的数据是多少，而且我知道我是<strong>整个大张量</strong>的哪一部分（或者是不是完整的副本），以及我住在 <code>DeviceMesh</code> 的哪个位置。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    try:
+        from torch.distributed.tensor import DTensor
+    except ...</code>
+    这段是在检查你的环境里有没有这个新功能。</li>
+</ul>
+<h3>📋 Task 4: 剖析类 <code>PrepareModuleWeight</code> —— 定义一种“风格”</h3>
+<ul>
+<li><strong>任务</strong>：看代码中的 <code>class PrepareModuleWeight(ParallelStyle):</code></li>
+<li><strong>解释</strong>：<code>ParallelStyle</code> 是 PyTorch 提供的一个基类（模版）。它的意思是：“我要定义一种把模型切分/并行化的<strong>风格</strong>”。</li>
+<li><strong>目的</strong>：这个类的目的是<strong>准备模型的权重</strong>。它并不做复杂的切分计算（比如矩阵乘法切分），它只是负责把普通的参数变成分布式的参数。</li>
+<li><strong>参数 <code>layouts</code></strong>：这是告诉程序，参数在多张卡上是“每张卡都复制一份完整数据（Replicate）”还是“每张卡只存一部分（Shard）”。</li>
+</ul>
+<h3>📋 Task 5: 核心逻辑 —— <code>_replicate_module_fn</code> (魔术变换)</h3>
+<p>这是代码里最重要的方法，我们逐行翻译它的逻辑：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_replicate_module_fn</span><span class="p">(</span>
+    <span class="bp">self</span><span class="p">,</span>
+    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">module</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span>
+    <span class="n">device_mesh</span><span class="p">:</span> <span class="n">DeviceMesh</span><span class="p">,</span>
+<span class="p">):</span>
+    <span class="c1"># 1. 遍历这个模型层里的所有参数 (比如 Linear 层的 weight 和 bias)</span>
+    <span class="k">for</span> <span class="n">p_name</span><span class="p">,</span> <span class="n">param</span> <span class="ow">in</span> <span class="n">module</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">():</span>
+
+        <span class="c1"># 2. 【关键一步】把普通的 param 变成 DTensor</span>
+        <span class="c1"># DTensor.from_local 意思说：</span>
+        <span class="c1"># &quot;我现在手头有一个本地的 Tensor (param)，</span>
+        <span class="c1"># 请根据这个设备网格 (device_mesh) 和布局 (self.layouts)，</span>
+        <span class="c1"># 把它包装成一个分布式张量。&quot;</span>
+        <span class="n">replicated_param</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span>
+            <span class="n">DTensor</span><span class="o">.</span><span class="n">from_local</span><span class="p">(</span><span class="n">param</span><span class="p">,</span> <span class="n">device_mesh</span><span class="p">,</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">layouts</span><span class="p">],</span> <span class="n">run_check</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+        <span class="p">)</span>
+
+        <span class="c1"># 3. 把旧的普通参数删掉，注册这个新的分布式参数</span>
+        <span class="n">module</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span><span class="n">p_name</span><span class="p">,</span> <span class="n">replicated_param</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>人话总结</strong>：这个函数就像一个加工流水线。一个普通的模型层进来，它把里面的每一个参数拿出来，贴上“分布式标签”（转成 DTensor），然后放回去。</p>
+<h3>📋 Task 6: 执行者 —— <code>_apply</code></h3>
+<ul>
+<li><strong>任务</strong>：看 <code>def _apply(self, module, device_mesh):</code></li>
+<li><strong>解释</strong>：这是 <code>ParallelStyle</code> 要求的入口函数。当你对一个模型调用这个并行风格时，就会触发这个函数。</li>
+<li><strong>代码逻辑</strong>：
+    <code>python
+    return distribute_module(
+        module,
+        device_mesh,
+        partition_fn=self._replicate_module_fn, # 告诉 PyTorch 用上面那个“魔术变换”函数来处理
+        ...
+    )</code></li>
+<li><strong>作用</strong>：它调用 PyTorch 官方的 <code>distribute_module</code> 工具，指挥说：“用我定义的 <code>_replicate_module_fn</code> 方法，去处理这个 <code>module</code>”。</li>
+</ul>
+<hr />
+<h3>总结：这个文件到底在干啥？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>工具类</strong>，用来把一个普通的 PyTorch 模型层，<strong>原地转换</strong>成支持 PyTorch 原生分布式训练（DTensor）的模型层。</p>
+<p><strong>使用场景举例</strong>：
+假设你有一个线性层 <code>Linear(100, 100)</code>。
+1.  你在 8 张显卡上运行代码。
+2.  你创建了一个 <code>PrepareModuleWeight(layouts=Replicate())</code> 对象。
+3.  你把 Linear 层传进去。
+4.  出来的 Linear 层，里面的权重（Weight）就不再是普通的 Tensor 了，而是变成了 <code>DTensor</code>。
+5.  这就为后续的复杂的并行计算（比如两个大矩阵在不同显卡上做乘法）做好了<strong>数据格式上的准备</strong>。</p>

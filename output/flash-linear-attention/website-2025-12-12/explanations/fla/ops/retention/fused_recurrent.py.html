@@ -1,0 +1,114 @@
+<h1>fla/ops/retention/fused_recurrent.py</h1>
+<p>没问题。这段代码看起来很短，但其实它是一个<strong>高度浓缩的数学实现</strong>，而且涉及到了模型架构（RetNet）和底层优化（Fused Kernel）。看不懂是非常正常的。</p>
+<p>我们可以把理解这段代码的任务拆解成一个 <strong>TODO List</strong>，一共分为 4 步。我们一步一步把这个“黑盒”打开。</p>
+<hr />
+<h3>📝 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 搞清楚这是在干什么 (背景)</strong> —— 什么是 Retention？</li>
+<li><strong>Task 2: 拆解输入数据 (原料)</strong> —— Q, K, V 是什么？</li>
+<li><strong>Task 3: 破解核心密码 (数学)</strong> —— 那个极其复杂的 <code>g_gamma</code> 公式是啥意思？</li>
+<li><strong>Task 4: 理解“借力打力” (实现)</strong> —— 为什么要调用 <code>simple_gla</code>？</li>
+</ol>
+<hr />
+<h3>🚀 Task 1: 搞清楚这是在干什么 (背景)</h3>
+<p>首先，这段代码属于 <strong>RetNet (Retention Network)</strong> 模型的一部分。
+RetNet 是一种试图替代 Transformer 的新架构。它的核心特点是：<strong>既能像 Transformer 一样并行训练，又能像 RNN 一样推理。</strong></p>
+<ul>
+<li><strong>文件名</strong>：<code>fused_recurrent.py</code><ul>
+<li><strong>Fused</strong>: 融合。意思是把很多计算步骤合并在一起，为了跑得快（通常用 CUDA 加速）。</li>
+<li><strong>Recurrent</strong>: 循环/递归。意思是它采用了 <strong>RNN (循环神经网络)</strong> 的方式来处理数据，是一个接一个字处理的（$S_t = S_{t-1} + \dots$），而不是像 Attention 那样一次算完矩阵。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论：</strong> 这个函数是用 <strong>RNN 的方式</strong>（省显存、推理快）来计算 RetNet 的核心层。</p>
+<hr />
+<h3>📦 Task 2: 拆解输入数据 (原料)</h3>
+<p>看函数的定义部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">fused_recurrent_retention</span><span class="p">(</span>
+    <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p>这三个是老朋友了，但在 RNN 模式下，它们的含义稍有不同：
+*   <strong>q (Query), k (Key), v (Value)</strong>: 输入的向量序列。
+*   <strong>initial_state</strong>: 初始状态。比如你处理长文章，处理完上半段，会留下一个“记忆”，处理下半段时把这个记忆传进来，这就是 <code>initial_state</code>。</p>
+<p><strong>结论：</strong> 函数接收输入信号，准备一步步更新记忆并输出结果。</p>
+<hr />
+<h3>🧮 Task 3: 破解核心密码 (数学)</h3>
+<p>这是全篇最难懂的一行代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">g_gamma</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="mf">2.</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="o">-</span><span class="mf">5.</span> <span class="o">-</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)))</span><span class="o">.</span><span class="n">log</span><span class="p">()</span>
+</code></pre></div>
+
+<p>我们要把它拆开看。RetNet 论文里有一个核心机制叫 <strong>Decay (遗忘/衰减)</strong>。
+它认为：<strong>模型应该逐渐忘记很久以前的信息。</strong></p>
+<ol>
+<li>
+<p><strong>RetNet 的规定</strong>：
+    RetNet 规定，每一层（或每一个头 Head）都有一个固定的遗忘率 $\gamma$（Gamma）。
+    公式是：$\gamma = 1 - 2^{-5 - n}$</p>
+<ul>
+<li>$n$ 是头的索引（第几个 Head）。</li>
+<li>这意味着：<strong>有的头忘得快，有的头忘得慢</strong>（多尺度记忆）。</li>
+</ul>
+</li>
+<li>
+<p><strong>代码对应</strong>：</p>
+<ul>
+<li><code>range(q.shape[2])</code>: 就是 $n$ (头的索引)。</li>
+<li><code>2.pow(-5. - ...)</code>: 就是 $2^{-5-n}$。</li>
+<li><code>1 - ...</code>: 就是 $\gamma$。</li>
+</ul>
+</li>
+<li>
+<p><strong>为什么要取 <code>.log()</code> (对数)？</strong></p>
+<ul>
+<li>在数学上，连续时间的衰减通常写成 $e^{-\alpha}$ 的形式。</li>
+<li>这里计算 <code>g_gamma</code> 其实是在算 <strong>对数空间下的衰减率</strong>。</li>
+<li>因为底层的计算函数（Simple GLA）是通用的，它可能接受的是 $\log(\gamma)$ 形式的输入，以便在底层做加法而不是乘法（$\log(a \cdot b) = \log a + \log b$，加法比乘法数值更稳定）。</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论：</strong> 这行代码<strong>生成了一个固定的“遗忘参数列表”</strong>，告诉模型每个头应该以多快的速度遗忘历史信息。</p>
+<hr />
+<h3>🤝 Task 4: 理解“借力打力” (实现)</h3>
+<p>看最后一段核心逻辑：</p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">fla.ops.simple_gla.fused_recurrent</span><span class="w"> </span><span class="kn">import</span> <span class="n">fused_recurrent_simple_gla</span>
+
+<span class="c1"># ... 中间算出了 g_gamma ...</span>
+
+<span class="n">o</span><span class="p">,</span> <span class="n">final_state</span> <span class="o">=</span> <span class="n">fused_recurrent_simple_gla</span><span class="p">(</span>
+    <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span>
+    <span class="n">g_gamma</span><span class="o">=</span><span class="n">g_gamma</span><span class="p">,</span> <span class="c1"># &lt;--- 把刚才算好的遗忘率传进去</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p>这里发生了一件很有趣的事：<strong>代码复用</strong>。</p>
+<ol>
+<li><strong>Simple GLA 是什么？</strong>
+    它是另一种模型（Gated Linear Attention），比 RetNet 更通用。Simple GLA 允许每一时刻的遗忘率都是<strong>变化</strong>的（动态的）。</li>
+<li><strong>RetNet 是什么？</strong>
+    RetNet 可以看作是 Simple GLA 的一个<strong>特例</strong>，它的遗忘率是<strong>固定不变</strong>的（就是 Task 3 算出来的那个）。</li>
+<li><strong>借力打力</strong>：
+    作者没有专门为 RetNet 写一套底层的 CUDA 循环代码，而是直接调用了更通用的 <code>simple_gla</code> 的求解器。<ul>
+<li>只要把 RetNet 那个固定的 $\gamma$ 传给 <code>simple_gla</code> 的 <code>g_gamma</code> 参数，Simple GLA 算出来的结果就是 RetNet 的结果。</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论：</strong> 这个函数本身是个“空壳”，它只是负责<strong>计算出 RetNet 特有的固定衰减率</strong>，然后把活儿外包给了 <code>simple_gla</code> 的底层算子。</p>
+<hr />
+<h3>✅ 总结 (Final Review)</h3>
+<p>如果把这段代码翻译成人话，它的逻辑是这样的：</p>
+<ol>
+<li><strong>老板 (用户)</strong>：嘿，帮我算一下 RetNet 的 RNN 模式推理结果。</li>
+<li><strong>这个函数 (经理)</strong>：<ul>
+<li>好的。RetNet 的特点是每个头有固定的遗忘速度。</li>
+<li><em>(执行 Task 3)</em>：我先根据公式 $1 - 2^{-5-n}$ 把每个头的遗忘参数算好，取个对数打包好。</li>
+<li><em>(执行 Task 4)</em>：我懒得自己写循环了。隔壁部门有个超级通用的 <code>simple_gla</code> 引擎。</li>
+<li>喂，<code>simple_gla</code>，给你数据 (Q,K,V) 和我算好的这个固定遗忘参数，你帮我跑一下。</li>
+</ul>
+</li>
+<li><strong>Simple GLA (工人)</strong>：跑完了，结果给你。</li>
+<li><strong>这个函数 (经理)</strong>：给，老板，这是结果。</li>
+</ol>
+<p>这就是为什么你完全看不懂代码逻辑的原因——因为<strong>真正的循环计算逻辑（for loop / scan）根本不在这里</strong>，而是在被调用的 <code>fused_recurrent_simple_gla</code> 里（那通常是 C++/CUDA 代码）。这里只是做了一个参数转换而已。</p>

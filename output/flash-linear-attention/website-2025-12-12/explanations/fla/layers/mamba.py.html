@@ -1,0 +1,96 @@
+<h1>fla/layers/mamba.py</h1>
+<p>这份代码文件 <code>fla/layers/mamba.py</code> 实现的是 <strong>Mamba 模型的核心层（Layer）</strong>。</p>
+<p>如果你把 Mamba 模型想象成一个处理信息的工厂，那么这个文件定义的就是工厂里最关键的<strong>流水线车间</strong>。它的作用是替代 Transformer 中的“自注意力机制（Self-Attention）”，让模型能以更低的显存、更快的速度处理长文本。</p>
+<p>为了让你看懂，我把这个代码的执行流程拆解成一个 <strong>Task Todo List（任务清单）</strong>。每一项任务对应代码中的一部分逻辑。</p>
+<hr />
+<h3>📋 Mamba Layer 任务清单 (Todo List)</h3>
+<p>我们将从代码的初始化 (<code>__init__</code>) 到数据流向 (<code>forward</code>) 一步步来看。</p>
+<h4>✅ Task 0: 建造车间与准备零件 (<code>__init__</code> 函数)</h4>
+<p><strong>目标</strong>：定义输入输出的大小，初始化各种权重矩阵。
+*   <strong>代码对应</strong>：<code>class Mamba(nn.Module): def __init__(...):</code>
+*   <strong>关键动作</strong>：
+    1.  <strong>定义投影层</strong>：
+        *   <code>self.in_proj</code>: 把输入的特征维度放大（通常放大2倍），为了捕获更多细节。
+        *   <code>self.out_proj</code>: 处理完后，把特征维度缩回去，方便传给下一层。
+    2.  <strong>定义卷积层</strong>：
+        *   <code>self.conv1d</code>: 一个局部的 1D 卷积。它的作用是让模型“看清”相邻的几个词（类似于 N-gram），处理极短期的记忆。
+    3.  <strong>定义 SSM (状态空间模型) 参数</strong>：
+        *   <code>self.x_proj</code>: <strong>这是 Mamba 的灵魂</strong>。它负责根据当前的输入，动态地生成参数 $B, C, \Delta$。这就是“Selective（选择性）”的来源——根据输入内容决定记什么、忘什么。
+        *   <code>self.A_log</code>: 参数 $A$（长期记忆的衰减率）。
+        *   <code>self.D</code>: 参数 $D$（跳跃连接）。
+    4.  <strong>检查加速包</strong>：
+        *   代码里有一堆 <code>try...except</code> 和 <code>is_fast_path_available</code>。这是在检查你的电脑有没有安装 CUDA 加速包（<code>mamba_ssm</code>, <code>causal_conv1d</code>）。如果有，就开法拉利（用 C++ 内核）；没有，就骑自行车（用 Python 慢速实现）。</p>
+<hr />
+<h4>✅ Task 1: 接收输入与分流 (<code>forward</code> -&gt; <code>in_proj</code>)</h4>
+<p><strong>目标</strong>：拿到输入数据，把它变宽，然后分成两路。
+*   <strong>代码对应</strong>：
+    *   <code>projected_states = self.in_proj(hidden_states)</code>
+    *   <code>hidden_states, gate = projected_states.chunk(2, dim=1)</code>
+*   <strong>解释</strong>：
+    *   输入进来了，首先通过 <code>in_proj</code> 变宽。
+    *   然后像切蛋糕一样切成两半：
+        *   <strong>主路 (<code>hidden_states</code>)</strong>：这一半要去经历卷积和 SSM 的复杂变换。
+        *   <strong>旁路 (<code>gate</code>)</strong>：这一半留着，最后作为一个“门控开关”控制主路的输出强度（类似于 SiLU 激活函数的门控机制）。</p>
+<hr />
+<h4>✅ Task 2: 局部特征提取 (<code>conv1d</code>)</h4>
+<p><strong>目标</strong>：先处理一下附近的词，防止 SSM 这种线性系统在这个环节丢失局部信息。
+*   <strong>代码对应</strong>：
+    *   <code>hidden_states = self.conv1d(hidden_states)</code> (在 <code>slow_forward</code> 中)
+    *   或者 <code>causal_conv1d_fn</code> (在 <code>cuda_kernels_forward</code> 中)
+*   <strong>解释</strong>：
+    *   这里进行了一个“因果卷积”。所谓“因果”，就是说在处理第 5 个词的时候，只能看第 1-5 个词，绝对不能偷看第 6 个词（不能穿越未来）。
+    *   <strong>关于缓存 (<code>cache_params</code>)</strong>：代码里有很多 <code>if cache_params is not None</code>。这是为了<strong>推理（生成文本）</strong>时加速用的。如果已经算过前面的词，就把它存起来，不用重新算。</p>
+<hr />
+<h4>✅ Task 3: 决定“记什么”与“忘什么” (Selection / <code>x_proj</code>)</h4>
+<p><strong>目标</strong>：这是 Mamba 最核心的步骤。根据当前看到的内容，计算出控制记忆的参数。
+*   <strong>代码对应</strong>：
+    *   <code>ssm_parameters = self.x_proj(hidden_states)</code>
+    *   <code>time_step, B, C = torch.split(...)</code>
+*   <strong>解释</strong>：
+    *   普通的状态空间模型（如 S4），$B$ 和 $C$ 是固定的。
+    *   <strong>Mamba 的 Mamba (Selective)</strong>：这里用 <code>x_proj</code> 看着当前的输入，实时计算出：
+        *   <strong>$\Delta$ (time_step)</strong>: 步长。这一步的信息有多重要？步长越大，当前输入对记忆的影响越大。
+        *   <strong>$B$</strong>: 怎么把当前信息写入记忆？
+        *   <strong>$C$</strong>: 怎么从记忆里读取信息？
+    *   这就像你在阅读：看到废话（$\Delta$ 小），你就不记；看到重点（$\Delta$ 大），你就狠狠记住。</p>
+<hr />
+<h4>✅ Task 4: 状态更新与扫描 (SSM Scan)</h4>
+<p><strong>目标</strong>：将当前的输入融合进“长期记忆”中，并产出结果。
+*   <strong>代码对应</strong>：
+    *   <strong>快路</strong>：<code>selective_scan_fn(...)</code> (直接调用写好的 CUDA 内核，速度极快)。
+    *   <strong>慢路</strong>：<code>for i in range(seq_len): ...</code> (在 <code>slow_forward</code> 里用 Python 循环写出来的公式)。
+*   <strong>数学逻辑 (简化版)</strong>：
+    1.  <code>ssm_state</code> 是一个历史记忆容器。
+    2.  <code>new_state = A * old_state + B * input</code> (旧记忆衰减 + 新信息写入)。
+    3.  <code>output = C * new_state</code> (从新记忆中提取需要的特征)。
+*   这一步完成了序列信息的<strong>压缩和传递</strong>。</p>
+<hr />
+<h4>✅ Task 5: 门控融合与输出 (<code>out_proj</code>)</h4>
+<p><strong>目标</strong>：把处理好的主路信息，和之前留下的旁路信息结合，然后输出。
+*   <strong>代码对应</strong>：
+    *   <code>scan_output = (scan_output * self.act(gate))</code>
+    *   <code>contextualized_states = self.out_proj(scan_output)</code>
+*   <strong>解释</strong>：
+    *   SSM 出来的结果，乘以 Task 1 里留下的那个 <code>gate</code>（旁路）。
+    *   最后通过 <code>out_proj</code> 把维度变回原来的大小（例如从 <code>intermediate_size</code> 变回 <code>hidden_size</code>）。
+    *   任务完成！把结果丢给下一层。</p>
+<hr />
+<h3>🚀 总结：这个文件到底讲了啥？</h3>
+<p>这个文件写了一个叫 <code>Mamba</code> 的类，它做了两件事：</p>
+<ol>
+<li>
+<p><strong>提供了两种实现方式</strong>：</p>
+<ul>
+<li><code>cuda_kernels_forward</code>：<strong>极速版</strong>。调用底层的 Triton/CUDA 优化代码，平时训练和推理主要跑这个。</li>
+<li><code>slow_forward</code>：<strong>教学版/备用版</strong>。用纯 PyTorch 写的，逻辑清晰但速度慢，主要是为了在没有 GPU 或者不支持 CUDA 的环境下也能跑，或者用来调试逻辑。</li>
+</ul>
+</li>
+<li>
+<p><strong>实现了 Mamba 算法的完整流程</strong>：</p>
+<ul>
+<li><strong>输入 -&gt; 放大 -&gt; 卷积(短期记忆) -&gt; 选择性SSM(长期记忆) -&gt; 门控 -&gt; 输出</strong>。</li>
+</ul>
+</li>
+</ol>
+<p><strong>给你的建议：</strong>
+如果你想看懂算法原理，<strong>只看 <code>slow_forward</code> 函数</strong>。那里的 <code>for</code> 循环把每一步数学计算都写出来了，非常直观。<code>cuda_kernels_forward</code> 只是一个黑盒子接口，不用深究内部。</p>

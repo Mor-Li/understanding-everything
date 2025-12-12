@@ -1,0 +1,94 @@
+<h1>fla/ops/gla/fused_recurrent.py</h1>
+<p>这份代码确实涉及了比较前沿的大模型底层架构知识（线性注意力机制 Linear Attention 和 RNN 的结合）。如果直接看代码细节很容易晕。</p>
+<p>为了帮你搞懂这段代码在干什么，我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>。我们将把这段代码拆解成 5 个具体的任务，一步步揭开它的面纱。</p>
+<hr />
+<h3>📝 任务清单：GLA (Gated Linear Attention) 核心机制解码</h3>
+<ol>
+<li><strong>Task 1: 理解核心背景</strong> —— 为什么要用“循环 (Recurrent)”的方式做注意力？</li>
+<li><strong>Task 2: 认识主角</strong> —— 搞懂输入参数 <code>q, k, v</code> 和最重要的 <code>g</code> (Gate) 是什么。</li>
+<li><strong>Task 3: 理解“状态”的概念</strong> —— 什么是 <code>initial_state</code> 和 <code>final_state</code>？</li>
+<li><strong>Task 4: 理解工程优化</strong> —— 什么是 <code>cu_seqlens</code> 和 <code>Fused</code>？</li>
+<li><strong>Task 5: 代码逻辑走读</strong> —— 这段 Python 代码具体做了什么？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1: 理解核心背景 (Why Recurrent?)</h4>
+<ul>
+<li><strong>传统 Transformer (Attention):</strong> 就像看书时，读每一个字都要回头看之前所有的字。句子越长，计算量爆炸（平方级增长）。</li>
+<li><strong>GLA (这段代码的算法):</strong> 就像这一段代码的名字 <code>fused_recurrent</code> 暗示的，它把 Attention 变成了一种 <strong>RNN (循环神经网络)</strong> 的形式。<ul>
+<li><strong>观点:</strong> 读句子时，不需要回头看所有字，只需要维护一个<strong>“记忆本” (State)</strong>。读一个新字，更新一下“记忆本”，然后输出。</li>
+<li><strong>好处:</strong> 速度极快，不管句子多长，内存消耗是固定的（线性复杂度）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 认识主角 (Inputs)</h4>
+<p>看代码中的 <code>Args</code> 部分，这是理解算法逻辑的关键：</p>
+<ul>
+<li><strong><code>q, k, v</code></strong>: 这是 Attention 的老三样。<ul>
+<li><code>q</code> (Query): 我现在想查什么信息。</li>
+<li><code>k</code> (Key): 信息的索引/标签。</li>
+<li><code>v</code> (Value): 信息的具体内容。</li>
+<li><strong>核心逻辑:</strong> 把 $k$ 和 $v$ 压缩进“记忆本”，用 $q$ 去从“记忆本”里取数据。</li>
+</ul>
+</li>
+<li><strong><code>gk, gv</code> (The Gates - 门控):</strong> 这是 <strong>GLA (Gated Linear Attention)</strong> 的灵魂，也是它区别于普通 Linear Attention 的地方。<ul>
+<li><strong>观点:</strong> 人的记忆是会遗忘的。你不能把所有历史信息都塞进脑子，需要有选择地“遗忘”旧信息。</li>
+<li><code>gk</code>: 针对 Key 的遗忘门（决定保留多少之前的 Key 信息）。</li>
+<li><code>gv</code>: 针对 Value 的遗忘门（决定保留多少之前的 Value 信息）。</li>
+<li><strong>代码体现:</strong> 这两个参数让模型具备了类似 LSTM 的遗忘能力，能更好地处理长序列。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 理解“状态” (State)</h4>
+<p>代码中出现了 <code>initial_state</code> 和 <code>final_state</code>，这是 RNN 模式特有的。</p>
+<ul>
+<li><strong>记忆本 (State):</strong> 这是一个形状为 <code>[N, H, K, V]</code> 的张量。它就是那个“压缩后的记忆”。</li>
+<li><strong><code>initial_state</code> (初始状态):</strong><ul>
+<li><strong>场景:</strong> 比如你在写长篇小说，写完第一章（Batch 1），现在要写第二章（Batch 2）。你不能把第一章的情节忘了。</li>
+<li><strong>做法:</strong> 把第一章算出来的 <code>final_state</code> 传给第二章作为 <code>initial_state</code>。这样模型就拥有了无限长的上下文记忆能力（Cache）。</li>
+</ul>
+</li>
+<li><strong><code>output_final_state</code>:</strong> 开关。问代码：“处理完这段文字后，要不要把最新的记忆本交给我？”</li>
+</ul>
+<h4>✅ Task 4: 理解工程优化 (Engineering)</h4>
+<p>这部分解释了代码里那些看起来很奇怪的参数：</p>
+<ul>
+<li><strong><code>cu_seqlens</code> (Cumulative Sequence Lengths):</strong><ul>
+<li><strong>问题:</strong> 训练时，大家通常把好多长短不一的句子拼成一个超长的序列喂给 GPU（为了快）。比如句子A长10，句子B长20，拼起来长30。</li>
+<li><strong>解决:</strong> <code>cu_seqlens</code> 就是告诉 GPU：“第0到10个字是句子A，第10到30个字是句子B”。</li>
+<li><strong>代码逻辑:</strong> 代码里专门检查了 <code>if cu_seqlens is not None</code>，如果是这种情况，Batch Size 必须看作 1（因为全拼在一起了）。</li>
+</ul>
+</li>
+<li><strong><code>Fused</code> (融合算子):</strong><ul>
+<li>文件名叫 <code>fused_recurrent.py</code>。这是指底层的 C++/CUDA 实现将“读取数据 -&gt; 计算遗忘 -&gt; 更新记忆 -&gt; 计算输出”这一系列动作融合在了一个 GPU 内核里完成，而不是用 PyTorch 一步步算。这是为了<strong>极致的速度</strong>。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 代码逻辑走读 (Code Walkthrough)</h4>
+<p>现在我们再看一遍代码，你会发现它其实是一个<strong>“中间人” (Wrapper)</strong>。它自己不干重活，主要是整理参数，然后调用底层的通用函数。</p>
+<ol>
+<li><strong>函数定义:</strong> <code>fused_recurrent_gla</code> 接收 Q, K, V 和 Gates。</li>
+<li><strong>检查 <code>cu_seqlens</code>:</strong><ul>
+<li>如果你用了变长序列 (<code>cu_seqlens</code> 存在)，代码会检查你的 Batch Size 是不是 1（必须压扁成1维处理）。</li>
+<li>检查初始状态的数量是否和句子数量对得上。</li>
+</ul>
+</li>
+<li><strong>设置 <code>scale</code>:</strong><ul>
+<li>如果没有指定缩放比例，默认使用 $\frac{1}{\sqrt{K}}$ (这是 Attention 的标准操作，防止数值过大)。</li>
+</ul>
+</li>
+<li><strong>调用核心 (The Real Magic):</strong><ul>
+<li><code>o, final_state = fused_recurrent(...)</code></li>
+<li>这里它调用了 <code>fla.ops.common.fused_recurrent</code>。</li>
+<li><strong>注意:</strong> 它把 <code>g</code> 设为 <code>None</code>，但是传入了 <code>gk</code> 和 <code>gv</code>。这说明底层的通用函数支持两种模式：要么统一遗忘 (<code>g</code>)，要么 KV 分别遗忘 (<code>gk</code>, <code>gv</code>)。GLA 使用的是后者（分别遗忘），所以这里体现了 GLA 的数学特性。</li>
+</ul>
+</li>
+<li><strong>返回结果:</strong> 返回输出 $O$ 和最新的记忆 $S_t$。</li>
+</ol>
+<h3>总结</h3>
+<p>这段代码是一个 <strong>高性能的、支持门控遗忘机制的线性注意力层接口</strong>。</p>
+<ul>
+<li><strong>它的输入</strong>是文本序列（QKV）和遗忘指令（Gates）。</li>
+<li><strong>它的工作</strong>是像 RNN 一样一步步读数据，更新内部记忆，算出结果。</li>
+<li><strong>它的目的</strong>是让大模型能处理超长文本，且计算速度极快。</li>
+</ul>

@@ -1,0 +1,81 @@
+<h1>fla/ops/mesa_net/chunk.py</h1>
+<p>这段代码确实比较硬核，因为它实现的是一种<strong>线性注意力机制（Linear Attention）</strong>的变体，叫做 <strong>MesaNet</strong>，并且是为了在 GPU 上高效运行而专门编写的“分块（Chunk）”版本。</p>
+<p>简单来说，这段代码在做一件事：<strong>用一种比传统 Transformer 更快、更省显存的方式，计算输入序列的注意力输出。</strong></p>
+<p>为了让你听懂，我把这段代码的执行逻辑拆解成一个 <strong>“5步走的 Task List（任务清单）”</strong>。想象你就是执行这段代码的 GPU，你的任务清单如下：</p>
+<hr />
+<h3>📋 Task List：MesaNet 的执行步骤</h3>
+<h4>Task 1: 准备食材 (输入处理)</h4>
+<p><strong>目标</strong>：拿到原始数据，做必要的清洗和标准化。
+*   <strong>输入</strong>：你有 Query ($Q$), Key ($K$), Value ($V$)，还有衰减因子 $g$ (用来遗忘旧信息)，以及 MesaNet 特有的参数 $\beta$ 和 $\lambda$。
+*   <strong>动作</strong>：
+    *   检查 $K$ 和 $V$ 的形状是否对齐。
+    *   如果你开启了 <code>use_qk_l2norm_in_kernel</code>，就要先对 $Q$ 和 $K$ 做归一化（L2 Norm），防止数值爆炸。
+    *   如果是长短不一的句子（Variable length），需要根据 <code>cu_seqlens</code> 把它们切好。</p>
+<h4>Task 2: 计算记忆衰减 (Decay Pre-calculation)</h4>
+<p><strong>目标</strong>：计算每个时间步的信息应该保留多少（类似于 RNN 的遗忘门）。
+*   <strong>代码对应</strong>：<code>chunk_local_cumsum(g, ...)</code>
+*   <strong>原理</strong>：线性注意力不仅看当前，还看历史。$g$ 决定了历史有多重要。这里先算好累积的衰减值，方便后面分块并行计算。</p>
+<h4>Task 3: 构建“双重记忆” (State Construction)</h4>
+<p><strong>目标</strong>：这是 MesaNet 最特别的地方。它不像标准 Attention 只存 $KV$，它存了两份状态（State）。
+*   <strong>代码对应</strong>：<code>chunk_mesa_fwd_h(...)</code>
+*   <strong>动作</strong>：遍历序列（分块进行），计算并更新两个核心状态：
+    1.  <strong>$h_{kk}$ (Key-Key State)</strong>：记录 Key 和 Key 之间的相关性矩阵。
+    2.  <strong>$h_{kv}$ (Key-Value State)</strong>：记录 Key 和 Value 之间的映射关系（这是传统线性注意力都有的）。
+*   <strong>为什么？</strong> 这一步是为了把历史信息压缩进这两个矩阵里，以后查阅历史只需要查这两个矩阵，不需要回看所有的 Token。</p>
+<h4>Task 4: 求解隐式方程 (The CG Solver)</h4>
+<p><strong>目标</strong>：计算最终的 Query 变换和输出。
+*   <strong>代码对应</strong>：<code>chunk_mesa_cg_fwd(...)</code>
+*   <strong>原理</strong>：MesaNet 认为原始的 $Q$ 不够好，需要根据 $h_{kk}$（历史 Key 的相关性）修正 $Q$ 得到 $Q^<em>$。
+    *   这是一个解线性方程组的过程：$A x = b$。
+    *   因为直接解太慢，代码里用了一个叫 </em><em>CG (Conjugate Gradient，共轭梯度法)</em><em> 的算法来迭代逼近解。
+    *   <code>max_CG_iteration=30</code> 就是说最多迭代 30 次来找最优的 $Q^</em>$。
+*   <strong>产出</strong>：得到修正后的 $Q^*$，然后用它去查询 $h_{kv}$，得到最终输出 $O$。</p>
+<h4>Task 5: 打包发货 (Output &amp; Backward Prep)</h4>
+<p><strong>目标</strong>：返回结果，并为反向传播（训练）留后路。
+*   <strong>动作</strong>：
+    *   输出最终的 $O$ (Output)。
+    *   如果是推理阶段（Inference），可能还需要输出最后的 $h_{kk}$ 和 $h_{kv}$ 给下一个 Token 用。
+    *   为了训练（Backward），把中间算出来的 $Q^*$、$h$ 等变量存起来（<code>ctx.save_for_backward</code>），因为算梯度时还要用到它们。</p>
+<hr />
+<h3>🧩 代码模块逐行对应讲解</h3>
+<p>现在如果你回头看代码，就能对应上了：</p>
+<ol>
+<li>
+<p><strong><code>chunk_fwd_mesa_net_fwd</code> 函数 (前向传播核心)</strong></p>
+<ul>
+<li><strong>行 31</strong>: <code>chunk_local_cumsum</code> -&gt; <strong>Task 2</strong> (处理衰减)。</li>
+<li><strong>行 32-43</strong>: <code>chunk_mesa_fwd_h</code> -&gt; <strong>Task 3</strong> (计算 $h_{kk}, h_{kv}$ 两个状态)。</li>
+<li><strong>行 44-56</strong>: <code>chunk_mesa_cg_fwd</code> -&gt; <strong>Task 4</strong> (用共轭梯度法解方程，算出 $Q^*$ 和输出 $O$)。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>chunk_fwd_mesa_net_bwd</code> 函数 (反向传播核心)</strong></p>
+<ul>
+<li>这是给训练用的。当你训练模型时，PyTorch 需要知道怎么算梯度。</li>
+<li><strong>行 77</strong>: 重新计算一遍 $h_{kk}, h_{kv}$（这是为了省显存，叫 Recomputation/Checkpointing 技术）。</li>
+<li><strong>行 89</strong>: <code>chunk_bwd_dh</code> -&gt; 算状态 $h$ 的梯度。</li>
+<li><strong>行 116</strong>: <code>chunk_mesa_cg_bwd</code> -&gt; <strong>Task 4 的逆过程</strong> (反向通过 CG 求解器传导梯度)。</li>
+<li><strong>行 143</strong>: <code>chunk_mesa_net_h_kk_bwd_intra_fn</code> -&gt; 算 $K, \beta, \lambda$ 的梯度。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>ChunkMesaNetFunction</code> 类</strong></p>
+<ul>
+<li>这是一个包装器，继承自 <code>torch.autograd.Function</code>。</li>
+<li>它把上面的 <code>fwd</code> 和 <code>bwd</code> 函数串联起来，告诉 PyTorch：“前向传播调 <code>forward</code>，反向传播调 <code>backward</code>”。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>chunk_mesa_net</code> 函数 (用户接口)</strong></p>
+<ul>
+<li>这是你（用户）直接调用的函数。</li>
+<li>它负责 <strong>Task 1</strong>：检查形状（Asserts），处理 <code>cu_seqlens</code>（变长序列），然后调用上面的 Function。</li>
+</ul>
+</li>
+</ol>
+<h3>总结：这到底是在干啥？</h3>
+<p>传统的 Attention 是 $O(N^2)$ 的复杂度，序列越长越慢。
+<strong>MesaNet</strong> 是一种 $O(N)$ 的线性注意力。
+但普通的线性注意力效果不如标准 Attention。
+MesaNet 通过引入 <strong>$h_{kk}$ (Key-Key 记忆)</strong> 和 <strong>CG 求解器</strong>，让模型能动态地调整 Query，从而在保持 $O(N)$ 速度的同时，试图达到更好的效果。</p>
+<p><strong>这个文件的作用就是：</strong> 极其高效地、分块地计算这个复杂的数学过程。</p>

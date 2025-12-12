@@ -1,0 +1,101 @@
+<h1>benchmarks/ops/benchmark_solv_tril.py</h1>
+<p>没问题，这段代码确实涉及到了深度学习底层优化（Triton）和特定的线性注意力机制（Linear Attention）实现，看起来比较晦涩是正常的。</p>
+<p>我们可以把这段代码看作是一个<strong>“赛车性能测试场”</strong>。它的目的不是造车，而是测试某个特定零件（<code>solve_tril</code> 函数）在不同路况下跑得有多快。</p>
+<p>为了帮你理解，我制定了一个 <strong>5步走的 To-Do List</strong>，我们一步步来拆解：</p>
+<h3>📝 学习 To-Do List</h3>
+<ol>
+<li><strong>Task 1：搞懂“我们在干什么”？（宏观定位）</strong></li>
+<li><strong>Task 2：搞懂“测试对象是谁”？（核心主角）</strong></li>
+<li><strong>Task 3：搞懂“测试场景是什么”？（参数配置）</strong></li>
+<li><strong>Task 4：搞懂“数据是怎么造出来的”？（数据预处理）</strong></li>
+<li><strong>Task 5：搞懂“结果怎么看”？（运行与输出）</strong></li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1：搞懂“我们在干什么”？（宏观定位）</h4>
+<p><strong>核心观点：这是一个基准测试脚本（Benchmark Script）。</strong></p>
+<ul>
+<li><strong>代码意图</strong>：这段代码不是为了训练一个AI模型，而是为了<strong>测速</strong>。</li>
+<li><strong>工具</strong>：它使用了 <code>triton</code>。Triton 是 OpenAI 推出的编程语言，专门用来写跑在 GPU 上飞快的代码。</li>
+<li><strong>装饰器</strong>：<code>@triton.testing.perf_report</code> 就像是一个自动化的裁判，它负责记录时间、绘制图表。</li>
+</ul>
+<p><strong>简单理解</strong>：这就好比你在跑分软件（如鲁大师、Geekbench）里点击了“开始测试”，这段代码就是那个跑分程序。</p>
+<h4>Task 2：搞懂“测试对象是谁”？（核心主角）</h4>
+<p><strong>核心观点：我们要测的是 <code>solve_tril</code> 这个函数的性能。</strong></p>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    from fla.ops.utils.solve_tril import solve_tril
+    # ...
+    results = triton.testing.do_bench(lambda: solve_tril(A), ...)</code></li>
+<li><strong>它是什么</strong>：<code>solve_tril</code> 字面意思是“求解下三角（Triangular Lower）系统”。</li>
+<li><strong>背景知识</strong>：在现在的很多新型大模型（如 Mamba, RWKV, Linear Attention）中，为了计算速度，会把计算拆分成很多小块（Chunk）。这个函数通常用于计算块内的状态更新。你可以把它想象成<strong>模型在处理长文本时，计算“前一个字对后一个字影响”的核心数学公式</strong>。</li>
+</ul>
+<h4>Task 3：搞懂“测试场景是什么”？（参数配置）</h4>
+<p><strong>核心观点：我们要模拟不同大小的模型和输入长度。</strong></p>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    x_names=['B', 'T', 'H', 'chunk_size'],
+    x_vals=[
+        (b, t, h, c)
+        for b in [8]                      # Batch size (一次处理几句话)
+        for t in [2048, 4096, 8192]       # Time/Sequence length (句子有多长)
+        for h in [16, 64]                 # Heads (注意力头数，模型的宽度)
+        for c in [16, 32, 64]             # Chunk size (切块的大小)
+    ],</code></li>
+<li><strong>解释</strong>：<ul>
+<li>测试不是只跑一次，而是组合各种情况。</li>
+<li>比如：当句子长度是 2048，切块大小是 16 时，速度是多少？当句子长度变长到 8192，速度又变成了多少？</li>
+<li>这就像测赛车：在直道（短序列）跑多快？在弯道（长序列）跑多快？载重（Batch size）不同时跑多快？</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4：搞懂“数据是怎么造出来的”？（数据预处理）</h4>
+<p><strong>核心观点：为了测试，必须伪造一些符合特定形状的数据 <code>A</code>。</strong></p>
+<p>这部分是代码里最难懂的数学变换，我们只需要理解它的<strong>形状（Shape）</strong>变化：</p>
+<ol>
+<li>
+<p><strong>生成随机数</strong>：
+    <code>k = torch.randn(...)</code>
+    先随机生成一个张量 <code>k</code>，代表模型的输入信号。</p>
+</li>
+<li>
+<p><strong>补齐（Padding）</strong>：
+    因为我们要把长句子切成小块（Chunk），如果句子长度不能被块大小整除，就得在后面补 0。
+    <em>比如：句子长 10，块大小 3，那就得补成 12，才能切成 4 块。</em></p>
+</li>
+<li>
+<p><strong>制造下三角矩阵 <code>A</code></strong>：
+    <code>python
+    A = (k_padded @ k_padded.transpose(-1, -2)).tril(-1)</code></p>
+<ul>
+<li>这里做了一个矩阵乘法，然后用 <code>.tril(-1)</code> 变成<strong>下三角矩阵</strong>（意味着矩阵右上角全是0）。</li>
+<li><strong>为什么？</strong> 在时间序列模型中，"下三角"代表<strong>因果关系</strong>——现在的字只能看之前的字，不能看未来的字（未来的字被 Mask 掉了，就是 0）。</li>
+</ul>
+</li>
+<li>
+<p><strong>变形（Reshape/Permute）</strong>：
+    代码最后把 <code>A</code> 变成了 <code>(B, T, H, chunk_size)</code> 这种形状，这是 <code>solve_tril</code> 函数所要求的特定输入格式。</p>
+</li>
+</ol>
+<h4>Task 5：搞懂“结果怎么看”？（运行与输出）</h4>
+<p><strong>核心观点：最后输出的是毫秒（ms）级的时间。</strong></p>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    benchmark.run(print_data=True, save_path=".")</code></li>
+<li><strong>执行流程</strong>：<ol>
+<li>程序启动。</li>
+<li>按照 Task 3 的列表，生成第一组参数（比如 B=8, T=2048...）。</li>
+<li>按照 Task 4 制造假数据 <code>A</code>。</li>
+<li>运行 <code>solve_tril(A)</code> 并计时。</li>
+<li>打印结果，保存成图表。</li>
+</ol>
+</li>
+<li><strong>图表含义</strong>：X轴通常是句子长度或块大小，Y轴是 <code>Time (ms)</code>。时间越短，说明你的 GPU 算子写得越好。</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件的作用就是：<strong>专门为 <code>fla</code> 库里的 <code>solve_tril</code> 这个算子做一个体检报告。</strong></p>
+<p>它通过不断改变输入数据的大小（B, T, H），来观察这个算子的计算速度是否稳定、是否够快，从而帮助开发者优化底层的 GPU 代码。你看不懂中间的数学变换没关系，只需要知道那是为了<strong>构造出符合函数输入的假数据</strong>即可。</p>

@@ -1,0 +1,108 @@
+<h1>fla/ops/nsa/naive.py</h1>
+<p>这份代码确实比较晦涩，主要是因为它是一个<strong>Naive（朴素/原生）</strong>的实现。它的目的通常不是为了“跑得快”（实际部署会用CUDA写），而是为了“跑得对”，用来验证算法逻辑。</p>
+<p>这份代码实现的是 <strong>NSA (Native Sparse Attention)</strong> 的核心逻辑。简单来说，它的核心思想是：<strong>我不看所有历史记录（Full Attention），我只看几个特定的“块”（Block）</strong>。</p>
+<p>为了让你读懂，我制定了一个 <strong>5步通关 List</strong>，我们一步步拆解：</p>
+<hr />
+<h3>📋 通关任务 List</h3>
+<ol>
+<li><strong>Task 1: 搞懂输入数据的“不对等” (GQA 处理)</strong></li>
+<li><strong>Task 2: 破解“块索引” (Block Indices) 的含义</strong></li>
+<li><strong>Task 3: 核心魔法——从“块ID”变身“Token位置”</strong></li>
+<li><strong>Task 4: “挑食”的过程 (Gather K/V)</strong></li>
+<li><strong>Task 5: 计算注意力与防作弊 (Attention &amp; Masking)</strong></li>
+</ol>
+<hr />
+<h3>🟢 Task 1: 搞懂输入数据的“不对等” (GQA 处理)</h3>
+<p>首先看这段代码，你会发现 Query (Q) 和 Key/Value (K/V) 的头数（Head）是不一样的：</p>
+<ul>
+<li><code>q</code>: shape <code>[B, T, HQ, K]</code> (HQ = Query Heads，比如 32个头)</li>
+<li><code>k</code>: shape <code>[B, T, H, K]</code> (H = KV Heads，比如 4个头)</li>
+</ul>
+<p>这就是 <strong>GQA (Grouped Query Attention)</strong>。为了能让它们做运算，必须把 K 和 V 复制，让它们的头数和 Q 对齐。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算倍数 G，比如 32 // 4 = 8</span>
+<span class="n">G</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">//</span> <span class="n">k</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
+<span class="c1"># 把 k, v, block_indices 都复制 G 倍</span>
+<span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">block_indices</span> <span class="o">=</span> <span class="p">(</span><span class="n">repeat</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="s1">&#39;b t h d -&gt; b t (h g) d&#39;</span><span class="p">,</span> <span class="n">g</span><span class="o">=</span><span class="n">G</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">block_indices</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+现在大家都在同一个起跑线上了，所有的头数都变成了 <code>HQ</code>。</p>
+<hr />
+<h3>🟢 Task 2: 破解“块索引” (Block Indices) 的含义</h3>
+<p>这是NSA算法最核心的输入。
+*   <code>block_indices</code>: shape <code>[B, T, H, S]</code>
+*   <code>block_size</code>: 比如 64。</p>
+<p><strong>含义：</strong>
+对于每一个时刻 <code>T</code> 的每一个头 <code>H</code>，我不需要看以前所有的 token，我只选 <code>S</code> 个“块”（Block）来看。
+<code>block_indices</code> 里存的就是：<strong>我要看第几个块</strong>。</p>
+<blockquote>
+<p><strong>比喻：</strong>
+你在读一本书（历史信息）。
+标准 Attention：你需要从第1页读到当前页。
+NSA Attention：你手里有一张小纸条（<code>block_indices</code>），上面写着“读第5页、第10页、第12页”。你只读这几页。</p>
+</blockquote>
+<hr />
+<h3>🟢 Task 3: 核心魔法——从“块ID”变身“Token位置”</h3>
+<p>只知道“读第5页”是不够的，计算机需要知道是“第几行到第几行”。这里需要把<strong>块索引</strong>转换成具体的<strong>Token索引</strong>。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># BS 是 block_size (比如64)</span>
+<span class="c1"># i_b 是块的编号 (比如 [5, 10, 12])</span>
+<span class="c1"># 下面这行代码把 [5] 变成了 [320, 321, ..., 383]</span>
+<span class="n">i_b</span> <span class="o">=</span> <span class="n">i_b</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">BS</span> <span class="o">+</span> <span class="n">i_b</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">BS</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   假设 <code>block_size = 64</code>。
+*   如果 <code>block_indices</code> 里有个数是 <code>0</code>，它就变成了 <code>0</code> 到 <code>63</code> (第0块的所有token)。
+*   如果有个数是 <code>2</code>，它就变成了 <code>128</code> 到 <code>191</code>。
+*   最后 <code>i_b</code> 变成了具体的 Token 下标，形状大概是 <code>[T, S*BS, HQ]</code>。意思是：对于每个时刻 T，我有 <code>S*BS</code> 个具体的历史 Token 需要去关注。</p>
+<hr />
+<h3>🟢 Task 4: “挑食”的过程 (Gather K/V)</h3>
+<p>现在进入了最慢的 <code>for i_q in range(T):</code> 循环。这是一个模拟生成的逐个 Token 处理过程。</p>
+<p>我们需要根据刚才算出来的“Token位置 (<code>i_i</code>)”，去原始的 K 和 V 里面把数据抓出来。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># q_i: 当前时刻的 Query</span>
+<span class="n">q_i</span> <span class="o">=</span> <span class="n">q_b</span><span class="p">[</span><span class="n">i_q</span><span class="p">]</span> <span class="o">*</span> <span class="n">scale</span>
+
+<span class="c1"># i_i: 当前时刻我们要关注的那些历史 Token 的下标</span>
+<span class="n">i_i</span> <span class="o">=</span> <span class="n">i_b</span><span class="p">[</span><span class="n">i_q</span><span class="p">]</span>
+
+<span class="c1"># gather: 拿着下标去 K 和 V 里抓数据</span>
+<span class="c1"># 结果 k_i 的形状是 [S*BS, HQ, D]</span>
+<span class="n">k_i</span><span class="p">,</span> <span class="n">v_i</span> <span class="o">=</span> <span class="nb">map</span><span class="p">(</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">x</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">i_i</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">T</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="o">*</span><span class="n">i_i</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])),</span> <span class="p">(</span><span class="n">k_b</span><span class="p">,</span> <span class="n">v_b</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <strong>普通 Attention</strong>：<code>k</code> 是之前所有的 token。
+*   <strong>NSA Attention</strong>：<code>k_i</code> 仅仅包含我们通过 <code>block_indices</code> 选出来的那些 token（总共 <code>S * block_size</code> 个）。
+*   这就是“Sparse（稀疏）”的体现：数据量大大减少了。</p>
+<hr />
+<h3>🟢 Task 5: 计算注意力与防作弊 (Attention &amp; Masking)</h3>
+<p>数据抓好了，现在开始算标准的 Attention 公式：$Softmax(Q \cdot K^T) \cdot V$。</p>
+<p>但这里有一个极其重要的细节：<strong>Causal Masking（因果遮罩）</strong>。
+因为是分块读取，有时候选中的块可能包含“未来”的信息（比如当前在第60个token，但块是0-63，那61-63就是未来），或者索引越界。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 算分数 (Query 点乘 Key)</span>
+<span class="n">attn</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">&#39;h d, n h d -&gt; n h&#39;</span><span class="p">,</span> <span class="n">q_i</span><span class="p">,</span> <span class="n">k_i</span><span class="p">)</span>
+
+<span class="c1"># 2. 防作弊 (Masking)</span>
+<span class="c1"># i_i &gt; i_q 意味着：如果选中的历史token位置 &gt; 当前时刻</span>
+<span class="c1"># 把它设为 -inf，这样 Softmax 后概率为 0</span>
+<span class="n">attn</span> <span class="o">=</span> <span class="n">attn</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="n">i_i</span> <span class="o">&gt;</span> <span class="n">i_q</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="s1">&#39;-inf&#39;</span><span class="p">))</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+
+<span class="c1"># 3. 加权求和 (Score 点乘 Value)</span>
+<span class="n">o</span><span class="p">[</span><span class="n">i</span><span class="p">,</span> <span class="n">i_q</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">&#39;n h, n h v -&gt; h v&#39;</span><span class="p">,</span> <span class="n">attn</span><span class="p">,</span> <span class="n">v_i</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <code>masked_fill(i_i &gt; i_q, ...)</code>：这行代码保证了模型<strong>绝不偷看未来</strong>。即使 <code>block_indices</code> 让你读这个块，如果块里某些字还没写出来（时间在当前时刻之后），你就不能看。
+*   最后算出来的 <code>o</code> 就是经过稀疏注意力机制筛选、加权后的结果。</p>
+<hr />
+<h3>总结 (Recap)</h3>
+<p>这个文件的逻辑可以一句话概括：</p>
+<blockquote>
+<p><strong>Naive NSA 模拟了一个“挑食”的阅读者。对于每个字（Query），它不回顾整本书，而是根据一张清单（block indices），把特定的几页书（Selected Blocks）撕下来拼在一起（Gather），只读这些内容来理解上下文，并且严格遵守不看剧透（Masking）的规则。</strong></p>
+</blockquote>
+<p><strong>为什么代码看起来这么乱？</strong>
+因为它为了处理 <code>varlen</code>（变长序列，把一堆句子拼成一个长条训练）和 <code>GQA</code>（分组查询），加了很多数据维度的变换（reshape/transpose/gather）。如果你只看最核心的 <code>for i_q in range(T)</code> 内部，其实就是标准的 Attention，只是 K 和 V 是“抓”出来的子集。</p>

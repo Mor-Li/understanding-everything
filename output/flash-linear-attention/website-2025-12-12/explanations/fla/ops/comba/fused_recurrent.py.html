@@ -1,0 +1,105 @@
+<h1>fla/ops/comba/fused_recurrent.py</h1>
+<p>这份代码是用 <strong>Triton</strong> 语言编写的一个高性能深度学习算子。Triton 代码通常很难读，因为它把数学逻辑和底层的显存读写混在一起了。</p>
+<p>简单来说，这个文件实现了一个叫 <strong>Comba</strong> 的模型的<strong>前向传播（Forward）</strong>过程。它本质上是一个 <strong>RNN（循环神经网络）</strong>，但是为了在 GPU 上跑得快，它把很多步骤“融合（Fused）”到了一个核函数里。</p>
+<p>为了让你看懂，我把你（作为 GPU）需要执行的任务拆解成一个 <strong>TODO List</strong>。</p>
+<hr />
+<h3>📋 任务清单：执行 Comba 模型的推理 (Forward)</h3>
+<p>想象你是一个在大显存仓库里干活的工人（GPU 线程），你的任务是处理一个序列的数据（比如一句话）。</p>
+<h4>✅ Task 1: 准备工作 (Setup)</h4>
+<p><strong>代码位置:</strong> <code>fused_recurrent_comba_fwd_kernel</code> 函数的前半部分。</p>
+<ol>
+<li><strong>认领任务区:</strong> 确定你要处理的是哪一个序列（Batch <code>i_n</code>），以及这个序列里的哪一组特征头（Head <code>i_h</code>）。</li>
+<li><strong>定位指针:</strong> 算出输入数据（<code>q</code>, <code>k</code>, <code>v</code>, <code>p</code>, <code>g</code>）在显存里的起始地址。</li>
+<li><strong>初始化记忆 (Hidden State):</strong><ul>
+<li>创建一个空的黑板 <code>b_h</code>（也就是隐藏状态 $H$，形状是 $K \times V$ 的矩阵）。</li>
+<li>如果用户给了初始状态 <code>h0</code>，就把以前的记忆抄到黑板上；否则黑板就是全 0。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 2: 时间循环 (The Loop) - 核心部分</h4>
+<p><strong>代码位置:</strong> <code>for _ in range(0, T):</code> 代码块。
+这是一个 RNN，所以必须一步一步（Time Step）往下走。对于每一个时刻 $t$：</p>
+<ol>
+<li>
+<p><strong>📥 读取输入:</strong></p>
+<ul>
+<li>从显存里把当前时刻的 $q_t, k_t, p_t, v_t, g_t$ 读取到寄存器（手边的快速缓存）里。</li>
+<li><em>(可选)</em> 对 $q, k, p$ 做一下归一化（L2 Norm），防止数值爆炸。</li>
+</ul>
+</li>
+<li>
+<p><strong>🧮 修正 Value (核心逻辑 1):</strong></p>
+<ul>
+<li><strong>代码:</strong> <code>b_v -= tl.sum(b_h * b_p[:, None], 0)</code></li>
+<li><strong>解释:</strong> 这是 Comba 这个模型独特的地方。在把新的信息写入记忆之前，先用辅助向量 $p$ 和当前的记忆 $H$ 做运算，去“修正”当前的 $v$。</li>
+<li><strong>人话:</strong> 看看过去的记忆里有哪些是 $p$ 关注的，从当前的 $v$ 里减去这部分影响。</li>
+</ul>
+</li>
+<li>
+<p><strong>📉 记忆衰减 (核心逻辑 2):</strong></p>
+<ul>
+<li><strong>代码:</strong> <code>b_h *= exp(b_g)</code></li>
+<li><strong>解释:</strong> 这个 $g$ 是 "Gate"（门控）或 "Decay"（衰减）。</li>
+<li><strong>人话:</strong> 这一步是“遗忘”。把黑板上的旧记忆 $H$ 乘以一个衰减系数（比如 0.9），让久远的信息慢慢变淡。</li>
+</ul>
+</li>
+<li>
+<p><strong>📝 写入新记忆 (核心逻辑 3):</strong></p>
+<ul>
+<li><strong>代码:</strong> <code>b_h += b_k[:, None] * b_v[None, :]</code></li>
+<li><strong>解释:</strong> 用 $k$（Key）和 $v$（Value）做一个<strong>外积</strong>（Outer Product），加到黑板 $H$ 上。</li>
+<li><strong>人话:</strong> 这一步是“写入”。$k$ 代表“存什么类型的知识”，$v$ 代表“具体内容”。把这一刻的新知识刻在黑板上。</li>
+</ul>
+</li>
+<li>
+<p><strong>📤 计算输出 (核心逻辑 4):</strong></p>
+<ul>
+<li><strong>代码:</strong> <code>b_o = tl.sum(b_h * b_q[:, None], 0)</code></li>
+<li><strong>解释:</strong> 用当前的 $q$（Query）去查询更新后的黑板 $H$。</li>
+<li><strong>人话:</strong> 这一步是“读取”。$q$ 代表“我想在这个时刻查什么”。根据 $q$ 和黑板上的记忆，算出这一刻的输出结果 $o_t$。</li>
+</ul>
+</li>
+<li>
+<p><strong>💾 保存输出:</strong></p>
+<ul>
+<li>把算出来的 $o_t$ 写回显存。</li>
+</ul>
+</li>
+<li>
+<p><strong>👉 移动指针:</strong></p>
+<ul>
+<li>把所有数据的指针往后移一位，准备处理 $t+1$ 时刻。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 3: 收尾工作 (Finalize)</h4>
+<p><strong>代码位置:</strong> 循环结束后。</p>
+<ol>
+<li><strong>保存最终状态:</strong><ul>
+<li><strong>代码:</strong> <code>if STORE_FINAL_STATE: ...</code></li>
+<li>如果用户需要，把你最后时刻黑板上留下的内容 $H_{final}$ 存回显存。这样下次处理下一段话时，可以接着用（实现无限长度推理）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这代码到底在干嘛？</h3>
+<p>这个文件实现了一个<strong>线性注意力（Linear Attention）</strong>的变体。</p>
+<ul>
+<li><strong>标准 Attention:</strong> 需要看之前所有时刻的数据 ($T \times T$ 复杂度)，显存和计算量很大。</li>
+<li><strong>Recurrent (RNN) 模式:</strong> 也就是这个代码的做法。它维护一个固定大小的矩阵 $H$（记忆黑板）。<ul>
+<li>每来一个词，它就：<ol>
+<li>根据旧记忆修正输入 (<code>v -= H*p</code>)</li>
+<li>遗忘一点旧记忆 (<code>H *= decay</code>)</li>
+<li>写入一点新记忆 (<code>H += k*v</code>)</li>
+<li>根据查询读出结果 (<code>o = H*q</code>)</li>
+</ol>
+</li>
+</ul>
+</li>
+<li><strong>Comba 的特点:</strong> 相比于标准的 Linear Attention (如 RetNet)，它多引入了一个 $p$ 向量来在写入前动态调整 $v$，这可能有助于模型去除噪声或更精准地控制记忆更新。</li>
+</ul>
+<h3>为什么这代码看起来这么乱？</h3>
+<p>因为它用了 <strong>Triton</strong>。
+*   Python 的逻辑通常是 <code>C = A @ B</code> (矩阵乘法)。
+*   Triton 需要你自己控制每一个线程块（Block）怎么搬运数据、怎么做分块矩阵乘法 (<code>tl.sum</code>, <code>[:, None]</code> 这种写法是在手动做广播和求和)。
+*   <strong>目的:</strong> 极致的性能。通过把“遗忘、写入、读取”这三个步骤融合在一个 Kernel 里，避免了反复读写显存（IO瓶颈），让训练和推理飞快。</p>

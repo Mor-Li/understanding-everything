@@ -1,0 +1,116 @@
+<h1>tests/ops/test_ttt.py</h1>
+<p>这份代码看起来确实充满了数学符号和深度学习的术语，如果你不熟悉底层的算子开发，看不懂是很正常的。</p>
+<p>简单来说，这是一个 <strong>单元测试（Unit Test）</strong> 文件。它的核心目的是：<strong>验证一个新的、运行速度很快的算法实现（TTT），其计算结果是否和通过普通方式算出来的标准结果一致。</strong></p>
+<p>所谓的 <strong>TTT</strong> (Test-Time Training) 是最近提出的一种新的序列建模层（类似 Transformer 中的 Attention 或 Mamba 中的 SSM）。</p>
+<p>为了让你读懂，我为你列了一个 <strong>“学习任务清单” (Task List)</strong>，我们一步步来拆解这个文件：</p>
+<hr />
+<h3>任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 搞清楚“谁”在被测试，以及“谁”是标准答案。</strong></li>
+<li><strong>Task 2: 理解输入数据的形状和含义（Q, K, V 是什么）。</strong></li>
+<li><strong>Task 3: 理解测试的核心流程（前向传播 + 反向传播）。</strong></li>
+<li><strong>Task 4: 理解 <code>assert_close</code> 是在比对什么。</strong></li>
+<li><strong>Task 5: 理解变长序列测试 (<code>test_chunk_varlen</code>) 的特殊性。</strong></li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>Task 1: 搞清楚“谁”在被测试，“谁”是标准答案</h4>
+<p>在代码中，你会反复看到两组函数的调用。</p>
+<ul>
+<li><strong>挑战者（待测试的快速版）</strong>：<ul>
+<li><code>chunk_ttt_linear</code> 和 <code>fused_chunk_ttt_linear</code>。</li>
+<li>这通常是用底层代码（如 Triton 或 CUDA）写的高性能版本，速度快，但容易写错。</li>
+</ul>
+</li>
+<li><strong>裁判员（标准答案/参考版）</strong>：<ul>
+<li><code>chunk_ttt_linear_ref</code> (注意那个 <code>_ref</code> 后缀，代表 Reference)。</li>
+<li>这是用最朴素的 PyTorch 写的“慢速版”，逻辑简单清晰，默认它是绝对正确的数学实现。</li>
+</ul>
+</li>
+</ul>
+<p><strong>观点：</strong> 整个文件的逻辑就是让“挑战者”和“裁判员”做同样的题，看答案是不是一样。</p>
+<h4>Task 2: 理解输入数据的形状和含义</h4>
+<p>在 <code>test_chunk</code> 函数中，定义了一堆张量（Tensor）。这些是 TTT 层的输入参数：</p>
+<ul>
+<li><strong>基础维度</strong>：<ul>
+<li><code>B</code>: Batch size (批次大小)</li>
+<li><code>T</code>: Time steps (序列长度)</li>
+<li><code>H</code>: Heads (多头注意力机制的头数)</li>
+<li><code>D</code>: Dimension (每个头的维度)</li>
+</ul>
+</li>
+<li><strong>核心数据</strong>：<ul>
+<li><code>q</code>, <code>k</code>, <code>v</code>: 类似于 Attention 中的 Query, Key, Value。</li>
+<li><code>w</code>, <code>b</code>: TTT 层特有的权重和偏置。</li>
+<li><code>eta</code> ($\eta$): 学习率参数（TTT 的核心思想是在推理时进行梯度下降，这个控制步长）。</li>
+<li><code>h0</code>, <code>hb0</code>: 初始状态（Initial States），类似于 RNN 的隐藏层初始状态。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码片段解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 生成随机数据作为输入</span>
+<span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+<span class="c1"># ... 其他变量初始化 ...</span>
+<span class="c1"># 开启 requires_grad=True，表示我们要测试这些变量的梯度（用于反向传播）</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">...</span> <span class="o">=</span> <span class="nb">map</span><span class="p">(</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">x</span><span class="o">...</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>Task 3: 理解测试的核心流程（前向 + 反向）</h4>
+<p>这是测试中最关键的一步，分为两阶段：</p>
+<p><strong>阶段 A：前向传播 (Forward Pass) - 算结果</strong>
+代码分别运行了快速版和参考版：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 运行快速版</span>
+<span class="n">tri</span><span class="p">,</span> <span class="n">tri_ht</span><span class="p">,</span> <span class="n">tri_hbt</span> <span class="o">=</span> <span class="n">chunk_ttt_linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+<span class="c1"># 2. 运行参考版</span>
+<span class="n">ref</span><span class="p">,</span> <span class="n">ref_ht</span><span class="p">,</span> <span class="n">ref_hbt</span> <span class="o">=</span> <span class="n">chunk_ttt_linear_ref</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><code>tri</code> / <code>ref</code>: 主要输出结果。</li>
+<li><code>_ht</code>, <code>_hbt</code>: 最终的隐藏状态（Final States），用于传递给下一个序列片段。</li>
+</ul>
+<p><strong>阶段 B：反向传播 (Backward Pass) - 算梯度</strong>
+为了训练模型，必须保证<strong>梯度的计算</strong>也是对的。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 对快速版的结果求导（反向传播）</span>
+<span class="p">((</span><span class="n">tri</span> <span class="o">*</span> <span class="n">do</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">+</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">retain_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="c1"># 获取快速版算出来的梯度 (tri_dq, tri_dk ...)</span>
+<span class="n">tri_dq</span><span class="p">,</span> <span class="n">tri_dk</span> <span class="o">...</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span><span class="p">,</span> <span class="n">k</span><span class="o">.</span><span class="n">grad</span> <span class="o">...</span>
+
+<span class="c1"># 清空梯度</span>
+<span class="n">q</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="o">...</span> <span class="o">=</span> <span class="kc">None</span> 
+
+<span class="c1"># 2. 对参考版的结果求导</span>
+<span class="p">((</span><span class="n">ref</span> <span class="o">*</span> <span class="n">do</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">+</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">retain_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="c1"># 获取参考版算出来的梯度 (ref_dq, ref_dk ...)</span>
+<span class="n">ref_dq</span><span class="p">,</span> <span class="n">ref_dk</span> <span class="o">...</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span><span class="p">,</span> <span class="n">k</span><span class="o">.</span><span class="n">grad</span> <span class="o">...</span>
+</code></pre></div>
+
+<p><strong>观点：</strong> 仅仅输出结果一样是不够的，深度学习模型要能训练，必须保证导数（梯度）计算也是完全一致的。</p>
+<h4>Task 4: 理解 <code>assert_close</code> 是在比对什么</h4>
+<p>最后一步就是“对答案”。<code>assert_close</code> 是一个自定义的检查函数，如果两个张量的数值差距超过某个极小的阈值（误差允许范围），测试就会报错。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;   o&quot;</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tri</span><span class="p">,</span> <span class="mf">0.005</span><span class="p">)</span>       <span class="c1"># 对比输出</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;  dq&quot;</span><span class="p">,</span> <span class="n">ref_dq</span><span class="p">,</span> <span class="n">tri_dq</span><span class="p">,</span> <span class="mf">0.005</span><span class="p">)</span> <span class="c1"># 对比 q 的梯度</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;  dk&quot;</span><span class="p">,</span> <span class="n">ref_dk</span><span class="p">,</span> <span class="n">tri_dk</span><span class="p">,</span> <span class="mf">0.010</span><span class="p">)</span> <span class="c1"># 对比 k 的梯度</span>
+<span class="c1"># ... 对比其他梯度 ...</span>
+</code></pre></div>
+
+<p><strong>观点：</strong> 这里列出了一长串的 <code>assert_close</code>，就是在确保：无论是前向计算的结果，还是反向传播算出的每一个参数的梯度，快速版都和标准版几乎一模一样。</p>
+<h4>Task 5: 理解变长序列测试 (<code>test_chunk_varlen</code>)</h4>
+<p>最后一个函数 <code>test_chunk_varlen</code> 是进阶测试。</p>
+<ul>
+<li><strong>背景</strong>：在实际处理文本时，一句话可能有 5 个字，另一句有 100 个字。为了并行计算，通常会把它们拼在一起或者用 Padding。</li>
+<li><strong><code>cu_seqlens</code></strong>：这是一个列表（Cumulative Sequence Lengths），比如 <code>[0, 15, 100]</code> 表示第一句话是 0-15，第二句话是 15-100。</li>
+<li><strong>测试逻辑</strong>：<ul>
+<li>快速版 (<code>chunk_ttt_linear</code>) 支持直接传入 <code>cu_seqlens</code> 一次性处理所有变长数据。</li>
+<li>参考版 (<code>chunk_ttt_linear_ref</code>) 不支持这个，所以测试代码写了一个 <code>for</code> 循环，把数据切开，一段一段地喂给参考版算。</li>
+<li>最后把参考版算出来的结果拼起来 (<code>torch.cat</code>)，再去和快速版的结果对比。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的<strong>唯一观点</strong>是：</p>
+<blockquote>
+<p><strong>我们写了一个新的 TTT 算子（<code>chunk_ttt_linear</code>），不管是在普通模式下，还是在变长序列模式下，它的计算结果和梯度更新都与标准的数学定义（<code>_ref</code>）完全一致，可以放心使用。</strong></p>
+</blockquote>
+<p>如果你不是为了开发这个算子，而只是使用它，你只需要知道：这个文件证明了这个库的代码质量是可靠的。</p>

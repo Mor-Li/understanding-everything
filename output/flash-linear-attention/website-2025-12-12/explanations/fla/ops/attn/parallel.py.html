@@ -1,0 +1,142 @@
+<h1>fla/ops/attn/parallel.py</h1>
+<p>这份代码确实非常硬核，它是一个用 <strong>OpenAI Triton</strong> 语言编写的高性能 GPU 算子（Kernel）。</p>
+<p>简单来说，这个文件实现了一个<strong>带衰减机制（Decay）的并行注意力（Parallel Attention）</strong>。它通常用于像 RetNet、GLA (Gated Linear Attention) 这类模型，目的是比 PyTorch 原生实现快几十倍，并节省显存。</p>
+<p>为了让你看懂，我列了一个 <strong>5步 Task List</strong>，我们一步步拆解：</p>
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>搞懂核心目标</strong>：这到底是在算什么数学公式？</li>
+<li><strong>理解 "Parallel" (并行) 的含义</strong>：为什么要切块（Tiling）？</li>
+<li><strong>拆解 Forward Kernel (前向传播)</strong>：最核心的 <code>parallel_attn_fwd_kernel</code> 是怎么跑的？</li>
+<li><strong>理解衰减机制 (Decay/Gate)</strong>：代码里的 <code>g_cumsum</code> 是干嘛的？</li>
+<li><strong>看懂 Python 包装层</strong>：如何处理输入形状和 GQA（分组查询注意力）。</li>
+</ol>
+<hr />
+<h3>Task 1: 搞懂核心目标 (数学原理)</h3>
+<p>普通的 Attention 公式是：
+$$Attention(Q, K, V) = \text{softmax}(\frac{QK^T}{\sqrt{d}})V$$</p>
+<p>这个文件实现的 Attention 多了一个 <strong>$G$ (Gate/Decay)</strong> 项。你可以把它理解为位置之间的“距离衰减”。
+公式变成了类似这样（简化版）：
+$$Score_{i,j} = Q_i K_j^T + (G_i - G_j)$$
+$$Output = \text{softmax}(Score) V$$</p>
+<ul>
+<li><strong>直觉</strong>：$G$ 是一个累加值 (<code>cumsum</code>)。$G_i - G_j$ 代表第 $i$ 个 token 和第 $j$ 个 token 之间的累积衰减量。如果距离越远，这个值通常越小（负数），导致 Attention 分数变低。</li>
+</ul>
+<hr />
+<h3>Task 2: 理解 "Parallel" 与 Tiling (分块)</h3>
+<p>如果你直接生成一个 $N \times N$ 的 Attention 矩阵，显存会瞬间爆炸。
+<strong>FlashAttention</strong> 的核心思想（也是这个文件的思想）是：<strong>切块计算 (Tiling)</strong>。</p>
+<p>代码中定义了几个关键的 Block Size（块大小）：
+*   <code>BT</code>: Time 维度的块大小 (Block Time)，例如 128。
+*   <code>BK</code>: Key 维度的块大小，例如 256。
+*   <code>BV</code>: Value 维度的块大小。</p>
+<p><strong>Triton 的工作方式</strong>：
+它启动很多个并行的“程序”（Program/Thread Block）。
+*   <code>pid(0)</code> 处理 Value 维度。
+*   <code>pid(1)</code> 处理 Time 维度（把长序列切成一段一段）。
+*   <code>pid(2)</code> 处理 Batch 和 Head 维度。</p>
+<p>每个“程序”只负责算<strong>一小块</strong>结果，最后拼起来。</p>
+<hr />
+<h3>Task 3: 拆解 Forward Kernel (核心代码)</h3>
+<p>让我们看 <code>parallel_attn_fwd_kernel</code> 函数。这是最难的部分，我来翻译它的逻辑流：</p>
+<p><strong>步骤 A: 准备工作</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 定位当前线程负责哪一部分数据</span>
+<span class="n">i_v</span><span class="p">,</span> <span class="n">i_t</span><span class="p">,</span> <span class="n">i_bh</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+<span class="c1"># 加载 Q (Query) 的一个块到 SRAM (GPU高速缓存)</span>
+<span class="c1"># b_q 的形状是 [BT, BK]</span>
+<span class="n">b_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_q</span><span class="p">,</span> <span class="n">boundary_check</span><span class="o">=</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>翻译</strong>：我是第 <code>i_t</code> 号工头，我先把这一小段的 Query 数据拿进高速缓存，这部分数据在整个计算过程中都要用。</li>
+</ul>
+<p><strong>步骤 B: 遍历 K 和 V (外层循环)</strong>
+代码里有两个 <code>for</code> 循环。这是 FlashAttention 的经典逻辑：
+1.  <strong>Causal Masking (因果遮罩)</strong>：因为是生成模型，Token $i$ 只能看 $i$ 之前的 Token。
+2.  循环遍历所有的 Key 和 Value 块。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 循环遍历 Key/Value 的块 (i_s 是步长)</span>
+<span class="k">for</span> <span class="n">i_s</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">i_t</span> <span class="o">*</span> <span class="n">BT</span><span class="p">,</span> <span class="n">BS</span><span class="p">):</span>
+    <span class="c1"># 加载 K 和 V 的块</span>
+    <span class="n">b_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_k</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">b_v</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_v</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 1. 计算 Q * K^T</span>
+    <span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span><span class="p">,</span> <span class="n">b_k</span><span class="p">)</span> <span class="o">*</span> <span class="n">scale</span> <span class="o">*</span> <span class="n">RCP_LN2</span>
+
+    <span class="c1"># 2. 加上位置衰减 (G)</span>
+    <span class="k">if</span> <span class="n">USE_G</span><span class="p">:</span>
+        <span class="c1"># b_s += (当前位置的G - 历史位置的G)</span>
+        <span class="n">b_s</span> <span class="o">+=</span> <span class="n">b_gq</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">-</span> <span class="n">b_gk</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>
+
+    <span class="c1"># 3. Online Softmax (在线 Softmax 技巧)</span>
+    <span class="c1"># 这是一个数值稳定的技巧，边算边更新最大值(b_m)和分母(b_acc)，不需要存整个矩阵</span>
+    <span class="n">b_m</span><span class="p">,</span> <span class="n">b_mp</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">b_m</span><span class="p">,</span> <span class="n">tl</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">b_s</span><span class="p">,</span> <span class="mi">1</span><span class="p">)),</span> <span class="n">b_m</span>
+    <span class="n">b_r</span> <span class="o">=</span> <span class="n">exp2</span><span class="p">(</span><span class="n">b_mp</span> <span class="o">-</span> <span class="n">b_m</span><span class="p">)</span>
+    <span class="n">b_p</span> <span class="o">=</span> <span class="n">exp2</span><span class="p">(</span><span class="n">b_s</span> <span class="o">-</span> <span class="n">b_m</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">])</span>
+
+    <span class="c1"># 4. 更新输出 O</span>
+    <span class="n">b_o</span> <span class="o">=</span> <span class="n">b_o</span> <span class="o">*</span> <span class="n">b_r</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_p</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">b_q</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span> <span class="n">b_v</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>步骤 C: 处理对角线块 (Masking)</strong>
+第一个循环处理的是完全在当前 Q 块之前的 K/V。第二个循环（代码中 <code>for i_s in range(i_t * BT, ...)</code>）处理的是<strong>对角线上的块</strong>。这里需要仔细的 <code>mask</code>，防止看到未来的 Token。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 确保只计算 causal 部分 (o_q &gt;= o_k)</span>
+<span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">((</span><span class="n">o_q</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="n">o_k</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:])</span> <span class="o">&amp;</span> <span class="n">m_k</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:],</span> <span class="n">b_s</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="s1">&#39;-inf&#39;</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>步骤 D: 收尾</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 最后除以 Softmax 的分母</span>
+<span class="n">b_o</span> <span class="o">=</span> <span class="n">b_o</span> <span class="o">/</span> <span class="n">b_acc</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span>
+<span class="c1"># 存回显存</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_o</span><span class="p">,</span> <span class="n">b_o</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>Task 4: 理解衰减机制 (Decay/Gate)</h3>
+<p>代码中反复出现的 <code>g_cumsum</code> 是什么？</p>
+<ul>
+<li><strong>输入 <code>g</code></strong>: 原始的 log-space decay factor。</li>
+<li><strong>预处理</strong>: 在 Python 函数 <code>forward</code> 里，有一行：
+    <code>python
+    g_cumsum = chunk_global_cumsum(g, ...)</code>
+    它预先算好了前缀和。</li>
+<li><strong>Kernel 中使用</strong>:
+    <code>python
+    b_s += b_gq[:, None] - b_gk[None, :]</code>
+    这里利用了对数性质：$\exp(A) \cdot \exp(-B) = \exp(A-B)$。
+    在 Log 空间做减法，等价于在原始空间做除法（衰减）。这让模型能够根据上下文动态调整关注历史的程度。</li>
+</ul>
+<hr />
+<h3>Task 5: 看懂 Python 包装层</h3>
+<p>最后看底部的 <code>parallel_attn</code> 函数，它是给用户调用的接口。</p>
+<ol>
+<li>
+<p><strong>检查硬件</strong>:
+    <code>python
+    if check_shared_mem('hopper', ...): ...</code>
+    根据显卡架构（H100, A100, 3090等）自动选择最优的 Block Size (<code>BT</code>, <code>BS</code>)。</p>
+</li>
+<li>
+<p><strong>处理 Variable Length (变长序列)</strong>:
+    代码里有很多 <code>cu_seqlens</code>。这是为了处理一个 Batch 里句子长短不一的情况。它不使用 Padding（填充0），而是把所有句子拼成一条长龙，用 <code>cu_seqlens</code> 记录每句话的分割点。</p>
+</li>
+<li>
+<p><strong>GQA (Grouped Query Attention)</strong>:
+    <code>python
+    HQ = q.shape[2]  # Query 的头数
+    G = HQ // H      # 每个 Key/Value 对应多少个 Query 头</code>
+    如果 Query 头数多，Key/Value 头数少，这就是 GQA。代码里的 <code>reduce</code> 操作就是为了处理这种情况下的梯度聚合。</p>
+</li>
+</ol>
+<hr />
+<h3>总结：这段代码在讲什么？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>手写的、极大优化的</strong> GPU 程序，用来计算<strong>带有位置衰减的 Attention</strong>。</p>
+<p><strong>它的核心流是</strong>：
+1.  把 Query 切成小块。
+2.  从显存加载 Query 块到 SRAM。
+3.  流式加载 Key/Value 块。
+4.  计算 $Q \cdot K^T$。
+5.  加上衰减项 $G_{query} - G_{key}$。
+6.  利用 Online Softmax 技巧计算概率并乘上 $V$。
+7.  写回结果。</p>
+<p>你不需要完全读懂每一行 <code>tl.load</code> 或指针计算（那些是 C 语言风格的指针偏移），只要明白它是为了<strong>不显式生成巨大的 Attention 矩阵</strong>，从而实现省显存、高速度的计算即可。</p>

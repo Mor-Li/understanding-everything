@@ -1,0 +1,107 @@
+<h1>utils/convert_from_llama.py</h1>
+<p>这份代码其实就是一个<strong>“模型搬家公司”</strong>的说明书。</p>
+<p>简单来说，它的作用是：<strong>把 HuggingFace 格式的 Llama（或 Mistral）模型的“大脑”（权重参数），移植到一个新的架构（FLA style）的外壳里去。</strong></p>
+<p>因为不同的代码库定义模型结构时，给每一层起的名字不一样（比如这边叫 <code>self_attn</code>，那边叫 <code>attn</code>），所以不能直接加载，必须手动把参数一个一个“复制粘贴”过去。</p>
+<p>下面我为你列一个<strong>Task Todo List（任务清单）</strong>，带你一步步看懂它是怎么“搬家”的：</p>
+<hr />
+<h3>📦 任务清单：模型权重迁移 (Weight Conversion)</h3>
+<h4>1. 准备阶段 (Setup)</h4>
+<ul>
+<li><strong>Task:</strong> 确定搬家清单。</li>
+<li><strong>代码对应:</strong> <code>if __name__ == "__main__":</code> 部分。</li>
+<li><strong>解释:</strong> 确定源模型是谁（比如 <code>Mistral-7B</code>），目标配置长啥样（<code>transformer_7B.json</code>），以及搬完放到哪里去。</li>
+</ul>
+<h4>2. 搬运字典 (Tokenizer)</h4>
+<ul>
+<li><strong>Task:</strong> 把原模型的“字典”直接复制到新家。</li>
+<li><strong>代码对应:</strong> <code>AutoTokenizer.from_pretrained(llama).save_pretrained(output)</code></li>
+<li><strong>解释:</strong> 模型怎么把字变成数字（分词器），这个不需要改结构，直接存到新目录就行。</li>
+</ul>
+<h4>3. 加载原模型 (Load Source)</h4>
+<ul>
+<li><strong>Task:</strong> 把旧房子里的东西全部拿出来。</li>
+<li><strong>代码对应:</strong> <code>llama = AutoModelForCausalLM.from_pretrained(...)</code></li>
+<li><strong>解释:</strong> 从 HuggingFace 加载原始的 Llama/Mistral 模型，这就是我们要提取权重的<strong>源</strong>。</li>
+</ul>
+<h4>4. 搭建新骨架 (Init Target)</h4>
+<ul>
+<li><strong>Task:</strong> 按照新的设计图纸，建一个空房子。</li>
+<li><strong>代码对应:</strong><ul>
+<li><code>config = AutoConfig.from_pretrained(config)</code></li>
+<li><code>model = AutoModelForCausalLM.from_config(config)</code></li>
+</ul>
+</li>
+<li><strong>解释:</strong> 初始化一个新的、空的 FLA 模型。这时候它里面全是随机数，没有智慧，只是有了骨架。</li>
+</ul>
+<h4>5. 搬运第一块砖：词嵌入 (Embeddings)</h4>
+<ul>
+<li><strong>Task:</strong> 把“单词”对应的“向量”搬过去。</li>
+<li><strong>代码对应:</strong> <code>model.model.embeddings.weight.data...copy_(llama.model.embed_tokens.weight...)</code></li>
+<li><strong>解释:</strong><ul>
+<li>旧模型叫 <code>embed_tokens</code>。</li>
+<li>新模型叫 <code>embeddings</code>。</li>
+<li>代码把旧的数值复制给新的，并检查一下大小是否一致。</li>
+</ul>
+</li>
+</ul>
+<h4>6. <strong>核心任务：逐层搬运 (Layer Loop)</strong></h4>
+<p>这是代码最长、最繁琐的部分。大模型有很多层（比如32层），代码写了个循环 <code>for i in range(config.num_hidden_layers):</code> 来一层一层搬。</p>
+<ul>
+<li>
+<p><strong>Task 6.1: 搬运“注意力层”的门卫 (Attention Norm)</strong></p>
+<ul>
+<li>旧名: <code>input_layernorm</code></li>
+<li>新名: <code>attn_norm</code> (或者 <code>attn.norm</code>)</li>
+<li><strong>动作:</strong> 复制 weight 和 bias。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 6.2: 搬运“注意力机制” (Attention Weights)</strong></p>
+<ul>
+<li>旧名: <code>self_attn.q_proj</code>, <code>k_proj</code>, <code>v_proj</code>, <code>o_proj</code></li>
+<li>新名: <code>attn.q_proj</code>, <code>k_proj</code>, <code>v_proj</code>, <code>o_proj</code></li>
+<li><strong>动作:</strong> 这是大模型最核心的计算部分。代码把 Q、K、V、O 四个矩阵的权重一一对应复制过去。</li>
+<li><strong>检查:</strong> <code>torch.testing.assert_close(...)</code> 这一行是在每一步搬运后，确认“新家的东西”和“旧家的东西”数值完全一模一样，确保没有搬坏。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 6.3: 搬运“前馈网络”的门卫 (MLP Norm)</strong></p>
+<ul>
+<li>旧名: <code>post_attention_layernorm</code></li>
+<li>新名: <code>mlp_norm</code></li>
+<li><strong>动作:</strong> 复制这一层的归一化参数。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 6.4: 搬运“前馈网络” (MLP Weights)</strong></p>
+<ul>
+<li>旧名: <code>mlp.gate_proj</code>, <code>up_proj</code>, <code>down_proj</code></li>
+<li>新名: 名字没变，也叫 <code>mlp...</code></li>
+<li><strong>动作:</strong> 复制这三个矩阵的权重。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 收尾工作 (Final Output)</h4>
+<ul>
+<li><strong>Task:</strong> 搬运最后的输出层。</li>
+<li><strong>代码对应:</strong><ul>
+<li><code>model.model.norm</code> (最后的 LayerNorm)</li>
+<li><code>model.lm_head</code> (最后的分类头，决定下一个字输出啥)</li>
+</ul>
+</li>
+<li><strong>解释:</strong> 同样是改名+复制。旧的叫 <code>llama.model.norm</code>，新的叫 <code>model.model.norm</code>。</li>
+</ul>
+<h4>8. 保存新模型 (Save)</h4>
+<ul>
+<li><strong>Task:</strong> 把填满家具的新房子锁好，交付使用。</li>
+<li><strong>代码对应:</strong> <code>model.save_pretrained(output)</code></li>
+<li><strong>解释:</strong> 现在这个 <code>model</code> 既有了 FLA 的新结构，又有了 Llama 的旧智慧（权重）。把它存到硬盘上，以后就可以用 <code>fla</code> 库来加载它了。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本其实就是在做 <strong>“翻译”变量名</strong> 的工作。</p>
+<ul>
+<li><strong>左边（源）</strong>：HuggingFace Llama/Mistral 的官方命名结构。</li>
+<li><strong>右边（目标）</strong>：FLA 库自定义的命名结构。</li>
+<li><strong>过程</strong>：如果不跑这个脚本，直接把 Llama 的权重塞给 FLA 模型，程序会报错说“找不到对应的键值”。跑了这个脚本，就是把原来的参数一一归位到新结构里。</li>
+</ul>

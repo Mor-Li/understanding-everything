@@ -1,0 +1,130 @@
+<h1>fla/modules/token_shift.py</h1>
+<p>这份代码确实涉及了很多高性能计算（HPC）和深度学习底层的概念，尤其是 Triton 算子的编写。如果不是专门做这块的，看懂确实很难。</p>
+<p>我们可以把它想象成你在<strong>学习如何高效地计算“今天和昨天的差异”</strong>。</p>
+<p>为了让你听懂，我把这个学习过程拆解成一个 <strong>To-Do List</strong>，我们一步一步来打勾。</p>
+<hr />
+<h3>✅ Task 1：搞懂这个模块的核心数学逻辑</h3>
+<p><strong>目标</strong>：不看代码，先知道它想算什么。</p>
+<ul>
+<li><strong>概念</strong>：Token Shift（词元平移/混合）。在很多现代模型（如 RWKV 或某些 SSM）中，为了让模型知道“上下文”，最简单的办法就是把“上一个时刻的信息”拿过来和“当前时刻”做对比。</li>
+<li><strong>公式</strong>：
+    简单来说，它想计算一个输出 $y$，公式大约是：
+    $$y_t = x_{t-1} - x_t$$
+    也就是：<strong>（前一个时刻的值）减去（当前时刻的值）</strong>。<ul>
+<li>第一项：如果 $t=0$（开头），通常用 0 或者缓存下来的状态代替 $x_{-1}$。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论</strong>：这个模块的功能就是高效地执行这个减法操作。</p>
+<hr />
+<h3>✅ Task 2：看懂 Python 参考实现 (<code>token_shift_ref</code>)</h3>
+<p><strong>目标</strong>：看懂最简单的 Python 代码，验证上面的数学逻辑。</p>
+<p>请看代码中的 <code>token_shift_ref</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 非 Variable Length (定长) 模式</span>
+<span class="n">time_shift</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">ZeroPad2d</span><span class="p">((</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">))</span> <span class="c1"># 这是在时间维度上把张量往右推一格</span>
+<span class="n">shifted</span> <span class="o">=</span> <span class="n">time_shift</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>                        <span class="c1"># shifted 就是 x_{t-1}</span>
+<span class="n">delta</span> <span class="o">=</span> <span class="n">shifted</span> <span class="o">-</span> <span class="n">x</span>                            <span class="c1"># 结果 = x_{t-1} - x_t</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是标准的 PyTorch 写法，逻辑清晰，但是速度可能不够快，或者显存占用稍多（因为造了中间变量）。</li>
+<li><strong>VarLen 部分</strong>：如果输入是变长的（比如几句话拼在一起），它用 <code>for</code> 循环手动处理每一句话，防止第一句话的结尾“平移”到第二句话的开头。</li>
+</ul>
+<hr />
+<h3>✅ Task 3：为什么要用 Triton？(Short vs Long)</h3>
+<p><strong>目标</strong>：理解为什么代码里有一大堆 <code>kernel</code>。</p>
+<p>PyTorch 自带的操作虽然方便，但在处理这种简单的逐元素操作时，如果数据量极大，启动开销和内存读写开销很大。<strong>Triton</strong> 是为了写出能在 GPU 上跑得飞快的 C++ 级别的代码，但用 Python 语法写。</p>
+<p>代码里把逻辑分成了两种情况：
+1.  <strong>Short Kernel (<code>_short</code>)</strong>：当序列长度 $T \le 4096$ 时使用。
+    *   <strong>逻辑</strong>：每个 GPU 线程块（Block）处理一整条序列。因为序列短，显存能一口气读完。
+2.  <strong>Long Kernel (<code>_long</code>)</strong>：当序列特别长时使用。
+    *   <strong>逻辑</strong>：把长序列切成小块（Chunk），分给不同的 GPU 核心去算。</p>
+<hr />
+<h3>✅ Task 4：拆解核心算子 <code>token_shift_fwd_kernel_short</code></h3>
+<p><strong>目标</strong>：看懂前向传播（Forward）是怎么算的。</p>
+<p>让我们聚焦在 <code>token_shift_fwd_kernel_short</code> 这个函数上，这是最直观的实现：</p>
+<ol>
+<li><strong>定位坐标</strong>：
+    <code>python
+    i_b, i_t = tl.program_id(0), tl.program_id(1) # 我现在处理第几个Batch，第几个时刻</code></li>
+<li><strong>读取数据</strong>：
+    <code>python
+    b_x = tl.load(x + base_offset, mask=m_d) # 读取当前的 x_t</code></li>
+<li><strong>核心计算（分类讨论）</strong>：<ul>
+<li><strong>如果是第一个字 (First Position)</strong>：
+    没有“上一个字”。
+    <code>python
+    if USE_INITIAL_STATE:
+        b_cache = tl.load(...)  # 如果有上一轮留下的缓存，就读缓存作为 x_{t-1}
+        delta = b_cache - b_x
+    else:
+        delta = -b_x            # 没有缓存，就相当于 0 - x_t</code></li>
+<li><strong>如果是中间的字</strong>：
+    <code>python
+    prev_values = tl.load(x + prev_offset...) # 去内存里读前一个位置的数据 x_{t-1}
+    delta = prev_values - b_x                 # 计算 x_{t-1} - x_t</code></li>
+</ul>
+</li>
+<li><strong>保存结果</strong>：
+    <code>python
+    tl.store(y + base_offset, delta, mask=m_d)</code></li>
+</ol>
+<p><strong>总结</strong>：这就是一个并行的 <code>for</code> 循环，每个位置都在算“我前面的那个数减去我”。</p>
+<hr />
+<h3>✅ Task 5：理解高级特性 (VarLen &amp; Cache)</h3>
+<p><strong>目标</strong>：理解代码中 <code>cu_seqlens</code> 和 <code>cache</code> 是干嘛的。</p>
+<ol>
+<li>
+<p><strong><code>cu_seqlens</code> (Variable Length)</strong>：</p>
+<ul>
+<li><strong>背景</strong>：通常我们把一堆句子 pad 到相同长度组成 Batch。但这很浪费。现在流行把所有句子首尾相连拼成一个超长 1D 数组。</li>
+<li><strong>作用</strong>：<code>cu_seqlens</code> 记录了每个句子的切分点。</li>
+<li><strong>代码体现</strong>：在 Kernel 里，通过 <code>bos</code> (Begin of Sequence) 和 <code>eos</code> (End of Sequence) 来确保读取 <code>prev_offset</code> 时，不会跨越句子边界。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>cache</code> (KV Cache 类似的逻辑)</strong>：</p>
+<ul>
+<li><strong>背景</strong>：在做大模型推理（生成）时，是一个字一个字生成的。</li>
+<li><strong>问题</strong>：当生成第 100 个字时，需要第 99 个字作为 $x_{t-1}$。但第 99 个字是上一次运算算过的。</li>
+<li><strong>解决</strong>：把每段的最后一个字存下来（<code>STORE_FINAL_STATE</code>），下次运算时作为初始状态（<code>USE_INITIAL_STATE</code>）传进去。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 6：反向传播 <code>token_shift_bwd</code></h3>
+<p><strong>目标</strong>：知道训练时梯度怎么传。</p>
+<p>这是为了训练用的。如果 $y = x_{t-1} - x_t$，那么 $x$ 的梯度怎么算？
+根据链式法则，$x_t$ 会影响两个地方：
+1.  当前的输出 $y_t$ (贡献了 $-1$ 倍梯度)。
+2.  下一个时刻的输出 $y_{t+1}$ (作为被减数，贡献了 $+1$ 倍梯度)。</p>
+<p>代码 <code>token_shift_bwd_kernel_short</code> 里体现了这一点：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># b_dx = -b_dy + b_dy_next</span>
+<span class="n">b_dx</span> <span class="o">=</span> <span class="o">-</span><span class="n">b_dy</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">dy</span> <span class="o">+</span> <span class="n">next_offset</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">m_d</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这就是在把梯度的影响反向拼回去。</p>
+<hr />
+<h3>✅ Task 7：封装成 PyTorch Function</h3>
+<p><strong>目标</strong>：看懂最后的 <code>class TokenShift</code>。</p>
+<p>Triton 写好的 Kernel 不能直接用，必须包装成 <code>torch.autograd.Function</code>，这样你用 <code>loss.backward()</code> 时，PyTorch 才知道去调用你写的 <code>bwd</code> kernel，而不是傻眼。</p>
+<ul>
+<li><code>forward</code>: 调用 <code>token_shift_fwd</code>，算出结果，保存必要的形状信息。</li>
+<li><code>backward</code>: 接收梯度 <code>dy</code>，调用 <code>token_shift_bwd</code>，算出输入梯度 <code>dx</code>。</li>
+</ul>
+<hr />
+<h3>总结 List</h3>
+<p>如果你要完全掌握这个文件，按这个顺序去读：</p>
+<ol>
+<li><strong>看 <code>token_shift_ref</code></strong>：确认数学公式就是 <code>Shifted - Original</code>。</li>
+<li><strong>看 <code>token_shift</code> (入口函数)</strong>：看它怎么根据输入形状决定调用 Short 还是 Long kernel。</li>
+<li><strong>看 <code>token_shift_fwd_kernel_short</code></strong>：<ul>
+<li>找到 <code>tl.load(x)</code> (当前)</li>
+<li>找到 <code>tl.load(x - 1)</code> (前一个)</li>
+<li>找到 <code>sub</code> (相减)</li>
+<li>找到 <code>tl.store(y)</code> (存结果)</li>
+</ul>
+</li>
+<li><strong>忽略 VarLen/Cache 细节</strong>：第一遍读的时候，假设 <code>IS_VARLEN=False</code>，<code>USE_INITIAL_STATE=False</code>，代码会变得很简单。</li>
+</ol>
+<p>这就把一个看起来很吓人的高性能算子文件拆解完了。本质上，它就是一个<strong>为了在 GPU 上极速运行的“错位减法”程序</strong>。</p>

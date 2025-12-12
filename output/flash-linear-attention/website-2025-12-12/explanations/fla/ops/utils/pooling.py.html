@@ -1,0 +1,131 @@
+<h1>fla/ops/utils/pooling.py</h1>
+<p>这份代码确实涉及到了比较深层的深度学习工程实现（Triton GPU 编程），看不懂是很正常的。它的核心功能是<strong>分块平均池化（Chunked Mean Pooling）</strong>。</p>
+<p>简单来说，就是把一个长序列切成很多小段（Chunk），算出每一段的平均值，然后输出变短的序列。</p>
+<p>为了让你能够循序渐进地理解，我为你列了一个 <strong>学习/阅读 Todo List</strong>，我们一步步来拆解。</p>
+<h3>📝 阅读任务清单 (Todo List)</h3>
+<ol>
+<li><strong>【概念篇】理解我们在做什么</strong>：搞懂输入是什么，输出是什么，为什么要切块。</li>
+<li><strong>【流程篇】理解数据流向</strong>：看 Python 层的入口函数，弄清数据的形状变化。</li>
+<li><strong>【核心篇】拆解前向传播 (Forward)</strong>：看 Triton 内核如何计算平均值。</li>
+<li><strong>【进阶篇】拆解反向传播 (Backward)</strong>：理解梯度是怎么算回去的。</li>
+<li><strong>【高阶篇】理解变长序列 (VarLen)</strong>：搞懂 <code>cu_seqlens</code> 是为了解决什么问题。</li>
+</ol>
+<hr />
+<h3>1. 【概念篇】理解我们在做什么</h3>
+<p><strong>任务目标</strong>：不要看代码，先看逻辑。</p>
+<p>假设你有一个形状为 <code>[Batch=1, Length=6, Head=1, Dim=1]</code> 的简单序列：
+<code>x = [1, 2, 3, 4, 5, 6]</code></p>
+<p>如果设定 <code>chunk_size = 2</code>（每2个切一块）：
+*   第一块：<code>[1, 2]</code> -&gt; 平均值 <code>1.5</code>
+*   第二块：<code>[3, 4]</code> -&gt; 平均值 <code>3.5</code>
+*   第三块：<code>[5, 6]</code> -&gt; 平均值 <code>5.5</code></p>
+<p><strong>输出结果</strong>：<code>o = [1.5, 3.5, 5.5]</code>。
+序列长度从 6 变成了 3。这个操作常用于长序列建模（如 Linear Attention），用来压缩信息。</p>
+<hr />
+<h3>2. 【流程篇】理解数据流向</h3>
+<p><strong>任务目标</strong>：看文件最底部的 <code>mean_pooling</code> 函数。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">mean_pooling</span><span class="p">(</span>
+    <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">chunk_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="o">...</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+</code></pre></div>
+
+<ul>
+<li><strong>输入 <code>x</code></strong>：形状通常是 <code>(Batch, Sequence_Len, Head, Dim)</code>。</li>
+<li><strong>参数 <code>chunk_size</code></strong>：就是上面说的切块大小（代码里常简写为 <code>BT</code>，Block Time）。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>调用 <code>MeanPoolingFunction.apply</code>。</li>
+<li>内部调用 <code>mean_pooling_fwd</code>。</li>
+<li>计算出新的序列长度 <code>NT</code> (New Time) = <code>T / chunk_size</code>。</li>
+<li>申请显存 <code>o</code>，形状变为 <code>(Batch, NT, Head, Dim)</code>。</li>
+<li>启动 GPU 内核进行计算。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>3. 【核心篇】拆解前向传播 (Forward)</h3>
+<p><strong>任务目标</strong>：看 <code>mean_pooling_fwd_kernel</code> 函数。这是最难的部分，我们只看核心逻辑。</p>
+<p>Triton 是一种类似 CUDA 的语言，用来写 GPU 并行计算的。</p>
+<p><strong>关键代码段解析：</strong></p>
+<ol>
+<li>
+<p><strong>定位 (Indexing)</strong>：
+    <code>python
+    i_d, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)</code>
+    GPU 有成千上万个线程。这里每个线程块负责处理：</p>
+<ul>
+<li><code>i_bh</code>: 某一个 Batch 和 Head。</li>
+<li><code>i_t</code>: <strong>第几个 Chunk</strong> (比如第1块，还是第2块)。</li>
+<li><code>i_d</code>: 隐藏层维度 Dim 的某一部分。</li>
+</ul>
+</li>
+<li>
+<p><strong>加载数据 (Loading)</strong>：
+    <code>python
+    # p_x 是一个指针，指向输入矩阵的某一块矩形区域
+    p_x = tl.make_block_ptr(x + ..., (T, D), ..., (i_t * BT, i_d * BD), (BT, BD), ...)
+    # 加载这块数据，形状是 [BT, BD] (即 chunk_size x dim_block)
+    b_x = tl.load(p_x, ...).to(tl.float32)</code>
+    这里 <code>b_x</code> 就是拿到了具体的数值，比如上面例子的 <code>[1, 2]</code>。</p>
+</li>
+<li>
+<p><strong>计算平均值 (Computing Mean)</strong>：
+    <code>python
+    # axis=0 表示沿着时间轴求和
+    # / min(BT, ...) 是除以块的大小（处理最后一块可能不足 BT 的情况）
+    b_o = tl.sum(b_x, axis=0) / min(BT, T - i_t * BT)</code>
+    这就是核心数学公式：<strong>Sum(Chunk) / Chunk_Size</strong>。</p>
+</li>
+<li>
+<p><strong>保存结果 (Storing)</strong>：
+    <code>python
+    tl.store(p_o, b_o...)</code>
+    把算出来的平均值写回显存。</p>
+</li>
+</ol>
+<hr />
+<h3>4. 【进阶篇】拆解反向传播 (Backward)</h3>
+<p><strong>任务目标</strong>：看 <code>mean_pooling_bwd_kernel</code>。</p>
+<p>在深度学习训练时，我们需要算梯度。
+如果前向公式是 $y = \frac{x_1 + x_2}{2}$。
+那么 $y$ 对 $x_1$ 的导数是 $\frac{1}{2}$，$y$ 对 $x_2$ 的导数也是 $\frac{1}{2}$。</p>
+<p><strong>代码逻辑：</strong>
+1.  <strong>加载输出的梯度</strong>：<code>b_do</code> (来自上一层传回来的梯度)。
+2.  <strong>计算输入的梯度</strong>：
+    <code>python
+    # 把梯度除以 Chunk 大小，然后广播给 Chunk 里的每一个元素
+    b_dx = b_do / tl.full((BT,), ... )[:, None]</code>
+    这就实现了把一个梯度值，平均分配给 Chunk 里的所有输入元素。</p>
+<hr />
+<h3>5. 【高阶篇】理解变长序列 (VarLen)</h3>
+<p><strong>任务目标</strong>：理解 <code>IS_VARLEN</code> 和 <code>cu_seqlens</code>。</p>
+<p><strong>问题背景</strong>：
+通常我们在处理 NLP 任务时，一个 Batch 里的句子长度不一样，比如：
+*   句子 A: "I love AI" (长度3)
+*   句子 B: "Hello" (长度1)
+为了凑成矩阵，通常会补 0 (Padding)。但这很浪费计算资源。</p>
+<p><strong>Fla 的解决方案 (VarLen)</strong>：
+把所有句子拼成一个超长的一维数组，不补 0。
+*   <code>x</code>: <code>["I", "love", "AI", "Hello"]</code> (总长4)
+*   <code>cu_seqlens</code> (Cumulative Sequence Lengths): <code>[0, 3, 4]</code>。
+    *   0到3是第一句。
+    *   3到4是第二句。</p>
+<p><strong>代码体现</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">IS_VARLEN</span><span class="p">:</span>
+    <span class="c1"># chunk_indices 是预先算好的索引，告诉 GPU：</span>
+    <span class="c1"># &quot;第 i_t 个 Chunk，其实属于第 i_n 个句子&quot;</span>
+    <span class="n">i_n</span><span class="p">,</span> <span class="n">i_t</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">chunk_indices</span> <span class="o">+</span> <span class="n">i_t</span> <span class="o">*</span> <span class="mi">2</span><span class="p">)</span><span class="o">...</span>
+    <span class="c1"># 获取该句子的开始(bos)和结束(eos)位置</span>
+    <span class="n">bos</span><span class="p">,</span> <span class="n">eos</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">cu_seqlens</span> <span class="o">+</span> <span class="n">i_n</span><span class="p">)</span><span class="o">...</span>
+</code></pre></div>
+
+<p>这段代码确保了在计算平均值时，<strong>不会跨越句子的边界</strong>（比如不会把句子A的最后一个词和句子B的第一个词放在一起求平均）。</p>
+<hr />
+<h3>总结</h3>
+<p>这份文件实现了一个 <strong>GPU 加速的、支持变长序列的、分块平均池化操作</strong>。</p>
+<ul>
+<li><strong>Python 部分</strong>：负责准备数据形状、计算 Grid 大小、处理 Autograd（自动求导）。</li>
+<li><strong>Triton 部分</strong>：负责最底层的并行计算，把数据块读进来，求和除以N，再写出去。</li>
+</ul>
+<p>建议你如果只是使用，只需要关注 <code>mean_pooling</code> 这个函数的接口即可；如果想学习 Triton 优化，重点看 <code>mean_pooling_fwd_kernel</code> 中的 <code>tl.make_block_ptr</code> 用法。</p>

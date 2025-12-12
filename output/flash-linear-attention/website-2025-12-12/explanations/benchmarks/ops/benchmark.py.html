@@ -1,0 +1,110 @@
+<h1>benchmarks/ops/benchmark.py</h1>
+<p>这份代码其实不是一个模型，也不是一个算法，而是一个<strong>“工具箱”</strong>。</p>
+<p>简单来说，它的作用就是<strong>拿来给深度学习的代码（算子）“掐表”和“体检”的</strong>。作者（Tri Dao，FlashAttention的作者）写这一堆函数，是为了方便地测试某个PyTorch操作到底跑得有多快、占多少显存。</p>
+<p>为了让你看懂，我给你列一个 <strong>学习任务清单 (Todo List)</strong>，我们一步一步把这个文件拆解开。</p>
+<hr />
+<h3>📚 任务清单 (Learning Task List)</h3>
+<ol>
+<li><strong>任务一：搞懂核心目的</strong> —— 为什么要写这个文件？</li>
+<li><strong>任务二：基础测试</strong> —— 怎么测“前向传播”（算结果）的速度？</li>
+<li><strong>任务三：进阶测试</strong> —— 怎么测“反向传播”（算梯度）的速度？</li>
+<li><strong>任务四：综合测试</strong> —— 怎么模拟真实训练（前向+反向）？</li>
+<li><strong>任务五：深度体检</strong> —— 怎么看GPU内部到底在忙什么（Profiler）？</li>
+<li><strong>任务六：资源体检</strong> —— 怎么测显存占用？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ 任务一：搞懂核心目的</h4>
+<p><strong>观点：</strong> 深度学习研究中，写出一个新算子（比如一个新的Attention写法）后，必须证明它比旧的快。
+<strong>代码逻辑：</strong> 这个文件封装了 <code>torch.utils.benchmark</code>。原本用 PyTorch 自带的 benchmark 写测试代码很繁琐，这个文件把繁琐的步骤（比如设置计时器、处理参数、热身）都包好了，你只需要把你的函数传进去就行。</p>
+<hr />
+<h4>✅ 任务二：基础测试 (<code>benchmark_forward</code>)</h4>
+<p><strong>目标：</strong> 测一下函数 <code>fn</code> 算出结果要多久。</p>
+<ul>
+<li><strong>步骤分解：</strong><ol>
+<li><strong>混合精度准备 (<code>amp</code>参数):</strong> 代码里有一个 <code>amp_wrapper</code>。这是为了测试在半精度（FP16/BF16）下跑得有多快，因为现在的显卡跑半精度更快。</li>
+<li><strong>设置计时器 (<code>benchmark.Timer</code>):</strong> 这是 PyTorch 的标准计时器。它会设置好线程数。</li>
+<li><strong>开始跑 (<code>t.timeit</code>):</strong> 运行指定次数（<code>repeats</code>），取平均值。</li>
+<li><strong>打印:</strong> 如果 <code>verbose=True</code>，就把耗时打印出来。</li>
+</ol>
+</li>
+</ul>
+<p><strong>简单理解：</strong> 就是按一下秒表，跑几十次你的函数，算个平均时间。</p>
+<hr />
+<h4>✅ 任务三：进阶测试 (<code>benchmark_backward</code>)</h4>
+<p><strong>目标：</strong> 测一下函数 <code>fn</code> 算出梯度（反向传播）要多久。这比前向传播麻烦，因为反向传播需要“梯度的种子”。</p>
+<ul>
+<li><strong>步骤分解：</strong><ol>
+<li><strong>先跑一次前向:</strong> <code>y = fn(*inputs)</code>。因为没有结果 <code>y</code>，就没法求导。</li>
+<li><strong>造一个梯度 (<code>grad</code>):</strong> 代码检查 <code>grad</code> 是否为空。如果为空，就随机造一个和 <code>y</code> 形状一样的张量作为梯度的初始值（<code>torch.randn_like(y)</code>）。</li>
+<li><strong>定义测试函数 <code>f</code>:</strong><ul>
+<li><strong>清零:</strong> <code>x.grad = None</code>。这是为了防止梯度累加影响测速（虽然在这里主要是为了纯粹测量计算时间）。</li>
+<li><strong>反向:</strong> <code>y.backward(grad, retain_graph=True)</code>。这句是核心，开始算梯度。<code>retain_graph=True</code> 是因为我们要重复测很多次，不能跑一次就把计算图扔了。</li>
+</ul>
+</li>
+<li><strong>计时:</strong> 把上面那个 <code>f</code> 扔进计时器跑。</li>
+</ol>
+</li>
+</ul>
+<p><strong>简单理解：</strong> 这一步模拟了训练中的“误差回传”过程，专门测算梯度要花多少时间。</p>
+<hr />
+<h4>✅ 任务四：综合测试 (<code>benchmark_combined</code> &amp; <code>benchmark_all</code>)</h4>
+<p><strong>目标：</strong> 既然训练是“前向+反向”不断循环，那就把它们绑在一起测。</p>
+<ul>
+<li><strong><code>benchmark_combined</code>:</strong><ul>
+<li>在一个函数里，先执行 <code>y = fn(...)</code> (前向)，紧接着执行 <code>y.backward(...)</code> (反向)。</li>
+<li>这最接近真实训练时的单个步骤耗时。</li>
+</ul>
+</li>
+<li><strong><code>benchmark_fwd_bwd</code>:</strong> 分别调用前向测速和反向测速，返回两个时间。</li>
+<li><strong><code>benchmark_all</code>:</strong> 贪心模式。把前向、反向、前向+反向 全都测一遍，返回三个数据。</li>
+</ul>
+<hr />
+<h4>✅ 任务五：深度体检 (<code>pytorch_profiler</code>)</h4>
+<p><strong>目标：</strong> 光知道慢没用，要知道慢在哪里。Profiler（分析器）能生成详细的报告。</p>
+<ul>
+<li><strong>步骤分解：</strong><ol>
+<li><strong>热身 (Warm up):</strong> 代码里有一个 <code>for _ in range(30)</code> 的循环。<ul>
+<li><strong>观点：</strong> GPU 是需要“热身”的。刚启动时可能有各种初始化开销、内核编译开销。为了测得准，必须先空跑几十圈。</li>
+</ul>
+</li>
+<li><strong>开启记录 (<code>torch.profiler.profile</code>):</strong> 打开一个记录仪，记录 GPU 和 CPU 的活动。</li>
+<li><strong>正式跑:</strong> 在记录仪打开期间，运行你的函数。</li>
+<li><strong>导出报告:</strong><ul>
+<li><code>prof.key_averages().table(...)</code>: 打印一个表格，告诉你哪个 CUDA 核函数（Kernel）占用的时间最长。</li>
+<li><code>prof.export_chrome_trace(...)</code>: 导出一个文件，你可以用 Chrome 浏览器打开它，看到非常酷炫的时间轴视图（就像视频剪辑软件的时间轴一样）。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<p><strong>简单理解：</strong> 这就像给代码做“核磁共振”，不仅看跑得快不快，还能看清楚每一微秒 GPU 都在干嘛。</p>
+<hr />
+<h4>✅ 任务六：资源体检 (<code>benchmark_memory</code>)</h4>
+<p><strong>目标：</strong> 测测这个操作会不会把显存撑爆。</p>
+<ul>
+<li><strong>步骤分解：</strong><ol>
+<li><strong>清空缓存:</strong> <code>torch.cuda.empty_cache()</code>，把之前的垃圾清理掉。</li>
+<li><strong>重置统计:</strong> <code>torch.cuda.reset_peak_memory_stats()</code>，把之前的“最高记录”归零。</li>
+<li><strong>运行函数:</strong> <code>fn(...)</code>。</li>
+<li><strong>读取峰值:</strong> <code>torch.cuda.max_memory_allocated()</code>。读取刚才运行过程中，显存占用最高达到了多少。</li>
+<li><strong>转换单位:</strong> 除以 <code>2^20</code> 变成 MB，或者再除以 1000 变成 GB（代码里写的逻辑是大致转为GB）。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>💡 总结 (Summary)</h3>
+<p>这个文件就是一个<strong>全能的性能测试助手</strong>。</p>
+<p>如果你在这个项目中看到这样的代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">benchmark_all</span><span class="p">(</span><span class="n">my_new_attention</span><span class="p">,</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">desc</span><span class="o">=</span><span class="s2">&quot;My Attention&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p>它的意思就是：</p>
+<blockquote>
+<p>“嘿，助手，帮我测一下 <code>my_new_attention</code> 这个函数。
+1. 测测它算结果多快。
+2. 测测它算梯度多快。
+3. 测测它整体跑一次多快。
+4. 顺便告诉我显存用了多少。”</p>
+</blockquote>
+<p>作者把这些脏活累活都写在这个 <code>benchmark.py</code> 里了，这样他在写其他算法文件时，就能很方便地证明自己的算法“遥遥领先”。</p>

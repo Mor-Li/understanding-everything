@@ -1,0 +1,74 @@
+<h1>fla/ops/rwkv6/chunk.py</h1>
+<p>这份代码确实非常硬核，它主要是在用 <strong>Triton</strong>（一种用于编写高效 GPU 内核的语言）来实现 <strong>RWKV6</strong> 模型的 <strong>Chunk（分块）模式</strong>的前向（Forward）和反向（Backward）传播。</p>
+<p>看不懂很正常，因为它混合了：
+1.  <strong>复杂的数学原理</strong>：RWKV6 的线性 Attention 机制。
+2.  <strong>工程优化</strong>：Chunk 并行化策略（把长序列切碎处理）。
+3.  <strong>底层编程</strong>：Triton 内核的手动显存管理和并行计算。</p>
+<p>为了让你读懂，我把阅读这份代码的任务拆解成一个 <strong>To-Do List</strong>，你可以按照这个顺序一步步理解核心观点。</p>
+<hr />
+<h3>任务清单：一步步拆解 RWKV6 Chunk 代码</h3>
+<h4>✅ Task 1: 搞清楚输入是什么 (术语对齐)</h4>
+<p>在看逻辑之前，先看 <code>chunk_rwkv6</code> 函数的文档字符串（docstring），搞清楚这几个变量代表什么：
+*   <strong>r (Receptance)</strong>: 相当于 Transformer 里的 <strong>Query (Q)</strong>。
+*   <strong>k (Key)</strong>: 相当于 <strong>Key (K)</strong>。
+*   <strong>v (Value)</strong>: 相当于 <strong>Value (V)</strong>。
+*   <strong>w (Decay)</strong>: 这是一个衰减项，决定了过去的记忆保留多少。在代码里经常转化为 <strong>g</strong> (cumulative decay，累积衰减)。
+*   <strong>u (Bonus)</strong>: 一个特殊的向量，用于给当前时刻的 token 加权。</p>
+<h4>✅ Task 2: 理解核心策略——“分块 (Chunking)”</h4>
+<p>RWKV 是 RNN 形式，本来只能串行（一个接一个词算）。为了加速，这份代码采用了 <strong>Chunk</strong> 策略：
+1.  把长序列（比如长度 2048）切成很多小块（比如每块长度 64，即 <code>chunk_size</code>）。
+2.  <strong>块内 (Intra)</strong>：像 Transformer 一样并行计算。
+3.  <strong>块间 (Inter)</strong>：像 RNN 一样传递隐藏状态（Hidden State, $h$）。</p>
+<h4>✅ Task 3: 追踪前向传播 (Forward Pass) 的主线</h4>
+<p>请直接定位到 <code>chunk_rwkv6_fwd</code> 这个 Python 函数（不要先看 kernel）。这是总指挥。</p>
+<p><strong>步骤 3.1：计算累积衰减 (CumSum)</strong>
+*   <strong>代码行</strong>: <code>gi, ge = chunk_rwkv6_fwd_cumsum(...)</code>
+*   <strong>解释</strong>: RWKV 的衰减是随时间累积的。这里调用了一个 Triton kernel 预先算出所有位置的累积衰减值 <code>g</code>。
+    *   <code>gi</code> (inclusive): 包含当前位置的衰减。
+    *   <code>ge</code> (exclusive): 不包含当前位置的衰减。</p>
+<p><strong>步骤 3.2：计算块间的状态 (State Passing)</strong>
+*   <strong>代码行</strong>: <code>h, ht = chunk_fwd_h(...)</code>
+*   <strong>解释</strong>: 这是计算“记忆”的部分。它计算每个 Chunk 结束时，传递给下一个 Chunk 的隐藏状态 $h$。这保证了模型能记得住很久以前的信息。</p>
+<p><strong>步骤 3.3：计算块内的注意力 (Intra-Chunk Attention)</strong>
+*   <strong>代码行</strong>: <code>A = chunk_rwkv6_fwd_intra(...)</code>
+*   <strong>解释</strong>: 在每个 64 长度的小块内部，计算 $Q$ 和 $K$ 的交互。
+    *   这里涉及到了 <code>u</code> 参数，处理当前时刻的特殊权重。
+    *   这一步生成了一个中间变量 <code>A</code>，保存了块内的注意力分数。</p>
+<p><strong>步骤 3.4：计算最终输出 (Output)</strong>
+*   <strong>代码行</strong>: <code>o = chunk_gla_fwd_o_gk(...)</code>
+*   <strong>解释</strong>: 最终输出 $O = \text{块内贡献} + \text{历史记忆贡献}$。
+    *   它把刚才算的 <code>A</code>（块内）和 <code>h</code>（历史记忆）结合起来，乘以 $V$，得到最终输出。</p>
+<h4>✅ Task 4: 理解 Triton Kernel 的作用 (不要深究细节)</h4>
+<p>文件里那些以 <code>@triton.jit</code> 开头的函数（如 <code>chunk_rwkv6_fwd_A_kernel...</code>），是具体的<strong>GPU 搬砖工</strong>。</p>
+<p>你只需要看懂它们的名字就能猜出它们在干嘛：
+*   <code>chunk_rwkv6_fwd_cumsum_kernel</code>: 在 GPU 上并行算累加和。
+*   <code>chunk_rwkv6_fwd_A_kernel_intra...</code>:
+    *   <code>intra</code>: 块内。
+    *   <code>sub</code>: 把块切得更细（为了利用显卡的 Tensor Core）。
+    *   这个 Kernel 负责极其暴力的矩阵乘法运算：$Q \times K^T \times \text{Decay}$。</p>
+<p><strong>核心难点逻辑（如果你非要看 Kernel 代码）：</strong>
+Triton 代码里充满了 <code>tl.load</code> (读取数据), <code>tl.dot</code> (矩阵乘法), <code>tl.store</code> (存回数据)。
+其中最关键的数学逻辑是：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 exp(b_g - b_gk) 就是 RWKV 的时间衰减机制</span>
+<span class="n">b_A</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span> <span class="o">*</span> <span class="n">exp</span><span class="p">(</span><span class="o">...</span><span class="p">),</span> <span class="n">b_k</span> <span class="o">*</span> <span class="n">exp</span><span class="p">(</span><span class="o">...</span><span class="p">))</span>
+</code></pre></div>
+
+<p>它在做矩阵乘法的同时，把时间衰减项乘进去了。</p>
+<h4>✅ Task 5: 反向传播 (Backward Pass) - 扫一眼即可</h4>
+<p>函数 <code>chunk_rwkv6_bwd</code> 及其相关的 Kernel（如 <code>chunk_rwkv6_bwd_kernel_dh</code>）。
+*   <strong>观点</strong>: 深度学习训练需要算梯度。
+*   <strong>逻辑</strong>: 前向传播怎么算过来的，反向传播就得怎么推回去。
+    *   前向是：输入 -&gt; 状态 -&gt; 输出。
+    *   反向是：输出的梯度 (<code>do</code>) -&gt; 状态的梯度 (<code>dh</code>) -&gt; 权重的梯度 (<code>dq</code>, <code>dk</code>, <code>dv</code>)。
+*   这部分代码比前向更复杂，因为要处理梯度的链式法则，通常只需要知道它输出了 <code>dq, dk, dv</code> 即可。</p>
+<hr />
+<h3>总结：这段代码在讲什么故事？</h3>
+<p>如果把 RWKV6 想象成阅读一本书：</p>
+<ol>
+<li><strong>Chunking (分块)</strong>: 我们不逐字阅读，而是每次读一页（比如 64 个字）。</li>
+<li><strong>CumSum (累积衰减)</strong>: 我们预先标记好每一句话相对于后面的话有多重要（越久远的通常越不重要，除非有特殊标记）。</li>
+<li><strong>State (状态 h)</strong>: 读完第 1 页，脑子里留个印象（$h_1$），带着这个印象去读第 2 页。</li>
+<li><strong>Intra (块内 A)</strong>: 在第 2 页内部，第 1 行的字会影响第 10 行的理解（局部注意力）。</li>
+<li><strong>Output (输出)</strong>: 这一页的理解 = 脑子里对上一页的印象 + 这一页内部的逻辑推导。</li>
+</ol>
+<p>这个文件 <code>chunk.py</code> 就是用最极致的 GPU 编程技巧，把上述过程并行化实现了。</p>

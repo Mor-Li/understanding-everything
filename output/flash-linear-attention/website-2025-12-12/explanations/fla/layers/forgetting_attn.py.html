@@ -1,0 +1,84 @@
+<h1>fla/layers/forgetting_attn.py</h1>
+<p>这份代码实现了一个名为 <strong><code>ForgettingAttention</code></strong> 的层。</p>
+<p>简单来说，这是一个<strong>线性注意力（Linear Attention）</strong>或者说<strong>RNN</strong>的变体。它和标准的 Transformer Attention（Softmax Attention）最大的区别在于：它引入了一个 <strong>“遗忘门”（Forget Gate, 变量名 <code>f</code>）</strong>，用来控制模型需要“记住”多少之前的历史信息，从而实现更高效的计算（线性的复杂度）。</p>
+<p>为了让你看懂，我把这个代码的执行逻辑拆解成一个 <strong>5步走的 To-Do List</strong>。假设你是计算机，拿到输入数据 <code>hidden_states</code> 后，你需要按顺序完成以下任务：</p>
+<hr />
+<h3>Task 1: 准备原料 (生成 Q, K, V 和 F)</h3>
+<p>这是最基础的一步。你需要把输入的向量转化成注意力机制需要的组件。</p>
+<ul>
+<li><strong>代码位置:</strong> <code>__init__</code> 定义层，<code>forward</code> 前几行执行。</li>
+<li><strong>动作:</strong><ol>
+<li><strong>Q, K, V:</strong> 用全连接层 (<code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>) 算出 Query, Key, Value。这和普通 Transformer 一样。</li>
+<li><strong>F (重点):</strong> 用 <code>f_proj</code> 算出一个 <strong>“遗忘值”</strong>。<ul>
+<li>代码：<code>f = F.logsigmoid(self.f_proj(hidden_states).float())</code></li>
+<li><strong>解读:</strong> <code>f</code> 代表 <strong>Forget（遗忘/衰减）</strong>。这里的 <code>logsigmoid</code> 意味着原本的值是在 (0, 1) 之间的一个衰减系数。比如 <code>f</code> 很大，说明保留记忆；<code>f</code> 很小，说明遗忘之前的上下文。</li>
+</ul>
+</li>
+<li><strong>Norm:</strong> 如果开了 <code>qk_norm</code>，就给 Q 和 K 做个归一化，防止数值爆炸。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 2: 检查历史 (处理 KV Cache)</h3>
+<p>这一步是为了区分“训练模式”和“推理模式（生成文本）”。</p>
+<ul>
+<li><strong>代码位置:</strong> <code>if past_key_values is not None:</code></li>
+<li><strong>动作:</strong><ul>
+<li><strong>如果是推理 (Inference):</strong> 你不需要每次都重算以前的 token。你需要从 <code>past_key_values</code> (缓存) 里读取之前的状态，并把当前这一步算出来的 K, V, F 更新进去。</li>
+<li><strong>如果是训练 (Training):</strong> 不需要缓存，直接处理整个序列。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 数据整形 (Reshape &amp; Layout)</h3>
+<p>为了让后面的数学运算（CUDA加速核）能跑起来，需要把数据的形状调整好。</p>
+<ul>
+<li><strong>代码位置:</strong> <code>rearrange</code> 相关代码。</li>
+<li><strong>动作:</strong><ul>
+<li>把数据从 <code>[batch, length, hidden]</code> 变成 <code>[batch, length, heads, head_dim]</code>。也就是把所有的头（Heads）拆分开，因为每个头是独立计算注意力的。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 核心烹饪 (执行 Forgetting Attention)</h3>
+<p>这是整个文件最核心的“黑盒”部分。根据输入数据的不同，选择不同的计算方式。</p>
+<ul>
+<li><strong>代码位置:</strong> <code>parallel_forgetting_attn</code> 或 <code>attn_decoding_one_step</code>。</li>
+<li>
+<p><strong>动作:</strong></p>
+<ul>
+<li><strong>情况 A：并行计算 (Parallel - 训练时):</strong><ul>
+<li>调用 <code>parallel_forgetting_attn(q, k, v, f, ...)</code>。</li>
+<li><strong>原理:</strong> 这里不是算 $QK^T$ 的矩阵乘法。而是利用 <strong><code>f</code> (遗忘门)</strong> 进行一种类似“前缀和”或“RNN 扫描”的计算。</li>
+<li>公式逻辑大约是：$Output_t = Q_t \cdot State_t$，而 $State_t = State_{t-1} \cdot F_t + K_t^T V_t$。</li>
+<li><strong>意思就是：</strong> 当前的状态 = (之前的状态 $\times$ 衰减系数 F) + (当前新的记忆 KV)。</li>
+</ul>
+</li>
+<li>
+<p><strong>情况 B：逐步解码 (Decoding - 生成时):</strong></p>
+<ul>
+<li>调用 <code>attn_decoding_one_step</code>。</li>
+<li>这是上面逻辑的单步版本，只算当前这一个 token。</li>
+</ul>
+</li>
+<li>
+<p><em>注：代码中还包含了一大段关于 <code>unpad_input</code> 的逻辑，那是为了去除 padding 使得计算更高效，属于工程优化，不影响核心算法逻辑。</em></p>
+</li>
+</ul>
+</li>
+</ul>
+<h3>Task 5: 摆盘上桌 (输出投影)</h3>
+<p>算出注意力结果 <code>o</code> 之后，最后处理一下输出。</p>
+<ul>
+<li><strong>代码位置:</strong> <code>forward</code> 的最后几行。</li>
+<li><strong>动作:</strong><ol>
+<li><strong>Reshape:</strong> 把拆开的头（Heads）拼回去。</li>
+<li><strong>Output Gate (可选):</strong> 如果 <code>use_output_gate</code> 为真，会再算一个门控信号 <code>g</code>，把输出缩放一下。这通常是为了增强模型的表达能力。</li>
+<li><strong>Output Projection:</strong> 最后过一个 <code>o_proj</code> 线性层，把维度对齐，输出最终结果。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这到底是个啥？</h3>
+<p>把这个 List 串起来，<strong><code>ForgettingAttention</code></strong> 实际上是一个 <strong>带有“记忆衰减开关”的注意力层</strong>。</p>
+<ul>
+<li><strong>普通 Attention:</strong> 能够无损地看清过去所有的 token（显存占用大，推理慢）。</li>
+<li><strong>Forgetting Attention:</strong> 给过去的记忆加了一个 <code>f</code> (forget) 参数。模型可以自己学习在什么位置该“遗忘”之前的信息（比如句号后面，或者话题转换时）。这使得它可以用类似 RNN 的方式（线性复杂度）高效地处理超长文本。</li>
+</ul>

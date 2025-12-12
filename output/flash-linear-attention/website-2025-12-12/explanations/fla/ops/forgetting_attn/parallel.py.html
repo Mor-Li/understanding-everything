@@ -1,0 +1,96 @@
+<h1>fla/ops/forgetting_attn/parallel.py</h1>
+<p>这段代码虽然看起来很短，但它其实是深度学习（特别是<strong>线性注意力机制 Linear Attention</strong> 或者 <strong>类似 RNN 的现代大模型</strong>，比如 RWKV、RetNet、Mamba 等变体）中非常核心的一个组件接口。</p>
+<p>它实现的是一种<strong>“带有遗忘机制的并行注意力计算”</strong>。</p>
+<p>为了让你彻底理解，我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>，我们将分 4 步来拆解这段代码背后的逻辑。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1：理解“原材料”</strong> —— 搞懂 Q, K, V 是什么（复习基础）。</li>
+<li><strong>Task 2：理解“遗忘” ($g$)</strong> —— 这是这段代码的灵魂，什么是 Log Decay？</li>
+<li><strong>Task 3：理解“并行” (Parallel)</strong> —— 为什么要强调 Parallel？它解决了什么痛点？</li>
+<li><strong>Task 4：代码走读</strong> —— 逐行看懂这个函数到底在做什么（其实它是个“包工头”）。</li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>✅ Task 1：理解“原材料” (Q, K, V)</h4>
+<p>在所有的注意力机制（Attention）中，我们都有三个核心输入：
+*   <strong>Q (Query)</strong>: 查询向量（我想找什么？）
+*   <strong>K (Key)</strong>: 键向量（内容对应的标签是什么？）
+*   <strong>V (Value)</strong>: 值向量（实际的内容是什么？）</p>
+<p><strong>代码中的体现：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># q: [B, T, HQ, K] -&gt; [Batch, Time(序列长度), Heads(多头), Key_Dim]</span>
+<span class="c1"># k: [B, T, H, K]</span>
+<span class="c1"># v: [B, T, H, V]</span>
+</code></pre></div>
+
+<p>这部分和标准的 Transformer 是一样的。你只需要知道，模型在根据 Q 和 K 的相似度，去提取 V 中的信息。</p>
+<h4>✅ Task 2：理解“遗忘” ($g$) —— 核心观点</h4>
+<p>这是这段代码名字叫 <code>forgetting_attn</code> 的原因。</p>
+<p>在标准的 Transformer 中，注意力是<strong>全关注</strong>的（Global Attention），前面的所有词都会被同等对待，没有“遗忘”。
+但在 <strong>RNN（循环神经网络）</strong> 或者 <strong>线性注意力</strong> 中，我们希望模拟人类的记忆：<strong>太久远的信息，应该逐渐淡忘</strong>。</p>
+<ul>
+<li><strong>输入 $g$ (Gate/Decay)</strong>:
+    代码注释写着：<code>Log decay at each time step (in log space)</code>。
+    $g$ 代表了一个“衰减系数”。因为它是在 <strong>对数空间 (log space)</strong> 的，所以实际的衰减值是 $e^g$。<ul>
+<li>如果 $g$ 是一个负数，那么 $e^g &lt; 1$，信息就会随着时间步 $T$ 的推移不断变小（被遗忘）。</li>
+<li>如果 $g$ 接近 0，信息就会被保留。</li>
+</ul>
+</li>
+</ul>
+<p><strong>直观理解：</strong>
+想象你在读一本书。$Q, K, V$ 是书的内容。而 $g$ 决定了你看完一页后，上一页的内容在脑子里<strong>保留多少</strong>。$g$ 让模型具备了“边走边忘”的能力，专注于局部或重要的信息，这通常能让推理速度更快（可以写成 RNN 形式）。</p>
+<h4>✅ Task 3：理解“并行” (Parallel)</h4>
+<p>代码文件名叫 <code>parallel.py</code>，函数名也有 <code>parallel</code>。这是为了解决 RNN 的痛点。</p>
+<ul>
+<li><strong>RNN 的痛点（串行）</strong>：必须先算出第 1 步，才能算第 2 步，再算第 3 步……训练时无法利用 GPU 的并行能力，非常慢。</li>
+<li><strong>Transformer 的优点（并行）</strong>：所有时间步 $T$ 可以一次性算完。</li>
+</ul>
+<p><strong>这个函数的观点：</strong>
+虽然我在逻辑上是一个带有“遗忘”的 RNN（或者是线性 Attention），但在<strong>训练阶段</strong>，我可以通过数学技巧（通常是 Prefix Sum 或者是特定的 CUDA Kernel），像 Transformer 一样<strong>并行地</strong>一次性把所有结果算出来。</p>
+<p>所以，这个函数是用于<strong>训练阶段</strong>的高效计算接口。</p>
+<h4>✅ Task 4：代码走读 (它其实是个“包工头”)</h4>
+<p>现在我们再看代码，你会发现这个函数其实主要是在做<strong>参数检查</strong>和<strong>预处理</strong>，真正的脏活累活是交给 <code>parallel_attn</code> 做的。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">parallel_forgetting_attn</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 1. 设置缩放比例 (Scale)</span>
+    <span class="c1"># 如果没传 scale，就用经典的 1/sqrt(K) 公式。</span>
+    <span class="c1"># 这是为了防止点积结果过大导致梯度消失/爆炸。</span>
+    <span class="k">if</span> <span class="n">scale</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">scale</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span>
+
+    <span class="c1"># 2. 检查 cu_seqlens (用于处理变长序列)</span>
+    <span class="c1"># 这是一个高级优化。如果把很多短句子拼成一个长句子训练，</span>
+    <span class="c1"># 需要 cu_seqlens 告诉程序哪里是句子的切分点。</span>
+    <span class="c1"># 这里限制：如果用了这个功能，Batch Size 必须为 1。</span>
+    <span class="k">if</span> <span class="n">cu_seqlens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">assert</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span><span class="p">,</span> <span class="s2">&quot;batch size must be 1...&quot;</span>
+
+    <span class="c1"># 3. 检查数据格式 (Head First)</span>
+    <span class="c1"># 以前的代码可能喜欢用 [Batch, Head, Time] 的格式，</span>
+    <span class="c1"># 现在作者强烈建议用 [Batch, Time, Head] 的格式。</span>
+    <span class="c1"># 这里主要是为了抛出警告，防止你传错形状。</span>
+    <span class="k">if</span> <span class="n">head_first</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">DeprecationWarning</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+
+    <span class="c1"># 这里是个很贴心的检查：</span>
+    <span class="c1"># 如果你没开 head_first，但是第1维比第2维小（通常序列长度 T 会大于头数 H），</span>
+    <span class="c1"># 它猜你可能传反了，给你一个 Warning。</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">head_first</span> <span class="ow">and</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">&lt;</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]:</span>
+        <span class="n">warnings</span><span class="o">.</span><span class="n">warn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 4. 【关键一步】调用底层算子</span>
+    <span class="c1"># 这才是真正干活的地方。</span>
+    <span class="c1"># 它把处理好的 q, k, v, g (遗忘门), scale 等传给 parallel_attn。</span>
+    <span class="c1"># parallel_attn 是一个用 CUDA 或者是 Triton 写的高性能算子。</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="n">parallel_attn</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">g</span><span class="p">,</span> <span class="n">scale</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">o</span>
+</code></pre></div>
+
+<h3>📝 总结</h3>
+<p>这段代码主要讲了以下几个观点：</p>
+<ol>
+<li><strong>功能</strong>：它实现了一个<strong>带有衰减（遗忘）机制</strong>的注意力计算。</li>
+<li><strong>效率</strong>：它采用<strong>并行（Parallel）</strong>模式进行计算，专为 GPU 训练加速设计（而不是像 RNN 那样一步步推）。</li>
+<li><strong>实现方式</strong>：它是一个<strong>Wrapper（包装器）</strong>。它负责处理默认参数、检查输入形状是否合法，然后把数据喂给底层的 <code>parallel_attn</code> 核心算子来执行实际的数学运算。</li>
+</ol>
+<p><strong>简单说：</strong> 这是一个为了让线性 Attention 模型（如 GLA, RWKV 等）在训练时能像 Transformer 一样快而写的 Python 接口。</p>

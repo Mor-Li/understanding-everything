@@ -1,0 +1,101 @@
+<h1>fla/layers/linear_attn.py</h1>
+<p>这份代码实现了一个 <strong>Linear Attention（线性注意力机制）</strong> 的层。</p>
+<p>简单来说，标准的 Transformer 注意力机制（Softmax Attention）计算速度随着序列长度变长会变得非常慢（$O(N^2)$），而 Linear Attention 通过数学技巧将这个复杂度降低到了线性级别（$O(N)$），让模型能处理非常长的文本。</p>
+<p>为了让你听懂，我把这个代码的执行逻辑拆解成一个 <strong>“流水线任务清单” (Task List)</strong>。我们把数据想象成流水线上的产品，一步步加工。</p>
+<hr />
+<h3>任务清单：Linear Attention 的流水线</h3>
+<h4>✅ Task 1: 准备原材料与工具 (Initialization / <code>__init__</code>)</h4>
+<p><strong>目标</strong>：在模型开始运行前，定义好所有的尺寸、形状和需要的工具。</p>
+<ul>
+<li><strong>设定尺寸</strong>：<ul>
+<li>代码定义了 <code>hidden_size</code>（隐藏层大小）、<code>num_heads</code>（头数）。</li>
+<li><strong>关键点</strong>：它支持 <strong>GQA/MQA</strong>（Grouped Query Attention）。也就是 <code>num_kv_heads</code> 可以比 <code>num_heads</code> 小。这意味着 Q（Query）有很多头，但 K（Key）和 V（Value）共用一些头，以此节省显存。</li>
+</ul>
+</li>
+<li><strong>选择“魔法药水” (Feature Map)</strong>：<ul>
+<li>线性注意力的核心在于不用 Softmax，而是用一个特征映射函数 $\phi(x)$。</li>
+<li>代码里的 <code>feature_map</code> 参数就是选药水：可以是 <code>hedgehog</code>、<code>elu</code>、<code>relu</code> 或者简单的 <code>identity</code>（啥也不做）。</li>
+<li>它初始化了 <code>self.feature_map_q</code> 和 <code>self.feature_map_k</code>。</li>
+</ul>
+</li>
+<li><strong>准备加工机器 (Projections)</strong>：<ul>
+<li>准备了三个线性层 <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code> 用来生成 Q, K, V。</li>
+<li>准备了 <code>o_proj</code> 用来输出。</li>
+<li>准备了 <code>norm</code> (RMSNorm) 用来最后做标准化。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 原料切割与分发 (Forward - Projections &amp; Reshape)</h4>
+<p><strong>目标</strong>：拿到输入数据 <code>hidden_states</code>，把它变成 Q, K, V，并按“多头”切分好。</p>
+<ul>
+<li><strong>投影</strong>：<ul>
+<li><code>q = self.q_proj(hidden_states)</code></li>
+<li><code>k = self.k_proj(hidden_states)</code></li>
+<li><code>v = self.v_proj(hidden_states)</code></li>
+</ul>
+</li>
+<li><strong>切头 (Reshape)</strong>：<ul>
+<li>把数据形状从 <code>[Batch, Length, Dim]</code> 变成 <code>[Batch, Length, Heads, Head_Dim]</code>。</li>
+</ul>
+</li>
+<li><strong>复制数据 (Handle GQA)</strong>：<ul>
+<li>如果 K 和 V 的头数少于 Q（即 <code>self.num_kv_groups &gt; 1</code>），代码用了 <code>repeat</code> 函数。</li>
+<li>这就像是：Q 有 8 个人要吃饭，但只有 2 份饭 (K/V)，那就把这 2 份饭复制一下，让每 4 个 Q 对应 1 份 K/V。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 施加核心魔法 (Forward - Feature Map)</h4>
+<p><strong>目标</strong>：这是线性注意力最关键的一步。在标准 Transformer 里这里是计算 $Q \times K^T$ 然后 Softmax；在这里，我们直接对 Q 和 K 进行变换。</p>
+<ul>
+<li><strong>应用函数</strong>：<ul>
+<li><code>q = self.feature_map_q(q)</code></li>
+<li><code>k = self.feature_map_k(k)</code></li>
+<li>比如选了 <code>relu</code>，这里就是把负数变成 0。这一步是为了保证注意力计算的数值稳定性或模拟 Softmax 的非负特性。</li>
+</ul>
+</li>
+<li><strong>归一化 (Optional)</strong>：<ul>
+<li>代码中 <code>if self.norm_q:</code> 部分。有些变体要求对 Q 或 K 再除以它们的和，防止数值爆炸。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 启动加速引擎 (Forward - Attention Ops)</h4>
+<p><strong>目标</strong>：进行真正的注意力计算。</p>
+<ul>
+<li><strong>选择模式</strong>：代码支持三种模式 (<code>mode</code>)：<ol>
+<li><code>chunk</code>: 分块计算，速度快，省显存。</li>
+<li><code>fused_chunk</code>: 融合分块，通过写 CUDA 算子极致优化速度。</li>
+<li><code>fused_recurrent</code>: 像 RNN 一样一步步算，推理时极快（恒定显存）。</li>
+</ol>
+</li>
+<li><strong>执行计算</strong>：<ul>
+<li><code>o, final_state = chunk_linear_attn(q, k, v, ...)</code></li>
+<li>这里调用了 <code>fla.ops</code> 里的底层算子。</li>
+<li><strong>这一步的数学本质</strong>：标准 Attention 是 $\text{Softmax}(QK^T)V$。线性 Attention 是 $Q(K^TV)$。通过先算 $K^TV$，计算量就和序列长度 $N$ 呈线性关系了。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 质检与打包出厂 (Forward - Output)</h4>
+<p><strong>目标</strong>：把算好的结果整理好，恢复成原来的形状输出。</p>
+<ul>
+<li><strong>层归一化</strong>：<ul>
+<li><code>o = self.norm(o)</code>：用 RMSNorm 让数据分布更稳定。注意这里是在 Attention 输出后立刻做的，这在 Linear Attention 中很常见（为了稳定）。</li>
+</ul>
+</li>
+<li><strong>合并头</strong>：<ul>
+<li><code>rearrange(o, '... h d -&gt; ... (h d)')</code>：把分开的“多头”重新拼回一个大的向量。</li>
+</ul>
+</li>
+<li><strong>最终投影</strong>：<ul>
+<li><code>o = self.o_proj(o)</code>：最后经过一个线性层，输出最终结果。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>这段代码定义了一个<strong>通用的线性注意力层</strong>。</p>
+<ol>
+<li>它<strong>不使用</strong>传统的 $N^2$ 复杂度的 Attention。</li>
+<li>它<strong>使用</strong>特征映射（Feature Map）+ 高效算子（Chunk/Recurrent）来实现 $N$ 复杂度的 Attention。</li>
+<li>它封装得很灵活，支持 GQA（分组查询），支持多种特征映射方法（ReLU, Hedgehog 等），也支持多种后端计算实现（Chunk, Fused）。</li>
+</ol>
+<p><strong>一句话概括</strong>：这是一个为了让 Transformer 处理超长文本而设计的“加速版”注意力层模块。</p>

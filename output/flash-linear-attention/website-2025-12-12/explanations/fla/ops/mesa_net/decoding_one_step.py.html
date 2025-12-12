@@ -1,0 +1,62 @@
+<h1>fla/ops/mesa_net/decoding_one_step.py</h1>
+<p>这份代码确实比较硬核，因为它结合了<strong>Triton（高性能GPU编程）</strong>、<strong>线性Attention（Linear Attention）</strong> 以及 <strong>共轭梯度法（Conjugate Gradient, CG）</strong>。</p>
+<p>简单来说，这是 <strong>Mesa-Layer</strong> 模型在推理（Inference/Decoding）阶段的核心算子。Mesa 是一种改进的 Transformer/RNN 架构，它不像标准 Transformer 那样直接算 $QK^T$，而是试图通过求解一个线性方程来“隐式”地计算注意力。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“任务清单 (Todo List)”</strong>。我们假装你是这个核函数的执行者，你需要按顺序完成以下 5 个任务。</p>
+<hr />
+<h3>任务清单：Mesa Net 单步解码 (Decoding One Step)</h3>
+<h4>Task 1: 理解背景与输入 (准备工作)</h4>
+<p><strong>目标</strong>：搞清楚我们手里有什么，要做什么。
+*   <strong>背景</strong>：这是一个“单步”解码。意味着我们有一个“之前的记忆”（Hidden State），现在来了一个新的 Token（当前的 $q, k, v$），我们需要算出这个 Token 的输出 $o$，并更新记忆。
+*   <strong>输入变量</strong>：
+    *   <code>q, k, v</code>: 当前时刻的查询、键、值向量。
+    *   <code>g</code>: Gate（遗忘门），决定我们要保留多少之前的记忆。
+    *   <code>prev_h_kk</code>, <code>prev_h_kv</code>: <strong>这是核心记忆</strong>。
+        *   <code>h_kv</code>: 类似于标准 Linear Attention 的记忆，存储了 $K$ 和 $V$ 的关系。
+        *   <code>h_kk</code>: 存储了 $K$ 和 $K$ 自身的关系（协方差矩阵），这是 Mesa 特有的。</p>
+<h4>Task 2: 更新记忆 (State Update)</h4>
+<p><strong>代码位置</strong>：<code>b_h_kk = ...</code> 到 <code>tl.store(p_hkv_curr, ...)</code>
+<strong>逻辑</strong>：
+1.  <strong>遗忘旧的</strong>：读取上一时刻的记忆 <code>prev_h</code>，乘以衰减系数 <code>g</code>（代码中的 <code>b_g</code>）。
+    *   <em>潜台词：“旧知识随着时间流逝变淡了”。</em>
+2.  <strong>写入新的</strong>：把当前时刻的 $k$ 信息写进去。
+    *   更新 <code>h_kk</code>：加上 $k \times k^T$ (代码：<code>b_k[:, None] * b_k[None, :]</code>)。
+    *   更新 <code>h_kv</code>：加上 $k \times v^T$。
+3.  <strong>保存</strong>：把更新后的结果存入 <code>curr_h_kk</code> 和 <code>curr_h_kv</code>，供下一步使用。</p>
+<h4>Task 3: 准备解方程 (The Setup)</h4>
+<p><strong>代码位置</strong>：<code>b_h_kk_diag = ...</code> 到 <code>delta_old = ...</code>
+<strong>核心思想</strong>：
+Mesa 的核心观点是：<strong>输出不仅仅是 Query 查询 Memory，而是要解一个线性方程</strong>。
+方程形式为：
+$$ (H_{kk} + \lambda I) \cdot x = q $$
+我们要解出这个 $x$。
+*   <strong>为什么要解这个？</strong> 这是一个正则化的最小二乘问题。解出 $x$ 后，用 $x$ 去查询 $H_{kv}$ 能得到更精准的输出。
+*   <strong>初始化猜测</strong>：我们先猜 $x$ 的初始值。代码里用了一个对角线近似的方法 <code>b_x = b_q / (b_h_kk_diag + ...)</code> 作为起点。
+*   <strong>计算残差 (Residual)</strong>：算出当前猜测的误差 <code>b_r = q - Ax</code>。</p>
+<h4>Task 4: 共轭梯度法迭代 (The CG Loop)</h4>
+<p><strong>代码位置</strong>：<code>for i_iter in range(MAX_CG_STEP): ...</code>
+<strong>逻辑</strong>：
+直接求矩阵逆太慢了，我们用<strong>共轭梯度法 (Conjugate Gradient)</strong> 迭代几次来逼近 $x$。
+这是一段标准的 CG 算法实现：
+1.  <strong>计算方向</strong>：看误差往哪个方向下降最快 (<code>b_Ap</code>, <code>alpha</code>)。
+2.  <strong>更新 x</strong>：把 $x$ 往正确方向挪一步 (<code>b_x = b_x + alpha * b_p</code>)。
+3.  <strong>更新误差</strong>：计算新的误差 (<code>b_r</code>)。
+4.  <strong>循环</strong>：如果误差够小或者达到最大步数 (<code>MAX_CG_STEP</code>)，就停下。</p>
+<p><em>这一步是整个代码最难懂的地方，你只需要知道它是一个</em><em>数学求解器</em><em>，目的是为了找到最完美的 $x$，使得 $(H_{kk} + \lambda)x \approx q$。</em></p>
+<h4>Task 5: 生成输出 (Output Generation)</h4>
+<p><strong>代码位置</strong>：倒数几行 <code>b_o = tl.sum(b_h_kv * b_x[:, None], axis=0)</code>
+<strong>逻辑</strong>：
+现在我们终于拿到了解出来的 $x$（它代表了修正后的 Query）。
+最后一步很简单：
+$$ Output = x^T \cdot H_{kv} $$
+用修正后的 Query 去查询 $K-V$ 的记忆矩阵，得到最终输出 $o$。</p>
+<hr />
+<h3>总结：这段代码到底干了啥？</h3>
+<p>如果把 Transformer 比作查字典：
+1.  <strong>标准 Attention</strong>：拿着 $q$ 直接去查所有的 $k$，看谁相似度高就取谁的 $v$。
+2.  <strong>Linear Attention (RNN模式)</strong>：把所有见过的 $k, v$ 压缩成一个大矩阵 $H$。拿着 $q$ 乘一下 $H$ 就完事了。
+3.  <strong>Mesa (这段代码)</strong>：
+    *   先把所有见过的 $k$ 压缩成矩阵 $H_{kk}$，把 $k, v$ 压缩成 $H_{kv}$。
+    *   来了个 $q$，它觉得直接乘 $H_{kv}$ 不够准。
+    *   它先问自己：“什么样的向量 $x$ 乘以我的 $H_{kk}$ 能还原出 $q$？”（这就是那个 CG 循环解方程的过程）。
+    *   找到这个“逆向”的 $x$ 后，再用 $x$ 去乘 $H_{kv}$ 得到结果。</p>
+<p><strong>一句话概括</strong>：这是一个带有<strong>记忆衰减</strong>机制，并且在每一步都通过<strong>迭代解方程</strong>来优化查询向量的<strong>RNN式</strong>推理算子。</p>

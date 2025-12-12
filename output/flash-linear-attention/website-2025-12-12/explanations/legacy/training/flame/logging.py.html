@@ -1,0 +1,149 @@
+<h1>legacy/training/flame/logging.py</h1>
+<p>没问题，这段代码确实涉及到了<strong>分布式训练</strong>、<strong>HuggingFace Transformers 框架</strong>以及<strong>日志管理</strong>，如果对这些背景不熟悉，看代码会觉得很乱。</p>
+<p>简单来说，这个文件的作用就是<strong>给训练过程做一个“私人定制”的记录员</strong>。它不满足于系统默认的打印方式，而是想把训练的进度、Loss（误差）、速度等信息，按照特定的格式写到一个文件里（<code>trainer_log.jsonl</code>），方便后续画图或者监控。</p>
+<p>为了让你听懂，我把这个文件的功能拆解成一个 <strong>“训练记录员的待办清单 (Todo List)”</strong>，我们一步步来看它是怎么完成这些任务的。</p>
+<hr />
+<h3>📋 训练记录员的 Todo List</h3>
+<ol>
+<li><strong>准备工具（Setup）</strong>：设置好喇叭（Logger），决定只有组长（主进程）能说话，避免太吵。</li>
+<li><strong>入职报到（Init）</strong>：带上秒表，准备开始计时。</li>
+<li><strong>开工仪式（On Train Begin）</strong>：<ul>
+<li>如果是从头开始，就把秒表归零，撕掉旧的日志本。</li>
+<li>如果是“断点续传”（接着上次练），就把秒表调回到上次的时间。</li>
+</ul>
+</li>
+<li><strong>日常记录（On Log）</strong>：每隔一段时间（比如每10步）：<ul>
+<li>看一眼秒表，算算过了多久。</li>
+<li>算算处理数据的速度（Throughput）。</li>
+<li>把关键信息（进度、Loss、学习率）写进 <code>trainer_log.jsonl</code> 文件。</li>
+</ul>
+</li>
+<li><strong>保存记忆（State）</strong>：如果训练暂停，要把秒表的时间记下来，下次接着用。</li>
+</ol>
+<hr />
+<h3>逐步讲解（中文大白话版）</h3>
+<h4>1. 准备工具：设置喇叭 (<code>get_logger</code>)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">get_logger</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">logging</span><span class="o">.</span><span class="n">Logger</span><span class="p">:</span>
+    <span class="c1"># ... (省略中间格式设置)</span>
+    <span class="k">if</span> <span class="s1">&#39;RANK&#39;</span> <span class="ow">in</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span> <span class="ow">and</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;RANK&#39;</span><span class="p">])</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">setLevel</span><span class="p">(</span><span class="n">logging</span><span class="o">.</span><span class="n">INFO</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">addHandler</span><span class="p">(</span><span class="n">handler</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">logger</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：在大规模AI训练中，通常会有很多张显卡（GPU）一起工作。如果每张卡都往屏幕上打印日志，屏幕就爆炸了。</li>
+<li><strong>代码逻辑</strong>：这里检查 <code>RANK</code>（显卡的编号）。只有编号为 <code>0</code> 的显卡（组长）才有资格打印日志（<code>logger.addHandler</code>），其他的显卡都闭嘴。</li>
+</ul>
+<h4>2. 定义记录员：插件机制 (<code>class LogCallback</code>)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">LogCallback</span><span class="p">(</span><span class="n">TrainerCallback</span><span class="p">,</span> <span class="n">ExportableState</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">start_time</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">elapsed_time</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">start_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="k">if</span> <span class="n">start_time</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">start_time</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">elapsed_time</span> <span class="o">=</span> <span class="mi">0</span> <span class="k">if</span> <span class="n">elapsed_time</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">elapsed_time</span>
+        <span class="c1"># ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这是利用了 HuggingFace 的 <strong>Callback（回调）</strong> 机制。你可以把它理解为一个“插件”。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>TrainerCallback</code>：说明这是一个可以在训练过程中被自动调用的插件。</li>
+<li><code>ExportableState</code>：说明这个插件的状态是可以被保存（Save）和加载（Load）的。</li>
+<li><code>__init__</code>：初始化两个计时器，一个记录“开始时间”，一个记录“已经花费的总时间”。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 开工仪式：训练开始时 (<code>on_train_begin</code>)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">on_train_begin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">args</span><span class="p">,</span> <span class="n">state</span><span class="p">,</span> <span class="n">control</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="c1"># 1. 检查是不是只有主进程在运行（避免多卡重复操作）</span>
+        <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">save_on_each_node</span><span class="p">:</span> <span class="o">...</span> 
+
+        <span class="c1"># 2. 处理断点续传 (Resume)</span>
+        <span class="k">if</span> <span class="n">state</span><span class="o">.</span><span class="n">is_local_process_zero</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">args</span><span class="o">.</span><span class="n">resume_from_checkpoint</span><span class="p">:</span>
+                <span class="c1"># 如果是新训练，时间归零</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">start_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">elapsed_time</span> <span class="o">=</span> <span class="mi">0</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="c1"># 如果是接着上次练，从存档里恢复时间</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">start_time</span> <span class="o">=</span> <span class="n">state</span><span class="o">.</span><span class="n">stateful_callbacks</span><span class="p">[</span><span class="s1">&#39;LogCallback&#39;</span><span class="p">][</span><span class="s1">&#39;start_time&#39;</span><span class="p">]</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">elapsed_time</span> <span class="o">=</span> <span class="n">state</span><span class="o">.</span><span class="n">stateful_callbacks</span><span class="p">[</span><span class="s1">&#39;LogCallback&#39;</span><span class="p">][</span><span class="s1">&#39;elapsed_time&#39;</span><span class="p">]</span>
+
+        <span class="c1"># 3. 清理旧日志</span>
+        <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="ow">and</span> <span class="n">args</span><span class="o">.</span><span class="n">overwrite_output_dir</span><span class="p">:</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 删掉旧的 trainer_log.jsonl</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：训练开始的一瞬间，必须搞清楚是“全新开始”还是“旧梦重温”。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>如果是 <code>resume_from_checkpoint</code>（续传），它会去读取之前的存档，把秒表调好，保证计算的时间是累积的。</li>
+<li>如果是新训练，且允许覆盖（<code>overwrite_output_dir</code>），它会把旧的日志文件删掉，防止数据混在一起。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 日常记录：每隔几步记一次 (<code>on_log</code>)</h4>
+<p>这是整个文件最核心的部分。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">on_log</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">args</span><span class="p">,</span> <span class="n">state</span><span class="p">,</span> <span class="n">control</span><span class="p">,</span> <span class="n">logs</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="c1"># ... (省略进程检查)</span>
+
+        <span class="c1"># 1. 更新时间</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">elapsed_time</span> <span class="o">+=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">last_time</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">last_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+
+        <span class="c1"># 2. 计算吞吐量 (Throughput) - 也就是算算练得有多快</span>
+        <span class="k">if</span> <span class="s1">&#39;num_input_tokens_seen&#39;</span> <span class="ow">in</span> <span class="n">logs</span><span class="p">:</span>
+            <span class="n">logs</span><span class="p">[</span><span class="s1">&#39;num_tokens&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">logs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;num_input_tokens_seen&#39;</span><span class="p">)</span>
+            <span class="c1"># 吞吐量 = 处理的总Token数 / 显卡数量 / 花费时间</span>
+            <span class="n">throughput</span> <span class="o">=</span> <span class="n">logs</span><span class="p">[</span><span class="s1">&#39;num_tokens&#39;</span><span class="p">]</span> <span class="o">/</span> <span class="n">args</span><span class="o">.</span><span class="n">world_size</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">elapsed_time</span>
+            <span class="n">state</span><span class="o">.</span><span class="n">log_history</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="s1">&#39;throughput&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">logs</span><span class="p">[</span><span class="s1">&#39;throughput&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">throughput</span>
+
+        <span class="c1"># 3. 整理要写入文件的数据</span>
+        <span class="n">logs</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span>
+            <span class="n">current_steps</span><span class="o">=</span><span class="n">state</span><span class="o">.</span><span class="n">global_step</span><span class="p">,</span>  <span class="c1"># 当前走了多少步</span>
+            <span class="n">total_steps</span><span class="o">=</span><span class="n">state</span><span class="o">.</span><span class="n">max_steps</span><span class="p">,</span>      <span class="c1"># 总共要走多少步</span>
+            <span class="n">loss</span><span class="o">=</span><span class="n">state</span><span class="o">.</span><span class="n">log_history</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;loss&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span> <span class="c1"># 当前的误差</span>
+            <span class="n">percentage</span><span class="o">=</span><span class="nb">round</span><span class="p">(</span><span class="n">state</span><span class="o">.</span><span class="n">global_step</span> <span class="o">/</span> <span class="n">state</span><span class="o">.</span><span class="n">max_steps</span> <span class="o">*</span> <span class="mi">100</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span> <span class="c1"># 百分比进度</span>
+            <span class="c1"># ... 其他参数如学习率、epoch等</span>
+        <span class="p">)</span>
+
+        <span class="c1"># 4. 写入文件</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">output_dir</span><span class="p">,</span> <span class="s2">&quot;trainer_log.jsonl&quot;</span><span class="p">),</span> <span class="s2">&quot;a&quot;</span><span class="p">,</span> <span class="n">encoding</span><span class="o">=</span><span class="s2">&quot;utf-8&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+            <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">logs</span><span class="p">)</span> <span class="o">+</span> <span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：系统自带的日志太杂乱，我想把最重要的数据（进度、Loss、速度）摘出来，存成一行行的 JSON 数据（JSONL格式），方便程序读取。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>它计算了 <code>throughput</code>（吞吐量），这是衡量训练效率的重要指标。</li>
+<li>它构建了一个干净的字典 <code>logs</code>，只包含最重要的信息。</li>
+<li>最后用 <code>"a"</code> (append) 模式打开文件，把这一行数据追加到文件末尾。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 保存记忆：存档机制 (<code>state</code> 和 <code>from_state</code>)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">state</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s1">&#39;start_time&#39;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">start_time</span><span class="p">,</span>
+            <span class="s1">&#39;elapsed_time&#39;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">,</span>
+        <span class="p">}</span>
+
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_state</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">state</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">state</span><span class="p">[</span><span class="s1">&#39;start_time&#39;</span><span class="p">],</span> <span class="n">state</span><span class="p">[</span><span class="s1">&#39;elapsed_time&#39;</span><span class="p">])</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：如果训练了三天三夜突然断电了，下次恢复时，不仅模型参数要恢复，<strong>“我练了多久”</strong> 这个计时器状态也要恢复。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>state()</code>：当 Trainer 保存 Checkpoint 时，会调用这个方法，把当前的时间状态打包存起来。</li>
+<li><code>from_state()</code>：当 Trainer 加载 Checkpoint 时，会调用这个方法，把时间状态恢复回来。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件就是一个<strong>自定义的训练监控插件</strong>。</p>
+<ul>
+<li><strong>它不做数学运算</strong>（不涉及模型的前向后向传播）。</li>
+<li><strong>它只负责记账</strong>：确保在单卡或多卡环境下，正确地记录训练时间、计算训练速度，并把干净、标准化的日志数据写入 <code>trainer_log.jsonl</code> 文件中，供后续分析使用。</li>
+</ul>

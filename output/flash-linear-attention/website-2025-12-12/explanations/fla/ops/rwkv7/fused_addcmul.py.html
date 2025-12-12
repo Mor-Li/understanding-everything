@@ -1,0 +1,108 @@
+<h1>fla/ops/rwkv7/fused_addcmul.py</h1>
+<p>没问题，面对这种底层算子（Operator）代码，直接看代码确实容易晕。我们把它拆解成一个<strong>“学习清单”（Task List）</strong>，由浅入深，一步步搞懂它在干什么。</p>
+<p>这份代码的核心目的是：<strong>为 RWKV-7 模型实现一个高性能的“融合加法乘法”（Fused Add-Component-Multiply）算子。</strong></p>
+<hr />
+<h3>📝 学习清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解数学公式</strong> (这玩意儿到底在算什么？)</li>
+<li><strong>Task 2: 理解数据形状</strong> (谁是大胖子，谁是小个子？)</li>
+<li><strong>Task 3: 为什么要“Fused”（融合）？</strong> (为了省钱/省时间)</li>
+<li><strong>Task 4: 剖析 Forward (前向传播)</strong> (Triton 是怎么并行干活的)</li>
+<li><strong>Task 5: 剖析 Backward (反向传播)</strong> (怎么算梯度)</li>
+<li><strong>Task 6: 总结代码结构</strong> (Python 怎么包装它)</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 理解数学公式</h4>
+<p>这段代码虽然看起来很长，但核心数学逻辑非常简单。它其实就是 PyTorch 中的 <code>torch.addcmul</code>。</p>
+<p>公式如下：
+$$ \text{Output} = \text{Hidden} + \text{Delta} \times \text{Parameter} $$</p>
+<p>但是在 RWKV-7 中，它需要<strong>同时</strong>对好几组参数做这个操作。
+输入有：
+*   <code>hidden_states</code> ($h$)
+*   <code>delta</code> ($x$)
+*   一堆参数向量：<code>xr</code>, <code>xw</code>, <code>xk</code>, <code>xv</code>, <code>xa</code>, <code>xg</code> (分别代表 Receptance, Weight, Key, Value, a-parameter, Gate)</p>
+<p>它实际上在做 5 到 6 次独立的运算，生成 5 到 6 个输出：
+1.  $O_r = h + x \times r$
+2.  $O_w = h + x \times w$
+3.  $O_k = h + x \times k$
+4.  ...以此类推</p>
+<h4>Task 2: 理解数据形状 (关键点)</h4>
+<p>理解形状是读懂 Triton kernel 的关键：</p>
+<ul>
+<li><strong>大张量 (Time-varying):</strong><ul>
+<li><code>hidden_states</code> 和 <code>delta</code>: 形状是 <code>(Batch, Time, Channel)</code>，比如 <code>(B, T, D)</code>。它们随时间步变化，数据量巨大。</li>
+</ul>
+</li>
+<li><strong>小向量 (Channel-mixing):</strong><ul>
+<li><code>xr</code>, <code>xw</code>, <code>xk</code>...: 形状通常是 <code>(1, 1, D)</code> 或者就是 <code>(D)</code>。</li>
+<li><strong>注意：</strong> 它们在 Batch 和 Time 维度上是<strong>共享（广播/Broadcast）</strong>的。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码逻辑：</strong> 每一个时间步 $t$，都用<strong>同一个</strong> $r$ 向量去和当前的 $h_t, x_t$ 做运算。</p>
+<h4>Task 3: 为什么要“Fused”（融合）？</h4>
+<p>如果你用普通的 PyTorch 写（就像代码最后的 <code>torch_addcmul_rwkv7</code> 函数）：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">oxr</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">addcmul</span><span class="p">(</span><span class="n">hidden</span><span class="p">,</span> <span class="n">delta</span><span class="p">,</span> <span class="n">xr</span><span class="p">)</span> <span class="c1"># 读 hidden, 读 delta, 读 xr -&gt; 写 oxr</span>
+<span class="n">oxw</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">addcmul</span><span class="p">(</span><span class="n">hidden</span><span class="p">,</span> <span class="n">delta</span><span class="p">,</span> <span class="n">xw</span><span class="p">)</span> <span class="c1"># 读 hidden, 读 delta, 读 xw -&gt; 写 oxw</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<p><strong>问题：</strong> <code>hidden</code> 和 <code>delta</code> 非常大。这样做你需要把它们从显存（HBM）里反复读取 5-6 次。这非常浪费带宽，速度慢。</p>
+<p><strong>解决方案 (Fused)：</strong>
+写一个 Triton Kernel（<code>fused_addcmul_fwd_kernel</code>），<strong>只读取一次</strong> <code>hidden</code> 和 <code>delta</code>，然后在芯片内部（SRAM）直接算出 $O_r, O_w, O_k...$ 所有结果，最后一次性写回。
+<strong>省了 5 倍的读取时间！</strong></p>
+<h4>Task 4: 剖析 Forward (前向传播) Kernel</h4>
+<p>看函数 <code>fused_addcmul_fwd_kernel</code>：</p>
+<ol>
+<li><strong>定位 (<code>program_id</code>):</strong> 确定当前线程处理的是哪个 Batch (<code>i_b</code>) 和哪个时间段 (<code>i_t</code>)。</li>
+<li><strong>加载 (<code>tl.load</code>):</strong><ul>
+<li><code>b_h = tl.load(hidden...)</code>: 加载当前块的 hidden。</li>
+<li><code>b_x = tl.load(delta...)</code>: 加载当前块的 delta。</li>
+<li><code>b_r = tl.load(ixr...)</code>: 加载参数 r (注意：这里没有加时间偏移，因为它是共享的)。</li>
+<li>同理加载 w, k, v, a...</li>
+</ul>
+</li>
+<li><strong>计算 (<code>tl.fma</code>):</strong><ul>
+<li><code>o_r = tl.fma(b_x, b_r, b_h)</code>: 意思是 Fused Multiply-Add，即 $x \times r + h$。</li>
+<li>一口气把 r, w, k, v, a 全算完。</li>
+</ul>
+</li>
+<li><strong>存储 (<code>tl.store</code>):</strong> 把算好的结果分别写回到 <code>oxr</code>, <code>oxw</code>... 的内存地址。</li>
+</ol>
+<h4>Task 5: 剖析 Backward (反向传播)</h4>
+<p>训练模型需要反向传播求梯度。这里分成了两部分，因为梯度的形状不一样。</p>
+<p><strong>Part 1: <code>addcmul_bwd_kernel1</code> (计算大张量的梯度)</strong>
+*   <strong>目标：</strong> 算出 <code>hidden</code> 和 <code>delta</code> 的梯度。
+*   <strong>数学：</strong> 根据链式法则：
+    *   $\frac{\partial L}{\partial h} = \sum (\text{所有输出的梯度})$
+    *   $\frac{\partial L}{\partial x} = \sum (\text{所有输出的梯度} \times \text{对应参数})$
+*   <strong>代码对应：</strong>
+    *   <code>g_hidden = b_dxr + b_dxw + ...</code> (把所有输出的梯度加起来)
+    *   <code>g_x = b_dxr * b_ixr + ...</code> (梯度乘以参数 r, w... 然后加起来)
+*   <strong>输出：</strong> 形状也是 <code>(B, T, D)</code>。</p>
+<p><strong>Part 2: <code>addcmul_bwd2</code> (计算小参数的梯度)</strong>
+*   <strong>目标：</strong> 算出 <code>xr</code>, <code>xw</code>... 的梯度。
+*   <strong>数学：</strong> 因为 <code>xr</code> 在整个 Batch 和 Time 上是共享的，所以它的梯度是所有时刻梯度的<strong>总和</strong>。
+    *   $\frac{\partial L}{\partial r} = \sum_{b,t} (\text{输出梯度} \times x_{b,t})$
+*   <strong>代码对应：</strong>
+    *   这里直接用了 PyTorch 的 <code>(d_oxr * delta).sum(...)</code>。
+    *   因为要做全量求和（Reduction），用 PyTorch 自带的优化或者 <code>torch.compile</code> 通常比手写 Triton reduce 更稳健或足够快。</p>
+<h4>Task 6: 总结代码结构</h4>
+<p>最后看 Python 类的封装：</p>
+<ol>
+<li><strong><code>Rwkv7FusedAddcmul</code> 类:</strong> 继承自 <code>torch.autograd.Function</code>。<ul>
+<li><code>forward</code>: 负责调用 Triton 的前向 kernel。为了处理超长序列，它把 Time 维度切成了每块 65536 长度来处理（防止索引溢出）。</li>
+<li><code>backward</code>: 依次调用 <code>bwd1</code> (算 hidden/delta 梯度) 和 <code>bwd2</code> (算参数梯度)。</li>
+</ul>
+</li>
+<li><strong><code>fused_addcmul_rwkv7</code> 函数:</strong><ul>
+<li>这是给外部调用的入口。</li>
+<li>有个小判断：如果 <code>hidden_states.shape[1] == 1</code> (也就是 Time=1，通常是推理/Decode阶段)，直接用 PyTorch 原生版 <code>torch_addcmul_rwkv7</code>，因为数据量太小，启动 Triton kernel 的开销反而不划算。</li>
+<li>否则，启动高性能的 Triton 融合算子。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p><strong>一句话解释：</strong>
+这个文件是为了让 RWKV-7 模型跑得更快，利用 Triton 写了一个<strong>“多合一”的乘加算子</strong>，避免了显卡在计算 $h + x \cdot r, h + x \cdot w \dots$ 时反复搬运庞大的 $h$ 和 $x$ 数据。</p>

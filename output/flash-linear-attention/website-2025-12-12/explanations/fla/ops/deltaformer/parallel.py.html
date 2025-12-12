@@ -1,0 +1,87 @@
+<h1>fla/ops/deltaformer/parallel.py</h1>
+<p>这份代码确实非常硬核，因为它混合了 <strong>PyTorch 高级逻辑</strong>、<strong>Triton 底层 GPU 编程</strong> 以及 <strong>FlashAttention 的调用</strong>。看不懂是很正常的，因为它在手动实现一个非常前沿的深度学习算子（Operator）。</p>
+<p>这个文件实现的是 <strong>Deltaformer</strong> 模型的核心并行算法。简单来说，它是一种试图结合 Transformer（并行计算快）和 RNN（推理显存占用少）优点的架构。</p>
+<p>为了让你读懂，我把阅读这份代码的任务拆解成一个 <strong>5步走的 Todo List</strong>。</p>
+<hr />
+<h3>📋 阅读任务清单 (Todo List)</h3>
+<h4>✅ Task 1: 理解核心目标 —— "我们在算什么？"</h4>
+<p>在深入代码之前，先搞懂数学逻辑。
+这份代码并不是标准的 Self-Attention ($softmax(QK^T)V$)。它实现了一个 <strong>两阶段</strong> 的过程：</p>
+<ol>
+<li><strong>Delta 步骤 (预处理 V):</strong> 利用 $Q, K, V, \beta$ 计算出一个新的张量 $U$。<ul>
+<li>公式大致逻辑是：$u_t = v_t - \beta_t \cdot \sum (\text{attention} \cdot u_{past})$。</li>
+<li>这里的 $U$ 可以理解为“去除了历史冗余信息的 Value”。</li>
+</ul>
+</li>
+<li><strong>Attention 步骤:</strong> 把这个算出来的 $U$ 当作新的 $V$，扔进标准的 FlashAttention 里去计算最终结果。</li>
+</ol>
+<p><strong>对应代码：</strong>
+看到最底部的 <code>deltaformer_attn</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 先计算 U (这是本文件的核心)</span>
+<span class="n">u</span> <span class="o">=</span> <span class="n">ParallelDeltaformerFunction</span><span class="o">.</span><span class="n">apply</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">beta</span><span class="p">,</span> <span class="n">C</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="p">)</span>
+
+<span class="c1"># 2. 再把 U 扔进 FlashAttention</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">flash_attn_varlen_func</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> 
+</code></pre></div>
+
+<hr />
+<h4>✅ Task 2: 理解 "Chunk Parallel" (分块并行)</h4>
+<p>RNN 是串行的（算完 t=1 才能算 t=2），这在 GPU 上很慢。为了加速，这个算法使用了 <strong>Chunk（分块）</strong> 技术。</p>
+<ul>
+<li><strong>思路：</strong> 把长序列切成很多小块（比如长度 512 或 128）。</li>
+<li><strong>块内：</strong> 使用类似 Transformer 的并行计算。</li>
+<li><strong>块间：</strong> 传递历史状态。</li>
+</ul>
+<p><strong>对应代码：</strong>
+*   <code>BLOCK_SIZE_C = 512</code>: 定义了块的大小。
+*   <code>parallel_deltaformer_chunk_fwd</code>: 这是一个“块级”的前向传播函数。</p>
+<hr />
+<h4>✅ Task 3: 攻克 Triton Kernel (前向传播)</h4>
+<p>这是最难的部分。<code>parallel_deltaformer_fwd_kernel</code> 是跑在 GPU 上的核心代码。</p>
+<p><strong>它的工作流程：</strong>
+1.  <strong>加载数据：</strong> 读取当前块的 Q, K, V。
+2.  <strong>计算局部 Attention：</strong> 在块内部计算 $QK^T$ (代码中叫 <code>qk</code>)。
+3.  <strong>计算修正量：</strong> 利用 Attention 分数，计算当前时刻应该从 $V$ 中减去多少历史信息，得到 $U$。
+    *   代码片段：<code>u = v - acc.to(...)</code>。这里的 <code>acc</code> 就是累积的历史影响。
+4.  <strong>保存中间结果：</strong>
+    *   保存 <code>u</code>：这是主要输出。
+    *   保存 <code>w</code>：这是块内的注意力权重，反向传播（训练）时算梯度要用。
+    *   保存 <code>lse</code> (Log-Sum-Exp)：为了数值稳定性保存的归一化因子。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算 QK 点积</span>
+<span class="n">qk</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span> <span class="o">*</span> <span class="n">qk_scale</span> 
+<span class="c1"># ... 计算 softmax ...</span>
+<span class="n">p</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">math</span><span class="o">.</span><span class="n">exp2</span><span class="p">(</span><span class="n">qk</span><span class="p">)</span>
+<span class="c1"># ... 累积历史影响 ...</span>
+<span class="n">acc</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="n">acc</span><span class="p">)</span> 
+<span class="c1"># ... 核心公式：U = V - 历史修正 ...</span>
+<span class="n">u</span> <span class="o">=</span> <span class="n">v</span> <span class="o">-</span> <span class="n">acc</span> 
+</code></pre></div>
+
+<hr />
+<h4>✅ Task 4: 理解反向传播 (Backward Pass)</h4>
+<p>深度学习需要训练，所以必须写反向传播（算梯度）。因为前向传播是我们手写的 Triton 内核，PyTorch 无法自动推导梯度，所以作者必须手写 <code>backward</code>。</p>
+<p><strong>对应代码：</strong>
+*   <code>ParallelDeltaformerFunction.backward</code>: 这是 PyTorch 的接口。
+*   它调用了三个特定的 Triton 内核来分别计算梯度：
+    1.  <code>parallel_deltaformer_bwd_kernel_u</code>: 算 $U$ 的梯度。
+    2.  <code>parallel_deltaformer_bwd_kernel_row_sum</code>: 辅助计算归一化因子的梯度。
+    3.  <code>parallel_deltaformer_bwd_kernel_qk</code>: 最复杂的部分，算 $Q$ 和 $K$ 的梯度。</p>
+<p>这里面还用到了一个 <code>invcum</code> (Inverse Cumulative Sum)，这是为了快速在时间轴上反向传播误差。</p>
+<hr />
+<h4>✅ Task 5: 串联整体流程 (The Pipeline)</h4>
+<p>现在你可以把整个文件看作一个黑盒流水线：</p>
+<ol>
+<li><strong>输入：</strong> <code>q, k, v, beta</code> (形状通常是 Batch, Time, Head, Dim)。</li>
+<li><strong>入口：</strong> <code>deltaformer_attn</code> 函数被调用。</li>
+<li><strong>计算 U：</strong> 进入 <code>ParallelDeltaformerFunction</code>。<ul>
+<li>启动 Triton Kernel (<code>parallel_deltaformer_fwd_kernel</code>)。</li>
+<li>GPU 疯狂并行计算，把序列切块，算出 $U$。</li>
+</ul>
+</li>
+<li><strong>计算 Output：</strong> 拿着刚算好的 $U$，调用第三方的 <code>flash_attn_varlen_func</code>。</li>
+<li><strong>输出：</strong> 得到最终的 Attention 输出 $O$。</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件其实就是 <strong>"为了让 DeltaNet 这种特殊的 RNN 模型能在 GPU 上跑得飞快，特意用 Triton 手写了一个预处理算子，算出修正后的 U，然后再借用 FlashAttention 完成最后一步"</strong>。</p>
+<p>如果你不是专门做底层算子优化的，只需要看懂 <strong>Task 1</strong> 和 <strong>Task 5</strong> 即可，中间的 Triton 指针操作（<code>tl.load</code>, <code>tl.store</code>, <code>make_block_ptr</code>）是给 GPU 编译器看的，非常繁琐且容易劝退。</p>

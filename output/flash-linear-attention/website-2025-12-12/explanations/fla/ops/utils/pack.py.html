@@ -1,0 +1,152 @@
+<h1>fla/ops/utils/pack.py</h1>
+<p>这份代码看起来确实比较硬核，因为它涉及到 <strong>Triton（GPU编程）</strong> 和 <strong>NLP中的变长序列处理</strong>。</p>
+<p>简单来说，这个文件的核心功能只有两个：<strong>“打包”（Pack）</strong> 和 <strong>“解包”（Unpack）</strong>。</p>
+<p>为了让你彻底搞懂，我为你制定了一个 <strong>5步走的 Task List</strong>。我们一步一步来拆解这个文件。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心概念 —— 为什么要 Pack（打包）？</strong></li>
+<li><strong>Task 2: 理解关键参数 —— <code>cu_seqlens</code> 是什么？</strong></li>
+<li><strong>Task 3: 核心逻辑 —— Triton Kernel 是怎么搬运数据的？</strong></li>
+<li><strong>Task 4: 填充处理 —— Left Padding vs Right Padding</strong></li>
+<li><strong>Task 5: 自动求导 —— 为什么 Forward 调 Pack，Backward 就要调 Unpack？</strong></li>
+</ol>
+<hr />
+<h3>🟢 Task 1: 理解核心概念 —— 为什么要 Pack？</h3>
+<p>在看代码前，先建立心理模型。</p>
+<ul>
+<li>
+<p><strong>现状 (Padded Tensor - 未打包):</strong>
+    我们在训练 Transformer 时，因为每个句子的长度不一样（比如句子A有2个词，句子B有4个词），为了把它们塞进一个 Batch，我们通常会把短的句子补零（Padding），凑成一样的长度。</p>
+<ul>
+<li>形状：<code>[Batch_Size, Max_Seq_Len, Hidden_Dim]</code></li>
+<li>缺点：里面有很多 <code>0</code>，计算它们是在浪费显卡算力。</li>
+</ul>
+</li>
+<li>
+<p><strong>目标 (Packed Tensor - 已打包):</strong>
+    我们想把所有句子里的有效词（非Padding部分）全部挤在一起，变成长长的一条。</p>
+<ul>
+<li>形状：<code>[Total_Token_Num, Hidden_Dim]</code></li>
+<li>优点：没有废话，全是干货，计算效率极高。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码对应：</strong>
+*   <code>pack_sequence</code>: 把 <strong>[B, S, D]</strong> 的方块数据，挤压成 <strong>[Total, D]</strong> 的长条数据。
+*   <code>unpack_sequence</code>: 把 <strong>[Total, D]</strong> 的长条数据，还原回 <strong>[B, S, D]</strong> 的方块数据（空缺处填0）。</p>
+<hr />
+<h3>🟢 Task 2: 理解关键参数 —— <code>cu_seqlens</code> 是什么？</h3>
+<p>代码里到处都是 <code>cu_seqlens</code>，它是 <strong>Cumulative Sequence Lengths（累积序列长度）</strong> 的缩写。</p>
+<p>如果不补零，我们怎么知道长条数据里，哪一段属于第一个句子，哪一段属于第二个？
+这就需要 <code>cu_seqlens</code>。</p>
+<p><strong>举个例子：</strong>
+*   句子1长度：2
+*   句子2长度：4
+*   <code>cu_seqlens</code> 就是：<code>[0, 2, 6]</code>
+    *   <code>0</code> 是起点。
+    *   <code>2</code> 是句子1的结束点（0+2）。
+    *   <code>6</code> 是句子2的结束点（2+4）。</p>
+<p><strong>代码解读：</strong>
+在 <code>packunpack_sequence_kernel</code> 函数中：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># i_b 是当前处理的第几个句子 (Batch index)</span>
+<span class="c1"># bos: begin of sequence (本句起点)</span>
+<span class="c1"># eos: end of sequence (本句终点)</span>
+<span class="n">bos</span><span class="p">,</span> <span class="n">eos</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">cu_seqlens</span> <span class="o">+</span> <span class="n">i_b</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">cu_seqlens</span> <span class="o">+</span> <span class="n">i_b</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+<span class="n">T</span> <span class="o">=</span> <span class="n">eos</span> <span class="o">-</span> <span class="n">bos</span> <span class="c1"># T 就是当前句子的真实长度</span>
+</code></pre></div>
+
+<p>这段代码就是在查户口：当前这个句子在长条数据里是从哪开始，到哪结束。</p>
+<hr />
+<h3>🟢 Task 3: 核心逻辑 —— Triton Kernel 是怎么搬运数据的？</h3>
+<p>这是文件最难懂的部分：<code>packunpack_sequence_kernel</code>。这是一个并行计算核函数。</p>
+<p>想象一下，有成千上万个小工（GPU 线程）同时在工作。
+*   每个小工负责搬运数据的一个小块。
+*   <code>PACK=True</code> 时：小工从方块矩阵（含0）里把非0数据搬到长条矩阵里。
+*   <code>PACK=False</code> 时：小工从长条矩阵里把数据搬回方块矩阵（含0）里。</p>
+<p><strong>关键逻辑拆解：</strong></p>
+<ol>
+<li>
+<p><strong>定位坐标：</strong>
+    <code>i_s</code> 是当前处理到句子的第几个词（Sequence index）。
+    <code>i_b</code> 是第几个句子。</p>
+</li>
+<li>
+<p><strong>判断是否越界：</strong>
+    如果当前位置是 Padding（补零区域），就直接 <code>return</code>，不干活。</p>
+</li>
+<li>
+<p><strong>计算搬运地址：</strong></p>
+<ul>
+<li><strong>Packed (长条) 地址:</strong> <code>i_t = bos + ...</code> (起点 + 偏移量)</li>
+<li><strong>Padded (方块) 地址:</strong> <code>i_b * S + i_s</code> (第几行 * 最大长度 + 第几列)</li>
+</ul>
+</li>
+<li>
+<p><strong>搬运 (Load &amp; Store):</strong>
+    <code>python
+    if PACK:
+        # 从方块读，写到长条
+        b_x = tl.load(x + (i_b * S + i_s) * D + o_d, ...)
+        tl.store(y + i_t * D + o_d, b_x, ...)
+    else:
+        # 从长条读，写到方块
+        b_x = tl.load(x + i_t * D + o_d, ...)
+        tl.store(y + (i_b * S + i_s) * D + o_d, b_x, ...)</code></p>
+</li>
+</ol>
+<hr />
+<h3>🟢 Task 4: 填充处理 —— Left Padding vs Right Padding</h3>
+<p>NLP里有两种补零习惯：
+1.  <strong>Right Padding:</strong> <code>[词, 词, 0, 0]</code> (常见)
+2.  <strong>Left Padding:</strong> <code>[0, 0, 词, 词]</code> (生成式模型/LLM 常用)</p>
+<p>代码里这段逻辑专门处理这两种情况：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">PADDING_SIDE</span> <span class="o">==</span> <span class="s1">&#39;left&#39;</span><span class="p">:</span>
+    <span class="n">NP</span> <span class="o">=</span> <span class="n">S</span> <span class="o">-</span> <span class="n">T</span>  <span class="c1"># S是最大长度，T是真实长度。NP就是补了几个0 (Number of Padding)</span>
+    <span class="k">if</span> <span class="n">i_s</span> <span class="o">&lt;</span> <span class="n">NP</span><span class="p">:</span> <span class="c1"># 如果当前的索引还在补0的区域</span>
+        <span class="k">return</span>   <span class="c1"># 啥也不干，因为这里是0</span>
+    <span class="n">i_t</span> <span class="o">=</span> <span class="n">bos</span> <span class="o">+</span> <span class="p">(</span><span class="n">i_s</span> <span class="o">-</span> <span class="n">NP</span><span class="p">)</span> <span class="c1"># 关键：计算在长条里的位置要减去左边的0的个数</span>
+<span class="k">else</span><span class="p">:</span> <span class="c1"># Right Padding</span>
+    <span class="k">if</span> <span class="n">i_s</span> <span class="o">&gt;=</span> <span class="n">T</span><span class="p">:</span> <span class="c1"># 如果超过了真实长度</span>
+        <span class="k">return</span>   <span class="c1"># 后面都是0，不干了</span>
+    <span class="n">i_t</span> <span class="o">=</span> <span class="n">bos</span> <span class="o">+</span> <span class="n">i_s</span> <span class="c1"># 也就是直接加索引</span>
+</code></pre></div>
+
+<p><strong>总结：</strong> 这段代码确保了 GPU 线程只搬运有效数据，跳过所有的 0。</p>
+<hr />
+<h3>🟢 Task 5: 自动求导 —— 为什么 Forward 调 Pack，Backward 就要调 Unpack？</h3>
+<p>最后看 <code>class PackSequenceFunction(torch.autograd.Function)</code>。
+这是为了让 PyTorch 能够进行反向传播（训练）。</p>
+<p><strong>逻辑闭环：</strong></p>
+<ol>
+<li>
+<p><strong>前向传播 (Forward):</strong></p>
+<ul>
+<li>你把一个含 0 的矩阵给它。</li>
+<li>它调用 <code>pack_sequence_fwdbwd</code>。</li>
+<li>输出一个不含 0 的长条。</li>
+</ul>
+</li>
+<li>
+<p><strong>反向传播 (Backward):</strong></p>
+<ul>
+<li>假设后续层传回来一个梯度假设叫 <code>dy</code>。因为前向输出是长条的，所以 <code>dy</code> 也是长条形状的。</li>
+<li>但是，输入是方块形状的，PyTorch 要求输入的梯度 <code>dx</code> 必须和输入 <code>x</code> 形状一样。</li>
+<li><strong>所以：</strong> 我们需要把长条形状的梯度 <code>dy</code>，<strong>“解包” (Unpack)</strong> 成方块形状的 <code>dx</code>，并在空缺处填 0（因为 Padding 部分不贡献梯度）。</li>
+<li>代码：<code>dx = unpack_sequence_fwdbwd(...)</code></li>
+</ul>
+</li>
+</ol>
+<p>同理，<code>UnpackSequenceFunction</code> 的逻辑正好相反（Forward 是 Unpack，Backward 是 Pack）。</p>
+<hr />
+<h3>🏁 总结</h3>
+<p>这个文件其实就是写了一个 <strong>高性能的 GPU 搬运工</strong>：</p>
+<ol>
+<li><strong>输入</strong>：一批长短不一的句子。</li>
+<li><strong>pack_sequence</strong>：把它们里面的有效词抠出来，拼成一条紧凑的数据（为了省显存、算得快）。<ul>
+<li><em>处理了左填充/右填充的索引换算。</em></li>
+</ul>
+</li>
+<li><strong>unpack_sequence</strong>：把紧凑的数据还原回原本带补零的矩阵形状（为了方便查看或接入需要固定形状的层）。</li>
+<li><strong>Autograd</strong>：包装了一下，确保你在训练模型做反向传播时，梯度也能正确地从“长条”变回“方块”，或者从“方块”变回“长条”。</li>
+</ol>

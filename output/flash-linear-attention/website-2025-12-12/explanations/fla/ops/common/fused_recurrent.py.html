@@ -1,0 +1,113 @@
+<h1>fla/ops/common/fused_recurrent.py</h1>
+<p>这份代码确实非常硬核，因为它不仅仅是普通的PyTorch代码，而是混合了<strong>Triton</strong>（一种用于编写高性能GPU内核的语言）和复杂的<strong>线性注意力/RNN数学逻辑</strong>。看不懂是很正常的。</p>
+<p>为了让你能够消化这段代码，我为你制定了一个<strong>5步学习任务清单 (To-Do List)</strong>。我们将从宏观概念开始，一步步深入到代码细节。</p>
+<hr />
+<h3>任务 1：搞懂这个算子在做什么 (数学原理)</h3>
+<p><strong>目标</strong>：理解“Fused Recurrent”这个名字的含义。</p>
+<ul>
+<li><strong>背景</strong>：在Transformer中，标准的Attention计算量很大（$O(N^2)$）。为了加速，人们提出了一类“线性注意力”或者“基于状态空间模型(SSM)”的方法（比如 RWKV, Mamba, GLA）。</li>
+<li><strong>核心逻辑</strong>：它们把注意力机制写成了一个<strong>循环神经网络 (RNN)</strong> 的形式。</li>
+<li><strong>公式直觉</strong>：
+    想象你有一个记忆池（Hidden State，代码中的 <code>h</code>）。<ol>
+<li><strong>输入</strong>：每个时刻 $t$，你有 Key ($k$) 和 Value ($v$)。你把 $k$ 和 $v$ 结合起来更新记忆池 $h$。</li>
+<li><strong>遗忘/门控</strong>：在更新前，记忆池会衰减一点点（由代码中的 <code>g</code>, <code>gk</code>, <code>gv</code> 控制，类似LSTM的遗忘门）。</li>
+<li><strong>输出</strong>：你有 Query ($q$)，你用 $q$ 去从记忆池 $h$ 中读取信息，得到输出 $o$。</li>
+</ol>
+</li>
+</ul>
+<p><strong>总结</strong>：这段代码就是在一个GPU核心里，<strong>一次性</strong>把这个“更新记忆 -&gt; 读取输出 -&gt; 下一时刻”的循环跑完，而不是用PyTorch的 <code>for</code> 循环（那样太慢了）。</p>
+<hr />
+<h3>任务 2：理解为什么要用 Triton (性能优化)</h3>
+<p><strong>目标</strong>：明白为什么不直接写 Python 循环。</p>
+<ul>
+<li><strong>PyTorch的问题</strong>：如果你在 Python 里写 <code>for i in range(T): h = h * decay + k * v</code>，GPU 需要频繁地从显存（HBM）读取数据，计算完再写回显存。这叫“IO瓶颈”。</li>
+<li><strong>Triton的解法</strong>：Triton 允许我们把整个序列（比如长度2048）加载到 GPU 的<strong>片上高速缓存 (SRAM)</strong> 中。</li>
+<li><strong>Fused (融合)</strong>：代码里的 <code>fused</code> 意味着把“加载数据”、“计算RNN循环”、“保存结果”全部融合在一个内核函数里完成，中间状态 <code>h</code> 一直留在高速缓存里，不写回主显存。速度极快。</li>
+</ul>
+<hr />
+<h3>任务 3：拆解核心函数 <code>fused_recurrent_fwd_kernel</code> (前向传播)</h3>
+<p><strong>目标</strong>：读懂 Triton 内核中最关键的循环部分。</p>
+<p>请看代码中 <code>fused_recurrent_fwd_kernel</code> 函数里的 <code>for</code> 循环，这是灵魂所在：</p>
+<ol>
+<li>
+<p><strong>初始化</strong>：</p>
+<ul>
+<li><code>b_h</code>：这是 Hidden State（记忆矩阵），形状是 <code>[BK, BV]</code>。一开始是全0（或者从 <code>h0</code> 加载）。</li>
+</ul>
+</li>
+<li>
+<p><strong>循环时间步 (<code>for _ in range(0, T):</code>)</strong>：</p>
+<ul>
+<li><strong>加载数据</strong>：
+    <code>python
+    b_q = tl.load(...) # 加载当前的 Query
+    b_k = tl.load(...) # 加载当前的 Key
+    b_v = tl.load(...) # 加载当前的 Value</code></li>
+<li><strong>应用遗忘/衰减 (Decay)</strong>：
+    <code>python
+    if USE_G:
+        b_g = tl.load(...) # 加载遗忘门
+        b_h = b_h * exp(b_g) # 记忆矩阵 h 乘以衰减系数
+    # ... (gk, gv 同理，是对 K 和 V 维度的不同衰减方式)</code></li>
+<li><strong>写入记忆 (Write)</strong>：
+    <code>python
+    # KV 外积更新： h_new = h_old + k^T * v
+    b_h += b_k[:, None] * b_v[None, :]</code></li>
+<li><strong>读取输出 (Read)</strong>：
+    <code>python
+    # 线性注意力读取： o = h * q
+    b_o = b_h * b_q[:, None]
+    b_o = tl.sum(b_o, axis=0) # 聚合结果</code></li>
+<li><strong>保存结果</strong>：<code>tl.store(p_o, ...)</code> 把结果存回显存。</li>
+<li><strong>指针移动</strong>：<code>p_q += ...</code> 指针移动到下一个时间步。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>任务 4：理解 <code>fused_recurrent_bwd_kernel</code> (反向传播)</h3>
+<p><strong>目标</strong>：知道为什么反向传播比前向传播更复杂。</p>
+<ul>
+<li><strong>梯度计算</strong>：为了训练模型，我们需要计算梯度。</li>
+<li><strong>难点</strong>：RNN 的梯度需要“随时间反向传播 (BPTT)”。这意味着我们得从最后一个时间步往回算。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>你会看到 <code>REVERSE</code> 参数。虽然名字叫 backward kernel，但实际上也是一个循环。</li>
+<li>它计算 <code>dq</code> (Query的梯度), <code>dk</code>, <code>dv</code>。</li>
+<li>公式非常复杂，本质上是前向传播的逆运算链式法则。</li>
+<li><strong>关键点</strong>：它需要重新计算一遍 <code>h</code> (Hidden State)，或者利用梯度流动的对称性来计算。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>任务 5：理解 Python 包装层 (接口)</h3>
+<p><strong>目标</strong>：知道怎么在你的模型里调用它。</p>
+<p>看最后的 <code>class FusedRecurrentFunction</code> 和 <code>def fused_recurrent</code>：</p>
+<ol>
+<li>
+<p><strong><code>FusedRecurrentFunction</code></strong>：</p>
+<ul>
+<li>这是一个标准的 <code>torch.autograd.Function</code>。</li>
+<li><code>forward</code>：调用刚才的 Triton <code>fwd_kernel</code>。</li>
+<li><code>backward</code>：调用 <code>bwd_kernel</code>。</li>
+<li>这让 PyTorch 知道：“嘿，遇到这个算子时，不要试图自动求导，直接用我写好的 Triton 内核来算梯度。”</li>
+</ul>
+</li>
+<li>
+<p><strong><code>fused_recurrent</code> (用户接口)</strong>：</p>
+<ul>
+<li><strong>输入</strong>：<code>q, k, v</code> (形状通常是 Batch, Time, Head, Dim)。</li>
+<li><strong>可选输入</strong>：<code>g</code> (全局衰减), <code>gk</code>/<code>gv</code> (向量级衰减), <code>initial_state</code> (初始记忆)。</li>
+<li><strong>分块 (Chunking)</strong>：代码里有 <code>BK, BV</code>。为了并行加速，它把 Hidden State 矩阵切成了小块（Block），每个 GPU 线程块（Block）只负责计算矩阵的一部分。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这段代码到底实现了什么？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>极度优化的、支持多种衰减机制的线性注意力（Linear Attention）算子</strong>。</p>
+<p><strong>它的工作流程</strong>：
+1.  把输入的 Q, K, V, G 切分成小块。
+2.  扔进 GPU 里的 Triton 内核。
+3.  内核在高速缓存里极其快速地跑完 <code>h = h * g + k*v; o = h * q</code> 这个循环。
+4.  吐出结果 <code>o</code>。</p>
+<p><strong>为什么你需要它</strong>：
+如果你在研究或使用像 <strong>GLA (Gated Linear Attention)</strong>、<strong>RetNet</strong> 或 <strong>Mamba</strong> 变体这样的模型，用 PyTorch 原生代码跑会非常慢且显存爆炸。这个文件就是为了让这些模型能跑得飞快。</p>

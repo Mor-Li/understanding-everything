@@ -1,0 +1,123 @@
+<h1>fla/ops/common/chunk_delta_h.py</h1>
+<p>这份代码确实看起来非常“劝退”，因为它是一份<strong>高度优化的 GPU 核心代码（Triton Kernel）</strong>。它的写法为了极致的性能，牺牲了所有的可读性。</p>
+<p>这份代码实现的是 <strong>Gated Linear Attention (GLA)</strong> 或者类似 <strong>RetNet</strong> 变体中的核心算法：<strong>Chunk-wise Gated Delta Rule</strong>。</p>
+<p>简单来说，它在算一个类似 RNN 的东西，但是为了在 GPU 上跑得快，它把长序列切成了很多小块（Chunks）来并行计算。</p>
+<p>为了让你读懂，我给你列一个 <strong>“通关任务清单” (ToDo List)</strong>。我们不要试图一行行读，而是按功能模块去理解。</p>
+<hr />
+<h3>任务清单：逐步拆解代码</h3>
+<h4>✅ Task 1: 搞懂核心数学逻辑 (这是在算什么？)</h4>
+<p>在看代码前，你得知道它想干嘛。
+这是一个 <strong>“记忆更新”</strong> 的过程。模型维护一个记忆矩阵 $H$（Hidden State）。
+对于每一块数据，它执行以下步骤（简化版）：
+1.  <strong>读取记忆</strong>：拿出上一时刻的记忆 $H_{t-1}$。
+2.  <strong>计算修正值 (Delta)</strong>：用当前的输入 $W$ 和记忆 $H$ 算出一个预测值，然后用真实值 $V$ 减去它，得到 $V_{new}$。
+    *   公式逻辑：$v_{new} = v - (w \cdot h)$
+3.  <strong>写入记忆</strong>：把这个修正值 $V_{new}$ 结合 Key $K$，写入记忆 $H$。
+    *   公式逻辑：$h_{new} = h + (k \cdot v_{new})$
+4.  <strong>遗忘 (Gating)</strong>：在更新前后，乘上一个衰减系数 $G$（Gate），让旧的记忆慢慢消失。</p>
+<hr />
+<h4>✅ Task 2: 拆解代码结构 (文件里都有啥？)</h4>
+<p>不要被几百行代码吓到，文件结构其实很简单：
+1.  <strong><code>chunk_gated_delta_rule_fwd_kernel_h_blockdim64</code></strong>: <strong>前向传播内核</strong>。就是上面 Task 1 说的过程。
+2.  <strong><code>chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64</code></strong>: <strong>反向传播内核</strong>。用来算梯度的，逻辑和前向是反过来的（时间倒流），用于训练。
+3.  <strong><code>chunk_gated_delta_rule_fwd_h</code> &amp; <code>..._bwd_dhu</code></strong>: <strong>Python 包装函数</strong>。负责准备数据、计算 Grid 大小，然后调用上面的 Triton 内核。</p>
+<p><strong>👉 你的重点只需要放在第 1 个函数（前向传播）上，懂了它就懂了全部。</strong></p>
+<hr />
+<h4>✅ Task 3: 攻克前向传播内核 (核心逻辑)</h4>
+<p>让我们进入 <code>chunk_gated_delta_rule_fwd_kernel_h_blockdim64</code>。</p>
+<p><strong>子任务 3.1：理解那一大堆 <code>if K &gt; 64 ...</code> 是什么鬼？</strong>
+你会看到代码里充满了这种重复的段落：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">K</span> <span class="o">&gt;</span> <span class="mi">64</span><span class="p">:</span>
+    <span class="n">b_h2</span> <span class="o">=</span> <span class="o">...</span>
+<span class="k">if</span> <span class="n">K</span> <span class="o">&gt;</span> <span class="mi">128</span><span class="p">:</span>
+    <span class="n">b_h3</span> <span class="o">=</span> <span class="o">...</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：这是 Triton 的一种手动优化。因为 GPU 寄存器有限，如果 Hidden Size ($K$) 很大（比如 256），一次性加载不进来。所以作者把矩阵切成了 64 大小的条带。
+*   <code>b_h1</code> 处理 0-64 维。
+*   <code>b_h2</code> 处理 64-128 维。
+*   以此类推。
+<strong>阅读技巧</strong>：<strong>直接忽略所有 <code>if K &gt; ...</code> 的代码块</strong>，只看 <code>b_h1</code> 的部分，逻辑是完全一样的。</p>
+<p><strong>子任务 3.2：理解主循环 <code>for i_t in range(NT):</code></strong>
+这是代码的灵魂。<code>NT</code> 是 Chunk 的数量。它在时间轴上一步步走。</p>
+<ol>
+<li>
+<p><strong>加载状态 (Load State)</strong>:
+    <code>python
+    p_h1 = tl.make_block_ptr(h + i_t * stride_h, ...) # 找到当前时间步的记忆位置
+    tl.store(p_h1, b_h1...) # 把上一步计算好的记忆存入显存(HBM)</code>
+    <em>注意：这里虽然是 store，但在循环开始前有 load initial state。在循环中，b_h1 是在寄存器里一直累积更新的。</em></p>
+</li>
+<li>
+<p><strong>计算 Delta (核心公式 $v - wh$)</strong>:
+    ```python
+    # 加载 w (权重/输入)
+    p_w = tl.make_block_ptr(w, ...)
+    b_w = tl.load(p_w, ...)</p>
+<h1>计算 w * h (预测值)</h1>
+<p>b_v = tl.dot(b_w, b_h1...)</p>
+<h1>加载 v (真实值) 并减去预测值</h1>
+<p>p_v = tl.make_block_ptr(v, ...)
+b_v = tl.load(p_v, ...) - b_v  # 这就是 Delta Rule!
+```</p>
+</li>
+<li>
+<p><strong>应用 Gating (遗忘机制)</strong>:
+    <code>python
+    if USE_G:
+        # 加载 gate
+        b_g = tl.load(...)
+        # 让 v 衰减
+        b_v = b_v * ... exp(b_g_last - b_g) ...
+        # 让 记忆 h 衰减
+        b_h1 *= b_g_last</code>
+    这段代码在做指数衰减，让旧的信息权重变低。</p>
+</li>
+<li>
+<p><strong>更新记忆 (核心公式 $h + kv$)</strong>:
+    ```python
+    # 加载 k (键)
+    p_k = tl.make_block_ptr(k, ...)
+    b_k = tl.load(p_k, ...)</p>
+<h1>写入新记忆：h = h + k * v</h1>
+<p>b_h1 += tl.dot(b_k, b_v)
+```</p>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 4: 扫一眼反向传播 (Backward)</h4>
+<p><code>chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64</code> 是反向传播。
+<strong>阅读技巧</strong>：
+*   循环变成了 <code>range(NT - 1, -1, -1)</code>：<strong>时间倒流</strong>。
+*   变量名前面加了 <code>d</code> (如 <code>dh</code>, <code>do</code>, <code>dv</code>)：代表 <strong>梯度 (Gradient)</strong>。
+*   逻辑是前向的镜像：前向是加，反向就是减；前向是乘，反向就是乘梯度。
+*   <strong>不要深究</strong>，除非你要修改算法。只要知道它负责算出怎么更新模型参数就行。</p>
+<hr />
+<h4>✅ Task 5: 总结与串联</h4>
+<p>现在回头看整个文件：</p>
+<ol>
+<li><strong>输入</strong>：一堆序列数据 ($Q, K, V, G$)。</li>
+<li><strong>分块</strong>：把长序列切成每块 64 长度 (<code>BT=64</code>)。</li>
+<li><strong>Kernel 运行</strong>：<ul>
+<li>在每个 Chunk 上，利用 Tensor Core (<code>tl.dot</code>) 高速计算矩阵乘法。</li>
+<li>维护一个在 Chunk 之间传递的 Hidden State $h$。</li>
+<li>利用 Delta Rule ($v_{new} = v - wh$) 来修正信息。</li>
+<li>利用 Gate ($g$) 来遗忘信息。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：计算好的 Hidden States 和更新后的 Values。</li>
+</ol>
+<p><strong>一句话总结这个文件的作用：</strong>
+这是一个<strong>基于 Triton 实现的高效“分块”线性注意力算子</strong>，它通过手动管理内存和矩阵切片，实现了比 PyTorch 原生代码快得多的 RNN 式序列更新。</p>
+<h3>此时你的 Todo List：</h3>
+<ol>
+<li>[ ] <strong>忽略细节</strong>：不要纠结 <code>tl.make_block_ptr</code> 的参数，那是内存寻址的黑魔法。</li>
+<li>[ ] <strong>忽略切片</strong>：无视所有 <code>if K &gt; 64</code>。</li>
+<li>[ ] <strong>关注数据流</strong>：看 <code>b_h1</code> (记忆) 是怎么被 <code>b_w</code>, <code>b_k</code>, <code>b_v</code>, <code>b_g</code> 这一堆东西在循环里不断加减乘除的。</li>
+<li>[ ] <strong>对应公式</strong>：<ul>
+<li><code>b_v = load(v) - dot(w, h)</code></li>
+<li><code>h = h * decay + dot(k, v)</code></li>
+</ul>
+</li>
+</ol>
+<p>这样看，是不是稍微清晰一点了？</p>

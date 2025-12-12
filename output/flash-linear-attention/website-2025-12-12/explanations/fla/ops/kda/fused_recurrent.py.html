@@ -1,0 +1,98 @@
+<h1>fla/ops/kda/fused_recurrent.py</h1>
+<p>这份代码确实涉及到了比较前沿的<strong>线性注意力机制（Linear Attention）</strong>和<strong>状态空间模型（SSM）</strong>的混合领域。如果你没有相关的背景知识，看不懂是非常正常的。</p>
+<p>这段代码的核心实际上是一个<strong>包装器（Wrapper）</strong>，它调用了底层的核心算法。为了让你理解它在干什么，我为你制定了一个 <strong>5步学习清单 (To-Do List)</strong>，我们一步一步来拆解。</p>
+<h3>学习清单 (Task Todo List)</h3>
+<ol>
+<li><strong>Task 1: 理解背景</strong> —— 为什么要写这个代码？（解决Transformer的痛点）</li>
+<li><strong>Task 2: 认识角色</strong> —— 输入参数 <code>q, k, v, g, beta</code> 分别代表什么？</li>
+<li><strong>Task 3: 核心逻辑</strong> —— "Gated Delta Rule" (门控增量规则) 是什么意思？</li>
+<li><strong>Task 4: 代码解析</strong> —— 这个函数具体做了什么操作？</li>
+<li><strong>Task 5: 高级用法</strong> —— 什么是 <code>cu_seqlens</code> 和 <code>initial_state</code>？</li>
+</ol>
+<hr />
+<h3>Step-by-Step 详细讲解</h3>
+<h4>Task 1: 理解背景 —— 它是谁？</h4>
+<ul>
+<li><strong>传统 Transformer:</strong> 计算注意力时，需要看前面所有的词。如果序列长度是 $T$，计算量是 $T^2$。序列太长就会爆显存。</li>
+<li><strong>RNN (循环神经网络):</strong> 像人看书一样，看一个字，更新一下脑子里的记忆（State），然后看下一个字。计算量是 $T$，非常快且省内存。</li>
+<li><strong>这个代码 (KDA/Fused Recurrent):</strong> 它是想<strong>把 Transformer 的注意力机制写成 RNN 的形式</strong>。<ul>
+<li><code>fused</code>: 表示使用了 CUDA 融合算子，速度极快。</li>
+<li><code>recurrent</code>: 表示它是循环模式（像 RNN 一样一步步处理）。</li>
+<li><strong>目的：</strong> 为了让模型在推理（生成文本）时速度飞快，且显存占用极低。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 认识角色 —— 参数解释</h4>
+<p>函数接收几个关键的张量（Tensor）：</p>
+<ol>
+<li><strong><code>q</code> (Query), <code>k</code> (Key), <code>v</code> (Value):</strong><ul>
+<li>这是注意力机制的老三样。你可以理解为：</li>
+<li>$K, V$: 书里的内容（知识）。</li>
+<li>$Q$: 你想查询的问题。</li>
+</ul>
+</li>
+<li><strong><code>g</code> (Decay / Gate):</strong> <strong>这是关键！</strong><ul>
+<li>在 RNN 模式下，记忆是有限的。你不能记住所有东西。</li>
+<li><code>g</code> 代表 <strong>“遗忘门” (Decay)</strong>。它决定了你脑子里的“旧记忆”要保留多少，忘掉多少。</li>
+<li>代码里 <code>g</code> 的形状对应 <code>k</code>，说明它是针对 Key 的衰减。</li>
+</ul>
+</li>
+<li><strong><code>beta</code> (Strength):</strong><ul>
+<li>代表 <strong>“更新强度”</strong>。</li>
+<li>它决定了当前的 $K$ 和 $V$ 有多重要，要以多大的力度写入你的记忆中。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 3: 核心逻辑 —— Gated Delta Rule (门控增量规则)</h4>
+<p>这个文件名叫 <code>fused_recurrent.py</code>，但它调用的核心函数叫 <code>fused_recurrent_gated_delta_rule</code>。这是什么意思？</p>
+<p>想象你在写一个笔记本（记忆状态 $S$）：</p>
+<ol>
+<li><strong>标准 RNN:</strong> $S_{今天} = S_{昨天} + 新信息$</li>
+<li><strong>带遗忘的 RNN:</strong> $S_{今天} = S_{昨天} \times (1 - 遗忘率) + 新信息$</li>
+<li><strong>Delta Rule (增量规则):</strong> 这是一种更高级的更新方式，通常用于修正错误或精确更新。公式大概长这样：
+    $$S_t = S_{t-1} - \beta (S_{t-1} K_t^T) + \beta V_t$$<ul>
+<li>简单说：它不仅仅是“加上”新信息，而是先从记忆里<strong>减去</strong>和当前 Key 相关的旧信息，然后再<strong>加上</strong>新的 Value。这是一种“去伪存真”的过程。</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结：</strong> 这个代码实现了一个数学过程：随着时间步 $t$ 的推移，不断根据 $g$ (遗忘) 和 $\beta$ (更新力度) 来利用 $k, v$ 更新内部记忆状态，并用 $q$ 从记忆中读取输出。</p>
+<h4>Task 4: 代码解析 —— 这一层做了什么？</h4>
+<p>现在回看代码，你会发现这个函数其实很“懒”，它只是一个<strong>中间人</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">fused_recurrent_kda</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 省略前面的检查 ...</span>
+
+    <span class="c1"># 1. 设置默认缩放比例 (Scale)</span>
+    <span class="k">if</span> <span class="n">scale</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">scale</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span>
+
+    <span class="c1"># 2. 核心调用！</span>
+    <span class="c1"># 注意这里：它把传入的 `g` 传给了参数 `gk`。</span>
+    <span class="c1"># 这暗示了在 KDA 算法中，Gate (g) 是作用在 Key 上的。</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">final_state</span> <span class="o">=</span> <span class="n">fused_recurrent_gated_delta_rule</span><span class="p">(</span>
+        <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span>
+        <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span>
+        <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span>
+        <span class="n">gk</span><span class="o">=</span><span class="n">g</span><span class="p">,</span>      <span class="c1"># &lt;--- 关键点：将 g 传给 gk</span>
+        <span class="n">beta</span><span class="o">=</span><span class="n">beta</span><span class="p">,</span>
+        <span class="n">scale</span><span class="o">=</span><span class="n">scale</span><span class="p">,</span>
+        <span class="o">...</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">o</span><span class="p">,</span> <span class="n">final_state</span>
+</code></pre></div>
+
+<p><strong>结论：</strong> <code>fused_recurrent_kda</code> 这个函数本身没有写复杂的循环逻辑，它只是把 KDA (Key-Decay Attention) 的参数格式整理好，然后扔给通用的 <code>gated_delta_rule</code> 求解器去执行。</p>
+<h4>Task 5: 高级用法 —— 形状与变长序列</h4>
+<p>代码里有一大段关于 <code>cu_seqlens</code> 的检查，这是为了处理<strong>变长序列</strong>（Variable Length Sequences）：</p>
+<ul>
+<li><strong>普通情况 (Batching):</strong> 比如一个 Batch 有 4 句话，每句都强行补零（Padding）到 2048 长度。这样会有很多无效计算。</li>
+<li><strong>高效情况 (VarLen):</strong> 把 4 句话首尾相连拼成一个超长的一维长条。<ul>
+<li><code>cu_seqlens</code> (Cumulative Sequence Lengths): 告诉 GPU，第 1 句话从哪结束，第 2 句话从哪开始。</li>
+<li>代码中的 <code>if cu_seqlens is not None:</code> 这一段就是在检查：如果你用了这种高效模式，你的 Batch Size 必须设为 1（因为拼成了一条），且初始状态的数量要对得上。</li>
+</ul>
+</li>
+</ul>
+<h3>总结：这段代码到底讲了啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个 PyTorch 函数，它实现了一种名为 <strong>KDA</strong> 的线性注意力算法的<strong>循环（RNN）推理模式</strong>。</p>
+<p><strong>它的作用：</strong>
+输入 $Q, K, V$ 以及控制遗忘的 $g$ 和控制更新强度的 $\beta$，它会利用 GPU 加速（Fused Kernel）快速计算出输出结果，并不仅输出当前的注意力结果，还可以输出最后的“记忆状态” (<code>final_state</code>)，以便你在下一次生成时直接接着用（类似 KV Cache，但更省内存）。</p>

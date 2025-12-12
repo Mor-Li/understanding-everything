@@ -1,0 +1,84 @@
+<h1>fla/ops/retention/naive.py</h1>
+<p>这份代码实现的是 <strong>RetNet (Retentive Network)</strong> 论文中的核心机制——<strong>Retention (保留机制)</strong> 的“朴素”（Naive）版本。</p>
+<p>RetNet 是微软提出的用来取代 Transformer 的架构，它的核心思想是：<strong>让模型像 Transformer 一样并行训练，但像 RNN 一样推理（有记忆，且记忆会衰减）。</strong></p>
+<p>这份代码之所以叫 <code>naive.py</code>，是因为它用最直观的矩阵乘法来实现，主要用于验证数学逻辑的正确性，而不是为了跑得快（跑得快的版本通常叫 Chunkwise 或 Recurrent）。</p>
+<p>为了帮你读懂，我制定了一个 <strong>5步走的 To-Do List</strong>，我们一步步拆解：</p>
+<hr />
+<h3>✅ Task 1: 搞清楚输入是什么 (准备食材)</h3>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">naive_retention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">):</span>
+    <span class="n">orig_type</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">dtype</span>
+    <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">float</span><span class="p">(),</span> <span class="n">k</span><span class="o">.</span><span class="n">float</span><span class="p">(),</span> <span class="n">v</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+    <span class="n">_</span><span class="p">,</span> <span class="n">n_heads</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">,</span> <span class="n">d_head</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span>
+</code></pre></div>
+
+<p><strong>解析：</strong>
+*   <strong>目标</strong>：准备数据。
+*   <strong>Q, K, V</strong>：和 Transformer 一样，代表 Query (查询), Key (键), Value (值)。
+*   <strong>类型转换</strong>：它强制转成了 <code>float()</code> (FP32)，这是为了防止计算指数衰减时溢出或精度不够。
+*   <strong>形状</strong>：<code>(Batch, Heads, SeqLen, HeadDim)</code>，标准的 4D 张量。</p>
+<hr />
+<h3>✅ Task 2: 设定“遗忘速度” (每个头性格不同)</h3>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">s</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="mf">2.</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="o">-</span><span class="mf">5.</span> <span class="o">-</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">n_heads</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)))</span><span class="o">.</span><span class="n">log2</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>解析：</strong>
+*   <strong>目标</strong>：Retention 的核心特点是<strong>“距离越远的 token，关系越弱”</strong>。这需要一个衰减系数 $\gamma$ (Gamma)。
+*   <strong>不同头，不同衰减</strong>：RetNet 设计让不同的 Head (注意力头) 拥有不同的记忆长短。有的头只看最近的词，有的头看得很远。
+*   <strong>数学魔法</strong>：
+    *   这里计算的 <code>s</code> 其实是 $\log_2(\gamma)$。
+    *   为什么要取对数？因为后面计算衰减矩阵时，乘法会变成加法，指数运算更稳定。
+    *   这一行代码就是在给每一个 Head 分配一个固定的“遗忘速率”。</p>
+<hr />
+<h3>✅ Task 3: 构建“时空衰减矩阵” (最难的一步)</h3>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">n</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">seq_len</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span>
+<span class="c1"># 下面这行最复杂，生成了一个 [SeqLen, SeqLen] 的矩阵</span>
+<span class="n">n</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp2</span><span class="p">((</span><span class="n">n</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">-</span> <span class="n">n</span><span class="p">)</span> <span class="o">*</span> <span class="n">s</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span> <span class="o">*</span> <span class="n">n</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">ge</span><span class="p">(</span><span class="n">n</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解析：</strong>
+*   <strong>目标</strong>：造出一个矩阵，告诉模型“第 $i$ 个词和第 $j$ 个词之间的权重是多少”。
+*   <strong>逻辑拆解</strong>：
+    1.  <strong>相对位置</strong>：<code>n.unsqueeze(-1) - n</code> 计算了位置差。比如第 5 个词和第 3 个词，距离是 2。
+    2.  <strong>指数衰减</strong>：<code>torch.exp2(...)</code>。回忆一下 Task 2 我们存的是 $\log_2(\gamma)$。这里利用公式 $2^{(i-j) \cdot \log_2 \gamma} = \gamma^{i-j}$。这意味着：<strong>距离越远，权重呈指数级下降。</strong>
+    3.  <strong>因果遮罩 (Causal Mask)</strong>：<code>n.unsqueeze(-1).ge(n)</code>。这部分是一个下三角矩阵（只保留 $i \ge j$ 的部分）。意思是：<strong>你只能看过去，不能看未来。</strong>
+*   <strong>结果</strong>：变量 <code>n</code> 现在是一个形状为 <code>(Heads, SeqLen, SeqLen)</code> 的权重矩阵。对角线是 1，越往左下角数值越小（因为记忆衰减了），右上角全是 0（因为那是未来）。</p>
+<hr />
+<h3>✅ Task 4: 计算带衰减的注意力分数 (Q * K)</h3>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">s</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">&#39;bhqd,bhkd,hqk-&gt;bhqk&#39;</span><span class="p">,</span> <span class="n">q</span> <span class="o">*</span> <span class="n">d_head</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">n</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">q</span><span class="o">.</span><span class="n">dtype</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>解析：</strong>
+*   <strong>目标</strong>：计算 Query 和 Key 的匹配度，但要乘上刚才算的衰减矩阵。
+*   <strong>操作</strong>：
+    1.  <code>q * d_head ** -0.5</code>：这是标准的缩放（Scale），防止数值过大，和 Transformer 一样。
+    2.  <code>einsum</code> 爱因斯坦求和约定：
+        *   <code>bhqd</code> (Q) 和 <code>bhkd</code> (K) 相乘 $\rightarrow$ 得到 <code>bhqk</code> (原始注意力分数)。
+        *   然后乘以 <code>hqk</code> (刚才算的衰减矩阵 <code>n</code>)。
+*   <strong>直白理解</strong>：
+    *   Standard Attention: $Score = Q \cdot K^T$
+    *   Retention: $Score = (Q \cdot K^T) \odot DecayMatrix$
+    *   这一步把“内容匹配度”和“位置衰减”融合在了一起。</p>
+<hr />
+<h3>✅ Task 5: 聚合信息并输出 (Score * V)</h3>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">o</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">&#39;bhqk,bhkd-&gt;bhqd&#39;</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
+<span class="k">return</span> <span class="n">o</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">orig_type</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解析：</strong>
+*   <strong>目标</strong>：根据刚才算好的分数，加权求和 Value。
+*   <strong>操作</strong>：
+    *   用分数矩阵 <code>s</code> (<code>bhqk</code>) 去乘 Value 矩阵 <code>v</code> (<code>bhkd</code>)。
+    *   得到最终输出 <code>o</code> (<code>bhqd</code>)。
+*   <strong>收尾</strong>：把数据类型转回最初的类型（比如 FP16 或 BF16）。</p>
+<hr />
+<h3>总结：它和普通 Attention 最大的区别？</h3>
+<p>如果让你用一句话总结给别人听：</p>
+<blockquote>
+<p><strong>普通的 Attention 是 $Softmax(Q \cdot K^T) \cdot V$，所有的历史 token 只要相关性高，权重都一样大；</strong></p>
+<p><strong>而这段代码实现的 Retention 是 $(Q \cdot K^T \odot D) \cdot V$，去掉了 Softmax，加上了 $D$ (Decay)，强制让模型更关注最近的信息，越久远的信息忘得越快。</strong></p>
+</blockquote>

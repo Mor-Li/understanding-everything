@@ -1,0 +1,96 @@
+<h1>fla/ops/utils/solve_tril.py</h1>
+<p>这份代码确实看起来很硬核，因为它涉及到 <strong>GPU 编程 (Triton)</strong>、<strong>线性代数 (矩阵求逆)</strong> 以及 <strong>底层性能优化</strong>。</p>
+<p>别担心，我们把它拆解成一个 <strong>“学习任务清单” (Todo List)</strong>。把这个文件看作是一个工程项目，我们一步步来搞懂它在干什么。</p>
+<hr />
+<h3>任务清单 (Task Todo List)</h3>
+<h4>✅ Task 1: 搞懂核心目标 (What)</h4>
+<p><strong>目标：</strong> 计算矩阵 $(I + A)$ 的逆矩阵。
+*   <strong>前提：</strong> $A$ 是一个 <strong>严格下三角矩阵</strong> (对角线及右上方全是0)。
+*   <strong>数学含义：</strong> $(I+A)$ 就是对角线全是 1 的下三角矩阵。
+*   <strong>应用场景：</strong> 这通常用于线性 Attention (Linear Attention) 或 RNN 中，计算“因果关系”的累积效应。</p>
+<h4>✅ Task 2: 理解数学原理 (How - 理论篇)</h4>
+<p>在这个代码里，核心思想是 <strong>分块矩阵求逆 (Blockwise Inversion)</strong>。
+假设我们有一个大的下三角矩阵 $M = I+A$，我们可以把它切成四块：
+$$
+M = \begin{bmatrix} M_{11} &amp; 0 \ M_{21} &amp; M_{22} \end{bmatrix}
+$$
+(右上角是0，因为是下三角)。</p>
+<p>根据线性代数公式，它的逆矩阵 $M^{-1}$ 是：
+$$
+M^{-1} = \begin{bmatrix} M_{11}^{-1} &amp; 0 \ -M_{22}^{-1} M_{21} M_{11}^{-1} &amp; M_{22}^{-1} \end{bmatrix}
+$$
+<strong>代码的整个逻辑就是围绕这个公式展开的：</strong>
+1.  先算出对角块 $M_{11}^{-1}$ 和 $M_{22}^{-1}$。
+2.  再用矩阵乘法算出左下角的块：$Result_{21} = - (Inv_{22} \times A_{21} \times Inv_{11})$。</p>
+<h4>✅ Task 3: 拆解基础积木 (16x16 Kernel)</h4>
+<p><strong>文件名：</strong> <code>solve_tril_16x16_kernel</code>
+这是最小的计算单元。因为 16x16 很小，不能再分块了，所以用暴力法（代入法）解。</p>
+<ul>
+<li><strong>代码解读：</strong><ul>
+<li><code>m_A</code> 和 <code>m_I</code>：生成掩码，确保我们只处理下三角部分。</li>
+<li><code>b_A = -b_A</code>：取负号，这是为了方便后面的加法计算（公式推导的变形）。</li>
+<li><strong>核心循环 (<code>for i in range...</code>)</strong>：<ul>
+<li>这其实是在做 <strong>前向代入 (Forward Substitution)</strong>。</li>
+<li>想象你在解方程组，因为是下三角，你算出了第一行，就能带入算出第二行，以此类推。</li>
+<li>代码里这一行 <code>b_a = b_a + tl.sum(b_a[:, None] * b_A, 0)</code> 就是在用已经算出的上面的行，来更新当前的行。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 理解“合并”逻辑 (32x32 Kernel)</h4>
+<p><strong>文件名：</strong> <code>merge_16x16_to_32x32_inverse_kernel</code>
+现在我们要处理 32x32 的矩阵。我们把它看作 4 个 16x16 的小块。</p>
+<ul>
+<li><strong>步骤 1：算对角线 (11 和 22 块)</strong><ul>
+<li>代码里的两个 <code>for</code> 循环（<code>range(2, min(16...))</code> 和 <code>range(16+2, min(32...))</code>）其实就是把 Task 3 里的逻辑重复了两遍。</li>
+<li>它分别算出了左上角 (11) 和右下角 (22) 的逆矩阵。</li>
+</ul>
+</li>
+<li><strong>步骤 2：算左下角 (21 块)</strong><ul>
+<li>这是最关键的一行代码：
+    <code>python
+    b_Ai_21 = -tl.dot(tl.dot(b_Ai_22, b_A_21, ...), b_Ai_11, ...)</code></li>
+<li><strong>翻译：</strong> 这完全对应 Task 2 中的公式：$-M_{22}^{-1} \times M_{21} \times M_{11}^{-1}$。</li>
+<li>它利用 Triton 的 <code>tl.dot</code> (矩阵乘法) 来快速完成这一步。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 进阶“合并”逻辑 (64x64 Kernel)</h4>
+<p><strong>文件名：</strong> <code>merge_16x16_to_64x64_inverse_kernel</code>
+逻辑同上，只是套娃层数多了。</p>
+<ul>
+<li>把 64x64 切成 4x4 个 16x16 的小块。</li>
+<li>先算对角线上的 4 个块的逆。</li>
+<li>然后利用矩阵乘法，一层一层地算出非对角线位置的块。</li>
+<li>代码中你能看到大量的 <code>tl.dot</code>，都是在拼凑那个矩阵求逆公式。</li>
+</ul>
+<h4>✅ Task 6: 外围设施 (Python Wrapper)</h4>
+<p><strong>函数名：</strong> <code>solve_tril</code>
+这是给 PyTorch 调用的接口。</p>
+<ul>
+<li><strong>逻辑：</strong><ol>
+<li>检查输入矩阵的大小 <code>BT</code> (Block Size)。目前只支持 16, 32, 64。</li>
+<li>根据大小，选择用哪个 Kernel (<code>merge_fn = ...</code>)。<ul>
+<li>如果是 16，直接用基础 Kernel。</li>
+<li>如果是 32，用 32 的合并 Kernel。</li>
+<li>如果是 64，用 64 的合并 Kernel。</li>
+</ul>
+</li>
+<li>启动 GPU Kernel (<code>merge_fn[...]</code>)。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码在讲什么故事？</h3>
+<p>想象你在拼乐高，目标是拼一个很大的倒三角形状：</p>
+<ol>
+<li><strong>基础能力 (16x16 Kernel)</strong>：你学会了如何徒手拼最小的三角形（通过一行一行解方程）。</li>
+<li><strong>组合能力 (32x32 &amp; 64x64 Kernel)</strong>：当你要拼更大的三角形时，你不需要重新一行一行拼。你发现大的三角形是由几个小的三角形组成的。<ul>
+<li>你先把对角线上的小三角形拼好。</li>
+<li>然后利用数学魔法（矩阵乘法公式），把这些小三角形“乘”起来，直接生成剩下的部分。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这是一个利用 <strong>GPU 高并行特性</strong>，通过 <strong>分块矩阵求逆算法</strong>，快速计算 <strong>下三角矩阵逆 $(I+A)^{-1}$</strong> 的高性能算子库。</p>

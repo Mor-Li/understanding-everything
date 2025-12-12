@@ -1,0 +1,128 @@
+<h1>fla/ops/ttt/naive.py</h1>
+<p>这份代码实现的是 <strong>TTT (Test-Time Training)</strong> 算法的一个变体，具体是 <strong>TTT-Linear</strong> 的朴素（Naive）实现。</p>
+<p>简单来说，普通的 Transformer 注意力机制是“查表”，而 TTT 的核心思想是：<strong>把注意力机制看作是一个微型的、在线的“训练”过程。</strong></p>
+<p>我们可以把这段代码看作是一个<strong>在推理过程中实时更新权重的线性模型</strong>。</p>
+<p>为了让你看懂，我制定了一个 <strong>5步走的 Task List</strong>，我们一步步拆解：</p>
+<hr />
+<h3>📋 Task 0: 核心概念理解 (Mental Model)</h3>
+<p>在看代码前，先建立这个心智模型：
+*   <strong>传统的 RNN/LSTM/Transformer</strong>：模型权重 $W$ 训练好后就固定了，推理时只改变隐藏状态 $h$。
+*   <strong>TTT (Test-Time Training)</strong>：这里的隐藏状态 $h$ <strong>本身就是一个权重矩阵</strong>。
+*   <strong>处理流程</strong>：每读入一小段数据（Mini-batch），模型就用梯度下降（Gradient Descent）更新一次这个 $h$。
+*   <strong>变量对应</strong>：
+    *   <code>h</code>: 隐藏状态，实际上是我们要在线训练的权重矩阵。
+    *   <code>eta</code>: 学习率 (Learning Rate)。
+    *   <code>k</code>: 训练数据的输入 (Input)。
+    *   <code>v</code>: 训练数据的标签 (Target)。</p>
+<hr />
+<h3>📋 Task 1: 数据预处理 (Data Prep)</h3>
+<p><strong>代码位置</strong>：函数开头到 <code>for</code> 循环之前。</p>
+<p><strong>目标</strong>：把长序列切成小块（Chunk），方便进行“小批量梯度下降”。</p>
+<ol>
+<li><strong>输入形状</strong>：<code>q, k, v</code> 的形状是 <code>[Batch, Head, Time, Dim]</code>。</li>
+<li><strong>切分 (Chunking)</strong>：<ul>
+<li>代码：<code>_q = q.reshape(B, H, NT, BT, D)...</code></li>
+<li>解释：把时间维度 <code>T</code> 切分成了 <code>NT</code> 个块，每个块的大小是 <code>BT</code> (即 <code>mini_batch_size</code>)。</li>
+<li>现在的维度变成了 <code>[NT, B, H, BT, D]</code>，也就是 <code>[块数, Batch, 头, 小块时间, 维度]</code>。</li>
+</ul>
+</li>
+<li><strong>初始化状态</strong>：<ul>
+<li><code>h</code> 和 <code>hb</code> 被初始化为 0。记住，这不仅是状态，它们是<strong>权重的初始值</strong>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📋 Task 2: 循环内的第一步——“前向传播” (Forward Pass)</h3>
+<p><strong>代码位置</strong>：<code>for i in range(NT):</code> 循环内部的前几行。</p>
+<p><strong>目标</strong>：使用当前的权重 <code>h</code> 对输入 <code>k</code> 进行预测。</p>
+<ol>
+<li><strong>提取当前块</strong>：<code>q_i, k_i, v_i</code> 是当前这一小段时间的数据。</li>
+<li><strong>线性预测</strong>：<ul>
+<li>代码：<code>kh = k_i @ h + hb</code></li>
+<li>解释：这就是最简单的线性层公式 $y = xW + b$。这里用当前的“状态权重” <code>h</code> 作用在 <code>k</code> 上，得到预测值 <code>kh</code>。</li>
+</ul>
+</li>
+<li><strong>层归一化 (LayerNorm) 的前半部分</strong>：<ul>
+<li>代码：计算 <code>mean</code>, <code>var</code>, <code>rstd</code>, <code>kh_hat</code>。</li>
+<li>解释：对预测结果 <code>kh</code> 进行标准化（减均值除方差）。这是为了让在线训练更稳定。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📋 Task 3: 循环内的第二步——“计算梯度” (Gradient Calculation)</h3>
+<p><strong>代码位置</strong>：<code>g = ...</code> 到 <code>v_new = ...</code></p>
+<p><strong>目标</strong>：计算预测值和目标值之间的误差，并反向传播算出梯度。这是 TTT 最硬核的部分。</p>
+<ol>
+<li><strong>计算误差 (Loss Gradient)</strong>：<ul>
+<li>代码：<code>g = w * kh_hat + b - reconstruction_target</code></li>
+<li>其中 <code>reconstruction_target = v_i - k_i</code>。</li>
+<li>解释：我们希望模型能学会从 <code>k</code> 预测 <code>v</code>。这里计算了预测值（经过LN变换后）与目标之间的差值。这个 <code>g</code> 就是损失函数对输出的梯度 $\frac{\partial Loss}{\partial Output}$。</li>
+</ul>
+</li>
+<li><strong>LayerNorm 的反向传播</strong>：<ul>
+<li>代码：<code>v_new = (D * g - g.sum...) / (rstd * D)</code></li>
+<li>解释：这行看起来很复杂的数学公式，其实是 <strong>手动实现了 LayerNorm 的反向传播（Backward Pass）</strong>。</li>
+<li>因为我们是在前向推理（Forward）中做训练，PyTorch 的自动求导（Autograd）还没生效，所以作者<strong>手写了梯度的链式法则</strong>。</li>
+<li><strong>结论</strong>：<code>v_new</code> 代表了为了减小误差，我们需要把输入调整的方向（即梯度）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📋 Task 4: 循环内的第三步——“输出与更新” (Output &amp; Update)</h3>
+<p><strong>代码位置</strong>：<code>Attn = ...</code> 到 <code>hb = ...</code></p>
+<p><strong>目标</strong>：生成当前时刻的输出，并更新权重 <code>h</code> 供下一时刻使用。</p>
+<ol>
+<li><strong>计算输出 <code>o_i</code></strong>：<ul>
+<li>代码：<code>o_i = q_i @ h - ...</code></li>
+<li>解释：这部分结合了 TTT 的对偶形式。简单理解为：<ul>
+<li><code>q_i @ h</code>：用当前的权重处理 Query。</li>
+<li>后面的一长串 <code>(eta_i * Attn) @ v_new ...</code>：这是对当前块内梯度的修正（类似于 Transformer 里的残差连接或 Attention 修正）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>更新权重 (The "Training" Step)</strong>：<ul>
+<li>代码：
+    <code>python
+    h = h - (eta_i... * k_i).transpose(...) @ v_new
+    hb = hb - ...</code></li>
+<li>解释：这就是标准的 <strong>梯度下降 (Gradient Descent)</strong>！<ul>
+<li>新权重 = 旧权重 - 学习率 * 梯度。</li>
+<li>这里的梯度是由输入 <code>k</code> 和误差信号 <code>v_new</code> 的外积构成的。</li>
+<li><code>eta_i</code> 就是学习率。</li>
+</ul>
+</li>
+<li><strong>关键点</strong>：<code>h</code> 被更新了！下一个循环（下一个时间块）用到就是更新后的 <code>h</code>。这就是“Test-Time Training”。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📋 Task 5: 输出后处理 (Final Polish)</h3>
+<p><strong>代码位置</strong>：循环内的最后几行 <code>mean = o_i.mean...</code> 和循环外的 <code>return</code>。</p>
+<ol>
+<li><strong>输出归一化</strong>：<ul>
+<li>代码：<code>o[i] = o_i + (o_i - mean) / rstd * w + b</code></li>
+<li>解释：对最终的输出 <code>o_i</code> 再做一次 LayerNorm 并加上残差连接。</li>
+</ul>
+</li>
+<li><strong>重组数据</strong>：<ul>
+<li>把切开的块 <code>[NT, BT]</code> 重新拼回完整的时间序列 <code>[T]</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>把这个文件看作一个<strong>“会学习的线性层”</strong>：</p>
+<ol>
+<li>它把长序列切成小块。</li>
+<li><strong>For 每一个小块</strong>：<ul>
+<li>用手头的权重 <code>h</code> 预测结果。</li>
+<li>看预测得准不准（和 <code>v</code> 比），算出误差。</li>
+<li><strong>手写反向传播</strong>算出梯度。</li>
+<li>用梯度下降<strong>更新权重 <code>h</code></strong>。</li>
+<li>输出结果。</li>
+</ul>
+</li>
+<li>拼好结果返回。</li>
+</ol>
+<p>这段代码之所以难懂，是因为它把通常由 PyTorch 自动处理的<strong>反向传播（求导）过程</strong>，用数学公式<strong>显式地写在了前向传播的代码里</strong>。</p>

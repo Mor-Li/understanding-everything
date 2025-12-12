@@ -1,0 +1,78 @@
+<h1>fla/layers/kda.py</h1>
+<p>这份代码实现了一个名为 <strong>Kimi Delta Attention (KDA)</strong> 的神经网络层。这是一种<strong>线性注意力（Linear Attention）</strong>或者说<strong>状态空间模型（SSM）</strong>的变体。</p>
+<p>为了让你听懂，我们不需要去扣复杂的数学公式。你可以把它想象成<strong>“如何让AI像人一样，一边读文章一边记笔记，而不是每次都要回头重新读整本书”</strong>。</p>
+<p>我为你列了一个 <strong>“学习任务清单 (Todo List)”</strong>，我们一步一步来拆解这个文件在干什么。</p>
+<hr />
+<h3>✅ Task 1: 理解宏观概念（这是什么？）</h3>
+<p><strong>目标</strong>：明白 KDA 和普通 Attention (如 Transformer) 的区别。
+*   <strong>普通 Attention</strong>：看这一页书时，必须同时要把前面读过的 1000 页书全都摊开在桌子上对比（计算量极大，内存爆炸）。
+*   <strong>KDA (以及这类线性 Attention)</strong>：读前面 1000 页时，脑子里维护一个“记忆状态”（State）。读新的一页时，根据新内容更新这个记忆。看第 1001 页时，只需要看当前的“记忆”和“新的一页”（计算量极小，推理极快）。
+*   <strong>代码地位</strong>：这个 <code>KimiDeltaAttention</code> 就是实现这个“更新记忆”逻辑的核心组件。</p>
+<hr />
+<h3>✅ Task 2: 准备原材料 (Q, K, V 的生成)</h3>
+<p><strong>代码位置</strong>：<code>__init__</code> 中的 <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code> 以及 <code>forward</code> 开头部分。
+<strong>解读</strong>：
+1.  <strong>输入</strong>：<code>hidden_states</code> (你读到的文字特征)。
+2.  <strong>投影</strong>：像所有 Transformer 一样，先把输入变成 Query (Q), Key (K), Value (V)。
+3.  <strong>短卷积 (Short Convolution)</strong>：
+    *   <em>代码</em>：<code>if use_short_conv: self.q_conv1d(...)</code>
+    *   <em>作用</em>：在做复杂的记忆更新前，先看看“左右邻居”。比如理解“不”字，得看后面是不是跟了“喜欢”。这是一个局部的、小范围的特征提取，让模型对局部信息更敏感。</p>
+<hr />
+<h3>✅ Task 3: 制造“控制信号” (这是 KDA 的特色)</h3>
+<p><strong>代码位置</strong>：<code>self.f_proj</code>, <code>self.b_proj</code>, <code>self.A_log</code>, <code>self.dt_bias</code>。
+<strong>解读</strong>：
+这是 KDA 与众不同的地方，它需要决定“记住多少”和“忘掉多少”。
+1.  <strong>$g$ (Gate/Decay)</strong>：
+    *   <em>代码</em>：<code>g = self.f_proj(hidden_states)</code>
+    *   <em>含义</em>：这是一个<strong>衰减/遗忘门</strong>。它决定了过去的记忆有多少要保留下来。
+2.  <strong>$\beta$ (Beta)</strong>：
+    *   <em>代码</em>：<code>beta = self.b_proj(hidden_states).sigmoid()</code>
+    *   <em>含义</em>：这是一个<strong>更新强度</strong>。它决定了当前的新信息（V）有多重要，要以多大的力度写入记忆中。
+3.  <strong>$A$ 和 $dt$</strong>：
+    *   <em>代码</em>：<code>self.A_log</code>, <code>self.dt_bias</code>
+    *   <em>含义</em>：这是状态空间模型（SSM）的底层数学参数，控制记忆随时间自然消退的速度。</p>
+<hr />
+<h3>✅ Task 4: 核心引擎——更新记忆 (Chunk vs Recurrent)</h3>
+<p><strong>代码位置</strong>：<code>forward</code> 方法中的 <code>mode</code> 判断，以及调用 <code>chunk_kda</code> 或 <code>fused_recurrent_kda</code>。
+<strong>解读</strong>：
+这是最硬核的计算部分。模型根据模式不同，选择不同的计算方式：</p>
+<ol>
+<li><strong>训练模式 (Chunk Mode)</strong>：<ul>
+<li><em>场景</em>：训练时，我们一次性把整本书喂给 GPU。</li>
+<li><em>做法</em>：为了利用 GPU 的并行能力，它把长文本切成小块（Chunk），块内并行计算，块间传递记忆。这是为了<strong>快</strong>。</li>
+</ul>
+</li>
+<li><strong>推理模式 (Fused Recurrent Mode)</strong>：<ul>
+<li><em>场景</em>：也就是 <code>q_len &lt;= 64</code> 或者 <code>use_cache=True</code> 时。就像你在这个对话框里打字，是一个字一个字蹦出来的。</li>
+<li><em>做法</em>：使用循环（RNN）模式。</li>
+<li><em>逻辑</em>：<code>新记忆 = 旧记忆 * 衰减 + 新信息 * 强度</code>。</li>
+<li><em>代码体现</em>：<code>o, recurrent_state = fused_recurrent_kda(...)</code>。这里算出了当前的输出 <code>o</code> 和新的记忆 <code>recurrent_state</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 整理输出 (Post-processing)</h3>
+<p><strong>代码位置</strong>：<code>forward</code> 的最后几行。
+<strong>解读</strong>：
+1.  <strong>归一化与门控 (Norm &amp; Gate)</strong>：
+    *   <em>代码</em>：<code>self.o_norm(o, ...)</code>
+    *   <em>含义</em>：计算出来的结果 <code>o</code> 可能会数值不稳定，需要用 <code>FusedRMSNormGated</code> 整理一下，并且再次结合输入信息（<code>g_proj</code>）做一个筛选。
+2.  <strong>最终投影</strong>：
+    *   <em>代码</em>：<code>self.o_proj(o)</code>
+    *   <em>含义</em>：把处理好的特征变回原来的维度（<code>hidden_size</code>），以便传给下一层网络。</p>
+<hr />
+<h3>✅ Task 6: 缓存管理 (KV Cache)</h3>
+<p><strong>代码位置</strong>：<code>past_key_values</code> 相关的逻辑。
+<strong>解读</strong>：
+*   <strong>问题</strong>：普通的 Transformer 缓存是把所有层之前的 K 和 V 都存下来（显存占用大）。
+*   <strong>KDA 的优势</strong>：你看代码里 <code>past_key_values.update(recurrent_state=...)</code>。
+*   <strong>含义</strong>：它只需要存一个固定大小的 <code>recurrent_state</code>（记忆状态）和一点点卷积的缓存 <code>conv_state</code>。不管文章有多长，这个缓存大小几乎是<strong>不变的</strong>。这就是为什么类似架构（如 Kimi, Mamba）能处理超长上下文的原因。</p>
+<hr />
+<h3>总结：这个文件讲了个啥故事？</h3>
+<p><strong>故事如下：</strong>
+1.  数据进来了，我先算出 Q、K、V，并顺手做个局部卷积（看看邻居）。
+2.  我计算出两个关键指标：<strong>$\beta$ (我要把新知识记得多牢)</strong> 和 <strong>$g$ (我要把旧知识忘掉多少)</strong>。
+3.  <strong>核心步骤</strong>：根据 $\beta$ 和 $g$，我把当前的 QKV 信息融合进我的“长期记忆状态”里（调用 <code>chunk_kda</code> 或 <code>recurrent_kda</code>）。
+4.  我把融合后的结果拿出来，整理一下（Norm），输出。
+5.  如果是推理模式，我把最新的“记忆状态”打包好，留给下一个 token 使用，这样我就不用回头看之前的文了。</p>
+<p>这就是 <code>KimiDeltaAttention</code> 的全貌。它是一个<strong>高效的、带记忆更新机制的注意力层</strong>。</p>

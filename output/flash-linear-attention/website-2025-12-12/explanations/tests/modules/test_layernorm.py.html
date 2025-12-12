@@ -1,0 +1,98 @@
+<h1>tests/modules/test_layernorm.py</h1>
+<p>这个文件其实是一个<strong>自动化测试脚本</strong>（Unit Test），使用的是 Python 的 <code>pytest</code> 框架。</p>
+<p>它的核心目的只有一个：<strong>验证 <code>fla</code> 这个库里写的各种 Normalization（归一化）层，计算结果是否和 PyTorch 官方或 HuggingFace 的标准实现一模一样。</strong></p>
+<p>为了让你彻底理解，我把它拆解成一个<strong>“任务清单”（Todo List）</strong>，带你一步步看懂它的逻辑。</p>
+<hr />
+<h3>核心逻辑任务清单 (Task Todo List)</h3>
+<p>我们要完成这个测试，需要按顺序做以下几件事：</p>
+<ol>
+<li><strong>准备环境 (Setup):</strong> 引入必要的库，设置好测试参数（比如输入数据的大小、批次大小）。</li>
+<li><strong>确立裁判 (Reference):</strong> 找一个“标准答案”。通常是 PyTorch 自带的 <code>nn.LayerNorm</code> 或者 Transformers 库里的 <code>LlamaRMSNorm</code>。我们叫它 <code>ref</code> (Reference)。</li>
+<li><strong>确立考生 (Target):</strong> 找我们要测试的“新代码”。这里是 <code>fla</code> 库里的 <code>LayerNorm</code>, <code>RMSNorm</code> 等。我们叫它 <code>tri</code> (可能是 Triton 实现的缩写，意指高性能实现)。</li>
+<li><strong>同步考题 (Sync Weights):</strong> 也就是把“标准答案”里的权重（weight）和偏置（bias）复制给“考生”，确保大家起跑线一样。</li>
+<li><strong>比对前向传播 (Forward Check):</strong> 输入同样的数据 <code>x</code>，看 <code>ref(x)</code> 和 <code>tri(x)</code> 输出的结果 <code>y</code> 是否一样。</li>
+<li><strong>比对反向传播 (Backward Check):</strong> 这是一个深度学习库最关键的。不仅结果要对，<strong>梯度（Gradient）</strong>也要对。我们要计算 <code>dx</code> (输入的梯度), <code>dw</code> (权重的梯度), <code>db</code> (偏置的梯度)，看两者是否一致。</li>
+<li><strong>覆盖不同场景 (Parametrize):</strong> 用不同的参数（比如数据维度 D=64 或 D=1024）反复跑上面的流程，确保在各种情况下都没 bug。</li>
+</ol>
+<hr />
+<h3>逐步代码解读</h3>
+<p>现在我们按照上面的逻辑，一步步看代码里的具体实现。</p>
+<h4>第一步：理解测试的通用模版</h4>
+<p>代码里每一个以 <code>test_</code> 开头的函数（比如 <code>test_layernorm</code>）都是在重复上面的逻辑。</p>
+<p><strong>关键代码片段解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这是一堆参数配置，pytest 会自动组合这些参数运行多次测试</span>
+<span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;B&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">])</span>      <span class="c1"># Batch size</span>
+<span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;D&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">50</span><span class="p">,</span> <span class="mi">64</span><span class="p">])</span> <span class="c1"># Dimension</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_layernorm</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 1. 造数据</span>
+    <span class="c1"># requires_grad=True 表示我们要测梯度</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+
+    <span class="c1"># 2. 实例化两个模型</span>
+    <span class="n">ref</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span> <span class="c1"># 裁判（官方版）</span>
+    <span class="n">tri</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>    <span class="c1"># 考生（fla库版）</span>
+
+    <span class="c1"># 3. 复制权重 (作弊让两人脑子里的参数一样)</span>
+    <span class="n">tri</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">ref</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">data</span><span class="p">)</span>
+
+    <span class="c1"># 4. 跑前向传播 (Forward)</span>
+    <span class="n">ref_y</span> <span class="o">=</span> <span class="n">ref</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+    <span class="n">tri_y</span> <span class="o">=</span> <span class="n">tri</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+
+    <span class="c1"># 5. 跑反向传播 (Backward / Gradient)</span>
+    <span class="c1"># 计算输出结果 sum() 后对输入 x 的导数</span>
+    <span class="n">ref_dx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">grad</span><span class="p">(</span><span class="n">ref</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(),</span> <span class="n">x</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="n">tri_dx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">grad</span><span class="p">(</span><span class="n">tri</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(),</span> <span class="n">x</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+
+    <span class="c1"># 6. 断言 (Assert) - 也就是判卷子</span>
+    <span class="c1"># 如果两者误差超过 1e-3，测试就报错失败</span>
+    <span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39; y&#39;</span><span class="p">,</span> <span class="n">ref_y</span><span class="p">,</span> <span class="n">tri_y</span><span class="p">,</span> <span class="mf">1e-3</span><span class="p">)</span>  <span class="c1"># 比输出</span>
+    <span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39;dx&#39;</span><span class="p">,</span> <span class="n">ref_dx</span><span class="p">,</span> <span class="n">tri_dx</span><span class="p">,</span> <span class="mf">1e-3</span><span class="p">)</span> <span class="c1"># 比输入的梯度</span>
+</code></pre></div>
+
+<hr />
+<h4>第二步：细分 Task - 不同的归一化层</h4>
+<p>这个文件测了三种不同的归一化方式，外加它们的“融合版本”。</p>
+<p><strong>Task 1: 测试 LayerNorm (<code>test_layernorm</code>)</strong>
+*   <strong>背景:</strong> 最经典的归一化，BERT、GPT 都在用。
+*   <strong>对比:</strong> <code>fla.modules.LayerNorm</code> <strong>VS</strong> <code>torch.nn.LayerNorm</code>。
+*   <strong>观点:</strong> 确保 <code>fla</code> 的实现和 PyTorch 官方完全一致。</p>
+<p><strong>Task 2: 测试 GroupNorm (<code>test_groupnorm</code>)</strong>
+*   <strong>背景:</strong> 把特征分成几组分别做归一化，常用于计算机视觉，但也用于某些大模型。
+*   <strong>难点:</strong> 代码里用到了 <code>rearrange</code>，因为 GroupNorm 通常对通道（Channel）操作，需要调整数据形状。
+*   <strong>对比:</strong> <code>fla.modules.GroupNorm</code> <strong>VS</strong> <code>torch.nn.GroupNorm</code> (或者一个手写的参考实现 <code>GroupNormRef</code>)。</p>
+<p><strong>Task 3: 测试 RMSNorm (<code>test_rmsnorm</code>)</strong>
+*   <strong>背景:</strong> LLaMA 模型用的归一化方式，去掉了减去均值的步骤，速度更快。
+*   <strong>对比:</strong> <code>fla.modules.RMSNorm</code> <strong>VS</strong> <code>transformers...LlamaRMSNorm</code> (HuggingFace 的实现)。
+*   <strong>观点:</strong> 既然是做大模型库，必须支持 LLaMA 的标准。</p>
+<hr />
+<h4>第三步：进阶 Task - 算子融合 (Fusion)</h4>
+<p>你会发现代码后面还有 <code>test_layernorm_linear</code>，<code>test_groupnorm_linear</code>，<code>test_rmsnorm_linear</code>。这是啥？</p>
+<p><strong>Task 4: 测试“归一化+线性层”的融合 (<code>test_..._linear</code>)</strong></p>
+<ul>
+<li><strong>观点:</strong> 在深度学习优化中，把两个操作（比如先做 LayerNorm，紧接着做一个 Linear 全连接层）合并成一个内核（Kernel）去跑，可以减少内存读写，极大提升速度。</li>
+<li><strong>对比对象:</strong><ul>
+<li><strong>Ref (裁判):</strong> 用 <code>nn.Sequential</code> 把两个层串起来：先跑 Norm，再跑 Linear。
+    <code>python
+    ref = nn.Sequential(nn.LayerNorm(...), nn.Linear(...))</code></li>
+<li><strong>Tri (考生):</strong> <code>fla</code> 提供的一个融合模块 <code>LayerNormLinear</code>。它应该能一步到位算出结果。
+    <code>python
+    tri = LayerNormLinear(...)</code></li>
+</ul>
+</li>
+<li><strong>验证点:</strong><ul>
+<li>不仅要验证最终输出 <code>y</code>。</li>
+<li>还要验证中间所有参数的梯度：<code>dw</code> (Norm的权重), <code>db</code> (Norm的偏置), <code>dlw</code> (Linear的权重), <code>dlb</code> (Linear的偏置)。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇文章（代码）讲的观点是：</p>
+<ol>
+<li><strong>我们写了一个高性能库 <code>fla</code>。</strong></li>
+<li><strong>为了证明它是对的，我们通过 <code>pytest</code> 把它和 PyTorch/Transformers 的官方实现进行了 PK。</strong></li>
+<li><strong>我们不仅测了 LayerNorm, GroupNorm, RMSNorm 的基础功能。</strong></li>
+<li><strong>我们还测了高级的“算子融合”功能（Norm + Linear），证明它在加速的同时，数学精度依然是准确的。</strong></li>
+</ol>
+<p>你看得懂这个 List 之后，再回看代码，就会发现它只是在机械地重复：<strong>造数据 -&gt; 跑官方版 -&gt; 跑自己版 -&gt; 比对结果 -&gt; 报错或通过</strong>。</p>

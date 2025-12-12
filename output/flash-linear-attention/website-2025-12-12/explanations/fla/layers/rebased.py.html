@@ -1,0 +1,110 @@
+<h1>fla/layers/rebased.py</h1>
+<p>这份代码确实涉及了很多深度学习底层优化和比较新的“线性注意力机制（Linear Attention）”的概念，乍一看非常劝退。</p>
+<p>为了让你能够理解，我制定了一个 <strong>“学习任务清单 (Todo List)”</strong>。我们将代码拆解成 5 个小任务，由浅入深，一步步攻克它。</p>
+<hr />
+<h3>任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂“它想干什么” (宏观概念)</strong></li>
+<li><strong>Task 2: 准备食材 (<code>__init__</code> 部分)</strong></li>
+<li><strong>Task 3: 核心魔法 (<code>RebasedFeatureMap</code> 是什么)</strong></li>
+<li><strong>Task 4: 真正的数学逻辑 (看 <code>forward_reference</code>)</strong></li>
+<li><strong>Task 5: 工程加速 (看 <code>forward</code>)</strong></li>
+</ol>
+<hr />
+<h3>Task 1: 搞懂“它想干什么” (宏观概念)</h3>
+<p><strong>目标：</strong> 明白这个类 <code>ReBasedLinearAttention</code> 是用来替代什么的。</p>
+<ul>
+<li><strong>背景：</strong> 标准的 Transformer（像 GPT）使用的是 Softmax Attention。它的计算量随着序列长度（比如你输入的字数）增加而<strong>平方级爆炸</strong>。字数翻倍，计算慢 4 倍。</li>
+<li><strong>这个代码的角色：</strong> 这是一个 <strong>线性注意力（Linear Attention）</strong> 层。它的目标是：<strong>效果要像 Transformer 那么好，但速度要像 RNN 那么快（随着字数线性增长）。</strong></li>
+<li><strong>"ReBased" 是什么：</strong> 这是这个算法的名字，全称是 "Revisiting Based Linear Attention"。你可以把它简单理解为一种特殊的、改进过的线性注意力算法。</li>
+</ul>
+<p><strong>结论：</strong> 这是一个为了<strong>省显存</strong>和<strong>加速长文本推理</strong>而设计的注意力层。</p>
+<hr />
+<h3>Task 2: 准备食材 (<code>__init__</code> 部分)</h3>
+<p><strong>目标：</strong> 看懂初始化函数里定义了哪些变量。</p>
+<p>请看代码中的 <code>__init__</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 产生 Query</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 产生 Key</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 产生 Value</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 产生 Output</span>
+</code></pre></div>
+
+<p>这部分和普通的 Transformer <strong>完全一样</strong>。它把输入的向量投影成 Q、K、V 三个矩阵。</p>
+<p><strong>区别在于这里：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="bp">self</span><span class="o">.</span><span class="n">feature_map</span> <span class="o">=</span> <span class="n">RebasedFeatureMap</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">feature_dim</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>在普通 Transformer 里，我们算完 Q 和 K 之后，直接相乘然后取 Softmax。</li>
+<li>在这里，我们<strong>不取 Softmax</strong>。我们用这个 <code>feature_map</code> 对 Q 和 K 先进行一次“预处理”（或者叫核函数映射）。</li>
+</ul>
+<hr />
+<h3>Task 3: 核心魔法 (<code>RebasedFeatureMap</code> 是什么)</h3>
+<p><strong>目标：</strong> 理解为什么要对 Q 和 K 做处理。</p>
+<p>代码里有一行：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">q</span><span class="p">,</span> <span class="n">k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">feature_map</span><span class="p">(</span><span class="n">q</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">feature_map</span><span class="p">(</span><span class="n">k</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>原理：</strong> 线性注意力的核心思想是移除 Softmax。但是直接移除效果很差。</li>
+<li><strong>ReBased 的做法：</strong> 它使用泰勒展开（Taylor Expansion）或者类似的数学技巧，把 Q 和 K 映射到一个新的特征空间，使得它们的乘积能够近似 Softmax 的效果，同时保持线性计算的特性。</li>
+<li><strong>简单理解：</strong> 你可以把 <code>feature_map</code> 想象成一个滤镜。Q 和 K 经过这个滤镜处理后，就可以用一种更省力的方式相乘了。</li>
+</ul>
+<hr />
+<h3>Task 4: 真正的数学逻辑 (看 <code>forward_reference</code>)</h3>
+<p><strong>目标：</strong> 这一步最关键。不要看 <code>forward</code>，先看 <code>forward_reference</code>。这是作者写的“慢速版但易读版”实现。</p>
+<p>请关注这几行代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 映射</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">feature_map</span><span class="p">(</span><span class="n">q</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">feature_map</span><span class="p">(</span><span class="n">k</span><span class="p">)</span>
+
+<span class="c1"># 2. 核心公式 (Causal 模式)</span>
+<span class="c1"># 这里的 cumsum 是“累加求和”的意思</span>
+<span class="n">y</span> <span class="o">=</span> <span class="p">((</span><span class="n">q</span> <span class="o">*</span> <span class="p">(</span><span class="n">k</span> <span class="o">*</span> <span class="n">v</span><span class="p">)</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="mi">2</span><span class="p">))</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">/</span> <span class="p">((</span><span class="n">q</span> <span class="o">*</span> <span class="n">k</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="mi">2</span><span class="p">))</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">eps</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>逐步解析这个公式：</strong></p>
+<ol>
+<li><strong>普通 Attention：</strong> 是先算 $Q \times K^T$ (得到一个巨大的 $N \times N$ 矩阵)，然后再乘以 $V$。</li>
+<li><strong>Linear Attention (这里)：</strong><ul>
+<li>它利用了矩阵乘法的结合律：$(Q \times K^T) \times V = Q \times (K^T \times V)$。</li>
+<li><strong>关键点：</strong> <code>(k * v).cumsum(2)</code>。</li>
+<li>这意味着，对于第 $t$ 个时刻，它不需要回头看所有之前的 $t-1$ 个时刻（不需要构建大矩阵）。它只需要把之前的 $K$ 和 $V$ 的乘积<strong>累加（cumsum）</strong>起来，存成一个状态 $S$。</li>
+<li>等到 $Q$ 来了，直接和这个状态 $S$ 交互就行了。</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论：</strong> 这就是为什么它快。它把“回顾所有历史”变成了“读取当前的累加状态”。</p>
+<hr />
+<h3>Task 5: 工程加速 (看 <code>forward</code>)</h3>
+<p><strong>目标：</strong> 理解为什么 <code>forward</code> 里写得那么复杂（<code>chunk</code>, <code>parallel</code>）。</p>
+<p>既然 <code>forward_reference</code> 已经能算出结果了，为什么 <code>forward</code> 里还要写一堆 <code>if mode == ...</code>？</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s2">&quot;fused_chunk&quot;</span><span class="p">:</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="n">fused_chunk_linear_attn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="k">elif</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;parallel&#39;</span><span class="p">:</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="n">parallel_rebased</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>原因：</strong> Python 的 <code>cumsum</code> 和循环在 GPU 上运行得不够快。</li>
+<li><strong>解决方案：</strong> 作者写了专门的 <strong>CUDA Kernel</strong> (底层的 C++/CUDA 代码) 来执行 Task 4 里的那个数学公式。<ul>
+<li><code>parallel</code>: 并行模式。在训练时，因为所有 token 都已知，可以并行地一次性算完所有累加，速度飞快。</li>
+<li><code>chunk</code>: 分块模式。为了进一步省显存，把长序列切成小块计算。</li>
+</ul>
+</li>
+<li><strong>代码逻辑：</strong><ol>
+<li>投影 Q, K, V。</li>
+<li>过 Feature Map。</li>
+<li><strong>丢给加速算子</strong> (比如 <code>parallel_rebased</code>)，让它用最快的速度算出 <code>forward_reference</code> 里一样的结果。</li>
+<li>最后投影输出 <code>o_proj</code>。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇代码讲的是：</p>
+<ol>
+<li>这是一个<strong>线性注意力层</strong> (ReBased Linear Attention)。</li>
+<li>它通过 <code>feature_map</code> 处理 Q 和 K，试图模拟 Softmax 的效果但移除计算瓶颈。</li>
+<li>它利用 <code>(K*V).cumsum</code> 的方式（在 <code>forward_reference</code> 中体现）把复杂度降到了线性。</li>
+<li>为了在 GPU 上跑得飞快，它在 <code>forward</code> 函数里调用了专门写好的底层加速算子 (<code>chunk</code>, <code>parallel</code>)。</li>
+</ol>

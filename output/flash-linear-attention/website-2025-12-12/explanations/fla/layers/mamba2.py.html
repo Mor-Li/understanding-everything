@@ -1,0 +1,129 @@
+<h1>fla/layers/mamba2.py</h1>
+<p>这份代码实现的是 <strong>Mamba2</strong> 模型的核心层。Mamba2 是目前非常火的架构，旨在替代 Transformer，它在处理长序列时速度更快，且显存占用更低。</p>
+<p>简单来说，这个文件的任务就是：<strong>接收输入序列 -&gt; 提取局部特征 -&gt; 通过“状态空间”记忆长期信息 -&gt; 输出处理后的序列。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“流水线任务清单 (Todo List)”</strong>，然后对应代码一步步讲。</p>
+<hr />
+<h3>🛠️ Mamba2 处理流程任务清单 (Todo List)</h3>
+<p>想象数据是一个包裹，经过这个流水线，要完成以下步骤：</p>
+<ol>
+<li><strong>[预处理]</strong>：把包裹里的“填充物”（Padding）标记好，别处理错了。</li>
+<li><strong>[扩容与分流]</strong>：把输入数据“变宽”（升维），然后切分成三份：<ul>
+<li>一份是<strong>主要信号</strong> (Signal)。</li>
+<li>一份是<strong>控制门</strong> (Gate)。</li>
+<li>一份是<strong>控制参数</strong> (Params: B, C, dt)。</li>
+</ul>
+</li>
+<li><strong>[局部混合]</strong>：用卷积 (Conv1d) 处理<strong>主要信号</strong>，让它看看“周围”的邻居（类似看前后文单词）。</li>
+<li><strong>[核心变换 SSM]</strong>：这是最难的一步。根据<strong>控制参数</strong>，决定<strong>主要信号</strong>里哪些该记住，哪些该遗忘。<ul>
+<li><em>如果是推理（生成文本）</em>：像 RNN 一样一步步更新记忆。</li>
+<li><em>如果是训练</em>：把数据切块（Chunk），块内并行计算（像 Attention），块间串行传递（像 RNN）。</li>
+</ul>
+</li>
+<li><strong>[门控与归一化]</strong>：把处理好的信号和最开始的<strong>控制门</strong>结合，并做标准化。</li>
+<li><strong>[压缩输出]</strong>：把数据“变窄”，恢复到原来的大小，输出。</li>
+</ol>
+<hr />
+<h3>🧐 逐步代码解读</h3>
+<p>我们主要看 <code>torch_forward</code> 这个函数（代码第 259 行起），因为 <code>cuda_kernels_forward</code> 是为了加速写的底层代码，逻辑是一样的，但很难读。</p>
+<h4>第一步：预处理与扩容 (Input Projection)</h4>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. Gated MLP&#39;s linear projection</span>
+<span class="n">input_states</span> <span class="o">=</span> <span class="n">apply_mask_to_padding_states</span><span class="p">(</span><span class="n">input_states</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">)</span> <span class="c1"># 处理 Padding</span>
+<span class="n">projected_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">in_proj</span><span class="p">(</span><span class="n">input_states</span><span class="p">)</span> <span class="c1"># 线性层：把维度变大</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+输入 <code>input_states</code> 维度通常是 <code>[batch, seq_len, hidden_size]</code>。<code>in_proj</code> 是一个巨大的全连接层，它把特征维度极大地膨胀了，因为后面要切分成好几块用。</p>
+<h4>第二步：切分数据 (Split)</h4>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 把膨胀后的数据切成好几份</span>
+<span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">gate</span><span class="p">,</span> <span class="n">hidden_states_B_C</span><span class="p">,</span> <span class="n">dt</span> <span class="o">=</span> <span class="n">projected_states</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+这里把大张量切开了：
+*   <code>gate</code>: 门控分支，最后才用。
+*   <code>hidden_states_B_C</code>: 包含了主要信号和 SSM 参数（B 和 C）。
+*   <code>dt</code>: 时间步长（Delta t），控制记忆更新的快慢。</p>
+<h4>第三步：局部卷积 (Convolution)</h4>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 2. Convolution sequence transformation</span>
+<span class="c1"># ... (中间有一段处理 cache 的逻辑，如果是生成模式) ...</span>
+<span class="n">hidden_states_B_C</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">act</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">conv1d</span><span class="p">(</span><span class="n">hidden_states_B_C</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">))</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+<code>conv1d</code> 是一个一维卷积，卷积核大小通常是 4。
+它的作用是<strong>局部平滑</strong>。在进入复杂的记忆模块前，让每个 token 先和它左右两三个 token 交流一下。比如理解 "New York"，卷积能把这两个词关联起来。
+<em>处理完后，再次切分 <code>hidden_states</code> (信号), <code>B</code>, <code>C</code>。</em></p>
+<h4>第四步：核心变换 SSM (The Magic)</h4>
+<p>这是 Mamba2 的灵魂。代码里分了两种情况：</p>
+<p><strong>情况 A：推理模式 (Inference / Cache)</strong>
+<strong>对应代码：</strong> <code>if cache_params is not None ...</code> (第 306 行左右)</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 像 RNN 一样一步步算</span>
+<span class="n">dA</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">dt</span> <span class="o">*</span> <span class="n">A</span><span class="p">)</span> <span class="c1"># 状态衰减系数</span>
+<span class="n">dBx</span> <span class="o">=</span> <span class="p">(</span><span class="n">dt</span> <span class="o">*</span> <span class="n">B</span> <span class="o">*</span> <span class="n">hidden_states</span><span class="p">)</span> <span class="c1"># 当前输入对状态的影响</span>
+<span class="c1"># 更新记忆：新记忆 = 旧记忆 * 衰减 + 新输入</span>
+<span class="n">new_ssm_state</span> <span class="o">=</span> <span class="n">cache_params</span><span class="o">.</span><span class="n">ssm_states</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">*</span> <span class="n">dA</span> <span class="o">+</span> <span class="n">dBx</span> 
+<span class="n">y</span> <span class="o">=</span> <span class="n">ssm_state</span> <span class="o">*</span> <span class="n">C</span> <span class="c1"># 输出 = 记忆 * C</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+这是一个循环过程。
+1.  <strong>A (遗忘)</strong>: 决定上一时刻的记忆保留多少。
+2.  <strong>B (输入)</strong>: 决定当前输入有多少存入记忆。
+3.  <strong>C (输出)</strong>: 决定从当前记忆里提取什么作为输出。
+这就是所谓的“选择性状态空间模型”（Selective SSM）。</p>
+<p><strong>情况 B：训练模式 (SSD - Chunk Scan)</strong>
+<strong>对应代码：</strong> <code>else: ... # begin ssd naive implementation</code> (第 362 行左右)
+Mamba2 引入了 <strong>SSD (State Space Duality)</strong>，把长序列切成小块 (Chunks)。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 块内计算 (Intra-chunk): 看起来像 Attention</span>
+<span class="c1"># 计算 G (类似 Attention 的分数)</span>
+<span class="n">G</span> <span class="o">=</span> <span class="o">...</span> 
+<span class="c1"># 计算 L (因果掩码)</span>
+<span class="n">L</span> <span class="o">=</span> <span class="o">...</span>
+<span class="c1"># 这里的计算逻辑类似 Transformer 的 QK^T * V，可以并行算得很开心。</span>
+<span class="n">Y_diag</span> <span class="o">=</span> <span class="o">...</span>
+
+<span class="c1"># 2. 块间递归 (Inter-chunk): 看起来像 RNN</span>
+<span class="c1"># 算完一个块，把最后的状态传给下一个块。</span>
+<span class="n">states</span> <span class="o">=</span> <span class="o">...</span>
+<span class="n">new_states</span> <span class="o">=</span> <span class="o">...</span> 
+</code></pre></div>
+
+<p><strong>解释：</strong>
+这一段非常复杂，它在数学上证明了 SSM 等价于一种带 Mask 的 Attention。
+*   <strong>块内</strong>：大家并行算，速度快。
+*   <strong>块间</strong>：传递记忆状态，保证长距离依赖。
+代码里的 <code>segment_sum</code>, <code>cumsum</code> 都是为了实现这种并行算法。</p>
+<h4>第五步：门控与归一化 (Norm &amp; Gate)</h4>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">scan_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">y</span><span class="p">,</span> <span class="n">gate</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+<code>y</code> 是 SSM 算出来的结果（带有长期记忆的特征）。
+<code>gate</code> 是第二步切出来的原始分支。
+<code>RMSNormGated</code> 会做两件事：
+1.  把 <code>y</code> 和 <code>gate</code> 相乘（Gating，类似 GLU 激活）。
+2.  做 RMSNorm 归一化，稳定数值。</p>
+<h4>第六步：输出投影 (Output Projection)</h4>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">contextualized_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">out_proj</span><span class="p">(</span><span class="n">scan_output</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+最后把特征维度变回 <code>hidden_size</code>，交给下一层网络。</p>
+<hr />
+<h3>总结</h3>
+<p>这篇代码看似吓人，其实核心就是一个改进版的 RNN：</p>
+<ol>
+<li><strong>输入</strong>进来。</li>
+<li><strong>卷积</strong>一下（看清局部）。</li>
+<li><strong>SSM/SSD</strong> 变换（记住该记的，忘掉该忘的，不管是 1000 步还是 10000 步之前的）。<ul>
+<li>Mamba2 的厉害之处在于它用数学技巧（Chunk Scan）让这个步骤在训练时能像 Transformer 一样并行，不像老 RNN 那么慢。</li>
+</ul>
+</li>
+<li><strong>归一化</strong>并<strong>输出</strong>。</li>
+</ol>
+<p>如果你是初学者，建议忽略 <code>cuda_kernels_forward</code> 和 <code>SSD naive</code> 里的具体数学公式（cumsum, segment_sum），先理解<strong>数据流向</strong>和<strong>每个模块的作用</strong>即可。</p>

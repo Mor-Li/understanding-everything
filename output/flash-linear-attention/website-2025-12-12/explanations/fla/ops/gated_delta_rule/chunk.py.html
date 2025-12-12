@@ -1,0 +1,147 @@
+<h1>fla/ops/gated_delta_rule/chunk.py</h1>
+<p>这份代码实现了一个非常前沿的深度学习算子，叫做 <strong>Chunk Gated Delta Rule</strong>（分块门控 Delta 规则）。通常这是用于线性 Attention 模型（如 DeltaNet、RetNet 等变体）的核心算法。</p>
+<p>它的核心目的是：<strong>在保持类似 Transformer 的并行训练速度的同时，实现类似 RNN 的推理（无限上下文、低显存占用）。</strong></p>
+<p>为了让你看懂，我把它拆解成一个“项目任务清单 (Todo List)”，然后一步步带你过一遍代码逻辑。</p>
+<hr />
+<h3>📋 任务清单 (Todo List)</h3>
+<p>要读懂这份代码，你需要完成以下几个思维步骤：</p>
+<ol>
+<li><strong>理解分块 (Chunking)</strong>：不要逐字读文章（RNN），也不要一口气读完（Attention），而是把文章分成一段一段（Chunk）来读。</li>
+<li><strong>处理遗忘门 (Gating)</strong>：计算每一段里，我们需要“记住”多少信息，“遗忘”多少信息。</li>
+<li><strong>计算更新量 (WY Representation)</strong>：这是最难的数学部分。Delta Rule 的核心是“修正记忆”。我们需要算出一个“修正矩阵”，代码里用 $W$ 和 $U$ 来表示。</li>
+<li><strong>更新记忆状态 (State Update)</strong>：把上一段的记忆传给下一段，结合当前的修正，得到新的记忆状态 $H$。</li>
+<li><strong>计算输出 (Output)</strong>：用查询向量 $Q$ 去读取记忆状态 $H$，得到最终输出 $O$。</li>
+</ol>
+<hr />
+<h3>🧐 逐步代码详解</h3>
+<p>我们主要关注 <code>chunk_gated_delta_rule_fwd</code> 这个函数，因为它是算法的核心逻辑（前向传播）。</p>
+<h4>第一步：准备门控信息 (Prepare Gating)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段</span>
+<span class="n">g</span> <span class="o">=</span> <span class="n">chunk_local_cumsum</span><span class="p">(</span><span class="n">g</span><span class="p">,</span> <span class="n">chunk_size</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="o">=</span><span class="n">cu_seqlens</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/逻辑</strong>：<ul>
+<li>这里的 <code>g</code> (gate) 是对信息的衰减系数（比如 log 空间下的衰减）。</li>
+<li><strong>Chunking</strong>：代码把长序列切成了长度为 64 的小块 (<code>chunk_size=64</code>)。</li>
+<li><strong>Cumsum</strong>：在一个小块内部，衰减是可以累加的。这一步预先算好每个位置相对于块起点的累计衰减量，方便后面直接调用。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：计算 Delta 更新的“配方” (The WY Representation)</h4>
+<p>这是 Delta Rule 最独特的地方。普通的 Attention 是 $K^T V$，但 Delta Rule 是 $S_{new} = S_{old} + \beta (V - S_{old} K) K^T$。它试图去拟合 $V$。这涉及到解方程。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段</span>
+<span class="c1"># 1. 计算 K 和 K 的相关性 (A矩阵)</span>
+<span class="n">A</span> <span class="o">=</span> <span class="n">chunk_scaled_dot_kkt_fwd</span><span class="p">(</span>
+    <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">g</span><span class="o">=</span><span class="n">g</span><span class="p">,</span> <span class="n">beta</span><span class="o">=</span><span class="n">beta</span><span class="p">,</span> <span class="o">...</span>
+<span class="p">)</span>
+<span class="c1"># 2. 解三角方程，得到修正系数</span>
+<span class="n">A</span> <span class="o">=</span> <span class="n">solve_tril</span><span class="p">(</span>
+    <span class="n">A</span><span class="o">=</span><span class="n">A</span><span class="p">,</span> <span class="o">...</span>
+<span class="p">)</span>
+<span class="c1"># 3. 重新计算 W 和 U (u 其实就是修正后的 v)</span>
+<span class="n">w</span><span class="p">,</span> <span class="n">u</span> <span class="o">=</span> <span class="n">recompute_w_u_fwd</span><span class="p">(</span>
+    <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span> <span class="n">beta</span><span class="o">=</span><span class="n">beta</span><span class="p">,</span> <span class="n">A</span><span class="o">=</span><span class="n">A</span><span class="p">,</span> <span class="n">g</span><span class="o">=</span><span class="n">g</span><span class="p">,</span> <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/逻辑</strong>：<ul>
+<li>为了在 GPU 上跑得快，不能像 RNN 那样一步步修正。</li>
+<li>作者使用了一种数学技巧（<strong>WY 分解</strong> / Woodbury Identity 的变体），把一个 Chunk 内所有的逐步修正，压缩成两个矩阵 $W$ 和 $U$。</li>
+<li><code>chunk_scaled_dot_kkt_fwd</code> 和 <code>solve_tril</code> 实际上是在解决一个块内的“线性动力学系统”，计算出为了达成 Delta Rule 的更新目标，我们需要如何调整输入。</li>
+<li><strong>结论</strong>：这一步结束后，我们把复杂的递归更新转化为了矩阵乘法所需的 $W$ 和 $U$。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：状态传递与更新 (Recurrent State Update)</h4>
+<p>现在我们有了“配方” ($W, U$)，开始真正地更新记忆状态 $H$。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段</span>
+<span class="n">h</span><span class="p">,</span> <span class="n">v_new</span><span class="p">,</span> <span class="n">final_state</span> <span class="o">=</span> <span class="n">chunk_gated_delta_rule_fwd_h</span><span class="p">(</span>
+    <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span>
+    <span class="n">w</span><span class="o">=</span><span class="n">w</span><span class="p">,</span>      <span class="c1"># 使用上面算出来的 w</span>
+    <span class="n">u</span><span class="o">=</span><span class="n">u</span><span class="p">,</span>      <span class="c1"># 使用上面算出来的 u</span>
+    <span class="n">g</span><span class="o">=</span><span class="n">g</span><span class="p">,</span>
+    <span class="n">initial_state</span><span class="o">=</span><span class="n">initial_state</span><span class="p">,</span> <span class="c1"># 上一个 batch 传过来的初始状态</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/逻辑</strong>：<ul>
+<li>这是一个混合模式：<ul>
+<li><strong>块间 (Inter-chunk)</strong>：像 RNN 一样，把上一个块的最终状态 <code>initial_state</code> 传给当前块。</li>
+<li><strong>块内 (Intra-chunk)</strong>：利用刚才算的 $W$ 和 $U$，并行地计算出块内每个时刻的 Hidden State ($h$)。</li>
+</ul>
+</li>
+<li><code>final_state</code> 是这一整段处理完后留下的记忆，会留给下一个序列使用。</li>
+</ul>
+</li>
+</ul>
+<h4>第四步：计算最终输出 (Compute Output)</h4>
+<p>有了每个时刻的记忆状态 $H$，现在用 Query ($Q$) 去查询它。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">chunk_fwd_o</span><span class="p">(</span>
+    <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span>
+    <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span>
+    <span class="n">v</span><span class="o">=</span><span class="n">v_new</span><span class="p">,</span> <span class="c1"># 注意这里用的是修正后的 v_new</span>
+    <span class="n">h</span><span class="o">=</span><span class="n">h</span><span class="p">,</span>     <span class="c1"># 当前时刻的记忆状态</span>
+    <span class="n">g</span><span class="o">=</span><span class="n">g</span><span class="p">,</span>
+    <span class="n">scale</span><span class="o">=</span><span class="n">scale</span><span class="p">,</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/逻辑</strong>：<ul>
+<li>这是最后一步投影。$O = Q \cdot H$。</li>
+<li>因为采用了 Chunk 结构，这里的计算被分解为：<ol>
+<li><strong>全局部分</strong>：$Q$ 乘以从之前块继承过来的状态。</li>
+<li><strong>局部部分</strong>：$Q$ 乘以当前块内部产生的状态变化。</li>
+</ol>
+</li>
+<li>最终得到 <code>o</code>，即模型的输出张量。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🧩 其他部分讲了啥？</h3>
+<ol>
+<li>
+<p><strong><code>chunk_gated_delta_rule_bwd</code> (Backward)</strong>:</p>
+<ul>
+<li>这是给神经网络训练用的<strong>反向传播</strong>。</li>
+<li>如果你只是用模型，不需要看懂这个。</li>
+<li>它的逻辑和 Forward 刚好相反：输入是梯度的导数 (<code>do</code>, <code>dht</code>)，输出是各个参数的梯度 (<code>dq</code>, <code>dk</code>, <code>dv</code>...)。它需要重新计算一遍 forward 里的一些中间变量（如 <code>w</code>, <code>u</code>）来求导。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>ChunkGatedDeltaRuleFunction</code> (Autograd Function)</strong>:</p>
+<ul>
+<li>这是 PyTorch 的包装器。</li>
+<li>它把 C++/CUDA 写的底层算子（<code>fwd</code>, <code>bwd</code>）包装成 PyTorch 可以识别的 <code>Function</code>，这样你调用 <code>.backward()</code> 时，PyTorch 才知道怎么求导。</li>
+<li>它还处理了混合精度训练（<code>autocast</code>）和 L2 Normalization（归一化）等杂活。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>chunk_gated_delta_rule</code> (User API)</strong>:</p>
+<ul>
+<li>这是<strong>给你用的接口</strong>。</li>
+<li>它处理了输入形状的检查、参数的默认值设置。</li>
+<li>比如：如果你输入变长序列 (<code>cu_seqlens</code>)，它会检查 batch size 是否为 1。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件的核心观点是：
+<strong>通过数学变换（WY分解），将原本只能串行计算的 Gated Delta Rule（一种强力的 RNN 更新规则），转化为可以分块（Chunk）并行计算的形式。</strong></p>
+<ul>
+<li><strong>输入</strong>：Q, K, V, Gate</li>
+<li><strong>黑盒内部</strong>：<ol>
+<li>把长序列切块。</li>
+<li>块内用矩阵运算解方程（快）。</li>
+<li>块间用 RNN 传递状态（省显存）。</li>
+</ol>
+</li>
+<li><strong>输出</strong>：Attention 的结果 O 和 最终记忆状态 H。</li>
+</ul>

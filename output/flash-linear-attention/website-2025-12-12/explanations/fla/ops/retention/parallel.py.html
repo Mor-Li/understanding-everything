@@ -1,0 +1,96 @@
+<h1>fla/ops/retention/parallel.py</h1>
+<p>这段代码看起来很硬核，因为它涉及到了<strong>RetNet (Retention Network)</strong> 的核心实现细节，而且为了代码复用，它把计算“外包”给了另一个函数。</p>
+<p>别担心，我们把理解这段代码的任务拆解成一个 <strong>To-Do List</strong>。我们一项一项来打勾，每完成一项，你就离看懂它更近一步。</p>
+<hr />
+<h3>✅ Task 1: 搞清楚我们在做什么菜 (背景知识)</h3>
+<p>首先，你要知道这段代码是干嘛的。
+*   <strong>目标</strong>：实现 <strong>RetNet</strong> 模型中的 <strong>并行 Retention (Parallel Retention)</strong> 机制。
+*   <strong>地位</strong>：你可以把它理解为 Transformer 中 <code>Attention</code> (注意力机制) 的替代品。
+*   <strong>特点</strong>：RetNet 的核心思想是“<strong>不同的注意力头 (Head) 有不同的记忆力</strong>”。有的头忘得快，有的头忘得慢。</p>
+<h3>✅ Task 2: 检查食材 (输入参数)</h3>
+<p>看函数 <code>parallel_retention</code> 的参数，这些是我们的原材料：
+*   <strong><code>q, k, v</code></strong>: 这就是经典的 Query, Key, Value。
+    *   形状是 <code>[B, T, H, K/V]</code>。
+    *   <strong>B</strong>: Batch size (多少个句子)。
+    *   <strong>T</strong>: Time step (句子有多长)。
+    *   <strong>H</strong>: Heads (有多少个头)。
+    *   <strong>K/V</strong>: 向量维度。
+*   <strong><code>scale</code></strong>: 缩放因子（类似注意力里的除以根号d）。
+*   <strong><code>cu_seqlens</code></strong>: 处理变长序列用的（不用深究，这是为了高效训练）。</p>
+<h3>✅ Task 3: 制作核心酱料 (理解那行最难的数学代码)</h3>
+<p>这是整个函数中最难懂的一行，也是 RetNet 的灵魂所在。请看代码中这两行：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">s</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="mf">2.</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="o">-</span><span class="mf">5.</span> <span class="o">-</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)))</span><span class="o">.</span><span class="n">log</span><span class="p">()</span>
+<span class="n">g</span> <span class="o">=</span> <span class="n">s</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="p">:]</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">])</span>
+</code></pre></div>
+
+<p>我们来剥洋葱一样剥开它：</p>
+<ol>
+<li>
+<p><strong>RetNet 的设定</strong>：
+    RetNet 规定，第 $i$ 个头的衰减率（Decay Rate，记为 $\gamma$）是固定的。
+    公式是：$\gamma_i = 1 - 2^{-5-i}$</p>
+<ul>
+<li>第0个头，衰减很快。</li>
+<li>第1个头，衰减稍微慢点。</li>
+<li>...以此类推，涵盖长短记忆。</li>
+</ul>
+</li>
+<li>
+<p><strong>代码对应</strong>：</p>
+<ul>
+<li><code>range(q.shape[2])</code>: 就是头的索引 $i$ ($0, 1, 2, ... H-1$)。</li>
+<li><code>2.pow(-5. - ...)</code>: 就是计算 $2^{-5-i}$。</li>
+<li><code>1 - ...</code>: 就是计算 $\gamma = 1 - 2^{-5-i}$。</li>
+</ul>
+</li>
+<li>
+<p><strong>为什么要取 <code>.log()</code> (对数)?</strong></p>
+<ul>
+<li>这就是代码里的 <code>s = (...).log()</code>。</li>
+<li>因为这个函数最终调用的是 <code>simple_gla</code>（广义线性注意力）。在 GLA 这类算法里，通常在指数空间计算衰减（即 $e^{decay}$）。</li>
+<li>为了让底层的计算结果等于我们的 $\gamma$，我们需要传入 $\ln(\gamma)$。因为 $e^{\ln(\gamma)} = \gamma$。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>g</code> 是什么？</strong></p>
+<ul>
+<li><code>s</code> 只是算出了每个头的一个标量数值。</li>
+<li><code>g</code> 把 <code>s</code> 扩展（expand）成了和输入数据一样的形状 <code>[B, T, H]</code>。</li>
+<li>这就相当于给每个时间步、每个样本都贴上了这个“遗忘速度”的标签。</li>
+</ul>
+</li>
+</ol>
+<h3>✅ Task 4: 甩手掌柜 (调用通用内核)</h3>
+<p>你可能会疑惑：“具体的矩阵乘法在哪？注意力分数怎么算的？”
+答案是：<strong>外包了</strong>。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">o</span><span class="p">,</span> <span class="n">attn</span> <span class="o">=</span> <span class="n">parallel_simple_gla</span><span class="p">(</span>
+    <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span>
+    <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span>
+    <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span>
+    <span class="n">scale</span><span class="o">=</span><span class="n">scale</span><span class="p">,</span>
+    <span class="n">g</span><span class="o">=</span><span class="n">g</span><span class="p">,</span>  <span class="c1"># &lt;--- 把刚才算好的对数衰减率传进去</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>：作者发现 <strong>Retention</strong> 其实是 <strong>Simple GLA (Gated Linear Attention)</strong> 的一个特例。</li>
+<li><strong>Simple GLA</strong> 说：“给我 Q, K, V 和一个门控信号 <code>g</code>，我帮你算线性注意力。”</li>
+<li><strong>Retention</strong> 说：“好的，我的门控信号 <code>g</code> 就是上面算出来的那些固定的衰减率。”</li>
+<li>于是，这个函数不需要自己写复杂的 CUDA 算子，直接调用 <code>parallel_simple_gla</code> 就可以完成计算。</li>
+</ul>
+<h3>✅ Task 5: 打包出餐 (返回值)</h3>
+<p>最后返回：
+*   <strong><code>o</code></strong>: 输出的张量（经过了 Retention 机制处理后的特征）。
+*   <strong><code>attn</code></strong>: 如果你需要查看注意力图（通常为了可视化），也会返回。</p>
+<hr />
+<h3>总结 (大白话版)</h3>
+<p>这个文件的逻辑是：</p>
+<ol>
+<li><strong>我要做 Retention</strong>（一种特殊的注意力）。</li>
+<li>Retention 的特点是每个头有固定的、几何级数的<strong>遗忘率</strong>。</li>
+<li>我先用数学公式把这些<strong>遗忘率</strong>算出来，并取个对数（为了配合后端算法）。</li>
+<li>然后我把 Q, K, V 和这些算好的遗忘率扔给一个更通用的函数 <code>parallel_simple_gla</code>。</li>
+<li>它算完还给我，我再还给用户。</li>
+</ol>
+<p><strong>一句话总结：</strong> 这是一个<strong>包装器 (Wrapper)</strong>，它通过配置特定的衰减参数，把通用的“简单线性注意力”变成了“Retention”。</p>

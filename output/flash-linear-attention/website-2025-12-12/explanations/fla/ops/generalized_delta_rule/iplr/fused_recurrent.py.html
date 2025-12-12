@@ -1,0 +1,125 @@
+<h1>fla/ops/generalized_delta_rule/iplr/fused_recurrent.py</h1>
+<p>这份代码确实很难懂，因为它不是普通的 Python 代码，而是 <strong>Triton</strong> 代码。Triton 是一种专门用来写 GPU 高性能算子（Kernel）的语言。</p>
+<p>简单来说，这段代码实现了一个 <strong>“带遗忘/更新机制的线性 RNN（循环神经网络）”</strong> 的核心计算过程。</p>
+<p>为了让你看懂，我为你列了一个 <strong>学习/阅读 Task List</strong>，我们将代码拆解为 4 个阶段，一步步揭开它的面纱。</p>
+<hr />
+<h3>📝 阅读与理解 Task List</h3>
+<ol>
+<li><strong>Task 1：搞懂数学原理</strong> (这段代码到底在算什么公式？)</li>
+<li><strong>Task 2：搞懂变量含义</strong> (q, k, v, a, b 都是干嘛的？)</li>
+<li><strong>Task 3：可视化核心循环</strong> (GPU 里的 for 循环是怎么走的？)</li>
+<li><strong>Task 4：理解 Triton 的“黑魔法”</strong> (指针运算与内存读写)</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 搞懂数学原理 —— "IPLR Delta Rule"</h4>
+<p>不要被文件名吓到。这段代码的核心逻辑其实就是在一个 <code>for</code> 循环里不断更新一个矩阵（隐藏状态 $h$）。</p>
+<p><strong>传统的 RNN/LSTM 更新逻辑：</strong>
+$h_t = \tanh(W h_{t-1} + U x_t)$ （非线性，很难并行，算得慢）</p>
+<p><strong>这个代码实现的逻辑 (线性 RNN / Delta Rule)：</strong>
+它维护一个记忆矩阵 $S$（代码里叫 <code>h</code>）。在每一步 $t$：</p>
+<ol>
+<li><strong>计算输出</strong>：用当前的记忆 $S_{t-1}$ 去回答问题 $q_t$。
+    $$o_t = S_{t-1} \cdot q_t$$</li>
+<li><strong>更新记忆</strong>：旧的记忆 $S_{t-1}$ 需要更新。更新由两部分组成：<ul>
+<li><strong>写入新知识</strong>：$v_t \cdot k_t^T$ (把当前的 Key-Value 写入记忆)。</li>
+<li><strong>修正旧知识</strong>：$S_{t-1} \cdot a_t \cdot b_t^T$ (这是一个低秩更新，用来模拟遗忘或旋转操作)。</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结公式：</strong>
+$$S_t = S_{t-1} + (S_{t-1} \cdot a_t) \cdot b_t^T + v_t \cdot k_t^T$$</p>
+<hr />
+<h4>Task 2: 搞懂变量含义</h4>
+<p>在 <code>fused_recurrent_fwd_kernel</code> 函数中，这些参数代表了输入数据：</p>
+<ul>
+<li><strong><code>h</code> (Hidden State)</strong>: 也就是上面的 $S$。它是模型的“大脑/记忆”，形状是 <code>[B, H, K, V]</code>。<ul>
+<li><code>B</code>: Batch size</li>
+<li><code>H</code>: 注意力头数 (Heads)</li>
+<li><code>K</code>, <code>V</code>: 特征维度</li>
+</ul>
+</li>
+<li><strong><code>q</code> (Query)</strong>: 当前时刻的查询向量。</li>
+<li><strong><code>k</code> (Key), <code>v</code> (Value)</strong>: 当前时刻要写入记忆的信息。</li>
+<li><strong><code>a</code>, <code>b</code></strong>: 这两个是专门用来控制“怎么修正旧记忆”的参数（对应公式里的 $a_t, b_t$）。</li>
+<li><strong><code>o</code> (Output)</strong>: 计算出来的结果存放处。</li>
+</ul>
+<hr />
+<h4>Task 3: 可视化核心循环 (Forward Kernel)</h4>
+<p>让我们深入 <code>fused_recurrent_fwd_kernel</code> 这个函数。Triton 的特点是<strong>多线程并行</strong>。</p>
+<p>假设我们现在是一个 GPU 线程，我们负责处理 <strong>第 <code>i</code> 个样本的第 <code>j</code> 个头</strong>。</p>
+<p><strong>步骤 1：定位与初始化</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 咱们负责哪个样本(i_n)？哪个头(i_h)？</span>
+<span class="n">i_v</span><span class="p">,</span> <span class="n">i_nh</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+<span class="o">...</span>
+<span class="c1"># 初始化记忆 b_h (Block of h)，一开始是全 0，或者从 h0 加载</span>
+<span class="n">b_h</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="n">BV</span><span class="p">,</span> <span class="n">BK</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+</code></pre></div>
+
+<p><em>这里 <code>b_h</code> 就是该线程维护的一小块“记忆矩阵”。</em></p>
+<p><strong>步骤 2：时间步循环 (The Loop)</strong>
+这是代码最核心的部分 <code>for _ in range(0, T):</code>。它沿着序列长度 $T$ 一步步往前走。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">T</span><span class="p">):</span>
+    <span class="c1"># 1. 加载当前时刻 t 的数据</span>
+    <span class="n">b_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_k</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="c1"># 加载 Key</span>
+    <span class="n">b_v</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_v</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="c1"># 加载 Value</span>
+    <span class="n">b_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_q</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="c1"># 加载 Query</span>
+    <span class="n">b_a</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_a</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="c1"># 加载控制门 a</span>
+    <span class="n">b_b</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_b</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="c1"># 加载控制门 b</span>
+
+    <span class="c1"># 2. 计算修正项 (S * a)</span>
+    <span class="c1"># 这一步计算旧记忆 b_h 和 b_a 的乘积</span>
+    <span class="n">tmp</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_h</span> <span class="o">*</span> <span class="n">b_a</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:],</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span> 
+
+    <span class="c1"># 3. 更新记忆 (核心公式实现！)</span>
+    <span class="c1"># b_h(新) = b_h(旧) + 修正项(tmp * b) + 新知识(k * v)</span>
+    <span class="n">b_h</span> <span class="o">+=</span> <span class="p">(</span><span class="n">tmp</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">b_b</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">+</span> <span class="n">b_k</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">*</span> <span class="n">b_v</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">])</span>
+
+    <span class="c1"># 4. 计算输出</span>
+    <span class="c1"># Output = 记忆 * Query</span>
+    <span class="n">b_o</span> <span class="o">=</span> <span class="n">b_h</span> <span class="o">*</span> <span class="n">b_q</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>
+    <span class="n">b_o</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_o</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+
+    <span class="c1"># 5. 保存结果到显存</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_o</span><span class="p">,</span> <span class="n">b_o</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 6. 指针移动到下一个时间步</span>
+    <span class="n">p_q</span> <span class="o">+=</span> <span class="n">K</span><span class="o">*</span><span class="n">H</span>  <span class="c1"># 移动到 t+1 时刻的 q</span>
+    <span class="n">p_k</span> <span class="o">+=</span> <span class="n">K</span><span class="o">*</span><span class="n">H</span>  <span class="c1"># ...</span>
+    <span class="o">...</span>
+</code></pre></div>
+
+<hr />
+<h4>Task 4: 理解 Triton 的“黑魔法” (指针与优化)</h4>
+<p>你可能会问：“为什么代码里全是 <code>p_q + ...</code> 这种看不懂的加法？”</p>
+<p>这是因为在 GPU 编程（类似 C 语言指针）中，我们操作的是<strong>扁平的内存地址</strong>。</p>
+<ul>
+<li>
+<p><strong>指针计算 (<code>p_q = ...</code>)</strong>:
+    想象内存是一条长长的纸带。<code>q</code> 是纸带的起点。
+    <code>p_q</code> 就像一个游标。
+    <code>p_q = q + (bos * H + i_h) * K</code> 意思就是：
+    &gt; "把游标移到：第 <code>bos</code> 个样本 -&gt; 第 <code>i_h</code> 个头 -&gt; 的起始位置"</p>
+</li>
+<li>
+<p><strong>Block (块) 处理 (<code>BK</code>, <code>BV</code>)</strong>:
+    GPU 不喜欢一个数一个数地算，它喜欢一次算一块（比如 32x32）。
+    代码里的 <code>BK</code>, <code>BV</code> 就是块的大小。
+    <code>tl.arange(0, BK)</code> 就是生成一个 <code>[0, 1, 2... BK-1]</code> 的索引，用来一次性抓取一整块数据。</p>
+</li>
+<li>
+<p><strong>Mask (掩码)</strong>:
+    <code>mask_k = tl.arange(0, BK) &lt; K</code>
+    这是为了防止越界。如果特征维度 K=10，但块大小 BK=32，我们需要把后面 22 个数“遮住”，不让它们参与计算，否则会读取到非法内存。</p>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<ol>
+<li><strong>它是一个自定义的 PyTorch 算子</strong>：为了让这种特殊的 RNN 跑得比 PyTorch 自带的 <code>for</code> 循环快 10-100 倍。</li>
+<li><strong>Fused (融合)</strong>：它把加载数据、计算乘法、加法更新、保存数据这一整套流程，全部“融合”在一个 GPU 内核里完成，避免了反复读写显存。</li>
+<li><strong>IPLR Delta Rule</strong>：它实现了一个特定的数学公式：$S_{new} = S_{old} + (S_{old} \cdot a) \cdot b^T + v \cdot k^T$。</li>
+</ol>
+<p><strong>给你的建议：</strong>
+如果你不是专门做底层算子优化的，<strong>不需要</strong>看懂每一行 <code>tl.load</code> 或指针偏移。
+你只需要关注 <code>for</code> 循环里的那几行数学计算（上面 Task 3 的第 2、3、4 步），确认它实现的公式符合论文里的定义即可。后面的 <code>backward</code> kernel 是反向传播（算梯度的），逻辑类似但更复杂，通常是为了训练用的。</p>

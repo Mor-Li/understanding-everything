@@ -1,0 +1,122 @@
+<h1>fla/ops/gla/naive.py</h1>
+<p>完全没问题。这段代码看起来只有短短几十行，但它其实浓缩了<strong>线性注意力机制（Linear Attention）</strong>的核心思想，特别是<strong>GLA（Gated Linear Attention，门控线性注意力）</strong>的循环（Recurrent）实现方式。</p>
+<p>为了让你听懂，我们不用复杂的数学公式，而是用一个<strong>“写日记与查阅日记”</strong>的比喻来拆解这个过程。</p>
+<p>我们将这段代码的任务拆解成一个 <strong>To-Do List</strong>，一步步来看它是怎么完成“记忆”和“输出”的。</p>
+<hr />
+<h3>核心背景：这是在干嘛？</h3>
+<p>传统的 Transformer（像 ChatGPT）处理长文本时，每写一个字都要回头看之前<strong>所有</strong>的字，这叫 $O(T^2)$ 复杂度，越长越慢。</p>
+<p>这段代码实现的是一种<strong>RNN（循环神经网络）模式</strong>的注意力。它不回头看所有的字，而是维护一个<strong>“记忆状态（Hidden State）”</strong>。每读入一个新词，就更新一下记忆，然后基于当前的记忆输出结果。这叫 $O(T)$ 复杂度，速度非常快。</p>
+<hr />
+<h3>Task To-Do List (代码拆解)</h3>
+<p>我们将代码逻辑拆分为以下 6 个步骤：</p>
+<ol>
+<li><strong>【准备工作】格式调整与初始化</strong></li>
+<li><strong>【建立记忆库】初始化 Hidden State</strong></li>
+<li><strong>【开始阅读】进入时间循环</strong></li>
+<li><strong>【决定遗忘】计算门控机制 (Gating)</strong></li>
+<li><strong>【更新记忆】写入新知识 (KV)</strong></li>
+<li><strong>【提取信息】根据问题 (Q) 产生输出</strong></li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>Task 1: 【准备工作】格式调整与初始化</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">dtype</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">dtype</span>
+<span class="c1"># 把维度从 (Batch, Time, Head, Dim) 转置为 (Batch, Head, Time, Dim)</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">gk</span> <span class="o">=</span> <span class="nb">map</span><span class="p">(</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">x</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">(),</span> <span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">gk</span><span class="p">))</span>
+<span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span> <span class="o">=</span> <span class="o">*</span><span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">v</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="c1"># 准备一个空容器装结果</span>
+<span class="n">scale</span> <span class="o">=</span> <span class="n">K</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span>       <span class="c1"># 标准的注意力缩放系数</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解</strong>：<ul>
+<li>先把输入数据的形状理顺，方便后续按时间步（Time）进行循环。</li>
+<li>转成 <code>float()</code> 是为了保证计算精度（避免溢出）。</li>
+<li><code>scale</code> 是为了防止数值过大，这在 Transformer 里很常见。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 【建立记忆库】初始化 Hidden State</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">h</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">new_zeros</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="k">if</span> <span class="n">initial_state</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">h</span> <span class="o">+=</span> <span class="n">initial_state</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解</strong>：<ul>
+<li><strong>这里的 <code>h</code> 就是“大脑”或“笔记本”。</strong></li>
+<li>它的形状是 <code>K x V</code>（也就是 Key 的维度乘以 Value 的维度）。这就像是一个压缩后的知识矩阵。</li>
+<li>如果有 <code>initial_state</code>（比如你是接着上一段文本读的），就继承之前的记忆；否则就是一张白纸（全 0）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 【开始阅读】进入时间循环</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">T</span><span class="p">):</span>
+    <span class="n">q_i</span> <span class="o">=</span> <span class="n">q</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">*</span> <span class="n">scale</span>
+    <span class="n">k_i</span> <span class="o">=</span> <span class="n">k</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>
+    <span class="n">v_i</span> <span class="o">=</span> <span class="n">v</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解</strong>：<ul>
+<li>这是一个 <code>for</code> 循环，模拟<strong>从左到右</strong>阅读文本的过程。</li>
+<li><code>i</code> 代表当前时刻（比如第 i 个字）。</li>
+<li>我们需要拿出当前的 Query (查询), Key (索引), Value (内容)。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 【决定遗忘】计算门控机制 (Gating) —— <em>这是 GLA 的核心</em></h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="n">gk_i</span> <span class="o">=</span> <span class="n">gk</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解</strong>：<ul>
+<li><code>gk</code> 代表 <strong>Gate for Key</strong>，也可以理解为<strong>“遗忘门”或“衰减系数”</strong>。</li>
+<li>代码里用了 <code>.exp()</code>，说明输入的 <code>gk</code> 原本可能是对数域的（通常是负数），取指数后变成一个 $(0, 1]$ 之间的小数。</li>
+<li><strong>观点</strong>：人类的记忆是会衰退的。这个系数告诉模型：<strong>上一时刻的记忆，我需要保留多少？</strong> 如果是 0.9，说明保留 90%；如果是 0.1，说明忘掉大部分。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 【更新记忆】写入新知识</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="n">kv_i</span> <span class="o">=</span> <span class="n">k_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">v_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>  <span class="c1"># 计算外积 (K x 1) * (1 x V) = K x V</span>
+    <span class="n">h</span> <span class="o">=</span> <span class="n">h</span> <span class="o">*</span> <span class="n">gk_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">+</span> <span class="n">kv_i</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解</strong>：这是全篇最重要的一行！公式是 $H_t = H_{t-1} \cdot \alpha + K_t^T V_t$。<ul>
+<li><strong><code>kv_i</code> (新知识)</strong>：把当前的 Key 和 Value 乘起来，形成一个新的知识块。</li>
+<li><strong><code>h * gk_i</code> (遗忘旧记忆)</strong>：把脑子里的旧记忆 <code>h</code> 乘以衰减系数（比如乘以 0.9），让旧信息慢慢淡去。</li>
+<li><strong><code>+ kv_i</code> (写入)</strong>：把处理过的新知识加到记忆里。</li>
+<li><strong>总结</strong>：今天的记忆 = 昨天的记忆 × 遗忘率 + 今天新学的知识。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: 【提取信息】根据问题 (Q) 产生输出</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="n">o</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">q_i</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">h</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解</strong>：<ul>
+<li>现在 <code>h</code> 包含了截止到目前为止的所有信息。</li>
+<li><code>q_i</code> 是当前的“查询”（Query）。</li>
+<li>我们用 <code>q_i</code> 去乘记忆矩阵 <code>h</code>，得到当前的输出 <code>o</code>。</li>
+<li>这相当于：<strong>基于我现在脑子里的所有记忆，回答当前这个问题。</strong></li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在讲什么观点？</h3>
+<p>如果把这段代码看作一篇论文的观点，它在说：</p>
+<ol>
+<li><strong>注意力可以被线性化</strong>：我们不需要保留所有历史的 Key 和 Value（那样内存会爆炸），我们只需要维护一个固定大小的矩阵 <code>h</code>。</li>
+<li><strong>记忆需要门控（Gating）</strong>：简单的累加记忆效果不好，我们需要一个 <code>gk</code> (Gate) 来动态控制每一时刻应该“记住多少”或者“忘掉多少”。这能让模型捕捉到短期依赖和长期依赖。</li>
+<li><strong>循环形式 (RNN)</strong>：虽然 Transformer 通常是并行计算的，但这段代码展示了它的<strong>推理（Inference）视角</strong>。这种一步步更新 <code>h</code> 的方式，使得它在生成文本时速度极快，且显存占用极低。</li>
+</ol>
+<p><strong>简单一句话：</strong>
+这是一个<strong>“边读边忘边记”</strong>的高效注意力机制实现，它用一个不断更新的矩阵 <code>h</code> 替代了传统 Transformer 庞大的历史缓存。</p>

@@ -1,0 +1,124 @@
+<h1>tests/ops/test_linear_attn.py</h1>
+<p>这段代码其实是一个 <strong>测试文件（Unit Test）</strong>。</p>
+<p>它的核心目的是：<strong>验证“快速/优化版”的算法（Flash Linear Attention），算出来的结果是否和“普通/慢速版”的算法完全一致。</strong></p>
+<p>为了让你看懂，我把这个文件的逻辑拆解成一个 <strong>任务清单 (Task List)</strong>，然后一步步给你解释其中的概念。</p>
+<hr />
+<h3>📋 任务清单 (Task To-Do List)</h3>
+<p>想象你是一个质检员，你的任务是检查一个新的高性能零件（优化代码）是否合格。你需要做以下步骤：</p>
+<ol>
+<li><strong>准备参数</strong>：设定好测试的规格（比如数据量大小 B, T, H, D）。</li>
+<li><strong>造数据</strong>：随机生成一组输入数据（Q, K, V），作为考题。</li>
+<li><strong>跑标准答案</strong>：用一个“虽然慢但绝对正确”的算法（Naive/Reference）跑一遍数据，记下结果（输出 output 和 梯度 grad）。</li>
+<li><strong>跑测试对象</strong>：用那个“虽然快但不确定对不对”的算法（Fused/Chunk）跑一遍同样的数据，记下结果。</li>
+<li><strong>比对答案</strong>：<ul>
+<li>对比 <strong>输出值</strong>：两个算法算出来的数，误差必须极小（比如小于 0.001）。</li>
+<li>对比 <strong>梯度值</strong>：两个算法反向传播算出来的梯度，误差也必须极小。</li>
+</ul>
+</li>
+<li><strong>盖章通过</strong>：如果都一致，测试通过；否则报错。</li>
+</ol>
+<hr />
+<h3>🪜 逐步概念解析</h3>
+<p>现在我们结合代码，一步步讲讲文中的观点和逻辑。</p>
+<h4>第一步：理解核心角色 (Imports &amp; Setup)</h4>
+<p>代码一开始引入了几个函数，它们是主角：
+*   <strong><code>naive_recurrent_linear_attn</code></strong>: <strong>标准答案</strong>。这是最朴素、最原始的实现，写得简单易懂，不容易出错，但运行速度慢。用来做参照物。
+*   <strong><code>fused_recurrent_linear_attn</code></strong> / <strong><code>chunk_linear_attn</code></strong>: <strong>测试对象</strong>。这是经过深度优化（通常用了 CUDA/Triton 融合算子）的算法，速度极快，但逻辑复杂，容易写出的 Bug。</p>
+<p><strong>观点</strong>：在深度学习底层开发中，为了保证速度，我们写了复杂的代码，但必须用简单的代码来验证它的正确性。</p>
+<h4>第二步：设定测试场景 (<code>@pytest.mark.parametrize</code>)</h4>
+<p>你会看到很多这样的代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span>
+    <span class="p">(</span><span class="s1">&#39;B&#39;</span><span class="p">,</span> <span class="s1">&#39;T&#39;</span><span class="p">,</span> <span class="s1">&#39;H&#39;</span><span class="p">,</span> <span class="s1">&#39;D&#39;</span><span class="p">,</span> <span class="s1">&#39;scale&#39;</span><span class="p">,</span> <span class="s1">&#39;dtype&#39;</span><span class="p">),</span>
+    <span class="p">[</span> <span class="o">...</span> <span class="p">]</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+这是在列举不同的“考试场景”。
+*   <strong>B (Batch)</strong>: 一次处理多少条数据。
+*   <strong>T (Time/Sequence Length)</strong>: 句子的长度（比如 512 个字，2048 个字）。
+*   <strong>H (Heads)</strong>: 注意力头的数量。
+*   <strong>D (Dimension)</strong>: 向量的维度。
+*   <strong>dtype</strong>: 数据精度（float32 或 float16）。</p>
+<p><strong>观点</strong>：代码必须在各种极端情况下（比如 T 很短或很长，精度很高或很低）都能正常工作。</p>
+<h4>第三步：造数据 (Data Generation)</h4>
+<p>在每个测试函数（如 <code>test_fused_recurrent</code>）的开头：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">()</span>
+<span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">()</span>
+<span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">()</span>
+<span class="n">h0</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 初始状态</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+*   <strong>Q, K, V</strong>: Linear Attention 的三个核心输入（Query, Key, Value）。
+*   <strong>requires_grad_()</strong>: 告诉 PyTorch，这些变量稍后需要计算梯度（用于训练神经网络）。
+*   <strong>h0</strong>: 循环神经网络（RNN）模式下的初始记忆状态。</p>
+<h4>第四步：跑“标准答案”并计算梯度 (Reference Run)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 前向传播 (算结果)</span>
+<span class="n">ref</span><span class="p">,</span> <span class="n">ref_ht</span> <span class="o">=</span> <span class="n">naive_recurrent_linear_attn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 2. 反向传播 (算梯度)</span>
+<span class="p">((</span><span class="n">ref</span> <span class="o">*</span> <span class="n">do</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">+</span> <span class="p">(</span><span class="n">ref_ht</span> <span class="o">*</span> <span class="n">dht</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+
+<span class="c1"># 3. 保存梯度并清空，防止干扰下一步</span>
+<span class="n">ref_dq</span><span class="p">,</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="kc">None</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+这里先运行了 <code>naive</code> (朴素) 版本。
+*   <strong>Forward</strong>: 算出输出 <code>ref</code>。
+*   <strong>Backward</strong>: 执行 <code>.backward()</code>。这是模拟神经网络训练时的“反向传播”。
+*   <strong>Clone</strong>: 把算出来的梯度（标准答案）存起来，比如存到 <code>ref_dq</code> (reference delta Q) 中。</p>
+<h4>第五步：跑“测试对象” (Target Run)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">tri</span><span class="p">,</span> <span class="n">tri_ht</span> <span class="o">=</span> <span class="n">fused_recurrent_linear_attn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="p">((</span><span class="n">tri</span> <span class="o">*</span> <span class="n">do</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">+</span> <span class="p">(</span><span class="n">tri_ht</span> <span class="o">*</span> <span class="n">dht</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="n">tri_dq</span><span class="p">,</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="kc">None</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+完全重复上面的步骤，但是换成了 <code>fused_recurrent_linear_attn</code>（优化版）。
+*   <code>tri</code> 通常指代 Triton（一种用于编写高性能 GPU 内核的语言）生成的实现。
+*   我们也算出了它的输出和梯度。</p>
+<h4>第六步：核心比对 (Assert Close)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39;o&#39;</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tri</span><span class="p">,</span> <span class="mf">0.001</span><span class="p">)</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39;dq&#39;</span><span class="p">,</span> <span class="n">ref_dq</span><span class="p">,</span> <span class="n">tri_dq</span><span class="p">,</span> <span class="mf">0.001</span><span class="p">)</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+这是最后的审判。
+*   <strong><code>assert_close</code></strong>: 这是一个断言函数。它在问：“标准答案 <code>ref</code> 和 测试结果 <code>tri</code> 是一样的吗？”
+*   <strong><code>0.001</code></strong>: 这是容忍度。因为浮点数计算总有微小的误差，只要误差小于 0.001，我们就认为它是对的。
+*   它不仅对比了输出结果 <code>o</code>，还对比了所有输入变量的梯度 <code>dq</code>, <code>dk</code>, <code>dv</code>。</p>
+<hr />
+<h3>🧠 进阶：这三个测试函数有什么区别？</h3>
+<p>文件中列了三个测试函数，它们分别测什么？</p>
+<ol>
+<li>
+<p><strong><code>test_fused_recurrent</code></strong>:</p>
+<ul>
+<li><strong>比对</strong>：Naive（朴素循环） vs. Fused Recurrent（融合循环）。</li>
+<li><strong>目的</strong>：验证最基础的优化版 RNN 模式是否写对了。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>test_chunk</code></strong>:</p>
+<ul>
+<li><strong>比对</strong>：Fused Recurrent（刚才验证过是对的） vs. Chunk（分块计算）。</li>
+<li><strong>背景</strong>：Linear Attention 可以像 RNN 一样一步步算（Recurrent），也可以分成小块并行算（Chunk）。</li>
+<li><strong>目的</strong>：验证“分块并行算法”算出来的结果，是否和“一步步算”的结果一致。Chunk 模式通常用于训练加速。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>test_fused_chunk</code></strong>:</p>
+<ul>
+<li><strong>比对</strong>：Fused Recurrent vs. Fused Chunk。</li>
+<li><strong>目的</strong>：验证深度优化的分块算法（Fused Chunk）是否正确。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件不是在讲算法原理，而是在<strong>做质检</strong>。
+它在说：<strong>“不管你是用简单的 Python 循环写，还是用复杂的 CUDA/Triton 加速写；也不管你是逐个字处理（Recurrent），还是一块块处理（Chunk），你们算出来的最终数值和梯度，必须一模一样！”</strong></p>

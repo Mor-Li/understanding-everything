@@ -1,0 +1,87 @@
+<h1>tests/ops/test_gated_delta.py</h1>
+<p>这份代码确实看起来很复杂，因为它涉及到了深度学习底层算子（Operator）的<strong>单元测试</strong>。</p>
+<p>简单来说，这个文件的目的是：<strong>验证一个叫“Gated Delta Rule”的新型注意力机制/RNN算法的实现是否正确。</strong></p>
+<p>为了让你听懂，我们假设你是一个开发经理，你给手下的工程师派了一个任务：“<strong>给我造一个叫 Gated Delta Rule 的超级引擎，要跑得快（用 GPU 加速），而且必须算得准。</strong>”</p>
+<p>下面是这位工程师为了向你证明“引擎没问题”而列出的 <strong>Task To-Do List（任务清单）</strong>，我们可以一步步来看：</p>
+<hr />
+<h3>任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>【制定标准】写一个“慢但绝对正确”的参考版 (Reference Impl)</strong><ul>
+<li><em>目的</em>：先用最简单的 Python 循环写一遍算法逻辑，不追求速度，只追求数学公式是对的。作为后续比对的“标准答案”。</li>
+</ul>
+</li>
+<li><strong>【测试模式 A】验证“循环推理模式” (Test Fused Recurrent)</strong><ul>
+<li><em>目的</em>：测试优化后的 GPU 版本在像 RNN 一样一步步处理数据时，结果是否和“标准答案”一致。</li>
+</ul>
+</li>
+<li><strong>【测试模式 B】验证“分块并行模式” (Test Chunk)</strong><ul>
+<li><em>目的</em>：测试优化后的 GPU 版本在训练时（可以并行计算）的结果是否正确，并且重点检查<strong>反向传播（梯度）</strong>是否准确，保证模型能正常学习。</li>
+</ul>
+</li>
+<li><strong>【边缘测试】验证“变长序列” (Test Variable Length)</strong><ul>
+<li><em>目的</em>：真实数据有的长有的短，测试算法能不能处理这种长短不一的数据（Batching），而不是只能处理固定长度。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<p>现在我们深入代码，把上面四个任务对应到文件内容里：</p>
+<h4>1. 制定标准：<code>recurrent_gated_delta_rule_ref</code></h4>
+<p>这是代码开头的函数。
+*   <strong>讲的啥</strong>：这是一个纯 Python/PyTorch 的实现。
+*   <strong>核心逻辑</strong>：你看它里面有一个 <code>for i in range(T):</code> 的循环。它模拟了时间步 $t=1, 2, 3...$。
+    *   它维护一个记忆状态 $h$。
+    *   每一步，它根据输入 $k, v$ 和门控信号 $g, \beta$ 来更新记忆 $h$。
+    *   公式逻辑大致是：<code>新值 = 旧值 - 遗忘的部分 + 新输入的部分</code> (这就是 Delta Rule 的核心)。
+    *   最后算出输出 $o$。
+*   <strong>为什么需要它</strong>：因为它逻辑直观，容易检查数学错误。后面的复杂 CUDA 版本都要跟它比结果。</p>
+<h4>2. 测试模式 A：<code>test_fused_recurrent</code></h4>
+<p>这是第一个测试函数。
+*   <strong>场景</strong>：模拟模型在“生成文本”时的状态（推理阶段），这时候模型是一个词一个词往外蹦的。
+*   <strong>做了什么</strong>：
+    1.  随机生成一堆数据 $q, k, v, \beta, g$。
+    2.  调用“慢速参考版” (<code>ref</code>) 算出一个结果。
+    3.  调用“快速优化版” (<code>fused_recurrent_gated_delta_rule</code>) 算出一个结果。
+    4.  <strong>关键点</strong>：<code>assert_close(ref, tri)</code>。这就是在问：“慢版本和快版本的结果，误差是不是在允许范围内？”如果是，测试通过。</p>
+<h4>3. 测试模式 B：<code>test_chunk</code></h4>
+<p>这是第二个测试函数，也是最重要的一个。
+*   <strong>场景</strong>：模拟模型在“训练”时的状态。训练时我们拥有整句话，不需要一个词一个词算，可以切成小块（Chunk）并行计算，速度极快。
+*   <strong>做了什么</strong>：
+    1.  随机生成数据，并开启 <code>requires_grad=True</code>（因为要测梯度）。
+    2.  调用“分块优化版” (<code>chunk_gated_delta_rule</code>)。
+    3.  <strong>关键点</strong>：不仅比对输出结果 (<code>assert_close('o', ...)</code>), 还要进行 <code>.backward()</code> (反向传播)。
+    4.  它比较了 $q, k, v, \beta$ 等所有参数的<strong>梯度（Gradient）</strong>。
+*   <strong>为什么重要</strong>：如果前向计算对了，但梯度算错了，模型就没法训练（Loss 降不下去）。这个测试保证了用来训练的算子是完美的。</p>
+<h4>4. 边缘测试：<code>test_chunk_varlen</code></h4>
+<p>这是最后一个测试函数。
+*   <strong>场景</strong>：处理变长数据。比如一个 Batch 里有两句话，一句 10 个词，一句 100 个词。
+*   <strong>做了什么</strong>：
+    1.  使用 <code>cu_seqlens</code> (Cumulative Sequence Lengths) 来标记每句话的起止位置。
+    2.  把这些变长句子拼成一条长龙塞进去算。
+    3.  同样对比参考实现的输出和梯度。
+*   <strong>观点</strong>：这证明了该算法支持高效的变长序列处理，不需要把短句子填充（Padding）成长的，节省显存和计算量。</p>
+<hr />
+<h3>总结：文中的核心观点（算法层面）</h3>
+<p>虽然这是一个测试文件，但它侧面反映了这个 <strong>Gated Delta Rule</strong> 算法的几个特性：</p>
+<ol>
+<li><strong>它是 RNN 和 Attention 的结合体</strong>：<ul>
+<li>它有状态 $h$（像 RNN），所以推理显存占用小。</li>
+<li>它有 $q, k, v$（像 Attention），表达能力强。</li>
+</ul>
+</li>
+<li><strong>它有两个版本</strong>：<ul>
+<li><strong>Recurrent (循环版)</strong>：用于推理，显存恒定。</li>
+<li><strong>Chunk (分块版)</strong>：用于训练，速度快，可以并行。</li>
+</ul>
+</li>
+<li><strong>Delta Rule (增量规则)</strong>：<ul>
+<li>注意代码里的 <code>b_v = b_v - (h.clone() * b_k[..., None]).sum(-2)</code>。这是一种“求差值”的更新方式，意味着它只学习“新知识”与“旧记忆”的差异，通常比直接覆盖记忆更高效。</li>
+</ul>
+</li>
+<li><strong>Gated (门控)</strong>：<ul>
+<li>代码里有 <code>beta</code> 和 <code>g</code>。<code>g</code> (Decay) 控制遗忘多少旧信息，<code>beta</code> 控制写入多少新信息。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结：</strong>
+这个文件就是为了确保 <strong>Gated Delta Rule</strong> 这个既能像 Transformer 一样并行训练，又能像 RNN 一样高效推理的算法，在工程实现上是<strong>准确无误</strong>的。</p>

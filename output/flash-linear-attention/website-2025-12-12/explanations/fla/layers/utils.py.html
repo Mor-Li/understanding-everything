@@ -1,0 +1,101 @@
+<h1>fla/layers/utils.py</h1>
+<p>这个文件看起来很底层，确实容易让人晕头转向。但其实它的核心逻辑非常简单，就是为了<strong>解决 Transformer 在处理变长序列时的效率问题</strong>。</p>
+<p>为了让你彻底搞懂，我为你设计了一个由浅入深的 <strong>Task List (学习清单)</strong>。我们一步步来划掉这些任务。</p>
+<hr />
+<h3>📋 Task 1: 理解核心背景 —— "Padding" (填充) 是什么痛点？</h3>
+<p>在看代码之前，你需要先明白这个文件存在的意义。</p>
+<ul>
+<li><strong>现状</strong>：我们在训练模型时，因为句子长短不一，为了凑成一个整齐的矩阵（Batch），通常会用 0 填充（Padding）短句子。<ul>
+<li>例如：<code>[[A, B, C], [D, 0, 0]]</code>。这里有两个句子，第二个句子短，补了两个 0。</li>
+<li>形状是 <code>[Batch=2, SeqLen=3]</code>。</li>
+</ul>
+</li>
+<li><strong>问题</strong>：那些 <code>0</code> 是无效信息，但显卡（GPU）照样会去计算它们，浪费了算力和显存。</li>
+<li><strong>解决</strong>：Flash Attention 等高效算子喜欢<strong>把所有句子的有效词拼成一长串</strong>，去掉 0。<ul>
+<li>变成：<code>[A, B, C, D]</code>。</li>
+<li>形状是 <code>[TotalTokens=4]</code>。</li>
+</ul>
+</li>
+<li><strong>本文件的作用</strong>：就是做这个<strong>“把矩阵压扁去掉0（Unpad）”</strong>和<strong>“把长条还原回矩阵（Pad）”</strong>的工作。</li>
+</ul>
+<hr />
+<h3>📋 Task 2: 理解基础工具 —— <code>IndexFirstAxis</code> 和 <code>IndexPutFirstAxis</code></h3>
+<p>这两个类是 pytorch 的自定义函数，是整个文件的“搬运工”。</p>
+<p><strong>1. <code>IndexFirstAxis</code> (提取)</strong>
+*   <strong>功能</strong>：从一个大张量里，根据索引（indices）挑出我们需要的那几行。
+*   <strong>代码对应</strong>：
+    <code>python
+    # 简单理解就是：
+    return x[indices] 
+    # 但作者为了速度，用了 torch.gather 和 rearrange 这种更底层的写法。</code>
+*   <strong>比喻</strong>：你去超市买苹果，一箱苹果里有好有坏（Padding），你手里有个清单（indices），只把清单上好的苹果挑出来放到篮子里。</p>
+<p><strong>2. <code>IndexPutFirstAxis</code> (放回)</strong>
+*   <strong>功能</strong>：把计算好的结果，放回到一个全是 0 的大张量的指定位置。
+*   <strong>代码对应</strong>：
+    <code>python
+    y = torch.zeros(...)
+    y[indices] = x # 把算好的有效数据填回去</code>
+*   <strong>比喻</strong>：你把篮子里的苹果削好皮了，现在要按照原来的位置，把它们放回原来的箱子里。</p>
+<hr />
+<h3>📋 Task 3: 准备工作 —— <code>get_unpad_data</code></h3>
+<p>在开始“压扁”数据之前，我们需要知道哪些数据是有效的。</p>
+<ul>
+<li><strong>输入</strong>：<code>attention_mask</code>（比如 <code>[[1, 1, 1], [1, 0, 0]]</code>，1代表有效，0代表填充）。</li>
+<li><strong>输出</strong>：<ol>
+<li><strong><code>indices</code></strong>: 有效数据的坐标。比如上面例子，第0,1,2,3个位置是有效的，indices就是 <code>[0, 1, 2, 3]</code>。</li>
+<li><strong><code>cu_seqlens</code></strong> (Cumulative Sequence Lengths): <strong>累积序列长度</strong>。这是给 CUDA 算子用的。<ul>
+<li>如果有两个句子长度分别是 3 和 1。</li>
+<li><code>cu_seqlens</code> 就是 <code>[0, 3, 4]</code>。它告诉 GPU：第1个句子是从0到3，第2个句子是从3到4。</li>
+</ul>
+</li>
+<li><strong><code>max_seqlen_in_batch</code></strong>: 这一批里最长的句子有多长。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 4: 核心操作 —— <code>unpad_input</code> (去填充)</h3>
+<p>这是文中最复杂的函数，但逻辑很清晰。</p>
+<ul>
+<li><strong>目标</strong>：把形状为 <code>[Batch, SeqLen, Dim]</code> 的 Query (q) 和 Key/Value (states) 变成 <code>[TotalTokens, Dim]</code>。</li>
+<li><strong>步骤讲解</strong>：<ol>
+<li>调用 <code>get_unpad_data</code> 拿到索引 <code>indices</code>。</li>
+<li><strong>压扁并提取 (States)</strong>：
+    <code>python
+    # 先把 Batch 和 SeqLen 维度合并，变成一长条
+    rearrange(s, "b s ... -&gt; (b s) ...") 
+    # 然后用 indices 挑出非 0 的部分
+    index_first_axis(..., indices_k)</code></li>
+<li><strong>处理 Query (q)</strong>：<ul>
+<li><strong>Prefilling 阶段</strong> (<code>q_len == seq_len</code>)：像上面一样，把 q 也压扁，挑出有效词。</li>
+<li><strong>Decoding 阶段</strong> (<code>q_len == 1</code>)：生成文本时，每次只进来 1 个词。这时候不需要复杂的压扁，只需要调整一下形状。</li>
+</ul>
+</li>
+<li><strong>返回</strong>：处理好的 q，k/v，以及算子需要的长度信息 (<code>cu_seqlens</code>)。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 5: 还原操作 —— <code>pad_input</code> (恢复填充)</h3>
+<p>当模型计算完 Attention 后，得到的结果是紧凑的 <code>[TotalTokens, Dim]</code>。为了传给下一层或者输出，通常需要变回标准的 <code>[Batch, SeqLen, Dim]</code>。</p>
+<ul>
+<li>
+<p><strong>代码逻辑</strong>：
+    ```python
+    # 1. 创建一个全 0 的大容器，把紧凑的数据填回原来的位置
+    output = index_put_first_axis(hidden_states, indices, batch_size * seq_len)</p>
+<h1>2. 把长条切回 [Batch, SeqLen] 的形状</h1>
+<p>return rearrange(output, "(b s) ... -&gt; b s ...", b=batch_size)
+```</p>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>把这个文件看作一个<strong>“数据打包/解包器”</strong>：</p>
+<ol>
+<li><strong>输入</strong>：带 0 的松散矩阵。</li>
+<li><strong><code>get_unpad_data</code></strong>：扫描一下，记下哪里是非 0 的数据。</li>
+<li><strong><code>unpad_input</code> (解包)</strong>：把非 0 数据抽出来，拼成紧凑的长条，喂给 Flash Attention 等高效算子计算。</li>
+<li><strong><code>pad_input</code> (打包)</strong>：算完后，把结果按原样填回去，恢复成矩阵形状。</li>
+</ol>
+<p><strong>为什么要这么折腾？</strong>
+为了<strong>快</strong>。虽然 Python 层面多写了几行代码，但对于底层的 GPU 来说，不用计算那些无意义的 0，能节省几倍的时间和显存。</p>

@@ -1,0 +1,78 @@
+<h1>benchmarks/ops/benchmark_simple_gla_vs_mamba2.py</h1>
+<p>这份代码其实不是在讲一个复杂的算法原理，而是在做一个<strong>“比武擂台”</strong>（Benchmark）。</p>
+<p>它的核心目的是：<strong>对比 <code>Simple GLA</code>（Flash Linear Attention 库中的实现）和 <code>Mamba2</code>（官方 Mamba 库中的实现）在不同序列长度下的运行速度。</strong></p>
+<p>为了让你彻底看懂，我为你列了一个<strong>“理解任务清单 (Todo List)”</strong>。请按照这个顺序，一步一步来拆解这份代码：</p>
+<hr />
+<h3>任务 1：搞清楚“比武”的双方是谁</h3>
+<p><strong>目标：</strong> 理解 <code>import</code> 部分。</p>
+<ul>
+<li><strong>红方选手 (Mamba2)</strong>: <code>mamba_chunk_scan_combined</code>。这是 Mamba2 官方提供的核心算子（SSD 算法）。</li>
+<li><strong>蓝方选手 (Simple GLA)</strong>: <code>chunk_simple_gla</code>。这是 FLA (Flash Linear Attention) 库自己写的一个算子。</li>
+<li><strong>裁判 (Triton)</strong>: <code>triton.testing</code>。这是一个工具，用来跑分、计时并画图。</li>
+</ul>
+<h3>任务 2：看懂“比赛规则”</h3>
+<p><strong>目标：</strong> 理解 <code>@triton.testing.perf_report</code> 装饰器部分。</p>
+<p>这段代码定义了图表的坐标轴：
+*   <strong>X 轴 (<code>x_names=['T']</code>)</strong>: 代表<strong>序列长度 (Sequence Length)</strong>。也就是输入的文本有多长。
+    *   <code>x_vals</code>: 测试长度从 64 开始，每次翻倍，一直测到很长（128 * 2^7）。
+*   <strong>Y 轴 (<code>ylabel</code>)</strong>: 代表<strong>执行时间 (毫秒)</strong>。越低越好。
+*   <strong>线条 (<code>line_names</code>)</strong>: 图上会有两条线，一条叫 "chunk_simple_gla" (蓝线)，一条叫 "mamba2_ssd" (红线)。</p>
+<h3>任务 3：准备“比赛道具” (数据初始化)</h3>
+<p><strong>目标：</strong> 理解 <code>benchmark</code> 函数开头的变量定义。</p>
+<p>代码模拟了 Mamba2 模型所需的标准输入数据：
+*   <strong>形状参数</strong>: Batch size ($B=16$), Heads ($H=8$), Dimension ($D=128$)。
+*   <strong>输入张量</strong>:
+    *   <code>X_mamba</code>: 输入信号。
+    *   <code>dt_mamba</code>: 时间步长 (delta t)。
+    *   <code>A_mamba</code>, <code>B_mamba</code>, <code>C_mamba</code>: 状态空间模型(SSM)的核心参数。
+    *   <em>注意：这些数据都是随机生成的 (<code>torch.randn</code>)，因为我们只测速度，不关心计算结果对不对。</em></p>
+<h3>任务 4：蓝方选手上场 (Simple GLA)</h3>
+<p><strong>目标：</strong> 理解 <code>if provider == 'chunk_simple_gla':</code> 这一段。</p>
+<p>这里有一个<strong>非常关键的观点</strong>：<strong>数据排布 (Memory Layout) 的差异</strong>。</p>
+<ol>
+<li>
+<p><strong>格式转换 (重点)</strong>:</p>
+<ul>
+<li>Mamba2 的官方格式习惯是：<code>[Batch, Time, Head, Dim]</code> (时间维度在中间)。</li>
+<li>FLA (Simple GLA) 的格式习惯是：<code>[Batch, Head, Time, Dim]</code> (Head 维度在前)。</li>
+<li><strong>代码动作</strong>: <code>q = C_mamba.transpose(1, 2).contiguous()</code>。</li>
+<li><strong>解读</strong>: 为了让 Simple GLA 能跑起来，代码强行把 Mamba 的数据格式转置（Transpose）了一下。作者还留了个注释：<em>“要不要把这次内存拷贝的时间算进去呢？”</em> (这会影响比赛公平性)。</li>
+</ul>
+</li>
+<li>
+<p><strong>映射关系</strong>:</p>
+<ul>
+<li>Simple GLA 里的 <code>q</code> 对应 Mamba 里的 <code>C</code>。</li>
+<li>Simple GLA 里的 <code>k</code> 对应 Mamba 里的 <code>B</code>。</li>
+<li>Simple GLA 里的 <code>v</code> 对应 Mamba 里的 <code>X</code>。</li>
+<li>Simple GLA 里的 <code>g</code> 对应 Mamba 里的 <code>A * dt</code> (衰减率)。</li>
+</ul>
+</li>
+<li>
+<p><strong>开跑</strong>: 调用 <code>chunk_simple_gla(...)</code> 并计时。</p>
+</li>
+</ol>
+<h3>任务 5：红方选手上场 (Mamba2 SSD)</h3>
+<p><strong>目标：</strong> 理解 <code>elif provider == 'mamba2_ssd':</code> 这一段。</p>
+<ol>
+<li><strong>直接运行</strong>: 因为输入数据本来就是按 Mamba 格式生成的，所以不需要转置，直接喂进去。</li>
+<li><strong>关键参数</strong>: <code>chunk_size=64</code>。<ul>
+<li><strong>解读</strong>: 这里的 <code>chunk</code> 是分块计算的大小。为了公平起见，作者把 Mamba2 的分块大小强制设为 64，因为 Simple GLA 的内核里写死了分块是 64。</li>
+</ul>
+</li>
+</ol>
+<h3>任务 6：生成报告</h3>
+<p><strong>目标：</strong> 理解 <code>if __name__ == '__main__':</code>。</p>
+<ul>
+<li><code>benchmark.run(...)</code>: 开始跑循环，记录时间，最后在当前目录下生成一个图表文件，并在终端打印出数据。</li>
+</ul>
+<hr />
+<h3>总结：文中的核心观点</h3>
+<p>如果把这份代码看作一篇文章，它的“中心思想”如下：</p>
+<ol>
+<li><strong>功能对齐</strong>: 证明了 Simple GLA 的算法逻辑本质上和 Mamba2 的 SSD 算法是可以对应的（通过 Q/K/V/G 的参数映射）。</li>
+<li><strong>性能对比</strong>: 作者想看看，在相同的分块大小（Chunk Size = 64）下，是自己写的 <code>chunk_simple_gla</code> 快，还是官方的 <code>mamba2_ssd</code> 快。</li>
+<li><strong>工程细节</strong>: 指出了两者在输入数据格式上的不同（FLA 喜欢把 Head 放在 Time 前面，Mamba 喜欢把 Time 放在 Head 前面），这在实际使用中需要注意 <code>transpose</code> 带来的开销。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这是一个测速脚本，用来看看把 Mamba2 的输入数据转置一下喂给 Simple GLA 算子，跑得有没有官方 Mamba2 算子快。</p>

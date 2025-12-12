@@ -1,0 +1,125 @@
+<h1>fla/ops/abc/naive.py</h1>
+<p>这份代码确实非常抽象，因为它涉及到了<strong>线性注意力机制（Linear Attention）</strong>和<strong>状态空间模型（SSM/RNN）</strong>的混合概念。</p>
+<p>这段代码实现的是 <strong>ABC (Attention with Bounded-memory Control)</strong> 机制的一个“朴素”（Naive）版本。简单来说，它是为了解决 Transformer 推理慢的问题，把注意力机制改成了一种类似于 RNN 的形式，但比普通 RNN 更强。</p>
+<p>为了让你看懂，我把理解这份代码拆解成 <strong>6 个 Task</strong> 的待办清单。我们一步步划掉它们。</p>
+<hr />
+<h3>✅ Task 1: 搞清楚“我们在做什么” (High-Level Concept)</h3>
+<ul>
+<li><strong>目标</strong>：Transformer 的注意力机制是 $O(N^2)$ 的，因为每个词都要看前面所有的词。ABC 机制想把它变成 $O(N)$，也就是<strong>线性复杂度</strong>。</li>
+<li><strong>方法</strong>：<ul>
+<li><strong>传统 Attention</strong>：我（Query）直接去翻阅以前所有的日记（Keys &amp; Values）。</li>
+<li><strong>ABC (Recurrent)</strong>：我维护这一个只有几页纸的“笔记本”（Hidden State）。每进来一个新词，我就更新一下笔记本。要回答问题时，我只查这个笔记本，不翻以前的原始日记。</li>
+</ul>
+</li>
+<li><strong>核心词汇</strong>：<ul>
+<li><strong>Slots ($M$)</strong>：笔记本的页数。代码里的 <code>s</code> 维度对应 <code>n_slots</code>。</li>
+<li><strong>Gate ($g$)</strong>：遗忘门。决定以前的记忆要保留多少（类似于 LSTM 的遗忘机制）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 认识演员表 (Inputs Definition)</h3>
+<p>在阅读函数 <code>naive_recurrent_abc</code> 之前，先搞懂输入变量是什么角色：</p>
+<ol>
+<li><strong><code>q, k, v</code></strong>: 老朋友了。Query（查询）, Key（索引）, Value（内容）。</li>
+<li><strong><code>s</code> (Scores/Slots)</strong>: <strong>这是 ABC 的核心</strong>。<ul>
+<li>你可以把它理解为“<strong>分类器</strong>”或者“<strong>槽位分配者</strong>”。</li>
+<li>它决定了当前的 <code>k</code> 和 <code>v</code> 应该被写进“笔记本”的哪一页（Slot）。</li>
+<li>形状通常是 <code>[batch, heads, seq_len, n_slots]</code>。</li>
+</ul>
+</li>
+<li><strong><code>g</code> (Gate)</strong>: 衰减系数。<ul>
+<li>类似于 <code>exp(-decay)</code>。它决定了记忆随着时间流逝会变淡多少。</li>
+</ul>
+</li>
+<li><strong><code>initial_state</code></strong>: 笔记本的初始状态（比如上一段话留下的记忆）。</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 拆解循环逻辑 - 第一阶段 (The "Key" Memory)</h3>
+<p>我们看 <code>naive_recurrent_abc</code> 中的<strong>第一个 <code>for</code> 循环</strong>。这是整个算法最难理解的部分，它实际上是在做“<strong>寻址</strong>”。</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 hk 是第一个“笔记本”（Hidden State for Keys）</span>
+<span class="c1"># 它的形状是 [Batch, Head, K_dim, M_slots]</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">T</span><span class="p">):</span>
+    <span class="c1"># ... 省略取值过程 ...</span>
+
+    <span class="c1"># 1. 更新记忆 hk</span>
+    <span class="c1"># 新的记忆 = 旧记忆 * 衰减(g) + 当前Key(k) * 当前Slot分配(v_i/s)</span>
+    <span class="n">hk</span> <span class="o">=</span> <span class="n">hk</span> <span class="o">*</span> <span class="n">g_i</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">+</span> <span class="n">k_i</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">*</span> <span class="n">v_i</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> 
+
+    <span class="c1"># 2. 查询记忆 ok</span>
+    <span class="c1"># 用 Query(q) 去在这个笔记本里找，算出每个 Slot 的得分</span>
+    <span class="n">ok</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">q_i</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">*</span> <span class="n">hk</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>人话解释：</strong>
+*   <strong>写入过程</strong>：不仅要把 <code>k</code> 存下来，还要根据 <code>s</code> (代码里变量名混用了，这里 <code>v_i</code> 其实是输入的 <code>s</code>) 把 <code>k</code> 存到具体的 Slot（槽位）里。
+*   <strong>读取过程</strong>：<code>q</code> 进来了，它和 <code>hk</code> 交互，计算出 <code>ok</code>。
+*   <strong>目的</strong>：<code>ok</code> 代表了 Query 认为“哪一个 Slot 对我最重要”。</p>
+<p><strong>中间转换：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">qv</span> <span class="o">=</span> <span class="n">ok</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>把 <code>ok</code> 变成概率分布。比如：Query 说“我觉得第 3 个 Slot 的信息最重要，概率 80%”。</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 拆解循环逻辑 - 第二阶段 (The "Value" Memory)</h3>
+<p>现在我们知道了 Query 对哪个 Slot 感兴趣（由 <code>qv</code> 决定），我们需要去第二个笔记本里把真正的 Value 取出来。</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 hv 是第二个“笔记本”（Hidden State for Values）</span>
+<span class="c1"># 它的形状是 [Batch, Head, M_slots, V_dim]</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">T</span><span class="p">):</span>
+    <span class="c1"># q_i 变成了刚才算出来的 Slot 概率 (qv)</span>
+    <span class="c1"># k_i 变成了 Slot 分配器 (s)</span>
+    <span class="c1"># v_i 是真正的 Value (v)</span>
+
+    <span class="c1"># 1. 更新记忆 hv</span>
+    <span class="c1"># 新记忆 = 旧记忆 * 衰减 + 当前Slot(s) * 当前Value(v)</span>
+    <span class="c1"># 意思就是：把 Value 存进对应的 Slot 里</span>
+    <span class="n">hv</span> <span class="o">=</span> <span class="n">hv</span> <span class="o">*</span> <span class="n">g_i</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">+</span> <span class="n">k_i</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">*</span> <span class="n">v_i</span><span class="p">[</span><span class="o">...</span><span class="p">]</span>
+
+    <span class="c1"># 2. 生成输出 ov</span>
+    <span class="c1"># 用刚才的 Slot 概率 (qv) 去加权求和 hv 里的内容</span>
+    <span class="n">ov</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">q_i</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">*</span> <span class="n">hv</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>人话解释：</strong>
+*   <strong>写入</strong>：把真正的 <code>v</code> 按照 <code>s</code> 指示的权重，存入 <code>hv</code> 的不同 Slot 里。
+*   <strong>读取</strong>：根据第一阶段算出来的“我想看哪个 Slot (<code>qv</code>)”，从 <code>hv</code> 里把对应 Slot 的 Value 提取出来，作为最终输出。</p>
+<hr />
+<h3>✅ Task 5: 理解并行版 (Cumsum / Parallel Mode)</h3>
+<p>函数 <code>naive_cumsum_abc</code> 是上面逻辑的另一种写法。</p>
+<ul>
+<li><strong>为什么要有这个函数？</strong><ul>
+<li>上面的 <code>for</code> 循环（RNN模式）在推理时好用（省内存，生成快），但在训练时很慢（无法并行）。</li>
+<li>因为这是<strong>线性系统</strong>，数学上 $h_t = h_{t-1} + x_t$ 等价于求前缀和（Cumulative Sum）。</li>
+</ul>
+</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>它没有用 <code>for</code> 循环，而是直接用了 <code>cumsum</code>。</li>
+<li><code>K = ...cumsum(...)</code>: 一次性算出所有时刻的记忆状态。</li>
+<li><code>p = ...</code>: 计算 Attention Score。</li>
+<li><strong>结论</strong>：这两个函数算出来的结果理论上是一样的（在数值精度允许范围内），只是一个用于训练（并行），一个用于推理（串行）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 6: 总结 (The "Ah-ha!" Moment)</h3>
+<p>把所有碎片拼起来，这篇代码讲的是这样一个故事：</p>
+<ol>
+<li><strong>传统 Attention</strong>：Query 直接找 Key 匹配，然后拿 Value。</li>
+<li><strong>ABC 机制</strong>：<ul>
+<li>引入了中间人 <strong>Slots (S)</strong>。</li>
+<li><strong>第一步</strong>：把 <code>Key</code> 压缩进 Slots。用 <code>Query</code> 问 Slots：“我要的信息在哪几个槽里？”得到概率 <code>qv</code>。</li>
+<li><strong>第二步</strong>：把 <code>Value</code> 也压缩进 Slots。根据刚才得到的概率 <code>qv</code>，去对应的 Slots 里拿回 <code>Value</code>。</li>
+<li>通过这种“先压缩进 Slot，再从 Slot 读”的方式，把计算量从 $O(N^2)$ 降到了 $O(N \times M)$ （$M$ 是 Slot 数量，通常很小）。</li>
+</ul>
+</li>
+</ol>
+<p><strong>你的 Todo List 完成了吗？</strong>
+1.  [x] 知道这是为了加速 Transformer。
+2.  [x] 知道 <code>s</code> 是用来给记忆分区的（槽位）。
+3.  [x] 知道第一个循环是算“去哪个槽位读”。
+4.  [x] 知道第二个循环是“从槽位里把值取出来”。
+5.  [x] 知道 Cumsum 版本是为了训练加速。</p>

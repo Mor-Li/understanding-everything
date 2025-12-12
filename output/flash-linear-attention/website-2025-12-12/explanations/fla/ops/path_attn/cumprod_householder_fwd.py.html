@@ -1,0 +1,101 @@
+<h1>fla/ops/path_attn/cumprod_householder_fwd.py</h1>
+<p>这份代码确实非常硬核，因为它是一段 <strong>Triton Kernel</strong> 代码，用于在 GPU 上极其高效地执行数学运算。它的核心目的是为一个类似 RNN 或线性 Attention 的模型计算 <strong>“累积乘积”（Cumulative Product）</strong>，并使用了 <strong>Householder 变换</strong> 的数学形式来保持数值稳定性。</p>
+<p>简单来说，这段代码在做一件事：<strong>把一连串的矩阵乘法压缩成高效的并行计算，算出一个序列的状态变化。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“GPU 打工人的 To-Do List”</strong>。想象你就是那个 GPU 线程，这是你的任务清单。</p>
+<hr />
+<h3>核心概念铺垫（先懂这俩词再看 List）</h3>
+<ol>
+<li><strong>Householder</strong>: 这是一种数学技巧，通常用来表示旋转或反射矩阵。在这里，它被用来高效地表示状态转移矩阵。你可以把它理解为“<strong>对数据进行某种变换的算子</strong>”。</li>
+<li><strong>Chunk (分块)</strong>: 序列太长（比如 4096 个 token），一口气算不完。我们把它切成大块（<code>S</code>），大块里再切成小块（<code>BT</code>）。</li>
+</ol>
+<hr />
+<h3>📝 任务清单：逐步拆解代码逻辑</h3>
+<p>假设你是一个负责处理其中一段数据的 GPU 核心，你的工作流程如下：</p>
+<h4>✅ Task 1: 找工位 (定位数据)</h4>
+<p><strong>代码对应:</strong> <code>i_ss, i_h = tl.program_id(0), ...</code> 以及 <code>if IS_VARLEN:</code> 块。</p>
+<ul>
+<li><strong>任务说明:</strong><ul>
+<li>你需要知道自己负责哪一个样本（Batch）、哪一个头（Head）以及哪一段序列（Chunk）。</li>
+<li>代码里有一大堆 <code>split_indices</code>, <code>cu_seqlens</code> 的计算，都是为了算出：<strong>“我该从内存的第几个地址开始读取数据？”</strong></li>
+<li><strong>通俗理解:</strong> 上班打卡，找到自己今天要处理的那一堆文件在哪里。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 准备工具箱 (初始化指针)</h4>
+<p><strong>代码对应:</strong> <code>hc_whole += ...</code>, <code>k += ...</code>, <code>w1 += ...</code></p>
+<ul>
+<li><strong>任务说明:</strong><ul>
+<li>把读取指针移动到具体的内存位置。</li>
+<li><code>k</code>: 输入的向量序列。</li>
+<li><code>w1</code>, <code>w2</code>: 构造成 Householder 变换的参数（你可以把它们理解为生成变换矩阵的原材料）。</li>
+<li><code>hc_whole</code>, <code>hc_suffix</code>: 你算完之后要填写的答案纸。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 拿出一个空桶 (初始化累加器)</h4>
+<p><strong>代码对应:</strong> <code>b_h = tl.zeros([BK, BK], ...)</code></p>
+<ul>
+<li><strong>任务说明:</strong><ul>
+<li>创建一个全为 0 的矩阵 <code>b_h</code>。</li>
+<li>这个 <code>b_h</code> 是最关键的变量。它代表 <strong>“从未来到现在积累的变换矩阵”</strong>。</li>
+<li><strong>通俗理解:</strong> 拿一个空购物车，准备装东西。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 【核心】倒着跑的时光机 (反向循环)</h4>
+<p><strong>代码对应:</strong> <code>for i_t_small in range(NT_small-1, -1, -1):</code></p>
+<ul>
+<li><strong>这是最难理解的一步，请注意：</strong> 循环是 <strong>倒序</strong> (<code>-1</code>) 的。</li>
+<li><strong>为什么要倒着算？</strong><ul>
+<li>在计算累积乘积（CumProd）时，如果我们想知道“从当前时刻到该块结束”的总变换效果，我们需要从后往前累积。</li>
+<li><strong>步骤 A: 存个档</strong><ul>
+<li><code>tl.store(p_hc_suffix, b_h...)</code></li>
+<li>把当前手里攒出来的 <code>b_h</code> 存到 <code>hc_suffix</code> 里。这代表“从这之后所有时刻累积起来的变换”。</li>
+</ul>
+</li>
+<li><strong>步骤 B: 修正旧数据 (应用变换)</strong><ul>
+<li><code>b_k = tl.load(...)</code></li>
+<li><code>b_k = (b_k - tl.dot(b_k, ... b_h))</code></li>
+<li><strong>含义:</strong> 拿出当前的输入 <code>k</code>，用手里攒的变换矩阵 <code>b_h</code> 去“修正”或“旋转”它。得到 <code>k</code> 的新值。</li>
+</ul>
+</li>
+<li><strong>步骤 C: 升级变换矩阵 (更新状态)</strong><ul>
+<li><code>b_w1 = ...</code>, <code>b_w2 = ...</code></li>
+<li><code>b_h += tl.dot(b_v_new, b_w2)</code></li>
+<li><strong>含义:</strong> 读取当前的参数 <code>w1</code> 和 <code>w2</code>，把它们融合进 <code>b_h</code> 里。</li>
+<li><strong>通俗理解:</strong> 购物车里又加了一个新的变换规则，现在的 <code>b_h</code> 变得更强大了，包含了更多时刻的信息。</li>
+</ul>
+</li>
+<li><strong>步骤 D: 写回数据</strong><ul>
+<li><code>tl.store(p_k_new, b_k...)</code></li>
+<li>把修正后的 <code>k</code> (也就是 <code>k_new</code>) 写回内存。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 提交最终报告 (保存整块结果)</h4>
+<p><strong>代码对应:</strong> <code>tl.store(p_hc_whole, b_h...)</code></p>
+<ul>
+<li><strong>任务说明:</strong><ul>
+<li>循环结束了，你已经把这一大块（Chunk）从后往前遍历了一遍。</li>
+<li>此时 <code>b_h</code> 里面装的是 <strong>“这一整块数据的总变换矩阵”</strong>。</li>
+<li>把它存入 <code>hc_whole</code>。</li>
+<li>这个 <code>hc_whole</code> 会被留给下一个大块使用（因为序列是连续的，下一个块需要知道上一个块的总效果）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在算啥？</h3>
+<p><strong>一句话总结：</strong>
+它在做一个 <strong>分块的、反向的矩阵累积更新</strong>。</p>
+<p><strong>详细逻辑链：</strong>
+1.  把长序列切成块。
+2.  在每个块内部，<strong>从后往前</strong> 扫描。
+3.  一边扫描，一边维护一个 <strong>“累积变换矩阵” (<code>b_h</code>)</strong>。
+4.  用这个矩阵去更新当前的输入向量 <code>k</code> (得到 <code>k_new</code>)。
+5.  同时记录下每个小节点的累积状态 (<code>hc_suffix</code>) 和整个大块的总状态 (<code>hc_whole</code>)。</p>
+<p><strong>为什么要这么复杂？</strong>
+这是为了 <strong>并行化</strong>。
+普通的 RNN 必须一步一步算（t=1, t=2, t=3...），没法并行。
+这个算法利用 Householder 的性质，允许我们在每个小块内部独立计算，最后再把块与块之间连起来（虽然这段代码只负责块内计算），从而极大地榨干 GPU 的性能。</p>

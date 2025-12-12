@@ -1,0 +1,123 @@
+<h1>fla/ops/kda/chunk_intra_token_parallel.py</h1>
+<p>Triton 代码确实非常晦涩，因为它把数学逻辑、显存管理和并行计算全部揉在一起了。看不懂是很正常的。</p>
+<p>为了让你能够消化这段代码，我为你制定了一个 <strong>“学习任务清单 (Todo List)”</strong>。我们将代码拆解为 5 个步骤，每一步只解决一个问题。</p>
+<h3>📋 学习任务清单 (Roadmap)</h3>
+<ol>
+<li><strong>Task 1: 理解背景与目标</strong> —— 这段代码到底在算什么？（宏观概念）</li>
+<li><strong>Task 2: 理解“分工” (Grid)</strong> —— GPU 的成千上万个线程是如何分配任务的？</li>
+<li><strong>Task 3: 理解“寻址” (Indexing)</strong> —— 一个线程怎么知道自己该处理哪个 Token？（特别是变长序列的处理）</li>
+<li><strong>Task 4: 理解“核心循环” (The Loop)</strong> —— 具体的数学计算（Q、K、G 的交互）是怎么发生的？</li>
+<li><strong>Task 5: 理解“输出” (Store)</strong> —— 算出来的 $A_{qk}$ 和 $A_{kk}$ 是存到哪里的？</li>
+</ol>
+<hr />
+<h3>Step-by-Step 详细讲解</h3>
+<h4>✅ Task 1: 理解背景与目标</h4>
+<p><strong>核心观点：</strong> 这是一个 <strong>“块内 (Intra-Chunk)”</strong> 的线性注意力计算。</p>
+<ul>
+<li><strong>线性注意力 (Linear Attention)</strong> 通常把长序列切成很多小块（Chunk）。</li>
+<li>计算分为两部分：<ol>
+<li><strong>块间 (Inter-Chunk)</strong>：利用这一块之前的记忆状态。</li>
+<li><strong>块内 (Intra-Chunk)</strong>：计算这一块内部，当前 Token 和它之前的 Token 的交互。</li>
+</ol>
+</li>
+<li><strong>本文件的作用</strong>：只负责第 2 部分。给定 Query ($q$) 和 Key ($k$) 以及衰减门控 ($g$)，计算它们在当前小窗口内的匹配分数。</li>
+</ul>
+<hr />
+<h4>✅ Task 2: 理解“分工” (Grid)</h4>
+<p><strong>核心观点：</strong> 这是一个 <strong>Token 并行 (Token-Parallel)</strong> 的实现。</p>
+<p>请看 Python 函数 <code>chunk_kda_fwd_intra_token_parallel</code> 中的这行代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">grid</span><span class="p">(</span><span class="n">meta</span><span class="p">):</span> <span class="k">return</span> <span class="p">(</span><span class="n">B</span> <span class="o">*</span> <span class="n">T</span><span class="p">,</span> <span class="n">triton</span><span class="o">.</span><span class="n">cdiv</span><span class="p">(</span><span class="n">H</span><span class="p">,</span> <span class="n">meta</span><span class="p">[</span><span class="s1">&#39;BH&#39;</span><span class="p">]))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：它启动了 <code>B * T</code> 个主要的线程块（Program ID 0）。</li>
+<li><strong>通俗解释</strong>：<strong>每一个 Token 都有一个专门的线程块为它服务</strong>。<ul>
+<li>如果你的 Batch=2, 长度=100，就有 200 个线程块并行工作。</li>
+<li>这与“Chunk 并行”（一个线程块处理一整个 Chunk）不同，这里粒度更细。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 3: 理解“寻址” (Indexing)</h4>
+<p><strong>核心观点：</strong> 线程需要知道自己属于第几个句子的第几个词。</p>
+<p>在 Kernel 函数 <code>chunk_kda_fwd_kernel_intra_token_parallel</code> 的开头：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">i_tg</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="c1"># 全局 Token ID (0 到 B*T-1)</span>
+
+<span class="k">if</span> <span class="n">IS_VARLEN</span><span class="p">:</span> <span class="c1"># 如果是变长序列 (Variable Length)</span>
+    <span class="c1"># ... 二分查找代码 (Binary Search) ...</span>
+    <span class="c1"># 目的：找到当前全局 ID (i_tg) 属于第几句话 (i_n)</span>
+    <span class="c1"># 以及在这句话里的相对位置 (i_t)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="c1"># 定长序列很简单，直接除法和取余</span>
+    <span class="n">bos</span> <span class="o">=</span> <span class="p">(</span><span class="n">i_tg</span> <span class="o">//</span> <span class="n">T</span><span class="p">)</span> <span class="o">*</span> <span class="n">T</span>
+    <span class="n">i_t</span> <span class="o">=</span> <span class="n">i_tg</span> <span class="o">%</span> <span class="n">T</span>
+</code></pre></div>
+
+<ul>
+<li><strong>难点</strong>：因为我们把所有句子的 Token 拍扁成了一维（<code>B*T</code>），所以如果不告诉 GPU 句子的边界（<code>cu_seqlens</code>），它不知道你在处理哪个句子。</li>
+<li><strong>二分查找</strong>：那段 <code>for _ in range(20)</code> 的代码就是在查表，确定当前 Token 属于 Batch 中的哪一个样本。</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 理解“核心循环” (The Loop)</h4>
+<p><strong>核心观点：</strong> 计算当前 Token ($q$) 与其所在子块内之前的 Token ($k$) 的点积。</p>
+<p>这是代码最核心的数学部分：</p>
+<ol>
+<li>
+<p><strong>准备数据</strong>：
+    <code>python
+    # 加载当前 Token 的 q, k, g (Gate/Decay)
+    b_q = tl.load(p_q, ...).to(tl.float32)
+    b_k = tl.load(p_k, ...).to(tl.float32)
+    b_g = tl.load(p_g, ...).to(tl.float32)</code></p>
+</li>
+<li>
+<p><strong>循环计算 (Intra-Chunk Loop)</strong>：
+    代码逻辑是：我是第 <code>i_t</code> 个 Token，我要回头看我所在的这个小块（Sub-chunk）里的其他 Token。
+    ```python
+    # 遍历当前子块内的位置 j
+    for j in range(i_ts, min(i_t + 1, ...)):
+        # 加载过去某个时刻 j 的 k 和 g
+        b_kj = tl.load(p_kj, ...).to(tl.float32)
+        b_gj = tl.load(p_gj, ...).to(tl.float32)</p>
+<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 计算衰减项：exp(当前g - 过去g)
+<span class="gh">#</span> 这就是线性注意力中的 &quot;位置衰减&quot;
+b_kgj = b_kj <span class="gs">* exp2(b_g - b_gj)</span>
+
+<span class="gs"># 核心计算 1: Aqk (Attention Score)</span>
+<span class="gs"># Q *</span> (K <span class="gs">* Decay)</span>
+<span class="gs">b_Aqk = tl.sum(b_q *</span> b_kgj, axis=1) <span class="gs">* scale</span>
+
+<span class="gs"># 核心计算 2: Akk (用于归一化或状态更新)</span>
+<span class="gs"># K *</span> (K <span class="gs">* Decay)</span>
+<span class="gs">b_Akk = tl.sum(b_k *</span> b_kgj, axis=1) * ...
+</code></pre></div>
+
+<p><code>``
+*   **直觉**：
+*</code>b_Aqk<code>：我想知道我（Query）和刚才那个词（Key）有多匹配，同时考虑距离越远衰减越大（</code>exp2(b_g - b_gj)<code>）。
+*</code>b_Akk`：这是 KDA/GLA 算法特有的，计算 Key 和 Key 自身的相互作用，通常用于后续计算分母或更新状态。</p>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 5: 理解“输出” (Store)</h4>
+<p><strong>核心观点：</strong> 把算好的一个小标量写回显存。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 把算好的 b_Aqk 存入全局内存 Aqk</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">Aqk</span> <span class="o">+</span> <span class="o">...</span><span class="p">,</span> <span class="n">b_Aqk</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="o">...</span><span class="p">),</span> <span class="n">mask</span><span class="o">=</span><span class="n">m_h</span><span class="p">)</span>
+<span class="c1"># 把算好的 b_Akk 存入全局内存 Akk</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">Akk</span> <span class="o">+</span> <span class="o">...</span><span class="p">,</span> <span class="n">b_Akk</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="o">...</span><span class="p">),</span> <span class="n">mask</span><span class="o">=</span><span class="n">m_h</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>因为是 <strong>Token 并行</strong>，每个线程只负责算它自己那一个时间步的结果，所以最后直接写回对应的位置即可。</li>
+<li><strong>Aqk 的形状</strong>：<code>[B, T, H, BT]</code>。注意最后一维是 <code>BT</code>（Chunk Size），这意味着它存储了当前 Token 与其 Chunk 内其他 Token 的注意力分数。</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>如果让你用一句话概括这个文件：</p>
+<blockquote>
+<p><strong>这是一个 GPU 内核，它为序列中的每一个 Token 分配一个线程，让这个 Token 去计算它和它所在“小窗口（Chunk）”内之前所有 Token 的加权注意力分数（考虑了 Gate 衰减），并将结果存下来供后续使用。</strong></p>
+</blockquote>
+<p><strong>建议阅读顺序：</strong>
+1.  先看 <code>chunk_kda_fwd_intra_token_parallel</code> (Python 函数) 的参数，搞清输入输出。
+2.  再看 Kernel 中的 <code>i_tg</code> 和 <code>IS_VARLEN</code> 部分，搞清怎么定位。
+3.  最后看 <code>for j in range(...)</code> 循环，知道它是在做简单的点积和衰减。</p>

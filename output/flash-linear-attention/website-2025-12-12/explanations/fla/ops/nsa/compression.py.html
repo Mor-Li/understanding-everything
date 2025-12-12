@@ -1,0 +1,98 @@
+<h1>fla/ops/nsa/compression.py</h1>
+<p>这份代码确实包含了很多底层的 Triton 优化逻辑，乍一看非常劝退。</p>
+<p>为了让你看懂，我们不要一上来就读代码。我们把它当成一个<strong>项目任务（Project Task）</strong>，我给你列一个 <strong>Todo List</strong>，我们一层一层剥洋葱。</p>
+<p>这个文件的核心功能叫 <strong>NSA Compression（NSA 压缩注意力）</strong>。简单来说，它的目的是：<strong>让当前的 Token（Query），去关注过去已经“压缩”好的记忆块（Compressed Key/Value），而不是关注过去每一个细碎的 Token。</strong></p>
+<hr />
+<h3>📋 学习任务清单 (Task Todo List)</h3>
+<h4>✅ Task 1: 搞懂核心概念（为什么要这么做？）</h4>
+<ul>
+<li><strong>普通注意力 (Standard Attention):</strong> 就像你读一本书，读到第 100 页时，你要回头去逐字逐句复习前 99 页的所有内容来理解上下文。这太慢了。</li>
+<li><strong>NSA Compression (本文代码):</strong> 读到第 100 页时，你不再复习前 99 页的原文，而是去读前 99 页每章的<strong>摘要（Summary）</strong>。</li>
+<li><strong>对应关系：</strong><ul>
+<li>$Q$ (Query): 你当前读到的字（精细的）。</li>
+<li>$K, V$ (Key, Value): 之前章节的<strong>摘要块</strong>（粗粒度的，被压缩过的）。</li>
+<li><strong>结果：</strong> 速度极快，显存占用极低，因为 $K$ 和 $V$ 的长度变短了。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 搞懂数据形状（Input/Output 是什么？）</h4>
+<p>这是看懂代码最关键的一步。注意 $Q$ 和 $K, V$ 长度的不对等。</p>
+<ul>
+<li><strong>$Q$ (Query):</strong> 形状是 <code>[Batch, T, Head, Dim]</code>。<ul>
+<li>代表原始序列，长度是 $T$。</li>
+</ul>
+</li>
+<li><strong>$K, V$ (Key, Value):</strong> 形状是 <code>[Batch, TC, Head, Dim]</code>。<ul>
+<li>注意这里是 <strong>$TC$</strong> (Total Compressed)，不是 $T$。</li>
+<li>$TC = T / \text{BlockSize}$。</li>
+<li><strong>重点：</strong> $K$ 和 $V$ 是每隔 <code>BlockSize</code> (比如 64) 个 Token 压缩成一个向量。</li>
+</ul>
+</li>
+<li><strong>$O$ (Output):</strong> 形状和 $Q$ 一样，是 <code>[Batch, T, Head, Dim]</code>。</li>
+</ul>
+<h4>✅ Task 3: 拆解 Forward Kernel (前向传播)</h4>
+<p>现在我们看核心函数 <code>parallel_nsa_compression_fwd_kernel</code>。它的逻辑其实就是<strong>矩阵乘法</strong>，只是加了遮罩（Mask）。</p>
+<p><strong>逻辑流程如下：</strong></p>
+<ol>
+<li><strong>定位当前位置 (<code>i_t</code>):</strong><ul>
+<li>内核并行处理每一个 Query Token。假设当前处理第 <code>i_t</code> 个 Token。</li>
+</ul>
+</li>
+<li><strong>加载 Query (<code>b_q</code>):</strong><ul>
+<li>从显存读取当前的 $q$ 向量。</li>
+</ul>
+</li>
+<li><strong>确定要看多少个压缩块 (<code>NC</code>):</strong><ul>
+<li>代码：<code>NC = (i_t + 1) // BS</code></li>
+<li>含义：因为是因果注意力（Causal），我只能看我<strong>之前</strong>的时间步。如果 BlockSize=64，我现在在第 130 个 Token，那我只能看前 2 个完整的压缩块（0-63, 64-127）。</li>
+</ul>
+</li>
+<li><strong>循环计算注意力 (<code>for i_c in range(0, NC, BC)</code>):</strong><ul>
+<li>这是一个循环，遍历所有合法的压缩块。</li>
+<li><strong>Load K, V:</strong> 读取一段压缩后的 $K$ 和 $V$。</li>
+<li><strong>Score ($Q \cdot K^T$):</strong> 计算相似度分数 <code>b_s</code>。</li>
+<li><strong>Softmax:</strong> 计算 <code>exp(score)</code>。这里用到了 Online Softmax 技巧（代码里的 <code>b_m</code>, <code>b_acc</code> 等变量），是为了防止数值溢出，边算边归一化。</li>
+<li><strong>Weighted Sum ($P \cdot V$):</strong> 用分数加权求和 $V$，累加到结果 <code>b_o</code> 中。</li>
+</ul>
+</li>
+<li><strong>保存结果:</strong><ul>
+<li>最后把计算好的 <code>b_o</code> 写回显存。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 4: 理解其中的 Triton 黑魔法 (优化技巧)</h4>
+<p>代码里有一些让你头大的变量，其实都是为了性能：</p>
+<ul>
+<li><strong><code>tl.make_block_ptr</code></strong>:<ul>
+<li>这是 Triton 特有的指针加载方式。它处理了矩阵在内存中的切块，让你不用手写复杂的索引计算（比如 <code>i * stride + j</code>）。</li>
+</ul>
+</li>
+<li><strong>Online Softmax (<code>b_m</code>, <code>b_lse</code>, <code>b_acc</code>)</strong>:<ul>
+<li>因为 Softmax 需要分母（所有分数的和），但我们是分块读取 $K, V$ 的，没法一次性算出分母。</li>
+<li>所以代码维护了当前的最大值 <code>b_m</code> 和累加和 <code>b_acc</code>，每读一块新的 $K, V$，就更新一次这两个值，并修正之前的计算结果。这是 FlashAttention 的核心逻辑。</li>
+</ul>
+</li>
+<li><strong><code>IS_VARLEN</code> (变长序列)</strong>:<ul>
+<li>处理像 "Batch 里有的句子长 10，有的长 100" 这种情况。如果有 <code>cu_seqlens</code>，说明是变长序列，需要通过查表找到每个句子的起始位置。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 扫一眼 Backward Kernel (反向传播)</h4>
+<p><code>parallel_nsa_compression_bwd_kernel_dq</code> 和 <code>_dkv</code> 是用来训练的。</p>
+<ul>
+<li><strong>你只需要知道：</strong> 这是一个标准的链式法则实现。</li>
+<li><strong><code>_dq</code></strong>: 计算 $Q$ 的梯度。需要用到 $dO$ (输出的梯度) 和 $K, V$。</li>
+<li><strong><code>_dkv</code></strong>: 计算 $K, V$ 的梯度。因为 $K, V$ 是压缩的，所以这里会把多个 $Q$ 对同一个压缩块的梯度累加起来。</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在讲什么？</h3>
+<p><strong>一句话解释：</strong>
+这是一个<strong>高性能的 Triton 算子</strong>，实现了一种特殊的注意力机制：<strong>原始长度的 Query 序列，去关注（Attend）长度被压缩了 <code>BS</code> 倍的 Key/Value 序列</strong>。</p>
+<p><strong>它的使用场景：</strong>
+通常用于长序列建模（Long Context）。通过把历史信息压缩（比如每 64 个 token 压成 1 个），让现在的 token 在回顾历史时，计算量减少 64 倍，从而能处理极长的上下文。</p>
+<h3>建议阅读顺序</h3>
+<ol>
+<li>先看最后的 Python 函数 <code>parallel_nsa_compression_fwd</code>，看它怎么定义 Grid（并行网格）和 Block 大小。</li>
+<li>再看 <code>parallel_nsa_compression_fwd_kernel</code> 中的 <code>for</code> 循环部分，那是算法的灵魂。</li>
+<li>最后再纠结 <code>make_block_ptr</code> 里面的参数细节。</li>
+</ol>

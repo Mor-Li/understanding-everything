@@ -1,0 +1,114 @@
+<h1>tests/modules/test_rotary.py</h1>
+<p>这份文件 <code>tests/modules/test_rotary.py</code> 是一个<strong>测试脚本</strong>。它的作用是验证 <code>fla</code> 这个库中实现的 <strong>Rotary Embedding (旋转位置编码，简称 RoPE)</strong> 功能是否正确。</p>
+<p>为了确保新写的代码（通常是为了加速而优化的版本）是没问题的，开发者会拿它和一个“标准答案”（Reference，通常是纯 PyTorch 写的最基础版本）进行比对。</p>
+<p>我为你列了一个 <strong>“理解任务清单” (Todo List)</strong>，带你一步步拆解这个文件的逻辑：</p>
+<h3>📝 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>理解测试目标</strong>：搞懂我们在测什么（Rotary Embedding）。</li>
+<li><strong>看懂测试配置</strong>：理解 <code>@pytest.mark.parametrize</code> 是在做什么。</li>
+<li><strong>拆解基础测试 (<code>test_rotary</code>)</strong>：<ul>
+<li>生成假数据 (Input)。</li>
+<li>运行“新版本”代码 (Actual)。</li>
+<li>运行“标准答案”代码 (Reference)。</li>
+<li>比对结果 (Forward &amp; Backward)。</li>
+</ul>
+</li>
+<li><strong>拆解进阶测试 1 (<code>test_rotary_with_offsets</code>)</strong>：理解带“偏移量”的测试场景（模拟推理时的 KV Cache）。</li>
+<li><strong>拆解进阶测试 2 (<code>test_rotary_varlen</code>)</strong>：理解“变长序列”的测试场景（Packed Dataset）。</li>
+</ol>
+<hr />
+<h3>🚀 逐步详细讲解</h3>
+<h4>第一步：理解测试目标</h4>
+<p>这个文件是为了测试 <code>fla.modules.rotary.RotaryEmbedding</code> 这个类。
+*   <strong>RoPE</strong> 是现在大模型（如 LLaMA）中最常用的位置编码方式。
+*   <code>fla</code> 库可能写了一个<strong>加速版</strong>（通常用 Triton 或 CUDA 写成），这里命名为 <code>tri_q</code> (Triton Query)。
+*   为了证明加速版是对的，必须和 <code>rotary_embedding_ref</code>（参考版）的结果完全一致。</p>
+<h4>第二步：看懂测试配置</h4>
+<p>你会看到函数头上顶着很多这样的装饰器：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;B&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">])</span>
+<span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;T&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2048</span><span class="p">,</span> <span class="mi">4096</span><span class="p">])</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<p><strong>这是在做什么？</strong>
+这是在告诉测试框架 <code>pytest</code>：“请自动排列组合这些参数来运行测试”。
+*   <code>B</code>: Batch size (批次大小)
+*   <code>T</code>: Time / Sequence length (序列长度)
+*   <code>H</code>: Heads (注意力头数)
+*   <code>D</code>: Dimension (每个头的维度)
+*   <code>dtype</code>: 数据类型 (如 float32, bfloat16)
+<strong>目的：</strong> 确保代码在各种形状和精度下都能正常工作，而不是只有一种情况能跑通。</p>
+<h4>第三步：拆解基础测试 (<code>test_rotary</code>)</h4>
+<p>这是最标准的测试，没有任何花哨的参数。</p>
+<ol>
+<li>
+<p><strong>准备数据 (Setup):</strong>
+    <code>python
+    # 随机生成 Query (q) 和 Key (k) 张量
+    # requires_grad_() 表示我们要测试反向传播（训练过程）是否正确
+    q = torch.randn(B, T, H, D)...requires_grad_()
+    k = torch.randn(B, T, H//G, D)...requires_grad_()
+    rotary = RotaryEmbedding(D)...</code></p>
+</li>
+<li>
+<p><strong>运行新代码 (Action):</strong>
+    <code>python
+    # 调用我们要测试的模块
+    tri_q, tri_k = rotary(q, k)
+    # 计算梯度（模拟模型训练时的反向传播）
+    tri_dq = torch.autograd.grad(tri_q.sum(), q...)[0]</code></p>
+</li>
+<li>
+<p><strong>运行标准答案 (Reference):</strong>
+    <code>python
+    # 调用一个肯定正确的参考函数 rotary_embedding_ref
+    ref_q = rotary_embedding_ref(q.float(), ...)
+    # 计算参考答案的梯度
+    ref_dq = torch.autograd.grad(ref_q.sum(), q...)[0]</code></p>
+</li>
+<li>
+<p><strong>比对 (Assert):</strong>
+    <code>python
+    # assert_close 会检查两个张量的数值是否极其接近
+    # 既比对输出结果 (q, k)，也比对梯度 (dq, dk)
+    assert_close(" q", ref_q, tri_q, ratio=1e-5)
+    assert_close("dq", ref_dq, tri_dq, ratio=1e-5)</code>
+    <em>如果这一步报错，说明新写的加速代码算错了。</em></p>
+</li>
+</ol>
+<h4>第四步：拆解进阶测试 1 (<code>test_rotary_with_offsets</code>)</h4>
+<p><strong>场景：</strong> 模拟大模型<strong>推理 (Inference)</strong> 时的场景。
+当你生成第 1001 个词时，你不需要重新计算前 1000 个词，只需要计算第 1001 个。但是，第 1001 个词的位置索引（Position ID）必须是 1001，而不是 0。这就是 <code>offset</code>（偏移量）。</p>
+<ul>
+<li><strong>关键点：</strong>
+    <code>python
+    # 随机生成每个样本的起始位置偏移
+    seqlen_offset = torch.randint(0, T//2, (B,)).to(device)</code></li>
+<li><strong>测试逻辑：</strong><ul>
+<li>新代码直接传入 <code>seqlen_offset</code> 参数：<code>rotary(q, k, seqlen_offset=...)</code>。</li>
+<li>参考代码（Ref）比较笨，它通过切片 <code>rotary._cos_cached[offset:offset+T]</code> 手动模拟这个偏移。</li>
+<li>最后比对两者结果是否一致。</li>
+</ul>
+</li>
+</ul>
+<h4>第五步：拆解进阶测试 2 (<code>test_rotary_varlen</code>)</h4>
+<p><strong>场景：</strong> 模拟 <strong>变长序列 (Variable Length / Packed Sequences)</strong>。
+在训练时，为了不浪费显存，我们常把几句话拼成一条长数据（比如：“你好” + “今天天气不错”）。这时候，不同句子的位置编码需要重新从 0 开始计数，不能混在一起。</p>
+<ul>
+<li><strong>关键点：</strong> <code>cu_seqlens</code> (Cumulative Sequence Lengths，累积序列长度)。<ul>
+<li>比如 <code>[0, 5, 12]</code> 表示第一句话是索引 0-5，第二句话是 5-12。</li>
+</ul>
+</li>
+<li><strong>测试逻辑：</strong><ul>
+<li>新代码直接处理这种打包格式：<code>rotary(q, k, cu_seqlens=cu_seqlens)</code>。</li>
+<li>参考代码（Ref）通过循环 <code>for start, end in zip(...)</code>，把每一段单独切出来做旋转编码，然后再拼回去。</li>
+<li>最后比对两者结果。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的逻辑非常清晰：
+1.  <strong>造数据</strong>：造一些随机的 Query 和 Key。
+2.  <strong>跑两遍</strong>：一遍用<strong>待测的新模块</strong>，一遍用<strong>笨但正确的参考函数</strong>。
+3.  <strong>比结果</strong>：不仅比输出值，还要比反向传播的梯度，确保训练和推理都对。
+4.  <strong>覆盖场景</strong>：覆盖了普通模式、带偏移模式（推理缓存）、变长模式（高效训练）。</p>

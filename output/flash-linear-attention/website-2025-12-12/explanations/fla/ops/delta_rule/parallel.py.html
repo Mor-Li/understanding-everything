@@ -1,0 +1,105 @@
+<h1>fla/ops/delta_rule/parallel.py</h1>
+<p>这代码确实非常硬核，因为它涉及到 <strong>线性 Attention（Linear Attention）</strong> 的一种变体——<strong>Delta Rule</strong> 的并行化实现，而且是用 <strong>Triton</strong>（一种高性能 GPU 编程语言）写的。</p>
+<p>简单来说，<strong>Delta Rule</strong> 本质上是一种 RNN（循环神经网络），通常是一个接一个（串行）算的。但为了在 GPU 上跑得快，这个文件实现了一种算法，把这个串行过程变成了<strong>并行</strong>过程。</p>
+<p>为了让你看懂，我把这个复杂的数学和代码逻辑拆解成一个 <strong>Task List（任务清单）</strong>，就好像你在处理一个大项目一样。</p>
+<hr />
+<h3>核心任务清单 (Task List)</h3>
+<p>我们将整个计算过程分为三个阶段：<strong>准备阶段</strong>、<strong>局部处理阶段</strong>、<strong>全局关联阶段</strong>。</p>
+<h4>✅ Task 1: 理解目标 (What is Delta Rule?)</h4>
+<p>在看代码前，先建立一个直觉：
+*   普通的 Attention 是 $Q \times K^T \times V$。
+*   <strong>Delta Rule</strong> 是一种特殊的更新机制，它的 $Q$（查询）在往前看的时候，会不断地被前面的 $K$（键）“修正”或“正交化”。
+*   <strong>公式直觉</strong>：$Q_{new} = Q - (Q \cdot K^T) \cdot K_{beta}$。意思是我查询的时候，要减去那些我已经“记住”了的信息。</p>
+<h4>✅ Task 2: 分块策略 (Divide and Conquer)</h4>
+<ul>
+<li><strong>代码对应</strong>：<code>ParallelDeltaRuleFunction.forward</code> 中的 <code>BT=128, BS=32</code>。</li>
+<li><strong>说明</strong>：序列太长（比如 T=2048），直接算太慢。</li>
+<li><strong>To-Do</strong>：<ol>
+<li>把长序列切成大的块（Chunk），大小为 <code>BT</code> (128)。</li>
+<li>把大块再切成小块，大小为 <code>BS</code> (32)。</li>
+<li>我们先在小块内部解决战斗，再在大块之间解决战斗。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 3: 块内预处理 (Intra-Chunk Transformation)</h4>
+<p>这是代码中最难懂的部分之一，目的是把“串行依赖”在小块内部先消化掉。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>chunk_transform_qk_fwd</code> Kernel。</li>
+<li><strong>To-Do</strong>：<ol>
+<li><strong>计算局部 Attention</strong>：在小块（32长）内部，算出 $Q$ 和 $K$ 的关系。</li>
+<li><strong>修正 Q 和 K</strong>：<ul>
+<li>因为 Delta Rule 要求 $Q$ 必须减去前面的 $K$ 的影响。</li>
+<li>在这个 Kernel 里，我们生成了 <code>q_new</code> 和 <code>k_new</code>。</li>
+<li><code>q_new</code> 是已经排除了当前小块内部 $K$ 干扰的 $Q$。</li>
+<li><code>k_new</code> 是经过变换后的 $K$，方便后面计算。</li>
+</ul>
+</li>
+<li><strong>计算局部输出 <code>o</code></strong>：先把小块内部能算的 $V$ 的贡献先算出来存到 <code>o</code> 里。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>人话解释</strong>：这步相当于“清理门户”。在去外面（其他块）找答案之前，先把自己家里的逻辑理顺，把该减的减掉，生成干净的 Q 和 K。</p>
+</blockquote>
+<h4>✅ Task 4: 块间并行计算 (Inter-Chunk Parallel Scan)</h4>
+<p>这是最核心的计算部分，模拟了 FlashAttention 的逻辑，但是增加了 Delta Rule 的减法逻辑。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>parallel_delta_rule_fwd_kernel</code> Kernel。</li>
+<li><strong>To-Do</strong>：<ol>
+<li><strong>加载数据</strong>：每个线程块负责处理一个时间段的 $Q$（用的是刚才算好的 <code>q_new</code>）。</li>
+<li><strong>向左扫描 (Loop)</strong>：代码里有两个 <code>for offset in range(...)</code> 循环。这是在拿着当前的 $Q$，去“看”之前所有的 $K$ 和 $V$ 块。</li>
+<li><strong>计算 Attention 分数</strong>：<code>b_s = q @ k</code>。</li>
+<li><strong>累加 Value</strong>：<code>b_o += b_s @ v</code>。这是标准的 Attention 操作。</li>
+<li><strong>核心差异 (Update Q)</strong>：<ul>
+<li>代码行：<code>b_q -= tl.dot(b_s, b_k2)</code>。</li>
+<li>这就是 Delta Rule 的精髓！当前的 $Q$ 在看完一个过去的块后，必须<strong>减去</strong>那个块的信息（由 <code>b_s</code> 和 <code>b_k2</code> 决定）。这意味着 $Q$ 是动态变化的，越往回看，$Q$ 剩下的“余量”越少。</li>
+</ul>
+</li>
+<li><strong>保存结果</strong>：把最终累加的 <code>b_o</code> 存入 <code>o_new</code>。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 5: 拼接结果 (Final Assembly)</h4>
+<ul>
+<li><strong>代码对应</strong>：<code>ParallelDeltaRuleFunction.forward</code> 的最后几行。</li>
+<li><strong>To-Do</strong>：<ol>
+<li>把 Task 3 算出来的局部输出 <code>o</code> 和 Task 4 算出来的全局输出 <code>o_new</code> 结合起来（实际上代码里直接输出了 <code>o_new</code>，因为 Kernel 里已经包含了初始值）。</li>
+<li>如果需要 <code>output_attentions</code>，把 Attention Map 存下来。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>代码片段逐行解读 (针对核心逻辑)</h3>
+<p>为了让你更清楚，我们来看那个 <code>naive_delta_rule_parallel</code> 函数（纯 PyTorch 版），它是 Triton 代码的逻辑原型，更容易懂：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的逻辑对应 Task 3 (块内)</span>
+<span class="c1"># 1. 算局部 Attention 矩阵 A_local</span>
+<span class="n">A_local</span> <span class="o">=</span> <span class="p">(</span><span class="n">q</span> <span class="o">@</span> <span class="n">k</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">2</span><span class="p">))</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="n">mask2</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">@</span> <span class="n">T</span>
+
+<span class="c1"># 2. 修正 Q (减去当前块内 K 的影响)</span>
+<span class="n">q</span> <span class="o">=</span> <span class="n">q</span> <span class="o">-</span> <span class="n">A_local</span> <span class="o">@</span> <span class="n">k_beta</span> 
+
+<span class="c1"># 这里的逻辑对应 Task 4 (块间)</span>
+<span class="c1"># 遍历之前的每一个块 (j)</span>
+<span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">i</span> <span class="o">-</span> <span class="n">BN</span><span class="p">,</span> <span class="o">-</span><span class="n">BN</span><span class="p">,</span> <span class="o">-</span><span class="n">BN</span><span class="p">):</span>
+    <span class="c1"># 1. 算当前的 Attention</span>
+    <span class="n">A_ij</span> <span class="o">=</span> <span class="n">q_i</span> <span class="o">@</span> <span class="n">k_j</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+
+    <span class="c1"># 2. 累加 Output</span>
+    <span class="n">o_i</span> <span class="o">+=</span> <span class="n">A_ij</span> <span class="o">@</span> <span class="n">v</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">j</span><span class="p">:</span><span class="n">j</span><span class="o">+</span><span class="n">BN</span><span class="p">]</span>
+
+    <span class="c1"># 3. 核心：更新 Q！</span>
+    <span class="c1"># 下一次循环用的 q_i 变了，减去了当前这个块的影响</span>
+    <span class="n">q_i</span> <span class="o">=</span> <span class="n">q_i</span> <span class="o">-</span> <span class="n">A_ij</span> <span class="o">@</span> <span class="n">k_beta</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">j</span><span class="p">:</span><span class="n">j</span><span class="o">+</span><span class="n">BN</span><span class="p">]</span> 
+</code></pre></div>
+
+<h3>总结：这代码到底在干啥？</h3>
+<ol>
+<li><strong>不是标准的 Transformer</strong>：它在算 Attention 的同时，不断地修改 Query ($Q$) 向量。</li>
+<li><strong>并行化的难点</strong>：因为 $Q$ 依赖于之前所有的计算结果（要一个个减过去），通常只能串行。</li>
+<li><strong>并行化的解法</strong>：<ul>
+<li>利用 <strong>结合律</strong> 和 <strong>分块矩阵</strong> 的性质。</li>
+<li><strong>Triton Kernel</strong> 使得我们可以把 $Q$ 放在 GPU 的寄存器里，然后快速地扫描过所有的 $K/V$ 块，一边算 Attention 输出，一边实时更新 $Q$。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结</strong>：这是一个<strong>一边回头看历史，一边根据历史修正自己看法（Query）</strong>的高效并行 Attention 算法实现。</p>

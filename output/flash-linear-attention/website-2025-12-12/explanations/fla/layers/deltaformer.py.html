@@ -1,0 +1,98 @@
+<h1>fla/layers/deltaformer.py</h1>
+<p>这份代码确实涉及到了比较前沿的 Transformer 架构优化（Linear Attention/RNN-like 变体），直接看代码容易一头雾水。</p>
+<p>为了让你能够消化这段代码，我为你制定了一个<strong>5步走的 ToDo List</strong>。我们将把这段代码拆解开，就像剥洋葱一样，从最外层的结构一直剥到最核心的逻辑。</p>
+<hr />
+<h3>📋 学习任务清单 (ToDo List)</h3>
+<h4>✅ Task 1: 搞清楚“我是谁，我在哪” (定位)</h4>
+<p><strong>目标</strong>：理解这个类 (<code>DeltaFormerAttention</code>) 在整个大模型里是干嘛的。</p>
+<ul>
+<li><strong>核心观点</strong>：<ul>
+<li>它是一个<strong>注意力层 (Attention Layer)</strong>。</li>
+<li>你可以把它想象成是一个“插件”，用来<strong>替换</strong>标准 Llama 或 GPT 中的 <code>SelfAttention</code> 模块。</li>
+<li><strong>为什么造这个轮子？</strong> 标准的 Attention 计算量是 $O(N^2)$（随着字数变长，计算量爆炸），而 <code>DeltaFormer</code> 试图通过一种叫做“联想记忆 (Associative Memory)”的方式，把计算量降低到 $O(N)$（线性复杂度），让模型能处理超长文本。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 找不同 —— 识别“新面孔” (初始化)</h4>
+<p><strong>目标</strong>：阅读 <code>__init__</code> 函数，找出它和普通 Attention 有什么不一样的地方。</p>
+<ul>
+<li><strong>看代码 (Line 66-96)</strong>：<ul>
+<li><strong>老朋友</strong>：<code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>, <code>o_proj</code>。这些是标准配置，负责把输入向量变成 Query, Key, Value。</li>
+<li><strong>老朋友</strong>：<code>rotary</code> (RoPE)。负责给向量加上位置信息。</li>
+<li><strong>⭐⭐ 新面孔</strong>：注意 Line 88 的 <strong><code>self.b_proj</code></strong>。
+    <code>python
+    self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=True)</code></li>
+<li><strong>解读</strong>：普通 Attention 只有 Q, K, V。这里多了一个 <strong><code>beta</code> (b_proj)</strong>。</li>
+<li><strong>直觉</strong>：<code>beta</code> 通常在类似 RNN 的模型里充当“遗忘门”或“更新率”的角色。它决定了模型要<strong>记住多少旧知识，写入多少新知识</strong>。这就是 "Delta" (变化量) 的核心来源。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 数据预处理流水线 (Forward 前半段)</h4>
+<p><strong>目标</strong>：理解数据进入核心计算前经历了什么。</p>
+<ul>
+<li><strong>看代码 (Line 114-137)</strong>：<ol>
+<li><strong>投影 (Projections)</strong>：
+    <code>python
+    # 把输入 X 变成 Q, K, V 和 Beta
+    q = ... q_proj(...)
+    k = ... k_proj(...)
+    v = ... v_proj(...)
+    beta = self.b_proj(hidden_states) # 算出每个头的更新率</code></li>
+<li><strong>归一化 (Normalization)</strong>：<ul>
+<li>如果有 <code>qk_norm</code>，对 Q 和 K 做一次 RMSNorm。这是为了训练稳定。</li>
+</ul>
+</li>
+<li><strong>位置编码 (RoPE)</strong>：
+    <code>python
+    q, k = self.rotary(q, k, ...)</code><ul>
+<li>这步很关键。给 Q 和 K 加上位置信息，否则模型不知道“昨天”和“今天”的区别。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 4: 见证奇迹的时刻 (核心计算)</h4>
+<p><strong>目标</strong>：理解 <code>deltaformer_attn</code> 这个黑盒是干嘛的。</p>
+<ul>
+<li><strong>看代码 (Line 139-146)</strong>：
+    <code>python
+    o = deltaformer_attn(
+        q=q,
+        k=k,
+        v=v,
+        beta=beta,  # 注意这里传入了 beta
+        ...
+    )</code></li>
+<li><strong>核心观点</strong>：<ul>
+<li><strong>普通 Attention</strong>：计算 $Q \times K^T$ 得到一个巨大的分数矩阵（N x N），然后乘以 V。这很慢。</li>
+<li><strong>DeltaFormer</strong>：它不计算那个巨大的矩阵。它利用 <code>beta</code> 作为控制，通过一种类似“写日记”的方式（递归/RNN方式）更新一个内部记忆状态 $S$。</li>
+<li><strong>逻辑推演</strong>：<ol>
+<li>我有一个记忆 $S_{t-1}$。</li>
+<li>新的信息来了 ($K_t, V_t$)。</li>
+<li>我用 <code>beta</code> 决定怎么更新记忆：$S_t = S_{t-1} + \text{Delta}(K, V, \text{beta})$。</li>
+<li>最后用 $Q_t$ 从记忆 $S_t$ 中读取结果。</li>
+</ol>
+</li>
+<li>这就是为什么它快：它只需要维护一个固定大小的记忆状态，不需要存所有历史记录的相互关系。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 打包带走 (输出)</h4>
+<p><strong>目标</strong>：理解输出格式。</p>
+<ul>
+<li><strong>看代码 (Line 148-154)</strong>：
+    <code>python
+    o = o.reshape(batch_size, q_len, -1) # 拼回原本的形状
+    o = self.o_proj(o)                   # 最后一次线性变换</code></li>
+<li><strong>解读</strong>：这就和普通 Transformer 一样了，把计算结果整理好，扔给下一层网络。</li>
+</ul>
+<hr />
+<h3>🧠 总结一下 (Mental Model)</h3>
+<p>如果你要给别人讲这个文件是干嘛的，你可以这样说：</p>
+<blockquote>
+<p>"这是一个改进版的 Attention 层。普通的 Attention 是暴力计算所有词之间的关系。而 DeltaFormer 引入了一个叫 <strong>Beta</strong> 的参数（由 <code>b_proj</code> 生成），把计算过程变成了一种<strong>记忆更新</strong>的过程。它像写日记一样，根据 Beta 决定每一时刻要往记忆里写入多少新东西（Delta），然后 Query 再从这个记忆里查东西。这让它处理长文本时速度非常快。"</p>
+</blockquote>
+<p><strong>现在你再回头看代码，是不是清晰了一些？</strong>
+1.  先看 <code>__init__</code> 里的 <code>b_proj</code> (这是关键)。
+2.  再看 <code>forward</code> 里怎么把 <code>beta</code> 传给 <code>deltaformer_attn</code>。
+3.  其他的代码（Norm, RoPE, Reshape）都是为了配合这两个核心动作打杂的。</p>

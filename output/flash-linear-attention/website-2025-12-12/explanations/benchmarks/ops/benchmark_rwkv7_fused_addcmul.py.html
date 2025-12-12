@@ -1,0 +1,96 @@
+<h1>benchmarks/ops/benchmark_rwkv7_fused_addcmul.py</h1>
+<p>这份代码看起来确实充满了技术术语，但别担心，它的核心逻辑其实非常简单。</p>
+<p>简单来说，这是一个 <strong>“跑分软件” (Benchmark)</strong>。</p>
+<p>它的目的是：<strong>测试三种不同的方法来计算同一个数学公式，看看谁最快。</strong></p>
+<p>为了让你彻底看懂，我为你列了一个 <strong>“学习 To-Do List”</strong>，我们将分 5 个任务，一步步拆解这份代码。</p>
+<hr />
+<h3>✅ Task 1：搞懂核心任务——我们在算什么？</h3>
+<p>首先，我们要知道这代码在测试什么运算。
+请看这一行代码（在 <code>torch_compile_addcmul</code> 函数里）：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">xr</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">addcmul</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">delta</span><span class="p">,</span> <span class="n">x_r</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <code>addcmul</code> 是 PyTorch 的一个数学函数。
+*   它的公式是：<code>输出 = hidden_states + (delta * x_r)</code>。也就是“先乘后加”。
+*   在 RWKV7（一种新型的大模型架构）中，这个操作非常重要，而且这里一口气做了 <strong>6 次</strong> 类似的运算（分别算出了 <code>xr</code>, <code>xw</code>, <code>xk</code>, <code>xv</code>, <code>xa</code>, <code>xg</code>）。</p>
+<p><strong>结论：</strong> 这个文件的任务就是测试 <strong>“连续做 6 次 addcmul 运算”</strong> 需要多长时间。</p>
+<hr />
+<h3>✅ Task 2：认识三位“参赛选手”</h3>
+<p>代码里有三种不同的方法来完成 Task 1 的运算，它们正在比赛：</p>
+<ol>
+<li>
+<p><strong>选手 A: <code>addcmul_torch</code> (原生 PyTorch)</strong></p>
+<ul>
+<li><strong>代码位置：</strong> <code>torch_addcmul_rwkv7</code> (从外部导入)。</li>
+<li><strong>特点：</strong> 最基础的方法，老实人。它会启动 6 次运算核（Kernel），显存读写频繁，通常比较慢。</li>
+</ul>
+</li>
+<li>
+<p><strong>选手 B: <code>compile</code> (PyTorch 2.0 编译版)</strong></p>
+<ul>
+<li><strong>代码位置：</strong> <code>@torch.compile</code> 装饰的 <code>torch_compile_addcmul</code> 函数。</li>
+<li><strong>特点：</strong> PyTorch 自带的加速器。它会自动分析代码，尝试把这 6 个操作合并，或者优化显存访问。比原生快，但有时不如手写的底层代码。</li>
+</ul>
+</li>
+<li>
+<p><strong>选手 C: <code>addcmul_triton</code> (Triton 自定义算子)</strong></p>
+<ul>
+<li><strong>代码位置：</strong> <code>fused_addcmul_rwkv7</code> (从外部导入)。</li>
+<li><strong>特点：</strong> 这是专门为这个任务手写的 <strong>Fused Kernel（融合算子）</strong>。</li>
+<li><strong>核心魔法：</strong> 既然这 6 个计算用的输入大部分是一样的（都用了 <code>hidden_states</code> 和 <code>delta</code>），Triton 可以一次性把数据读进显卡，一口气算完 6 个结果再存回去。<strong>理论上它应该是最快的。</strong></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3：理解比赛场地 (Benchmark 设置)</h3>
+<p>代码中间的一大段 <code>@triton.testing.perf_report</code> 是在搭建比赛舞台。</p>
+<ul>
+<li><strong><code>x_names=['T']</code></strong>: 这是一个变量。<code>T</code> 代表 <strong>序列长度 (Sequence Length)</strong>。</li>
+<li><strong><code>x_vals=[128 * 2 ** i ...]</code></strong>: 比赛会分几轮进行。第一轮测长度 128，第二轮 256，一直测到很大。目的是看在短文本和长文本下，谁的表现更好。</li>
+<li><strong><code>line_arg='provider'</code></strong>: 图表里的几条线代表不同的选手（上面提到的 Torch, Compile, Triton）。</li>
+</ul>
+<p><strong>结论：</strong> 这段代码告诉程序：“请帮我画一张图，横轴是数据长度，纵轴是耗时，画出不同选手的速度曲线。”</p>
+<hr />
+<h3>✅ Task 4：理解比赛项目 (Forward vs Backward)</h3>
+<p>在 <code>benchmark</code> 函数里，你会看到 <code>provider</code> 有两种后缀：</p>
+<ol>
+<li>
+<p><strong>正向传播 (Forward):</strong></p>
+<ul>
+<li>例如 <code>addcmul_triton</code>。</li>
+<li><strong>含义：</strong> 仅仅计算出结果。这对应模型 <strong>“推理/预测”</strong> 时的速度。</li>
+</ul>
+</li>
+<li>
+<p><strong>反向传播 (Backward):</strong></p>
+<ul>
+<li>例如 <code>addcmul_triton_bwd</code>。</li>
+<li>代码里有一句看起来很复杂的 lambda：<code>sum([o.sum() for o in outputs]).backward()</code>。</li>
+<li><strong>含义：</strong> 模拟模型 <strong>“训练”</strong> 的过程。它不仅要算出结果，还要算出梯度（Gradient）。这通常比正向传播更慢，更吃显存。</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论：</strong> 代码不仅比谁算结果快，还要比谁在训练时求导快。</p>
+<hr />
+<h3>✅ Task 5：最后一步，开始跑分</h3>
+<p>最后一段代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+    <span class="n">benchmark</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">print_data</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   这就像按下秒表。
+*   程序会生成随机的假数据（<code>torch.randn</code>）。
+*   然后让三位选手（Torch, Compile, Triton）在不同长度（T）下分别跑正向和反向。
+*   最后打印出一张表格，显示毫秒数（ms）。</p>
+<hr />
+<h3>总结 (Summary)</h3>
+<p><strong>这段代码讲了什么观点？</strong></p>
+<p>它的“观点”是隐含在运行结果里的。通常运行后，它想证明：
+<strong>“对于 RWKV7 模型中的这个特定计算步骤，使用 Triton 编写的融合算子（Fused Kernel）比原生的 PyTorch 甚至编译后的 PyTorch 都要快得多。”</strong></p>
+<p><strong>你的学习路径：</strong>
+1.  这是一个<strong>测速脚本</strong>。
+2.  测的是 <strong>RWKV7 模型</strong>里的一个<strong>乘加运算</strong>。
+3.  对比了 <strong>原生 PyTorch</strong> vs <strong>编译器优化</strong> vs <strong>手写 Triton 加速</strong>。
+4.  同时也对比了 <strong>推理速度</strong> 和 <strong>训练速度</strong>。</p>

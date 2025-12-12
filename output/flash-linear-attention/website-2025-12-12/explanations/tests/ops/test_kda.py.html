@@ -1,0 +1,90 @@
+<h1>tests/ops/test_kda.py</h1>
+<p>这个文件 <code>tests/ops/test_kda.py</code> 实际上是一个<strong>测试脚本</strong>（Test Script）。它的作用不是定义新的AI模型，而是用来<strong>验证</strong>一种叫做 <strong>KDA (Kernel Decay Attention)</strong> 的算法在代码实现上是否正确。</p>
+<p>在深度学习底层开发中，为了让模型跑得快，开发者通常会写两套代码：
+1.  <strong>Naive（朴素版）：</strong> 用最简单的 PyTorch 公式写，跑得慢，但逻辑清晰，绝对正确（作为“标准答案”）。
+2.  <strong>Fused/Chunk（融合/分块版）：</strong> 用 Triton 或 CUDA 写的高性能代码，跑得飞快，但代码极其复杂，容易写出 Bug。</p>
+<p><strong>这个文件的核心目的就是：对比这两套代码的输出结果。如果结果一致，说明高性能代码没写错。</strong></p>
+<p>下面我为你列一个 <strong>Task List</strong>，带你一步步拆解这里面的逻辑：</p>
+<hr />
+<h3>Task 1：搞懂主角 —— KDA 是什么？</h3>
+<p><strong>任务：</strong> 理解输入数据的含义。
+在代码的开头（如 <code>test_naive_chunk</code> 函数里），你会看到这些变量：
+*   <strong>Q, K, V:</strong> 这就是 Transformer 里的 Query, Key, Value，是注意力机制的三大件。
+*   <strong>g (gate/decay):</strong> 这是一个门控或衰减项，用来控制模型“遗忘”多少历史信息（类似 LSTM 的遗忘门）。
+*   <strong>beta:</strong> 这是 KDA 特有的一个参数，可能是另一种缩放或控制因子。</p>
+<p><strong>观点：</strong> 这个算法本质上是一种<strong>线性注意力（Linear Attention）</strong>或者<strong>RNN</strong>。它不像标准 Transformer 那样一次看所有词，而是像贪吃蛇一样一步步吃数据，同时根据 <code>g</code> 来决定保留多少记忆。</p>
+<hr />
+<h3>Task 2：理解测试的“黄金法则” (Ground Truth)</h3>
+<p><strong>任务：</strong> 找到代码中的“标准答案”生成者。
+请看这一段代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ref</span><span class="p">,</span> <span class="n">ref_ht</span> <span class="o">=</span> <span class="n">naive_recurrent_kda</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong><code>naive_recurrent_kda</code></strong>: 这里的 <code>naive</code> 代表朴素版，<code>recurrent</code> 代表它像 RNN 一样用循环写出来的。</li>
+<li><strong><code>ref</code> (Reference)</strong>: 这就是<strong>参考答案</strong>。开发者认为这个函数算出来的结果是绝对正确的。</li>
+</ul>
+<p><strong>观点：</strong> 一切测试都是基于“对比”。必须先有一个算得慢但算得对的基准。</p>
+<hr />
+<h3>Task 3：测试“分块计算” (Chunk Mode) 的正确性</h3>
+<p><strong>任务：</strong> 理解 <code>test_naive_chunk</code> 函数。
+代码对比了 <code>naive_recurrent_kda</code> 和 <code>naive_chunk_kda</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">tri</span><span class="p">,</span> <span class="n">tri_ht</span> <span class="o">=</span> <span class="n">naive_chunk_kda</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;o&quot;</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tri</span><span class="p">,</span> <span class="mf">0.005</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>Recurrent (循环模式):</strong> 也就是一个个词串行处理，$t_1 \to t_2 \to t_3$。</li>
+<li><strong>Chunk (分块模式):</strong> 把长序列切成小块（比如每块64个词），块内并行计算。这是为了加速训练。</li>
+</ul>
+<p><strong>观点：</strong> 这个 Task 验证的是数学推导：<strong>“一个个算”和“切块算”结果必须一样</strong>。</p>
+<hr />
+<h3>Task 4：测试“高性能内核” (Fused Kernel)</h3>
+<p><strong>任务：</strong> 理解 <code>test_fused_recurrent</code> 和 <code>test_chunk</code> 函数。
+这是整个文件最重要的部分。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 chunk_kda 通常是底层用 Triton 写的加速版本</span>
+<span class="n">tri</span><span class="p">,</span> <span class="n">tri_ht</span> <span class="o">=</span> <span class="n">chunk_kda</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+
+<span class="c1"># 对比 标准答案(ref) 和 加速版本(tri)</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;o&quot;</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tri</span><span class="p">,</span> <span class="mf">0.005</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>Fused (融合):</strong> 指把多个计算步骤合并成一个 GPU 内核操作，减少内存读写。</li>
+<li><strong>TMA:</strong> 代码里出现的 <code>os.environ["FLA_USE_TMA"]</code> 是指 Tensor Memory Accelerator，这是 NVIDIA H100 显卡的新特性，用来加速数据搬运。</li>
+</ul>
+<p><strong>观点：</strong> 这一步是在通过“图灵测试”——如果加速版代码吐出的数字和朴素版只有 0.005 的误差，我们就认为加速版是可用的。</p>
+<hr />
+<h3>Task 5：测试“反向传播” (Backpropagation)</h3>
+<p><strong>任务：</strong> 观察代码中的 <code>.backward()</code> 和 <code>.grad</code>。
+在 <code>test_chunk</code> 函数里：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算梯度</span>
+<span class="p">((</span><span class="n">tri</span> <span class="o">*</span> <span class="n">do</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">+</span> <span class="p">(</span><span class="n">tri_ht</span> <span class="o">*</span> <span class="n">dht</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 对比梯度</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;dq&quot;</span><span class="p">,</span> <span class="n">ref_dq</span><span class="p">,</span> <span class="n">tri_dq</span><span class="p">,</span> <span class="mf">0.008</span><span class="p">)</span> <span class="c1"># 对比 Q 的梯度</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s2">&quot;dk&quot;</span><span class="p">,</span> <span class="n">ref_dk</span><span class="p">,</span> <span class="n">tri_dk</span><span class="p">,</span> <span class="mf">0.008</span><span class="p">)</span> <span class="c1"># 对比 K 的梯度</span>
+</code></pre></div>
+
+<ul>
+<li>训练神经网络不仅需要前向算出结果，还需要反向算出<strong>梯度</strong>（Gradient）来更新参数。</li>
+<li>很多时候，前向算对了，但反向求导写错了。</li>
+</ul>
+<p><strong>观点：</strong> 这个 Task 确保<strong>训练过程</strong>也是对的。它对比了朴素版算出的梯度和加速版算出的梯度是否一致。</p>
+<hr />
+<h3>Task 6：测试“变长序列” (Variable Length / Packed Sequence)</h3>
+<p><strong>任务：</strong> 理解 <code>test_chunk_varlen</code> 函数。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">cu_seqlens</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">15</span><span class="p">,</span> <span class="mi">100</span><span class="p">,</span> <span class="mf">300.</span><span class="o">..</span><span class="p">]</span> <span class="c1"># 累积序列长度</span>
+</code></pre></div>
+
+<ul>
+<li>在实际训练中，我们经常把不同长度的句子拼在一起（Packed Sequence）塞进一个 Batch 里。</li>
+<li>比如第一句长15，第二句长85，拼成一个100的张量。</li>
+</ul>
+<p><strong>观点：</strong> 高性能代码处理这种拼盘数据非常容易出错（比如不小心让第一句读到了第二句的信息）。这个测试专门用来防止这种“越界”Bug。</p>
+<hr />
+<h3>总结：这个文件在讲什么？</h3>
+<p>如果把开发 KDA 算法比作<strong>造飞机</strong>：
+1.  <strong><code>naive_recurrent_kda</code></strong> 是<strong>风洞里的数学模型</strong>（理论正确，但不能飞，太慢）。
+2.  <strong><code>chunk_kda</code></strong> 是<strong>真飞机的引擎</strong>（结构复杂，追求极速）。
+3.  <strong>这个测试文件</strong> 就是<strong>地勤检查清单</strong>：它拿着数学模型算出的数据，去核对真引擎跑出的数据。只有两者一致（Output 和 Gradient 都对上），还要能适应各种天气（变长序列），这架飞机（算法）才允许起飞（发布使用）。</p>

@@ -1,0 +1,86 @@
+<h1>evals/ppl.py</h1>
+<p>这份代码 <code>evals/ppl.py</code> 的核心目的是：<strong>给一个语言模型（LLM）做一场“阅读理解考试”，算出一个分数（Perplexity / 困惑度），看看它到底有多聪明，尤其是在读很长的文章时表现如何。</strong></p>
+<p>Perplexity (PPL) 越低，说明模型对下一个词的预测越准，模型越好。</p>
+<p>为了让你听懂，我把这个过程比喻成<strong>“老师（代码）给学生（模型）安排一场超长篇幅的填空考试”</strong>。</p>
+<p>下面是一个 <strong>Task Todo List</strong>，我们将代码逻辑拆解为 6 个步骤：</p>
+<hr />
+<h3>📋 Task Todo List (代码执行流程)</h3>
+<ol>
+<li><strong>准备考场与考生</strong> (Setup &amp; Load)<ul>
+<li>设置参数，把模型（学生）和数据（考卷）加载进来。</li>
+</ul>
+</li>
+<li><strong>把考卷翻译成机器语言</strong> (Preprocess)<ul>
+<li>把人类的文字变成模型能读懂的数字（Token IDs）。</li>
+</ul>
+</li>
+<li><strong>把考卷裁剪成标准长度</strong> (Batchify - <strong>核心难点</strong>)<ul>
+<li>因为模型一次只能读一定长度（比如 32k 长度），我们需要把无数个短句子拼接起来，再切成一块一块的长条。</li>
+</ul>
+</li>
+<li><strong>让学生做题</strong> (Model Forward)<ul>
+<li>把切好的长条喂给模型，让它预测下一个字是什么。</li>
+</ul>
+</li>
+<li><strong>分段阅卷打分</strong> (Calculate Loss &amp; PPL)<ul>
+<li>看模型预测得准不准，算出“困惑度”。</li>
+<li><strong>特色功能</strong>：不仅算总分，还算“分段得分”（比如：读到第100字时的水平 vs 读到第20000字时的水平）。</li>
+</ul>
+</li>
+<li><strong>输出成绩单</strong> (Report)<ul>
+<li>打印最终的 PPL 分数和分段详情。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 逐步详细讲解</h3>
+<h4>Step 1: 准备考场与考生 (Main Function)</h4>
+<p><strong>代码位置：</strong> <code>main()</code> 函数
+<strong>讲人话：</strong>
+代码首先读取命令行参数（比如用哪张显卡、测哪个模型）。
+*   <code>AutoTokenizer</code> 和 <code>AutoModelForCausalLM</code>：这就是把“考生”（模型）请进房间。
+*   <code>load_dataset</code>：从网上（HuggingFace）下载“考卷”（比如 <code>pg19</code> 是一本很厚的书的数据集）。</p>
+<h4>Step 2: 把考卷翻译成机器语言 (Preprocess)</h4>
+<p><strong>代码位置：</strong> <code>PerplexityEvaluator.preprocess</code>
+<strong>讲人话：</strong>
+模型看不懂中文或英文，它只认识数字。
+*   这一步调用 <code>tokenizer</code> 把类似 "Today is a good day" 转换成 <code>[101, 203, 55, ...]</code> 这样的数字列表。</p>
+<h4>Step 3: 把考卷裁剪成标准长度 (Batchify) ⚠️ <strong>最重要的一步</strong></h4>
+<p><strong>代码位置：</strong> <code>PerplexityEvaluator.batchify</code>
+<strong>讲人话：</strong>
+这是测长文本（Long Context）模型的关键。
+*   <strong>问题</strong>：数据集里的句子有长有短，但我们想测模型一口气读 32,768 (<code>block_size</code>) 个字的能力。
+*   <strong>做法</strong>：
+    1.  代码搞了一个巨大的“传送带” (<code>current_tokens</code>)。
+    2.  它把所有句子的数字首尾相连，拼成一条无限长的长龙，不管句子有没有结束。
+    3.  然后拿着一把刀，每隔 32,768 个数字切一刀。
+    4.  <strong>目的</strong>：这样能保证模型每次吃进去的都是<strong>填满</strong>的超长上下文，用来测试它记性好不好。</p>
+<h4>Step 4: 让学生做题 (Process Batch)</h4>
+<p><strong>代码位置：</strong> <code>PerplexityEvaluator.process_batch</code>
+<strong>讲人话：</strong>
+*   <code>input_ids</code> 是题目，<code>labels</code> 是标准答案。
+*   <code>outputs = self.model(input_ids, labels=labels)</code>：这一行就是让模型开始做题。模型会根据前面的字预测下一个字。
+*   代码里计算了 <code>nlls</code> (Negative Log Likelihood)：简单说就是“扣分项”。模型预测得越错，这个值越大。</p>
+<h4>Step 5: 分段阅卷打分 (Evaluate Loop) 🌟 <strong>本文特色</strong></h4>
+<p><strong>代码位置：</strong> <code>PerplexityEvaluator.evaluate</code>
+<strong>讲人话：</strong>
+这个脚本不仅算总分，还非常细致地把长文章切成了很多个小桶 (<code>bucket_size</code>，默认2048)。
+*   <strong>为什么要这么做？</strong>
+    *   有些模型读前 2000 字很聪明，读到 20000 字时脑子就糊涂了（遗忘问题）。
+    *   这段代码会统计：
+        *   Block 0 (0-2048字) 的得分
+        *   Block 1 (2048-4096字) 的得分
+        *   ...以此类推。
+*   <code>block_loss</code> 和 <code>block_tokens</code> 就是用来存这些分段成绩的容器。</p>
+<h4>Step 6: 输出成绩单 (Results)</h4>
+<p><strong>代码位置：</strong> <code>evaluate</code> 的最后部分 和 <code>main</code> 的最后
+<strong>讲人话：</strong>
+*   <code>math.exp(total_loss / total_tokens)</code>：这是 PPL 的计算公式。把所有扣的分数取平均，再做一个指数运算。
+    *   <strong>PPL = 1</strong>：完美预测（神）。
+    *   <strong>PPL = 10-20</strong>：非常好的模型。
+    *   <strong>PPL = 1000+</strong>：模型在胡言乱语。
+*   最后打印出的 <code>Block-wise Perplexities</code> 会告诉你：这个模型是不是“烂尾”了（前面准，后面不准）。</p>
+<hr />
+<h3>总结</h3>
+<p>这个脚本是一个<strong>专业的长文本模型体检工具</strong>。</p>
+<p>如果你看不懂代码细节，只需要记住：<strong>它把无数短句子拼成超长句子，喂给模型，然后检查模型在阅读长文的开头、中间、结尾时，是不是都能保持聪明（低 PPL）。</strong></p>

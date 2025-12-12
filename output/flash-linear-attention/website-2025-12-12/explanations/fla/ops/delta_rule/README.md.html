@@ -1,0 +1,83 @@
+<h1>fla/ops/delta_rule/README.md</h1>
+<p>这份文档确实写得非常数学化，因为它是在为一个深度学习模型的底层算子（Operator）做数学推导。简单来说，它是在讲<strong>如何把一个原本需要一步一步算的过程（串行），转化成可以一次性算完的矩阵运算（并行），以便让显卡（GPU）跑得飞快。</strong></p>
+<p>为了让你听懂，我们把这个过程拆解成一个 <strong>Task List（任务清单）</strong>，然后一步步攻克。</p>
+<h3>🚀 任务清单 (Task List)</h3>
+<ol>
+<li><strong>搞懂背景</strong>：为什么要搞这个“Chunkwise”并行？</li>
+<li><strong>分析痛点</strong>：原本的公式长什么样？为什么慢？</li>
+<li><strong>核心魔法</strong>：什么是“WY表示法”？（这是解题的关键钥匙）</li>
+<li><strong>推导过程</strong>：如何把复杂的连乘变成简单的加减乘除？</li>
+<li><strong>最终成果</strong>：最终的公式长什么样？为什么GPU喜欢它？</li>
+</ol>
+<hr />
+<h3>第一步：搞懂背景 (Context)</h3>
+<p><strong>DeltaNet</strong> 是一种类似于 RNN（循环神经网络）的模型。
+*   <strong>传统 RNN 的做法</strong>：看一个字，更新一下记忆（State），再看下一个字。
+    *   缺点：必须等上一步做完才能做下一步，像排队过安检，GPU 没法全力开火。
+*   <strong>Chunkwise（分块）的做法</strong>：把一篇文章切成很多小块（Chunk）。在每一个小块内部，我们希望能<strong>并行计算</strong>，而不是排队。</p>
+<p><strong>这篇文档的目标</strong>：证明并推导出一套公式，让 DeltaNet 在每一个“小块”内部能利用矩阵乘法一次性算出结果，而不是写 <code>for</code> 循环。</p>
+<hr />
+<h3>第二步：分析痛点 (The Problem)</h3>
+<p>文档一开始给出了状态 $S$ 的更新公式：</p>
+<p>$$ \mathbf{S}^r = \mathbf{P}^r \cdot \mathbf{S}^{0} + \mathbf{H}^r $$</p>
+<p>这里有个巨大的麻烦：
+*   <strong>$\mathbf{P}^r$ 是什么？</strong> 它是一个<strong>连乘</strong>（$\prod$）。公式里写着 $\prod_{i=1}^r (\mathbf{I} - \beta^i \mathbf{k}^i \mathbf{k}^{i\top})$。
+    *   意思是：第 $r$ 步的状态，是由第 $1$ 步乘到第 $r$ 步累积下来的。
+    *   这就像折纸，折第100次的效果取决于前99次怎么折。
+*   <strong>痛点</strong>：在计算机里算连乘（Product）通常意味着要写循环，没法并行。</p>
+<hr />
+<h3>第三步：核心魔法 (The WY Representation)</h3>
+<p>这是文中最重要的概念。作者提到了 <strong>"Classical WY representation"</strong>。</p>
+<ul>
+<li>
+<p><strong>通俗解释</strong>：
+    你想象一下，$\mathbf{I} - \beta \mathbf{k} \mathbf{k}^T$ 这种形式的矩阵，在数学上很像一种“反射”或者“修正”操作（类似 Householder 变换）。
+    如果你要连续做 100 次这种修正，<strong>WY 表示法</strong>告诉我们：<strong>不需要真的乘 100 次！</strong>
+    这 100 次修正叠加后的总效果，可以写成<strong>一个</strong>简单的形式：
+    $$ \mathbf{I} - \mathbf{K}^\top \mathbf{W} $$
+    即：<strong>原始矩阵 - (某个矩阵 $\times$ 另一个矩阵)</strong>。</p>
+</li>
+<li>
+<p><strong>文档里的操作</strong>：
+    作者说：“别傻傻地算连乘了，我们用 WY 表示法，把 $\mathbf{P}^r$ 直接变成 $\mathbf{I} - \sum \mathbf{k}\mathbf{w}^T$ 的形式。”</p>
+</li>
+</ul>
+<hr />
+<h3>第四步：推导过程 (The Derivation)</h3>
+<p>这一大段数学公式（We prove this by induction...）其实都在做一件事：<strong>找规律</strong>。</p>
+<ol>
+<li>
+<p><strong>找 $\mathbf{W}$</strong>：
+    作者通过数学归纳法证明，要把连乘变成减法，我们需要构造一个辅助矩阵 $\mathbf{W}$。
+    公式推导出了 $\mathbf{W}$ 和 $\mathbf{K}$（Key向量）以及 $\beta$ 之间的关系。</p>
+</li>
+<li>
+<p><strong>找 $\mathbf{U}$</strong>：
+    同理，公式里的 $\mathbf{H}^r$（历史信息的总和）原本也是个复杂的求和，作者用同样的方法，把它转化成了 $\mathbf{K}^\top \mathbf{U}$ 的形式。</p>
+</li>
+<li>
+<p><strong>解方程</strong>：
+    推导的后半部分（In matrix form...），作者解出了 $\mathbf{W}$ 和 $\mathbf{U}$ 到底怎么算。
+    最终发现，它们可以通过一个<strong>下三角矩阵的求逆</strong>（Inversion）来得到：
+    $$ \mathbf{T} = (\mathbf{I} + \text{下三角部分})^{-1} $$
+    $$ \mathbf{W} = \mathbf{T} \mathbf{K} $$</p>
+<p><em>为什么这很重要？</em> 因为计算三角矩阵的逆，在 GPU 上是非常成熟且高效的算法。</p>
+</li>
+</ol>
+<hr />
+<h3>第五步：最终成果 (The Conclusion)</h3>
+<p>文档最后给出的公式是：</p>
+<p>$$ \mathbf{O} = \mathbf{Q} \mathbf{S}^0 + (\dots) (\mathbf{U} - \mathbf{W} \mathbf{S}^0) $$</p>
+<p><strong>这个公式的牛逼之处在于：</strong>
+1.  <strong>没有连乘符号 $\prod$</strong>：原本复杂的连乘消失了。
+2.  <strong>全是矩阵乘法</strong>：$\mathbf{Q} \mathbf{K}^\top$、$\mathbf{W} \mathbf{S}^0$ 等等。
+3.  <strong>Tensor Core 友好</strong>：NVIDIA 的 GPU 最擅长的就是做矩阵乘法（Matrix Multiplication）。</p>
+<h3>总结 (Summary)</h3>
+<p>这篇文档讲了一个<strong>“数学魔术”</strong>：</p>
+<ol>
+<li><strong>原始问题</strong>：DeltaNet 模型算起来太慢，因为公式里有一堆像“俄罗斯套娃”一样的连乘运算。</li>
+<li><strong>解决思路</strong>：利用线性代数里的 <strong>WY 表示法</strong>。</li>
+<li><strong>操作</strong>：证明了这堆连乘可以被压缩成几个矩阵 ($\mathbf{K}, \mathbf{W}, \mathbf{U}$) 的简单乘法。</li>
+<li><strong>结果</strong>：把原本需要串行（排队）算的算法，改写成了完全并行的矩阵运算，从而可以在 GPU 上利用 <strong>Tensor Core</strong> 极速运行。</li>
+</ol>
+<p><strong>一句话概括：</strong> 作者用高深的数学推导，把一个慢速算法转化成了显卡最喜欢的快速矩阵算法。</p>
